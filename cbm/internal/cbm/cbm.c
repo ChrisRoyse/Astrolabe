@@ -839,6 +839,150 @@ static int count_params_from_signature(const char *sig) {
     return commas + 1;
 }
 
+/* Preserve the exact quoted-header spellings before pass_parallel retires the
+ * tree-sitter tree. Compiler path admission needs includes nested beneath
+ * header guards, including syntactically present inactive branches; the exact
+ * compiler dependency closure later decides which branches applied to one
+ * compilation context. */
+static bool capture_exact_quoted_includes(CBMFileResult *result, const char *source, int source_len,
+                                          CBMLanguage language, TSNode root) {
+    if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
+        return true;
+    }
+    if (!result || !source || source_len < 0 || ts_node_is_null(root)) {
+        cbm_file_result_set_error(
+            result, "CBM_EXACT_INCLUDE_CAPTURE_INPUT_INVALID", "capture_exact_quoted_includes",
+            "extract", source_len < 0 ? 0 : (size_t)source_len,
+            "the authoritative C-family syntax/source pair is unavailable for exact include "
+            "capture",
+            "preserve the source generation and repair parser/source ownership before retrying");
+        return false;
+    }
+
+    const char **temporary = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool traversal_complete = false;
+    while (!traversal_complete) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *node_kind = ts_node_type(node);
+        if (strcmp(node_kind, "preproc_include") == 0 || strcmp(node_kind, "preproc_import") == 0) {
+            TSNode path_node = ts_node_child_by_field_name(node, "path", 4);
+            if (ts_node_is_null(path_node)) {
+                uint32_t child_count = ts_node_child_count(node);
+                for (uint32_t child_index = 0; child_index < child_count; child_index++) {
+                    TSNode child = ts_node_child(node, child_index);
+                    if (strcmp(ts_node_type(child), "string_literal") == 0) {
+                        path_node = child;
+                        break;
+                    }
+                }
+            }
+            if (!ts_node_is_null(path_node) &&
+                strcmp(ts_node_type(path_node), "string_literal") == 0) {
+                uint32_t start = ts_node_start_byte(path_node);
+                uint32_t end = ts_node_end_byte(path_node);
+                if (end <= start + 1 || end > (uint32_t)source_len || source[start] != '"' ||
+                    source[end - 1] != '"') {
+                    ts_tree_cursor_delete(&cursor);
+                    free(temporary);
+                    cbm_file_result_set_error(
+                        result, "CBM_EXACT_INCLUDE_CAPTURE_SPAN_INVALID",
+                        "capture_exact_quoted_includes", "extract", end,
+                        "a quoted include syntax node does not map to an exact bounded source "
+                        "spelling",
+                        "preserve the source/tree generation and repair its byte-span identity");
+                    return false;
+                }
+                if (count == capacity) {
+                    if (capacity > (size_t)INT_MAX / 2 ||
+                        capacity > SIZE_MAX / (2 * sizeof(*temporary))) {
+                        ts_tree_cursor_delete(&cursor);
+                        free(temporary);
+                        cbm_file_result_set_error(
+                            result, "CBM_EXACT_INCLUDE_CAPTURE_CAPACITY_OVERFLOW",
+                            "capture_exact_quoted_includes", "extract", count,
+                            "one source file has more quoted includes than the exact witness can "
+                            "represent",
+                            "split the source file or extend the exact-include representation");
+                        return false;
+                    }
+                    size_t next_capacity = capacity ? capacity * 2 : 8;
+                    const char **resized = realloc(temporary, next_capacity * sizeof(*temporary));
+                    if (!resized) {
+                        ts_tree_cursor_delete(&cursor);
+                        free(temporary);
+                        cbm_file_result_set_error(
+                            result, "CBM_EXACT_INCLUDE_CAPTURE_ALLOC_FAILED",
+                            "capture_exact_quoted_includes", "extract",
+                            next_capacity * sizeof(*temporary),
+                            "the exact quoted-include witness could not grow",
+                            "free memory or reduce concurrent repository workload, then retry");
+                        return false;
+                    }
+                    temporary = resized;
+                    capacity = next_capacity;
+                }
+                size_t request_length = (size_t)(end - start - 2);
+                const char *request =
+                    cbm_arena_strndup(&result->arena, source + start + 1, request_length);
+                if (!request) {
+                    ts_tree_cursor_delete(&cursor);
+                    free(temporary);
+                    cbm_file_result_set_error(
+                        result, "CBM_EXACT_INCLUDE_CAPTURE_ALLOC_FAILED",
+                        "capture_exact_quoted_includes", "extract", request_length + 1,
+                        "one exact quoted-include spelling could not be retained",
+                        "free memory or reduce concurrent repository workload, then retry");
+                    return false;
+                }
+                temporary[count++] = request;
+            }
+        }
+
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                traversal_complete = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+
+    if (count > 0) {
+        if (count > (size_t)INT_MAX || count == SIZE_MAX / sizeof(*temporary)) {
+            free(temporary);
+            cbm_file_result_set_error(
+                result, "CBM_EXACT_INCLUDE_CAPTURE_CAPACITY_OVERFLOW",
+                "capture_exact_quoted_includes", "extract", count,
+                "the exact quoted-include count exceeds its immutable representation",
+                "split the source file or extend the exact-include representation");
+            return false;
+        }
+        result->exact_quoted_includes =
+            cbm_arena_alloc(&result->arena, (count + 1) * sizeof(*temporary));
+        if (!result->exact_quoted_includes) {
+            free(temporary);
+            cbm_file_result_set_error(
+                result, "CBM_EXACT_INCLUDE_CAPTURE_ALLOC_FAILED", "capture_exact_quoted_includes",
+                "extract", (count + 1) * sizeof(*temporary),
+                "the exact quoted-include pointer manifest could not be retained",
+                "free memory or reduce concurrent repository workload, then retry");
+            return false;
+        }
+        memcpy((void *)result->exact_quoted_includes, temporary, count * sizeof(*temporary));
+        result->exact_quoted_includes[count] = NULL;
+    }
+    free(temporary);
+    result->exact_quoted_include_count = (int)count;
+    result->exact_quoted_includes_captured = true;
+    return true;
+}
+
 // --- Main extraction function ---
 
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
@@ -847,8 +991,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             const char *rust_edition, bool rust_is_crate_root,
                                             const char *structured_classification_override,
                                             const char *structured_classification_provenance,
-                                            int64_t timeout_micros,
-                                            const char **extra_defines,
+                                            int64_t timeout_micros, const char **extra_defines,
                                             const char **include_paths,
                                             const CBMPreprocessContextSet *preprocess_contexts);
 
@@ -877,6 +1020,9 @@ static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     result->constants = NULL;
     result->global_vars = NULL;
     result->macros = NULL;
+    result->exact_quoted_includes = NULL;
+    result->exact_quoted_include_count = 0;
+    result->exact_quoted_includes_captured = false;
     result->module_qn = NULL;
     result->namespace_name = NULL;
     result->source = NULL;
@@ -1527,6 +1673,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     free(has_self);
     free(has_guarded);
 
+    if (!capture_exact_quoted_includes(result, source, source_len, language, root)) {
+        goto extraction_failed;
+    }
+
     // #501/#473: capture the byte-exact parse-time source of every definition while
     // the file buffer is still alive. The per-type extractors recorded each def's
     // tree-sitter byte span (def.start_byte/def.end_byte, end-exclusive); slice the
@@ -1960,16 +2110,18 @@ static bool compact_fact_array(void **out, int count, size_t item_size, CBMArena
 #define COMPACT_FACT_DUP(dst, src, member) (dst)->member = compact_fact_string(arena, (src)->member)
 #define COMPACT_FACT_LIST(dst, src, member)                                                    \
     (dst)->member = compact_fact_string_list(arena, (src)->member)
-#define COMPACT_FACT_ARRAY(candidate, source, member)                                          \
-    (compact_fact_array((void **)&(candidate)->member.items, (source)->member.count,            \
-                        sizeof(*(candidate)->member.items), &(candidate)->arena,                \
-                        #member ".facts") &&                                                   \
-     (((candidate)->member.count = (source)->member.count),                                    \
+#define COMPACT_FACT_ARRAY(candidate, source, member)                                \
+    (compact_fact_array((void **)&(candidate)->member.items, (source)->member.count, \
+                        sizeof(*(candidate)->member.items), &(candidate)->arena,     \
+                        #member ".facts") &&                                         \
+     (((candidate)->member.count = (source)->member.count),                          \
       ((candidate)->member.cap = (source)->member.count), true))
 
 bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_source,
                                    int source_len) {
-    if (!result || !immutable_source || source_len < 0 || result->cached_tree) {
+    if (!result || !immutable_source || source_len < 0 || result->cached_tree ||
+        result->exact_quoted_include_count < 0 ||
+        (result->exact_quoted_include_count > 0 && !result->exact_quoted_includes)) {
         return false;
     }
 
@@ -1988,6 +2140,8 @@ bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_
     candidate->has_error = result->has_error;
     candidate->structured_schema_path_count = result->structured_schema_path_count;
     candidate->structured_occurrence_count = result->structured_occurrence_count;
+    candidate->exact_quoted_include_count = result->exact_quoted_include_count;
+    candidate->exact_quoted_includes_captured = result->exact_quoted_includes_captured;
     candidate->source = immutable_source;
     candidate->source_len = source_len;
     COMPACT_FACT_DUP(candidate, result, module_qn);
@@ -1996,6 +2150,7 @@ bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_
     COMPACT_FACT_LIST(candidate, result, constants);
     COMPACT_FACT_LIST(candidate, result, global_vars);
     COMPACT_FACT_LIST(candidate, result, macros);
+    COMPACT_FACT_LIST(candidate, result, exact_quoted_includes);
     COMPACT_FACT_DUP(candidate, result, structured_classification);
     COMPACT_FACT_DUP(candidate, result, structured_classification_provenance);
     COMPACT_FACT_DUP(candidate, result, error_msg);

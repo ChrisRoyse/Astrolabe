@@ -612,6 +612,12 @@ typedef struct {
     const char **constants;     // NULL-terminated (NULL if none)
     const char **global_vars;   // NULL-terminated (NULL if none)
     const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
+    // Exact quoted preprocessor spellings captured while the authoritative
+    // C/C++ syntax tree is live. The parser tree is intentionally retired per
+    // file, but compiler admission consumes this compact immutable witness.
+    const char **exact_quoted_includes; // NULL-terminated; source-spelling order
+    int exact_quoted_include_count;
+    bool exact_quoted_includes_captured;
 
     // File-level structured-data summary. The pipeline persists this on the
     // exact File atom after extraction so an empty JSON object and aggregate

@@ -92,14 +92,6 @@ typedef struct {
     size_t capacity;
 } compile_context_set_owner_t;
 
-typedef struct {
-    char **requests;
-    int count;
-    int capacity;
-    bool initialized;
-    bool failed;
-} quoted_include_cache_t;
-
 struct cbm_compile_context_index {
     compile_baseline_t *baselines;
     int baseline_count;
@@ -616,182 +608,16 @@ static const char *context_dependency_match(const compile_context_owner_t *conte
     return NULL;
 }
 
-/* Return one exact quoted preprocessor spelling from the retained immutable
- * syntax tree. This is deliberately separate from semantic import extraction:
- * compiler admission must see includes nested under header guards, while the
- * exact dependency closure decides whether a conditional branch was active. */
-static int quoted_include_extract_failure(const char *source_path, const char *reason,
-                                          const char *node_kind, uint32_t start, uint32_t end,
-                                          int source_len, int start_character, int end_character) {
-    char start_text[32];
-    char end_text[32];
-    char source_length_text[32];
-    char start_character_text[32];
-    char end_character_text[32];
-    snprintf(start_text, sizeof(start_text), "%u", start);
-    snprintf(end_text, sizeof(end_text), "%u", end);
-    snprintf(source_length_text, sizeof(source_length_text), "%d", source_len);
-    snprintf(start_character_text, sizeof(start_character_text), "%d", start_character);
-    snprintf(end_character_text, sizeof(end_character_text), "%d", end_character);
-    cbm_log_error(
-        "compiler_preprocess.quoted_include_extract_failed", "code",
-        "CBM_PREPROCESS_EXACT_INCLUDE_EXTRACT_FAILED", "path", source_path ? source_path : "",
-        "reason", reason ? reason : "unknown", "node_kind", node_kind ? node_kind : "",
-        "start_byte", start_text, "end_byte", end_text, "source_bytes", source_length_text,
-        "start_character", start_character_text, "end_character", end_character_text, "message",
-        "a quoted include could not be read from retained immutable syntax/source", "remediation",
-        "preserve the generation and repair retained syntax/source consistency");
-    return CBM_NOT_FOUND;
-}
-
-static int quoted_include_request(const CBMFileResult *result, const char *source_path, TSNode node,
-                                  char **out_request) {
-    *out_request = NULL;
-    if (!result || !result->source || result->source_len < 0) {
-        return quoted_include_extract_failure(source_path, "retained_source_unavailable",
-                                              ts_node_type(node), 0, 0,
-                                              result ? result->source_len : -1, -1, -1);
-    }
-    TSNode path_node = ts_node_child_by_field_name(node, "path", 4);
-    if (ts_node_is_null(path_node)) {
-        uint32_t child_count = ts_node_child_count(node);
-        for (uint32_t i = 0; i < child_count; i++) {
-            TSNode child = ts_node_child(node, i);
-            if (strcmp(ts_node_type(child), "string_literal") == 0) {
-                path_node = child;
-                break;
-            }
-        }
-    }
-    if (ts_node_is_null(path_node) || strcmp(ts_node_type(path_node), "string_literal") != 0) {
-        return 0;
-    }
-    uint32_t start = ts_node_start_byte(path_node);
-    uint32_t end = ts_node_end_byte(path_node);
-    if (end <= start + 1 || end > (uint32_t)result->source_len) {
-        return quoted_include_extract_failure(source_path, "path_span_outside_retained_source",
-                                              ts_node_type(path_node), start, end,
-                                              result->source_len, -1, -1);
-    }
-    if (result->source[start] != '"' || result->source[end - 1] != '"') {
-        return quoted_include_extract_failure(
-            source_path, "quoted_path_delimiter_mismatch", ts_node_type(path_node), start, end,
-            result->source_len, (unsigned char)result->source[start],
-            (unsigned char)result->source[end - 1]);
-    }
-    size_t length = (size_t)(end - start - 2);
-    char *request = malloc(length + 1);
-    if (!request) {
-        return quoted_include_extract_failure(
-            source_path, "request_allocation_failed", ts_node_type(path_node), start, end,
-            result->source_len, (unsigned char)result->source[start],
-            (unsigned char)result->source[end - 1]);
-    }
-    memcpy(request, result->source + start + 1, length);
-    request[length] = '\0';
-    *out_request = request;
-    return 1;
-}
-
-static void free_quoted_include_cache(quoted_include_cache_t *cache, int source_count) {
-    if (!cache) {
-        return;
-    }
-    for (int source_index = 0; source_index < source_count; source_index++) {
-        for (int i = 0; i < cache[source_index].count; i++) {
-            free(cache[source_index].requests[i]);
-        }
-        free(cache[source_index].requests);
-    }
-    free(cache);
-}
-
-/* Materialize every quoted include spelling once per source generation. A
- * source can participate in many compilation contexts; caching prevents each
- * context from cold-walking the same retained syntax tree. */
-static int load_quoted_include_cache(const CBMFileResult *result, const char *source_path,
-                                     quoted_include_cache_t *cache) {
-    if (cache->initialized) {
-        return cache->failed ? CBM_NOT_FOUND : 0;
-    }
-    cache->initialized = true;
-    if (!result || !result->cached_tree || !result->source || result->source_len < 0) {
-        (void)quoted_include_extract_failure(source_path,
-                                             !result                ? "retained_result_unavailable"
-                                             : !result->cached_tree ? "retained_tree_unavailable"
-                                             : !result->source      ? "retained_source_unavailable"
-                                                               : "retained_source_length_invalid",
-                                             "", 0, 0, result ? result->source_len : -1, -1, -1);
-        cache->failed = true;
-        return CBM_NOT_FOUND;
-    }
-
-    TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(result->cached_tree));
-    bool traversal_complete = false;
-    while (!traversal_complete) {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *node_kind = ts_node_type(node);
-        char *request = NULL;
-        int request_state = 0;
-        if (strcmp(node_kind, "preproc_include") == 0 || strcmp(node_kind, "preproc_import") == 0) {
-            request_state = quoted_include_request(result, source_path, node, &request);
-        }
-        if (request_state == CBM_NOT_FOUND) {
-            free(request);
-            cache->failed = true;
-            break;
-        }
-        if (request_state == 1 && request && request[0]) {
-            if (cache->count == cache->capacity) {
-                if (cache->capacity > INT_MAX / 2) {
-                    free(request);
-                    cache->failed = true;
-                    break;
-                }
-                int next_capacity = cache->capacity ? cache->capacity * 2 : 8;
-                if (next_capacity < cache->capacity ||
-                    (size_t)next_capacity > SIZE_MAX / sizeof(*cache->requests)) {
-                    free(request);
-                    cache->failed = true;
-                    break;
-                }
-                char **resized =
-                    realloc(cache->requests, (size_t)next_capacity * sizeof(*cache->requests));
-                if (!resized) {
-                    free(request);
-                    cache->failed = true;
-                    break;
-                }
-                cache->requests = resized;
-                cache->capacity = next_capacity;
-            }
-            cache->requests[cache->count++] = request;
-        } else {
-            free(request);
-        }
-
-        if (ts_tree_cursor_goto_first_child(&cursor)) {
-            continue;
-        }
-        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
-            if (!ts_tree_cursor_goto_parent(&cursor)) {
-                traversal_complete = true;
-                break;
-            }
-        }
-    }
-    ts_tree_cursor_delete(&cursor);
-    return cache->failed ? CBM_NOT_FOUND : 0;
-}
-
-static int validate_compiler_snapshot_path_budget(
-    cbm_pipeline_ctx_t *ctx, const compile_context_owner_t *owner,
-    const cbm_compile_context_index_t *index, const cbm_file_info_t *source_files, int source_count,
-    CBMFileResult *const *result_cache, quoted_include_cache_t *include_cache) {
+static int validate_compiler_snapshot_path_budget(cbm_pipeline_ctx_t *ctx,
+                                                  const compile_context_owner_t *owner,
+                                                  const cbm_compile_context_index_t *index,
+                                                  const cbm_file_info_t *source_files,
+                                                  int source_count,
+                                                  CBMFileResult *const *result_cache) {
     const char *relative_directory =
         path_relative_within(ctx ? ctx->repo_path : NULL, owner ? owner->directory : NULL);
     if (!ctx || !ctx->source_root || !owner || !relative_directory || !index || !source_files ||
-        source_count < 0 || (source_count > 0 && (!result_cache || !include_cache))) {
+        source_count < 0 || (source_count > 0 && !result_cache)) {
         return preprocess_fail(
             ctx, "CBM_PREPROCESS_WORKING_DIRECTORY_UNPROJECTABLE", "validate_compiler_path_budget",
             owner && owner->tu_rel_path ? owner->tu_rel_path : "", 0,
@@ -888,18 +714,24 @@ static int validate_compiler_snapshot_path_budget(
         if (!result || result->has_error) {
             continue;
         }
-        quoted_include_cache_t *source_include_cache = &include_cache[set->source_index];
-        if (load_quoted_include_cache(result, source_file->rel_path, source_include_cache) != 0) {
+        if (!result->exact_quoted_includes_captured || result->exact_quoted_include_count < 0 ||
+            (result->exact_quoted_include_count > 0 && !result->exact_quoted_includes)) {
             free(longest_normalized_target);
             free(longest_path);
             return preprocess_fail(
-                ctx, "CBM_PREPROCESS_EXACT_INCLUDE_EXTRACT_FAILED", "extract_exact_include_paths",
-                source_file->rel_path, (size_t)(result->source_len < 0 ? 0 : result->source_len),
-                "quoted includes could not be read from retained immutable syntax/source",
-                "preserve the generation and repair retained syntax/source consistency");
+                ctx, "CBM_PREPROCESS_EXACT_INCLUDE_CAPTURE_MISSING",
+                "validate_exact_include_capture", source_file->rel_path,
+                (size_t)(result->exact_quoted_include_count < 0
+                             ? 0
+                             : result->exact_quoted_include_count),
+                "a C-family compiler dependency has no complete parse-time quoted-include "
+                "witness",
+                "preserve the generation and repair exact-include capture before parser-tree "
+                "retirement");
         }
-        for (int request_index = 0; request_index < source_include_cache->count; request_index++) {
-            const char *include_request = source_include_cache->requests[request_index];
+        for (int request_index = 0; request_index < result->exact_quoted_include_count;
+             request_index++) {
+            const char *include_request = result->exact_quoted_includes[request_index];
             if (!include_request || !include_request[0] || path_is_absolute(include_request)) {
                 continue;
             }
@@ -2632,7 +2464,6 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         "build the native Astrolabe artifact with its shell-free spawn authority enabled");
 #else
     if ((size_t)source_count > SIZE_MAX / sizeof(uint32_t) ||
-        (size_t)source_count > SIZE_MAX / sizeof(quoted_include_cache_t) ||
         (size_t)index->set_count > SIZE_MAX / sizeof(char *) ||
         (size_t)index->set_count > SIZE_MAX / sizeof(CBMFileResult *)) {
         return preprocess_fail(
@@ -2648,15 +2479,12 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
     CBMFileResult **target_results =
         index->set_count > 0 ? malloc((size_t)index->set_count * sizeof(*target_results)) : NULL;
     bool *touched = source_count > 0 ? calloc((size_t)source_count, sizeof(*touched)) : NULL;
-    quoted_include_cache_t *include_cache =
-        source_count > 0 ? calloc((size_t)source_count, sizeof(*include_cache)) : NULL;
-    if ((source_count > 0 && (!target_by_source_index || !touched || !include_cache)) ||
+    if ((source_count > 0 && (!target_by_source_index || !touched)) ||
         (index->set_count > 0 && (!target_rel_paths || !target_results))) {
         free(target_by_source_index);
         free(target_rel_paths);
         free(target_results);
         free(touched);
-        free_quoted_include_cache(include_cache, source_count);
         return preprocess_fail(ctx, "CBM_PREPROCESS_TARGET_ALLOC_FAILED",
                                "allocate_projection_index", ctx->repo_path, (size_t)source_count,
                                "the compiler-preprocess target index could not be allocated",
@@ -2686,7 +2514,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         }
         const compile_context_owner_t *owner = &index->contexts[context_index];
         if (validate_compiler_snapshot_path_budget(ctx, owner, index, source_files, source_count,
-                                                   result_cache, include_cache) != 0) {
+                                                   result_cache) != 0) {
             status = CBM_NOT_FOUND;
             break;
         }
@@ -2918,7 +2746,6 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
     free(target_rel_paths);
     free(target_results);
     free(touched);
-    free_quoted_include_cache(include_cache, source_count);
     return status;
 #endif
 }
