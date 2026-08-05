@@ -262,6 +262,53 @@ pub(crate) enum ShadowRefreshStatus {
 
 impl SlotRuntime for ShadowSlotRuntime {
     fn measure_slot(&self, slot: &PanelSlotSpec, input: &PanelInput) -> PanelResult<SlotVector> {
+        if slot.slot >= astrolabe_panel::semantic::SEMANTIC_SLOT_START {
+            let rule = astrolabe_panel::semantic::semantic_rule_by_slot(slot.slot_id())
+                .ok_or_else(|| {
+                    astrolabe_panel::PanelError::invalid_vector(
+                        format!(
+                            "semantic slot {} has no frozen registry rule",
+                            slot.slot_id()
+                        ),
+                        "Restore the exact panel-v3 semantic registry before indexing.",
+                    )
+                })?;
+            let value = input.semantic_values.get(&slot.slot_id()).ok_or_else(|| {
+                astrolabe_panel::PanelError::invalid_vector(
+                    format!("semantic slot {} has no typed source value", slot.slot_id()),
+                    "Build semantic values from the validated CBM row before panel dispatch.",
+                )
+            })?;
+            if matches!(
+                rule.kind,
+                astrolabe_panel::semantic::SemanticKind::LatentCode
+                    | astrolabe_panel::semantic::SemanticKind::LatentProse
+            ) {
+                let joined;
+                let text = match value {
+                    astrolabe_panel::semantic::SemanticValue::Text(text) => text.as_str(),
+                    astrolabe_panel::semantic::SemanticValue::TextArray(values) => {
+                        joined = values.join("\n");
+                        joined.as_str()
+                    }
+                    _ => {
+                        return Err(astrolabe_panel::PanelError::invalid_vector(
+                            format!(
+                                "latent semantic slot {} did not receive text or a text array",
+                                slot.slot_id()
+                            ),
+                            "Correct the frozen semantic source-type binding before indexing.",
+                        ));
+                    }
+                };
+                let table = SHADOW_EMBEDDING_TABLE
+                    .get_or_init(astrolabe_panel::StaticEmbeddingTable::load_default)
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                return table.embed_text(text);
+            }
+            return astrolabe_panel::semantic::encode_structured_value(rule, value);
+        }
         if matches!(slot.slot, 18..=20) {
             let table = SHADOW_EMBEDDING_TABLE
                 .get_or_init(astrolabe_panel::StaticEmbeddingTable::load_default)
@@ -269,7 +316,7 @@ impl SlotRuntime for ShadowSlotRuntime {
                 .map_err(Clone::clone)?;
             return astrolabe_panel::encode_static_embedding_slot(
                 slot.slot_id(),
-                &shadow_embedding_input(input),
+                &shadow_embedding_input(input)?,
                 table,
             );
         }
@@ -280,28 +327,26 @@ impl SlotRuntime for ShadowSlotRuntime {
     }
 }
 
-fn shadow_embedding_input(input: &PanelInput) -> astrolabe_panel::StaticEmbeddingInput {
-    // #531: S18 (body embedding) must NOT fall back to `source_bytes` when the CBM
-    // `bt` (body-token) property is absent. For bt-absent symbols `source_bytes` is
-    // the #413 property-fingerprint proxy (framed signature + full properties_json,
-    // including derived numerics such as `transitive_loop_depth`) — NOT source code.
-    // Embedding that proxy silently substituted METADATA for a code body and clustered
-    // S18 neighbours by property-JSON shape (invariants 1/3 violation: an unlabeled,
-    // uncounted degradation). We now derive body tokens ONLY from real `bt` evidence;
-    // when it is absent we emit no body tokens, so `encode_static_embedding_slot`
-    // reports S18 as a labeled, counted `SlotVector::Absent` (refusal with deficit)
-    // rather than a metadata-derived vector. Real retained chunk bytes (#501) will,
-    // once present, be the correct exact-source input — never the fingerprint proxy.
-    astrolabe_panel::StaticEmbeddingInput {
-        body_tokens: property_string(&input.properties, "bt")
-            .map(text_tokens)
-            .unwrap_or_default(),
+fn shadow_embedding_input(
+    input: &PanelInput,
+) -> PanelResult<astrolabe_panel::StaticEmbeddingInput> {
+    // #980: source_bytes is now the exact CBM source span retained by #501.
+    // S18 consumes those bytes directly; the former `bt` projection is a capped
+    // derived token string and cannot stand in for exact code.
+    let source = std::str::from_utf8(&input.source_bytes).map_err(|error| {
+        astrolabe_panel::PanelError::invalid_vector(
+            format!("exact source bytes are not UTF-8 for code embedding: {error}"),
+            "Repair the CBM source-span extraction or commission a byte-native frozen code embedder.",
+        )
+    })?;
+    Ok(astrolabe_panel::StaticEmbeddingInput {
+        body_tokens: text_tokens(source),
         doc_tokens: property_string(&input.properties, "docstring")
             .map(text_tokens)
             .unwrap_or_default(),
         name: input.symbol_name.clone(),
         qualified_name: input.qualified_name.clone(),
-    }
+    })
 }
 
 fn shadow_encoder_input(slot: u16, input: &PanelInput) -> astrolabe_panel::EncoderLensInput {
@@ -619,7 +664,7 @@ fn parse_api_callees(encoded: &str) -> Option<Vec<astrolabe_panel::ApiCall>> {
 /// on every real repo — #336). v2 is the honest path per frozen-roster discipline:
 /// rosters change only by version bump, so persisting S23 means minting shadow
 /// constellations under panel version 2 (their CxIds are v2-derived).
-pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::PANEL_V2_VERSION;
+pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::PANEL_V3_VERSION;
 
 /// Slots the shadow import feeds to the panel driver.
 ///
@@ -630,9 +675,9 @@ pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::PANEL_V2_VERSION;
 /// per class by the panel driver, so value/structural atoms carry `NotApplicable` for
 /// S23 exactly as the v2 contract prescribes.
 pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
-    astrolabe_panel::PANEL_V2_SLOTS
+    astrolabe_panel::PANEL_V3_SLOTS
         .iter()
-        .filter(|slot| slot.slot <= 21 || slot.slot == 23)
+        .filter(|slot| slot.slot != 22)
         .map(|slot| (*slot).slot_id())
         .collect()
 }
@@ -2669,83 +2714,18 @@ pub(crate) enum ShadowIndexPassOutcome {
 }
 
 /// Reads the CBM SQLite (`<project>.db`) written by the out-of-process index pass
-/// back into the row-sink-equivalent [`CbmPipelineRows`] (#405).
+/// back into its complete seven-family semantic row set (#405/#980).
 ///
-/// The SQLite `nodes`/`edges`/`file_hashes` tables and the in-process row-sink stream
-/// are two serializations of the identical committed snapshot (same final ids and
-/// exact captured file facts), so this readback reproduces the row stream the sink
-/// would have delivered — see
-/// [`astrolabe_ingest::read_cbm_sqlite_pipeline_rows`]. Feeding the result through
-/// the same [`row_sink_import_candidate_from_rows_with_skills`] keeps every derived
-/// shadow surface byte-identical to the old in-process path.
+/// The legacy bridge row sink carries nodes/edges/file hashes only. The SQLite
+/// source also carries exact project/summary rows and real node/token vector bytes;
+/// returning [`CbmSqlitePipelineRows`] keeps those families alive until the
+/// candidate builder has derived its legacy structural surfaces and then moves the
+/// same owned bytes into the Calyx snapshot without cloning.
 pub(crate) fn read_shadow_pipeline_rows(
     sqlite_path: &Path,
     project: &str,
-) -> Result<CbmPipelineRows, DynError> {
-    let rows = astrolabe_ingest::read_cbm_sqlite_pipeline_rows(sqlite_path, project)?;
-    let project = rows.project;
-    let graph_schema_version = rows.graph_schema_version;
-    let nodes = rows
-        .nodes
-        .into_iter()
-        .map(|node| astrolabe_bridge::CbmPipelineNodeRow {
-            id: node.id,
-            project: node.project,
-            label: node.label,
-            name: node.name,
-            atom_id: node.atom_id,
-            qualified_name: node.qualified_name,
-            file_path: node.file_path,
-            start_line: node.start_line,
-            end_line: node.end_line,
-            source_present: node.source_present,
-            source_bytes: node.source_bytes,
-            source_sha256: node.source_sha256,
-            start_byte: node.start_byte,
-            end_byte: node.end_byte,
-            properties_json: node.properties_json,
-        })
-        .collect::<Vec<_>>();
-    let edges = rows
-        .edges
-        .into_iter()
-        .map(|edge| astrolabe_bridge::CbmPipelineEdgeRow {
-            id: edge.id,
-            project: edge.project,
-            source_id: edge.source_id,
-            target_id: edge.target_id,
-            edge_type: edge.edge_type,
-            properties_json: edge.properties_json,
-            url_path_gen: edge.url_path_gen,
-            local_name_gen: edge.local_name_gen,
-            preprocess_context_id_gen: edge.preprocess_context_id_gen,
-        })
-        .collect::<Vec<_>>();
-    let file_hashes = rows
-        .file_hashes
-        .into_iter()
-        .map(|file_hash| astrolabe_bridge::CbmPipelineFileHashRow {
-            project: file_hash.project,
-            rel_path: file_hash.rel_path,
-            sha256: file_hash.sha256,
-            mtime_ns: file_hash.mtime_ns,
-            size: file_hash.size,
-        })
-        .collect::<Vec<_>>();
-    let manifest = astrolabe_bridge::CbmPipelineRowManifest {
-        project: project.clone(),
-        node_count: nodes.len(),
-        edge_count: edges.len(),
-        file_hash_count: file_hashes.len(),
-        graph_schema_version,
-    };
-    Ok(CbmPipelineRows {
-        project,
-        nodes,
-        edges,
-        file_hashes,
-        manifest: Some(manifest),
-    })
+) -> Result<CbmSqlitePipelineRows, DynError> {
+    astrolabe_ingest::read_cbm_sqlite_pipeline_rows(sqlite_path, project).map_err(Into::into)
 }
 
 /// Runs the shadow CBM index pass OUT OF PROCESS via the supervisor and, on a clean
@@ -2874,7 +2854,7 @@ pub(crate) fn shadow_index_pass_error_result(error_result: &str) -> Result<Strin
 /// Builds the row-sink import candidate, running skill discovery under `skills` — the
 /// registry defaults unless the caller supplied a `calyx_skills` override (#198).
 pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
-    rows: CbmPipelineRows,
+    rows: CbmSqlitePipelineRows,
     skills: &SkillDiscoveryConfig,
 ) -> RowSinkImportCandidate {
     if rows.project.trim().is_empty() {
@@ -2894,41 +2874,120 @@ pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
                 .to_string(),
         );
     }
-    let Some(manifest) = rows.manifest.as_ref() else {
-        return RowSinkImportCandidate::Unavailable(
-            "single-run row sink produced no completion manifest".to_string(),
-        );
-    };
-    if manifest.project != rows.project
-        || manifest.node_count != rows.nodes.len()
-        || manifest.edge_count != rows.edges.len()
-        || manifest.file_hash_count != rows.file_hashes.len()
-        || manifest.graph_schema_version != astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION as u32
-    {
+    if rows.projects.len() != 1 || rows.projects[0].project != rows.project {
         return RowSinkImportCandidate::Unavailable(format!(
-            "single-run row sink completion mismatch: \
-             project={:?}/{:?}, nodes={}/{}, edges={}/{}, file_hashes={}/{}, schema={}/{}",
-            manifest.project,
+            "complete SQLite readback for project {:?} carried project rows {:?}; expected its one exact source row",
             rows.project,
-            manifest.node_count,
-            rows.nodes.len(),
-            manifest.edge_count,
-            rows.edges.len(),
-            manifest.file_hash_count,
-            rows.file_hashes.len(),
-            manifest.graph_schema_version,
-            astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION,
+            rows.projects
+                .iter()
+                .map(|row| row.project.as_str())
+                .collect::<Vec<_>>()
         ));
     }
-    let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
-    let security_screen = security_screen_from_row_sink_rows(&rows);
-    let skill_tree = skill_tree_from_row_sink_rows_with_config(&rows, skills);
-    let bridges = bridges_from_row_sink_rows(&rows);
-    let kernel_context = kernel_context_from_row_sink_rows(&rows);
-    let anomalies = anomalies_from_row_sink_rows(&rows);
-    let provenance = provenance_from_row_sink_rows(&rows);
+    if rows.graph_schema_version != astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION as u32 {
+        return RowSinkImportCandidate::Unavailable(format!(
+            "complete SQLite readback graph schema {} does not equal required {}",
+            rows.graph_schema_version,
+            astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION
+        ));
+    }
+
+    let source_fingerprint_sha256 = sqlite_pipeline_fingerprint(&rows);
+    let CbmSqlitePipelineRows {
+        project,
+        projects,
+        nodes: sqlite_nodes,
+        edges: sqlite_edges,
+        file_hashes: sqlite_file_hashes,
+        project_summaries,
+        token_vectors,
+        graph_schema_version,
+    } = rows;
+    let mut node_vectors = BTreeMap::new();
+    let nodes = sqlite_nodes
+        .into_iter()
+        .map(|mut node| {
+            if let Some(vector) = node.node_vector.take() {
+                node_vectors.insert(node.id, vector);
+            }
+            astrolabe_bridge::CbmPipelineNodeRow {
+                id: node.id,
+                project: node.project,
+                label: node.label,
+                name: node.name,
+                atom_id: node.atom_id,
+                qualified_name: node.qualified_name,
+                file_path: node.file_path,
+                start_line: node.start_line,
+                end_line: node.end_line,
+                source_present: node.source_present,
+                source_bytes: node.source_bytes,
+                source_sha256: node.source_sha256,
+                start_byte: node.start_byte,
+                end_byte: node.end_byte,
+                properties_json: node.properties_json,
+            }
+        })
+        .collect::<Vec<_>>();
+    let edges = sqlite_edges
+        .into_iter()
+        .map(|edge| astrolabe_bridge::CbmPipelineEdgeRow {
+            id: edge.id,
+            project: edge.project,
+            source_id: edge.source_id,
+            target_id: edge.target_id,
+            edge_type: edge.edge_type,
+            properties_json: edge.properties_json,
+            url_path_gen: edge.url_path_gen,
+            local_name_gen: edge.local_name_gen,
+            preprocess_context_id_gen: edge.preprocess_context_id_gen,
+        })
+        .collect::<Vec<_>>();
+    let file_hashes = sqlite_file_hashes
+        .into_iter()
+        .map(|row| astrolabe_bridge::CbmPipelineFileHashRow {
+            project: row.project,
+            rel_path: row.rel_path,
+            sha256: row.sha256,
+            mtime_ns: row.mtime_ns,
+            size: row.size,
+        })
+        .collect::<Vec<_>>();
+    let manifest = astrolabe_bridge::CbmPipelineRowManifest {
+        project: project.clone(),
+        node_count: nodes.len(),
+        edge_count: edges.len(),
+        file_hash_count: file_hashes.len(),
+        graph_schema_version,
+    };
+    let bridge_rows = CbmPipelineRows {
+        project,
+        nodes,
+        edges,
+        file_hashes,
+        manifest: Some(manifest),
+    };
+    let security_screen = security_screen_from_row_sink_rows(&bridge_rows);
+    let skill_tree = skill_tree_from_row_sink_rows_with_config(&bridge_rows, skills);
+    let bridges = bridges_from_row_sink_rows(&bridge_rows);
+    let kernel_context = kernel_context_from_row_sink_rows(&bridge_rows);
+    let anomalies = anomalies_from_row_sink_rows(&bridge_rows);
+    let provenance = provenance_from_row_sink_rows(&bridge_rows);
+    let mut snapshot = pipeline_rows_to_graph_snapshot(bridge_rows);
+    snapshot.projects = projects;
+    snapshot.project_summaries = project_summaries;
+    snapshot.token_vectors = token_vectors;
+    for node in &mut snapshot.nodes {
+        node.node_vector = node_vectors.remove(&node.source_node_id);
+    }
+    if !node_vectors.is_empty() {
+        return RowSinkImportCandidate::Unavailable(format!(
+            "complete SQLite readback retained {} node vector(s) with no matching snapshot node",
+            node_vectors.len()
+        ));
+    }
     RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
-        snapshot: pipeline_rows_to_graph_snapshot(rows),
+        snapshot,
         source_fingerprint_sha256,
         security_screen,
         skill_tree,
@@ -2976,6 +3035,7 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
             src: None,
             dst: None,
             edge_type: edge.edge_type,
+            url_path_gen: edge.url_path_gen,
             local_name_gen: edge.local_name_gen,
             preprocess_context_id_gen: edge.preprocess_context_id_gen,
             weight: 1.0,
@@ -3008,9 +3068,106 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
     }
 }
 
+fn sqlite_pipeline_fingerprint(rows: &CbmSqlitePipelineRows) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"astrolabe-cbm-complete-sqlite-pipeline-v1\0");
+    hash_str(&mut hasher, &rows.project);
+    hasher.update(rows.graph_schema_version.to_le_bytes());
+
+    let mut projects = rows.projects.iter().collect::<Vec<_>>();
+    projects.sort_by(|left, right| left.project.cmp(&right.project));
+    hash_u64(&mut hasher, projects.len() as u64);
+    for row in projects {
+        hash_str(&mut hasher, &row.project);
+        hash_str(&mut hasher, &row.indexed_at);
+        hash_str(&mut hasher, &row.root_path);
+    }
+
+    let mut file_hashes = rows.file_hashes.iter().collect::<Vec<_>>();
+    file_hashes.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    hash_u64(&mut hasher, file_hashes.len() as u64);
+    for row in file_hashes {
+        hash_str(&mut hasher, &row.project);
+        hash_str(&mut hasher, &row.rel_path);
+        hash_str(&mut hasher, &row.sha256);
+        hash_i64(&mut hasher, row.mtime_ns);
+        hash_i64(&mut hasher, row.size);
+    }
+
+    let mut nodes = rows.nodes.iter().collect::<Vec<_>>();
+    nodes.sort_by_key(|row| row.id);
+    hash_u64(&mut hasher, nodes.len() as u64);
+    for row in nodes {
+        hash_i64(&mut hasher, row.id);
+        hash_str(&mut hasher, &row.project);
+        hash_str(&mut hasher, &row.label);
+        hash_str(&mut hasher, &row.name);
+        hash_str(&mut hasher, &row.atom_id);
+        hash_str(&mut hasher, &row.qualified_name);
+        hash_str(&mut hasher, &row.file_path);
+        hash_i64(&mut hasher, row.start_line);
+        hash_i64(&mut hasher, row.end_line);
+        hasher.update([u8::from(row.source_present)]);
+        hash_u64(&mut hasher, row.source_bytes.len() as u64);
+        hasher.update(&row.source_bytes);
+        hash_str(&mut hasher, &row.source_sha256);
+        hash_u64(&mut hasher, row.start_byte);
+        hash_u64(&mut hasher, row.end_byte);
+        hash_str(&mut hasher, &row.properties_json);
+        match &row.node_vector {
+            Some(vector) => {
+                hasher.update([1]);
+                hash_u64(&mut hasher, vector.len() as u64);
+                hasher.update(vector);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut edges = rows.edges.iter().collect::<Vec<_>>();
+    edges.sort_by_key(|row| row.id);
+    hash_u64(&mut hasher, edges.len() as u64);
+    for row in edges {
+        hash_i64(&mut hasher, row.id);
+        hash_str(&mut hasher, &row.project);
+        hash_i64(&mut hasher, row.source_id);
+        hash_i64(&mut hasher, row.target_id);
+        hash_str(&mut hasher, &row.edge_type);
+        hash_str(&mut hasher, &row.properties_json);
+        hash_str(&mut hasher, &row.url_path_gen);
+        hash_str(&mut hasher, &row.local_name_gen);
+        hash_str(&mut hasher, &row.preprocess_context_id_gen);
+    }
+
+    let mut summaries = rows.project_summaries.iter().collect::<Vec<_>>();
+    summaries.sort_by(|left, right| left.project.cmp(&right.project));
+    hash_u64(&mut hasher, summaries.len() as u64);
+    for row in summaries {
+        hash_str(&mut hasher, &row.project);
+        hash_str(&mut hasher, &row.summary);
+        hash_str(&mut hasher, &row.source_hash);
+        hash_str(&mut hasher, &row.created_at);
+        hash_str(&mut hasher, &row.updated_at);
+    }
+
+    let mut tokens = rows.token_vectors.iter().collect::<Vec<_>>();
+    tokens.sort_by_key(|row| row.id);
+    hash_u64(&mut hasher, tokens.len() as u64);
+    for row in tokens {
+        hash_i64(&mut hasher, row.id);
+        hash_str(&mut hasher, &row.project);
+        hash_str(&mut hasher, &row.token);
+        hash_u64(&mut hasher, row.vector.len() as u64);
+        hasher.update(&row.vector);
+        hash_i64(&mut hasher, row.idf);
+    }
+
+    hasher.finalize().into()
+}
+
 pub(crate) fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-cbm-row-sink-v3\0");
+    hasher.update(b"astrolabe-cbm-row-sink-v4\0");
     hash_str(&mut hasher, &rows.project);
 
     let mut nodes = rows.nodes.iter().collect::<Vec<_>>();
@@ -3054,6 +3211,7 @@ pub(crate) fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
         hash_str(&mut hasher, &edge.properties_json);
         hash_str(&mut hasher, &edge.url_path_gen);
         hash_str(&mut hasher, &edge.local_name_gen);
+        hash_str(&mut hasher, &edge.preprocess_context_id_gen);
     }
 
     let mut file_hashes = rows.file_hashes.iter().collect::<Vec<_>>();

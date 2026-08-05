@@ -18,8 +18,8 @@ use astrolabe_guard::{
 };
 use astrolabe_ingest::{
     CBM_FILE_HASH_ROW_SCHEMA, CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
-    RowSinkStreamParams, SqliteImportOptions, import_cbm_row_stream_to_vault,
-    snapshot_into_row_stream, verify_chain,
+    CbmSqlitePipelineRows, RowSinkStreamParams, SqliteImportOptions,
+    import_cbm_row_stream_to_vault, snapshot_into_row_stream, verify_chain,
 };
 use astrolabe_kernel::{
     BRIDGE_SCHEMA, BridgeKernelSymbol, BridgeReport, BridgeScopeKernel,

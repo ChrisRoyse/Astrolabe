@@ -501,6 +501,9 @@ pub(crate) fn measure_guard_panel_sources(
         signature: string_field("signature"),
         properties,
         scalars: BTreeMap::new(),
+        semantic_family: None,
+        semantic_values: BTreeMap::new(),
+        legacy_slots_enabled: true,
     };
     let readout = driver.measure(&input, runtime).map_err(|err| {
         (
@@ -1376,6 +1379,9 @@ fn measure_generated_source_case(
         signature: primary.signature.clone().unwrap_or_default(),
         properties: obj.get("properties").cloned().unwrap_or(Value::Null),
         scalars: BTreeMap::new(),
+        semantic_family: None,
+        semantic_values: BTreeMap::new(),
+        legacy_slots_enabled: true,
     };
     let readout = driver.measure(&input, runtime).map_err(|err| {
         (

@@ -4,6 +4,7 @@ mod detmath;
 mod embeddings;
 pub mod layout_registry;
 mod lenses;
+pub mod semantic;
 pub mod similarity;
 mod unicode61;
 
@@ -55,10 +56,14 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const PANEL_SCHEMA_ID: &str = "astro.panel.v1";
 /// Panel schema id emitted by readouts from the v2 roster (S0-S23, adds S23 `layer_role`).
 pub const PANEL_SCHEMA_ID_V2: &str = "astro.panel.v2";
+/// Panel schema id emitted by the v3 exhaustive code-memory semantic roster.
+pub const PANEL_SCHEMA_ID_V3: &str = "astro.panel.v3";
 /// First Astrolabe panel version.
 pub const DEFAULT_PANEL_VERSION: u32 = 1;
 /// Second Astrolabe panel version — adds the S23 `layer_role` frozen slot (#180a).
 pub const PANEL_V2_VERSION: u32 = 2;
+/// Third Astrolabe panel version — exhaustive typed CBM semantic atom coverage.
+pub const PANEL_V3_VERSION: u32 = 3;
 /// Frozen seed registry schema identifier.
 pub const ASTRO_SEED_REGISTRY_SCHEMA: &str = "astro.seed_registry.v1";
 /// Frozen seed registry artifact kind.
@@ -116,6 +121,11 @@ impl PanelError {
     /// Suggested operator remediation.
     pub fn remediation(&self) -> &str {
         &self.remediation
+    }
+
+    /// Builds a fail-closed vector-invariant error for a production runtime.
+    pub fn invalid_vector(message: impl Into<String>, remediation: impl Into<String>) -> Self {
+        Self::new(ASTRO_PANEL_VECTOR_INVALID, message, remediation)
     }
 }
 
@@ -241,7 +251,9 @@ impl FrozenLensContract {
     /// identity that omits the math.
     pub fn for_slot(slot: &PanelSlotSpec) -> PanelResult<Self> {
         let shape = shape_fingerprint(slot.shape);
-        let weights_sha = if matches!(slot.slot, 18 | 19 | 20 | 22) {
+        let weights_sha = if slot.slot >= semantic::SEMANTIC_SLOT_START {
+            semantic::semantic_weights_identity(slot.slot_id())?
+        } else if matches!(slot.slot, 18 | 19 | 20 | 22) {
             nomic_weights_identity()
         } else {
             encoder_weights_identity(slot, &shape)?
@@ -774,6 +786,14 @@ pub static PANEL_V2_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
     slots
 });
 
+/// Frozen v3 slot roster: panel v2 plus the exhaustive typed CBM semantic
+/// registry. Existing S0-S23 specs and lens identities remain byte-identical.
+pub static PANEL_V3_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
+    slots.extend(semantic::SEMANTIC_SLOT_SPECS.iter().copied());
+    slots
+});
+
 /// Returns the frozen v1 slot roster.
 pub fn default_panel_slots() -> &'static [PanelSlotSpec] {
     PANEL_V1_SLOTS
@@ -784,6 +804,11 @@ pub fn default_panel_v2_slots() -> &'static [PanelSlotSpec] {
     &PANEL_V2_SLOTS
 }
 
+/// Returns the frozen v3 roster including exhaustive CBM semantic slots.
+pub fn default_panel_v3_slots() -> &'static [PanelSlotSpec] {
+    &PANEL_V3_SLOTS
+}
+
 /// Returns the frozen slot roster for a panel roster version.
 ///
 /// Fails closed for a version that has no frozen roster rather than silently
@@ -792,10 +817,11 @@ pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> 
     match version {
         DEFAULT_PANEL_VERSION => Ok(PANEL_V1_SLOTS),
         PANEL_V2_VERSION => Ok(&PANEL_V2_SLOTS),
+        PANEL_V3_VERSION => Ok(&PANEL_V3_SLOTS),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen slot roster"),
-            "Measure with panel version 1 (S0-S22) or 2 (S0-S23).",
+            "Measure with panel version 1 (S0-S22), 2 (S0-S23), or 3 (S0-S173).",
         )),
     }
 }
@@ -805,20 +831,73 @@ pub fn schema_id_for_version(version: u32) -> PanelResult<&'static str> {
     match version {
         DEFAULT_PANEL_VERSION => Ok(PANEL_SCHEMA_ID),
         PANEL_V2_VERSION => Ok(PANEL_SCHEMA_ID_V2),
+        PANEL_V3_VERSION => Ok(PANEL_SCHEMA_ID_V3),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen schema id"),
-            "Measure with panel version 1 or 2.",
+            "Measure with panel version 1, 2, or 3.",
         )),
     }
 }
 
-/// Returns a slot specification by id, searching the v2 superset roster (S0-S23).
+/// Returns the canonical SHA-256 witness for every frozen slot contract in a
+/// panel version.
 ///
-/// The v1 slots are a prefix of the v2 roster with byte-identical specs, so a v1
-/// consumer sees the same answer; S23 additionally resolves.
+/// The manifest is explicitly length-delimited and includes the slot id/key,
+/// physical shape, modality, full norm policy, lifecycle flags, and frozen lens
+/// id. It is intentionally independent of Serde so a diagnostic JSON change
+/// cannot silently move the persisted coverage contract.
+pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
+    const MANIFEST_SCHEMA: &[u8] = b"astro.panel.slot-manifest.v1";
+
+    fn append_part(bytes: &mut Vec<u8>, part: &[u8]) {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+
+    let slots = slots_for_version(version)?;
+    let schema_id = schema_id_for_version(version)?;
+    let mut bytes = Vec::with_capacity(slots.len() * 128);
+    append_part(&mut bytes, MANIFEST_SCHEMA);
+    append_part(&mut bytes, schema_id.as_bytes());
+    append_part(&mut bytes, &version.to_be_bytes());
+    append_part(&mut bytes, &(slots.len() as u64).to_be_bytes());
+    for spec in slots {
+        append_part(&mut bytes, &spec.slot.to_be_bytes());
+        append_part(&mut bytes, spec.key.as_bytes());
+        append_part(&mut bytes, shape_fingerprint(spec.shape).as_bytes());
+        append_part(&mut bytes, modality_fingerprint(spec.modality).as_bytes());
+        match spec.norm {
+            NormPolicy::Finite => append_part(&mut bytes, b"finite"),
+            NormPolicy::Unit { tolerance } => {
+                append_part(&mut bytes, b"unit");
+                append_part(&mut bytes, &tolerance.to_bits().to_be_bytes());
+            }
+            NormPolicy::L1 { tolerance } => {
+                append_part(&mut bytes, b"l1");
+                append_part(&mut bytes, &tolerance.to_bits().to_be_bytes());
+            }
+        }
+        append_part(
+            &mut bytes,
+            &[
+                u8::from(spec.retrieval_only),
+                u8::from(spec.excluded_from_dedup),
+                u8::from(spec.guard_raw),
+            ],
+        );
+        let lens_id = FrozenLensContract::for_slot(spec)?.lens_id();
+        append_part(&mut bytes, lens_id.as_bytes());
+    }
+    Ok(sha256_digest(&[&bytes]))
+}
+
+/// Returns a slot specification by id, searching the v3 superset roster.
+///
+/// Older rosters are byte-identical prefixes, so their consumers see the same
+/// answer while v3 semantic slots additionally resolve.
 pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
-    PANEL_V2_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
+    PANEL_V3_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
 }
 
 /// Returns the default frozen contracts for every v1 slot.
@@ -991,6 +1070,17 @@ pub struct PanelInput {
     pub properties: serde_json::Value,
     /// Exact scalar measurements preserved beside the vector panel.
     pub scalars: BTreeMap<String, f64>,
+    /// CBM row family for panel-v3 semantic slots. `None` is valid only for
+    /// pre-v3 measurement.
+    pub semantic_family: Option<semantic::SemanticFamily>,
+    /// Typed semantic source values for present atoms, keyed by their frozen
+    /// value slot. The driver derives the family presence vector and dispatches
+    /// each value through the slot runtime; there is no JSON catch-all path.
+    pub semantic_values: BTreeMap<SlotId, semantic::SemanticValue>,
+    /// Whether the legacy S0-S23 symbol panel is requested for this input.
+    /// Non-symbol CBM row families set this false and measure only their typed
+    /// semantic registry slots.
+    pub legacy_slots_enabled: bool,
 }
 
 impl PanelInput {
@@ -1007,6 +1097,9 @@ impl PanelInput {
             signature: String::new(),
             properties: serde_json::Value::Object(serde_json::Map::new()),
             scalars: BTreeMap::new(),
+            semantic_family: None,
+            semantic_values: BTreeMap::new(),
+            legacy_slots_enabled: true,
         }
     }
 
@@ -1026,12 +1119,32 @@ impl PanelInput {
             signature: String::new(),
             properties: serde_json::Value::Object(serde_json::Map::new()),
             scalars: BTreeMap::new(),
+            semantic_family: None,
+            semantic_values: BTreeMap::new(),
+            legacy_slots_enabled: true,
         }
     }
 
     /// Attaches exact scalar measurements to be preserved beside emitted vectors.
     pub fn with_scalars(mut self, scalars: BTreeMap<String, f64>) -> Self {
         self.scalars = scalars;
+        self
+    }
+
+    /// Attaches the exact panel-v3 semantic family and present-slot map.
+    pub fn with_semantic_values(
+        mut self,
+        family: semantic::SemanticFamily,
+        values: BTreeMap<SlotId, semantic::SemanticValue>,
+    ) -> Self {
+        self.semantic_family = Some(family);
+        self.semantic_values = values;
+        self
+    }
+
+    /// Enables or disables legacy S0-S23 dispatch for this input.
+    pub fn with_legacy_slots_enabled(mut self, enabled: bool) -> Self {
+        self.legacy_slots_enabled = enabled;
         self
     }
 }
@@ -1088,6 +1201,10 @@ pub struct PanelReadoutSummary {
     pub not_applicable: usize,
     /// Slots that degraded to a labeled absence, mapped to the recorded reason label.
     pub degraded: BTreeMap<SlotId, String>,
+    /// Registered optional semantic value slots omitted because their source
+    /// atom is not present. Missingness is carried by the family presence slot.
+    #[serde(default)]
+    pub semantic_not_present: usize,
 }
 
 impl PanelReadoutSummary {
@@ -1098,7 +1215,7 @@ impl PanelReadoutSummary {
 
     /// Total number of slots accounted for across every bucket.
     pub fn accounted_slots(&self) -> usize {
-        self.measured + self.not_applicable + self.degraded.len()
+        self.measured + self.not_applicable + self.degraded.len() + self.semantic_not_present
     }
 }
 
@@ -1121,7 +1238,7 @@ fn absent_reason_label(reason: &AbsentReason) -> String {
 /// space; this bridges a gated lens key to its frozen [`SlotId`] so a per-repo
 /// admission set can be applied to a readout without touching the frozen roster.
 pub fn slot_spec_by_key(key: &str) -> Option<&'static PanelSlotSpec> {
-    PANEL_V2_SLOTS.iter().find(|slot| slot.key == key)
+    PANEL_V3_SLOTS.iter().find(|slot| slot.key == key)
 }
 
 impl PanelReadout {
@@ -1141,7 +1258,10 @@ impl PanelReadout {
     /// roster is unchanged by admission.
     pub fn serving_view(&self, active_slots: &BTreeSet<SlotId>) -> PanelReadout {
         let mut slots = BTreeMap::new();
-        let mut summary = PanelReadoutSummary::default();
+        let mut summary = PanelReadoutSummary {
+            semantic_not_present: self.summary.semantic_not_present,
+            ..PanelReadoutSummary::default()
+        };
         for (slot_id, vector) in &self.slots {
             let is_measured = matches!(
                 vector,
@@ -1178,6 +1298,67 @@ impl PanelReadout {
             summary,
         }
     }
+}
+
+fn validate_semantic_panel_input(version: u32, input: &PanelInput) -> PanelResult<()> {
+    if version < PANEL_V3_VERSION {
+        if input.semantic_family.is_some() || !input.semantic_values.is_empty() {
+            return Err(PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                format!("panel version {version} cannot accept panel-v3 semantic slots"),
+                "Use panel version 3 for exhaustive code-memory semantic measurement.",
+            ));
+        }
+        return Ok(());
+    }
+
+    let Some(family) = input.semantic_family else {
+        if input.semantic_values.is_empty() {
+            // Ad-hoc panel measurements (for example guard candidates) are not
+            // persisted CBM rows and may request only S0-S23.
+            return Ok(());
+        }
+        return Err(PanelError::new(
+            ASTRO_PANEL_CONTRACT_INVALID,
+            "panel-v3 semantic values have no exact row family",
+            "Classify the CBM source row before attaching semantic values.",
+        ));
+    };
+    for (slot_id, value) in &input.semantic_values {
+        let rule = semantic::semantic_rule_by_slot(*slot_id).ok_or_else(|| {
+            PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                format!("semantic input contains unregistered slot {slot_id}"),
+                "Add a versioned semantic registry rule before emitting the source atom.",
+            )
+        })?;
+        if rule.family != family {
+            return Err(PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                format!(
+                    "{} input contains {} rule {}",
+                    family.as_str(),
+                    rule.family.as_str(),
+                    rule.path
+                ),
+                "Keep each constellation's semantic slots within one exact row family.",
+            ));
+        }
+        if value.source_type() != rule.source_type {
+            return Err(PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                format!(
+                    "{} rule {} expects {}, received {}",
+                    family.as_str(),
+                    rule.path,
+                    rule.source_type.as_str(),
+                    value.source_type().as_str()
+                ),
+                "Update the versioned registry for a real CBM schema change; never coerce the observed value.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Default Astrolabe panel driver.
@@ -1224,7 +1405,7 @@ impl PanelDriver {
         self.version
     }
 
-    /// Measures all v1 slots, enforcing applicability before runtime dispatch.
+    /// Measures the selected frozen roster, enforcing applicability before runtime dispatch.
     pub fn measure<R>(&self, input: &PanelInput, runtime: &R) -> PanelResult<PanelReadout>
     where
         R: SlotRuntime,
@@ -1232,11 +1413,19 @@ impl PanelDriver {
         validate_scalar_sidecar(&input.scalars)?;
         let roster = slots_for_version(self.version)?;
         let schema_id = schema_id_for_version(self.version)?;
+        validate_semantic_panel_input(self.version, input)?;
         let applicable = applicable_slot_ids_versioned(input.label, self.version);
         let mut slots = BTreeMap::new();
         let mut summary = PanelReadoutSummary::default();
-        for slot in roster {
+        for slot in roster
+            .iter()
+            .filter(|slot| slot.slot < semantic::SEMANTIC_SLOT_START)
+        {
             let slot_id = slot.slot_id();
+            if !input.legacy_slots_enabled {
+                summary.not_applicable += 1;
+                continue;
+            }
             let vector = if !applicable.contains(&slot_id) {
                 SlotVector::Absent {
                     reason: AbsentReason::NotApplicable,
@@ -1247,7 +1436,7 @@ impl PanelDriver {
                 }
             } else {
                 let vector = runtime.measure_slot(slot, input)?;
-                validate_slot_shape(*slot, &vector)?;
+                validate_slot_vector_contract(slot_id, &vector)?;
                 vector
             };
             match &vector {
@@ -1264,6 +1453,68 @@ impl PanelDriver {
                 }
             }
             slots.insert(slot_id, vector);
+        }
+        if let Some(family) = input.semantic_family {
+            let rules = input
+                .semantic_values
+                .keys()
+                .map(|slot_id| {
+                    semantic::semantic_rule_by_slot(*slot_id)
+                        .expect("validated semantic value slot")
+                })
+                .collect::<Vec<_>>();
+            let presence_slot_id = family.presence_slot();
+            let _presence_slot = slot_spec(presence_slot_id).ok_or_else(|| {
+                PanelError::new(
+                    ASTRO_PANEL_CONTRACT_INVALID,
+                    format!(
+                        "{} presence slot {} is absent from panel version {}",
+                        family.as_str(),
+                        presence_slot_id,
+                        self.version
+                    ),
+                    "Restore the exact frozen panel-v3 semantic roster before measurement.",
+                )
+            })?;
+            let presence = semantic::encode_presence(family, rules)?;
+            validate_slot_vector_contract(presence_slot_id, &presence)?;
+            slots.insert(presence_slot_id, presence);
+            summary.measured += 1;
+
+            for slot_id in input.semantic_values.keys() {
+                let slot = slot_spec(*slot_id).ok_or_else(|| {
+                    PanelError::new(
+                        ASTRO_PANEL_CONTRACT_INVALID,
+                        format!("semantic slot {slot_id} is absent from the frozen roster"),
+                        "Restore the exact panel-v3 registry and slot roster before measurement.",
+                    )
+                })?;
+                let vector = runtime.measure_slot(slot, input)?;
+                validate_slot_vector_contract(*slot_id, &vector)?;
+                if vector.is_absent() {
+                    return Err(PanelError::new(
+                        ASTRO_PANEL_VECTOR_INVALID,
+                        format!("present semantic slot {slot_id} emitted Absent"),
+                        "Repair the frozen encoder/embedder input or registry; every present CBM atom must produce a concrete vector.",
+                    ));
+                }
+                slots.insert(*slot_id, vector);
+                summary.measured += 1;
+            }
+            let family_rules = semantic::semantic_rule_count_for_family(family);
+            summary.semantic_not_present = family_rules
+                .checked_sub(input.semantic_values.len())
+                .ok_or_else(|| {
+                    PanelError::new(
+                        ASTRO_PANEL_CONTRACT_INVALID,
+                        format!(
+                            "{} semantic input contains {} values for only {family_rules} rules",
+                            family.as_str(),
+                            input.semantic_values.len()
+                        ),
+                        "Repair the frozen semantic registry or typed input map before measurement.",
+                    )
+                })?;
         }
         Ok(PanelReadout {
             schema_id: schema_id.to_string(),
@@ -1477,7 +1728,7 @@ pub const ASTRO_SEED_SPECS: &[FrozenSeedSpec] = &[
         0.125,
         "body_tokens",
         "nomic_static_sum",
-        "code semantic random-index fallback",
+        "frozen Nomic static code-token embedding",
     ),
     seed(
         19,
@@ -1487,7 +1738,7 @@ pub const ASTRO_SEED_SPECS: &[FrozenSeedSpec] = &[
         0.125,
         "docstring_comments",
         "nomic_static_sum",
-        "documentation semantic random-index fallback",
+        "frozen Nomic static documentation embedding",
     ),
     seed(
         20,
@@ -1497,7 +1748,7 @@ pub const ASTRO_SEED_SPECS: &[FrozenSeedSpec] = &[
         0.125,
         "identifier_name",
         "nomic_static_sum",
-        "name semantic random-index fallback",
+        "frozen Nomic static identifier embedding",
     ),
     seed(
         22,
@@ -2016,19 +2267,27 @@ fn validate_vector(
         },
         vector,
     )?;
-    match contract.norm {
+    validate_vector_norm(contract.norm, &format!("lens {lens_id}"), vector)
+}
+
+fn validate_vector_norm(
+    norm_policy: NormPolicy,
+    subject: &str,
+    vector: &SlotVector,
+) -> PanelResult<()> {
+    match norm_policy {
         NormPolicy::Unit { tolerance } => {
             let norm = vector_norm(vector).ok_or_else(|| {
                 PanelError::new(
                     ASTRO_PANEL_VECTOR_INVALID,
-                    format!("lens {lens_id} emitted absent vector for a unit-norm contract"),
+                    format!("{subject} emitted absent vector for a unit-norm contract"),
                     "Use explicit Absent only for unavailable runtime paths, not registration probes.",
                 )
             })?;
             if (norm - 1.0).abs() > tolerance {
                 return Err(PanelError::new(
                     ASTRO_PANEL_VECTOR_INVALID,
-                    format!("lens {lens_id} norm {norm:.6} outside unit tolerance {tolerance}"),
+                    format!("{subject} norm {norm:.6} outside unit tolerance {tolerance}"),
                     "Normalize the emitted vector or change the frozen contract norm policy.",
                 ));
             }
@@ -2037,14 +2296,14 @@ fn validate_vector(
             let mass = vector_l1_mass(vector).ok_or_else(|| {
                 PanelError::new(
                     ASTRO_PANEL_VECTOR_INVALID,
-                    format!("lens {lens_id} emitted absent vector for an L1-norm contract"),
+                    format!("{subject} emitted absent vector for an L1-norm contract"),
                     "Use explicit Absent only for unavailable runtime paths, not registration probes.",
                 )
             })?;
             if (mass - 1.0).abs() > tolerance {
                 return Err(PanelError::new(
                     ASTRO_PANEL_VECTOR_INVALID,
-                    format!("lens {lens_id} L1 mass {mass:.6} outside tolerance {tolerance}"),
+                    format!("{subject} L1 mass {mass:.6} outside tolerance {tolerance}"),
                     "L1-normalize the emitted distribution or change the frozen contract norm policy.",
                 ));
             }
@@ -2052,6 +2311,26 @@ fn validate_vector(
         NormPolicy::Finite => {}
     }
     Ok(())
+}
+
+/// Validates one persisted/runtime vector against its frozen slot shape and norm.
+///
+/// Explicit [`SlotVector::Absent`] remains a valid representation for a genuinely
+/// unavailable or inapplicable slot. Callers that are verifying a declared-present
+/// semantic atom must additionally require a concrete vector.
+pub fn validate_slot_vector_contract(slot_id: SlotId, vector: &SlotVector) -> PanelResult<()> {
+    let slot = slot_spec(slot_id).ok_or_else(|| {
+        PanelError::new(
+            ASTRO_PANEL_CONTRACT_INVALID,
+            format!("slot {slot_id} has no frozen panel contract"),
+            "Restore the versioned frozen slot roster before reading or writing this vector.",
+        )
+    })?;
+    validate_slot_shape(*slot, vector)?;
+    if vector.is_absent() {
+        return Ok(());
+    }
+    validate_vector_norm(slot.norm, &format!("slot {} ({slot_id})", slot.key), vector)
 }
 
 fn validate_slot_shape(slot: PanelSlotSpec, vector: &SlotVector) -> PanelResult<()> {

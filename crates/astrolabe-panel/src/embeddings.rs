@@ -356,6 +356,19 @@ impl StaticEmbeddingTable {
         self.weights_sha
     }
 
+    /// Embeds arbitrary UTF-8 code/prose through the frozen token table. Token
+    /// segmentation is deterministic and shared with the identifier lenses.
+    /// An all-OOV value remains an explicit absence; panel v3 then refuses that
+    /// present atom rather than silently substituting a different encoder.
+    pub fn embed_text(&self, text: &str) -> PanelResult<SlotVector> {
+        let tokens = text
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .filter(|part| !part.is_empty())
+            .flat_map(cbm_camel_split_tokens)
+            .collect::<Vec<_>>();
+        self.embed_tokens(&tokens)
+    }
+
     /// Returns the frozen static vector for a token, or `None` when the token is
     /// out of the bound vocabulary. OOV tokens contribute no fabricated semantic
     /// evidence — the caller skips them and reports Absent when nothing is in

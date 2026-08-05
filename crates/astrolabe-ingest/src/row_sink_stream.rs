@@ -47,7 +47,8 @@ use serde_json::Value;
 use crate::registry::{IngestError, IngestResult};
 use crate::sqlite_import::{
     CBM_FILE_HASH_ROW_SCHEMA, CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
-    SqliteImportOptions, SqliteImportReport, import_cbm_graph_snapshot_to_vault_direct,
+    CbmProjectRow, CbmProjectSummaryRow, CbmTokenVectorRow, SqliteImportOptions,
+    SqliteImportReport, import_cbm_graph_snapshot_to_vault_direct,
 };
 
 /// Refusal code: the requested drain-batch size is outside the declared knob bounds.
@@ -66,12 +67,18 @@ const ROW_REMEDIATION: &str = "Fix or drop the malformed CBM row-sink row at its
 /// is carried per the #123 independent-failure contract.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowSinkStreamRow {
+    /// An exact CBM project row.
+    Project(CbmProjectRow),
     /// A CBM node row.
     Node(CbmGraphNode),
     /// A CBM edge row.
     Edge(CbmGraphEdge),
     /// An exact persisted CBM file-hash row.
     FileHash(CbmFileHashRow),
+    /// An exact generated project-summary row.
+    ProjectSummary(CbmProjectSummaryRow),
+    /// An exact generated token-vector row.
+    TokenVector(CbmTokenVectorRow),
 }
 
 /// Registry-bounded parameters for the streaming row-sink importer.
@@ -126,12 +133,18 @@ pub struct RowSinkStreamReport {
     /// The underlying single ledger-paired import report (ledger seq, readback,
     /// row counts) produced by the shared direct vault-writer path.
     pub import: SqliteImportReport,
+    /// Number of project rows accepted from the stream.
+    pub stream_projects: usize,
     /// Number of node rows accepted from the stream.
     pub stream_nodes: usize,
     /// Number of edge rows accepted from the stream.
     pub stream_edges: usize,
     /// Number of exact file-hash rows accepted from the stream.
     pub stream_file_hashes: usize,
+    /// Number of project-summary rows accepted from the stream.
+    pub stream_project_summaries: usize,
+    /// Number of token-vector rows accepted from the stream.
+    pub stream_token_vectors: usize,
     /// Number of drain/backpressure batches the stream was validated in.
     pub drain_batches: usize,
     /// The registry-bounded drain-batch size used for this import.
@@ -164,9 +177,12 @@ where
     let project = options.project.as_str();
 
     let drain_start = std::time::Instant::now();
+    let mut projects: Vec<CbmProjectRow> = Vec::new();
     let mut nodes: Vec<CbmGraphNode> = Vec::new();
     let mut edges: Vec<CbmGraphEdge> = Vec::new();
     let mut file_hashes: Vec<CbmFileHashRow> = Vec::new();
+    let mut project_summaries: Vec<CbmProjectSummaryRow> = Vec::new();
+    let mut token_vectors: Vec<CbmTokenVectorRow> = Vec::new();
     let mut drain_batches: usize = 0;
     let mut rows_in_batch: u64 = 0;
 
@@ -175,9 +191,12 @@ where
     // returns before a single byte is persisted — there is never a partial batch.
     for item in stream {
         let accepted = StreamCounts {
+            projects: projects.len(),
             nodes: nodes.len(),
             edges: edges.len(),
             file_hashes: file_hashes.len(),
+            project_summaries: project_summaries.len(),
+            token_vectors: token_vectors.len(),
         };
         // A stream-level Err honours the #123 independent-failure contract: the
         // sink failed for this row, so the whole import fails closed.
@@ -188,6 +207,10 @@ where
             )
         })?;
         match row {
+            RowSinkStreamRow::Project(row) => {
+                validate_stream_project(project, &row, accepted)?;
+                projects.push(row);
+            }
             RowSinkStreamRow::Node(node) => {
                 validate_stream_node(project, &node, accepted)?;
                 nodes.push(node);
@@ -200,6 +223,14 @@ where
                 validate_stream_file_hash(project, &file_hash, accepted)?;
                 file_hashes.push(file_hash);
             }
+            RowSinkStreamRow::ProjectSummary(row) => {
+                validate_stream_project_summary(project, &row, accepted)?;
+                project_summaries.push(row);
+            }
+            RowSinkStreamRow::TokenVector(row) => {
+                validate_stream_token_vector(project, &row, accepted)?;
+                token_vectors.push(row);
+            }
         }
         rows_in_batch += 1;
         if rows_in_batch >= batch {
@@ -211,27 +242,29 @@ where
         drain_batches += 1;
     }
 
+    let stream_projects = projects.len();
     let stream_nodes = nodes.len();
     let stream_edges = edges.len();
     let stream_file_hashes = file_hashes.len();
+    let stream_project_summaries = project_summaries.len();
+    let stream_token_vectors = token_vectors.len();
 
     let snapshot = CbmGraphSnapshot {
         project: options.project.clone(),
         panel_version: Some(options.panel_version),
-        projects: Vec::new(),
+        projects,
         nodes,
         edges,
         file_hashes,
-        project_summaries: Vec::new(),
-        token_vectors: Vec::new(),
+        project_summaries,
+        token_vectors,
     };
 
     let drain_ms = drain_start.elapsed().as_millis() as u64;
     // Phase B: single ledger-paired persistence through the shared direct path.
     // Exactly one write batch, one ledger entry — the invariant the raw-CF byte
-    // parity with the SQLite importer depends on. An empty stream reaches here with
-    // zero nodes and is refused by the shared path's >=1-node contract, so an empty
-    // import never records a successful-but-empty ledger entry.
+    // parity with the SQLite importer depends on. A genuinely empty stream reaches
+    // the shared path as an exact zero-family snapshot; no row is fabricated.
     let mut import = import_cbm_graph_snapshot_to_vault_direct(
         &snapshot,
         source_fingerprint_sha256,
@@ -243,9 +276,12 @@ where
 
     Ok(RowSinkStreamReport {
         import,
+        stream_projects,
         stream_nodes,
         stream_edges,
         stream_file_hashes,
+        stream_project_summaries,
+        stream_token_vectors,
         drain_batches,
         drain_batch_rows: batch,
     })
@@ -254,7 +290,8 @@ where
 /// Lazily adapts a materialized [`CbmGraphSnapshot`] into the
 /// [`RowSinkStreamRow`] sequence [`import_cbm_row_stream_to_vault`] consumes.
 ///
-/// Nodes are yielded first (in stored order), then edges and exact file hashes.
+/// Families are yielded in frozen semantic order: project, file hash, node (with
+/// its optional node-vector bytes), edge, project summary, and token vector.
 /// Every item is `Ok`
 /// because a snapshot handed to this adapter has already cleared FFI row-sink
 /// validation — the per-item [`IngestResult`] failure channel is reserved for a
@@ -269,50 +306,139 @@ where
 /// kernel-context / anomaly / provenance surfaces) and the streaming vault
 /// writer: the same materialized rows are streamed row-by-row into the single
 /// ledger-paired write instead of being handed over as one snapshot argument.
-/// Project/summary/token-vector rows remain outside the frozen v1 contract
-/// (#698); file hashes are mandatory and are streamed without reconstruction.
+/// Every semantic family is moved without cloning or reconstruction.
 ///
 /// [`pipeline_rows_to_graph_snapshot`]: crate::sqlite_import::CbmGraphSnapshot
 pub fn snapshot_into_row_stream(
     snapshot: CbmGraphSnapshot,
 ) -> impl Iterator<Item = IngestResult<RowSinkStreamRow>> {
     snapshot
-        .nodes
+        .projects
         .into_iter()
-        .map(|node| Ok(RowSinkStreamRow::Node(node)))
-        .chain(
-            snapshot
-                .edges
-                .into_iter()
-                .map(|edge| Ok(RowSinkStreamRow::Edge(edge))),
-        )
+        .map(|row| Ok(RowSinkStreamRow::Project(row)))
         .chain(
             snapshot
                 .file_hashes
                 .into_iter()
-                .map(|file_hash| Ok(RowSinkStreamRow::FileHash(file_hash))),
+                .map(|row| Ok(RowSinkStreamRow::FileHash(row))),
+        )
+        .chain(
+            snapshot
+                .nodes
+                .into_iter()
+                .map(|row| Ok(RowSinkStreamRow::Node(row))),
+        )
+        .chain(
+            snapshot
+                .edges
+                .into_iter()
+                .map(|row| Ok(RowSinkStreamRow::Edge(row))),
+        )
+        .chain(
+            snapshot
+                .project_summaries
+                .into_iter()
+                .map(|row| Ok(RowSinkStreamRow::ProjectSummary(row))),
+        )
+        .chain(
+            snapshot
+                .token_vectors
+                .into_iter()
+                .map(|row| Ok(RowSinkStreamRow::TokenVector(row))),
         )
 }
 
 #[derive(Debug, Clone, Copy)]
 struct StreamCounts {
+    projects: usize,
     nodes: usize,
     edges: usize,
     file_hashes: usize,
+    project_summaries: usize,
+    token_vectors: usize,
 }
 
 fn stream_row_refused(accepted: StreamCounts, detail: String) -> IngestError {
     IngestError::refused(
         ASTRO_ROW_SINK_STREAM_ROW_REFUSED,
         format!(
-            "{detail} (refused after accepting {} well-formed rows: {} nodes, {} edges, {} file hashes; nothing persisted)",
-            accepted.nodes + accepted.edges + accepted.file_hashes,
+            "{detail} (refused after accepting {} well-formed rows: {} projects, {} file hashes, {} nodes, {} edges, {} project summaries, {} token vectors; nothing persisted)",
+            accepted.projects
+                + accepted.file_hashes
+                + accepted.nodes
+                + accepted.edges
+                + accepted.project_summaries
+                + accepted.token_vectors,
+            accepted.projects,
+            accepted.file_hashes,
             accepted.nodes,
             accepted.edges,
-            accepted.file_hashes
+            accepted.project_summaries,
+            accepted.token_vectors
         ),
         ROW_REMEDIATION,
     )
+}
+
+fn validate_stream_project(
+    project: &str,
+    row: &CbmProjectRow,
+    accepted: StreamCounts,
+) -> IngestResult<()> {
+    if row.project != project {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink project row belongs to {:?}, not import project {project:?}",
+                row.project
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_project_summary(
+    project: &str,
+    row: &CbmProjectSummaryRow,
+    accepted: StreamCounts,
+) -> IngestResult<()> {
+    if row.project != project {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink project summary belongs to {:?}, not import project {project:?}",
+                row.project
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_token_vector(
+    project: &str,
+    row: &CbmTokenVectorRow,
+    accepted: StreamCounts,
+) -> IngestResult<()> {
+    if row.project != project {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink token vector {} belongs to {:?}, not import project {project:?}",
+                row.id, row.project
+            ),
+        ));
+    }
+    if row.vector.len() != 768 {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink token vector {} has {} i8 bytes, expected the frozen i8x768 imported-vector shape",
+                row.id,
+                row.vector.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_stream_file_hash(
@@ -416,6 +542,18 @@ fn validate_stream_node(
             format!(
                 "row-sink node {} properties JSON must be an object",
                 node.source_node_id
+            ),
+        ));
+    }
+    if let Some(vector) = &node.node_vector
+        && vector.len() != 768
+    {
+        return Err(stream_row_refused(
+            accepted,
+            format!(
+                "row-sink node {} vector has {} i8 bytes, expected the frozen i8x768 imported-vector shape",
+                node.source_node_id,
+                vector.len()
             ),
         ));
     }

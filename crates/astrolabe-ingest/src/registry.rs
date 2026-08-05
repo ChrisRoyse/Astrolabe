@@ -424,6 +424,22 @@ pub struct DeepVerifyReport {
     pub sqlite_constellation_rows: usize,
     /// Number of SQLite-import typed edge rows decoded and provenance-checked.
     pub sqlite_edge_rows: usize,
+    /// Non-node semantic Graph rows bound to their Base constellation.
+    pub sqlite_semantic_constellation_rows: usize,
+    /// Current zero-gap semantic coverage witnesses reconstructed and ledger-bound.
+    pub sqlite_semantic_coverage_witness_rows: usize,
+    /// Concrete semantic Slot CF rows joined to immutable Base hashes.
+    pub sqlite_semantic_slot_rows: usize,
+    /// Persisted semantic atoms classified by deterministic encoders or embedders.
+    pub sqlite_semantic_coverage_present: u64,
+    /// Persisted semantic atoms classified by deterministic encoders.
+    pub sqlite_semantic_coverage_encoded: u64,
+    /// Persisted semantic atoms classified by learned embedders.
+    pub sqlite_semantic_coverage_embedded: u64,
+    /// Persisted semantic atoms classified by frozen imported-vector lenses.
+    pub sqlite_semantic_coverage_imported_vectors: u64,
+    /// Persisted semantic atoms without a frozen lens classification (zero on success).
+    pub sqlite_semantic_coverage_uncovered: u64,
     /// Ledger hash-chain status (`intact`, `broken`, or `corrupt`).
     pub ledger_chain_status: String,
     /// Number of Ledger CF rows visible during deep verification.
@@ -748,6 +764,14 @@ where
         sqlite_structural_rows: sqlite.structural_rows,
         sqlite_constellation_rows: sqlite.constellation_rows,
         sqlite_edge_rows: sqlite.edge_rows,
+        sqlite_semantic_constellation_rows: sqlite.semantic_constellation_rows,
+        sqlite_semantic_coverage_witness_rows: sqlite.semantic_coverage_witness_rows,
+        sqlite_semantic_slot_rows: sqlite.semantic_slot_rows,
+        sqlite_semantic_coverage_present: sqlite.semantic_coverage_present,
+        sqlite_semantic_coverage_encoded: sqlite.semantic_coverage_encoded,
+        sqlite_semantic_coverage_embedded: sqlite.semantic_coverage_embedded,
+        sqlite_semantic_coverage_imported_vectors: sqlite.semantic_coverage_imported_vectors,
+        sqlite_semantic_coverage_uncovered: sqlite.semantic_coverage_uncovered,
         ledger_chain_status: ledger_chain.status,
         ledger_rows: ledger_chain.ledger_rows,
         ledger_payload_rows: ledger_pairing.ledger_payload_rows,
@@ -766,13 +790,9 @@ pub fn verify_deep_vault_path(
     let options = VaultOptions {
         read_only: true,
         restore_ledger_hook: false,
-        selected_cfs: Some(vec![
-            ColumnFamily::Kv,
-            ColumnFamily::Recurrence,
-            ColumnFamily::Graph,
-            ColumnFamily::Base,
-            ColumnFamily::Ledger,
-        ]),
+        // Deep verification must open every physically existing dynamic Slot CF;
+        // a selected core-only view cannot prove the semantic vectors on disk.
+        selected_cfs: None,
         ..VaultOptions::default()
     };
     let vault = AsterVault::open(vault_dir, vault_id, vault_salt.as_bytes().to_vec(), options)?;

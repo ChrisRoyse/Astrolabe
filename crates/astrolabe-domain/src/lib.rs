@@ -31,7 +31,7 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// Absolute path to the owned Calyx tree used by this workspace.
 pub const CALYX_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../calyx");
 /// Version tag prepended to every symbol canonical byte sequence.
-pub const SYMBOL_CANONICAL_TAG: &str = "astro-symbol-v2";
+pub const SYMBOL_CANONICAL_TAG: &str = "astro-symbol-v3";
 /// Domain tag framed into every stable series identifier preimage.
 pub const SERIES_ID_TAG: &str = "astro-series-v2";
 /// Prefix used to build the per-project Calyx vault salt.
@@ -923,6 +923,11 @@ pub struct SymbolRecord {
     pub end_line: u32,
     /// Optional BLAKE3 hash of the source snippet bytes read from the source file.
     pub expected_source_snippet_blake3: Option<[u8; 32]>,
+    /// SHA-256 of the exact corpus-commissioned CBM semantic vector bytes.
+    /// Included in immutable version identity so a corpus-dependent vector can
+    /// never change under an existing constellation id.
+    #[serde(default)]
+    pub semantic_vector_sha256: Option<[u8; 32]>,
     /// Numeric observations that must be finite before the symbol is admitted.
     pub scalars: BTreeMap<String, f64>,
     /// JSON object supplied to property-driven measurement lenses.
@@ -962,6 +967,7 @@ impl SymbolRecord {
             start_line,
             end_line,
             expected_source_snippet_blake3: None,
+            semantic_vector_sha256: None,
             scalars: BTreeMap::new(),
             properties_json: empty_properties_json(),
             available_slots: BTreeSet::new(),
@@ -1087,6 +1093,13 @@ pub fn canonical_input_bytes(symbol: &SymbolRecord) -> Result<Vec<u8>> {
     append_frame(&mut out, symbol.signature.as_bytes());
     append_frame(&mut out, &symbol.start_line.to_be_bytes());
     append_frame(&mut out, &symbol.end_line.to_be_bytes());
+    match symbol.semantic_vector_sha256 {
+        Some(hash) => {
+            append_frame(&mut out, &[1]);
+            append_frame(&mut out, &hash);
+        }
+        None => append_frame(&mut out, &[0]),
+    }
     append_frame(&mut out, &properties_digest);
     append_frame(&mut out, &(symbol.scalars.len() as u64).to_be_bytes());
     for (key, value) in &symbol.scalars {
