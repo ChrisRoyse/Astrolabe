@@ -1246,8 +1246,8 @@ static uint8_t *build_node_record(WriterIo *io, const CBMDumpNode *n, int *out_l
     return data;
 }
 
-// Build an edges table record: (id, project, source_id, target_id, type, properties)
-// url_path_gen and local_name_gen are VIRTUAL generated columns — NOT stored in the record.
+// Build an edges table record: (id, project, source_id, target_id, type, properties).
+// All *_gen columns are VIRTUAL generated columns — NOT stored in the record.
 static uint8_t *build_edge_record(WriterIo *io, const CBMDumpEdge *e, int *out_len) {
     RecordBuilder r;
     rec_init(&r, io, "build_edge_record");
@@ -1512,17 +1512,19 @@ static uint8_t *build_index_entry_text_int_text_rowid(WriterIo *io, const char *
     return cell;
 }
 
-// Build UNIQUE index entry for (int64, int64, text, text) + rowid — edges
-// unique(source_id, target_id, type, local_name_gen) (#768).
-static uint8_t *build_index_entry_unique_2int_2text_rowid(WriterIo *io, int64_t v1, int64_t v2,
+// Build UNIQUE index entry for (int64, int64, text, text, text) + rowid — edges
+// unique(source_id, target_id, type, local_name_gen, preprocess_context_id_gen).
+static uint8_t *build_index_entry_unique_2int_3text_rowid(WriterIo *io, int64_t v1, int64_t v2,
                                                           const char *text, const char *text2,
-                                                          int64_t rowid, int *out_len) {
+                                                          const char *text3, int64_t rowid,
+                                                          int *out_len) {
     RecordBuilder r;
     rec_init(&r, io, "build_unique_index_record");
     rec_add_int(&r, v1);
     rec_add_int(&r, v2);
     rec_add_text(&r, text);
     rec_add_text(&r, text2);
+    rec_add_text(&r, text3);
     rec_add_int(&r, rowid);
     int payload_len = 0;
     uint8_t *payload = rec_finalize(&r, &payload_len);
@@ -2097,7 +2099,8 @@ static int __cdecl cmp_edge_by_url_path(void *context, const void *a, const void
     return cmp_i64(edges[ia].id, edges[ib].id);
 }
 
-// autoindex_edges_1: UNIQUE(source_id, target_id, type, local_name_gen) + rowid (#768)
+// autoindex_edges_1: UNIQUE(source_id, target_id, type, local_name_gen,
+// preprocess_context_id_gen) + rowid.
 static int __cdecl cmp_edge_by_src_tgt_type(void *context, const void *a, const void *b) {
     const CBMDumpEdge *edges = (const CBMDumpEdge *)context;
     int ia = *(const int *)a;
@@ -2118,7 +2121,60 @@ static int __cdecl cmp_edge_by_src_tgt_type(void *context, const void *a, const 
     if (c) {
         return c;
     }
+    c = strcmp(safe_str(edges[ia].preprocess_context_id),
+               safe_str(edges[ib].preprocess_context_id));
+    if (c) {
+        return c;
+    }
     return cmp_i64(edges[ia].id, edges[ib].id);
+}
+
+static bool edge_unique_identity_equal(const CBMDumpEdge *left, const CBMDumpEdge *right) {
+    return left->source_id == right->source_id && left->target_id == right->target_id &&
+           strcmp(safe_str(left->type), safe_str(right->type)) == 0 &&
+           strcmp(safe_str(left->local_name), safe_str(right->local_name)) == 0 &&
+           strcmp(safe_str(left->preprocess_context_id), safe_str(right->preprocess_context_id)) ==
+               0;
+}
+
+/* The direct writer bypasses SQLite INSERT-time constraint enforcement. Prove
+ * that its sorted semantic key stream is unique before emitting any index cell,
+ * so a future graph/schema drift reports exact rows instead of a late generic
+ * integrity_check failure. */
+static bool validate_edge_unique_identities(WriterIo *io, const CBMDumpEdge *edges, int edge_count,
+                                            const int *perm) {
+    for (int i = 1; i < edge_count; i++) {
+        const CBMDumpEdge *left = &edges[perm[i - 1]];
+        const CBMDumpEdge *right = &edges[perm[i]];
+        if (!edge_unique_identity_equal(left, right)) {
+            continue;
+        }
+        if (!io || io->failed) {
+            return false;
+        }
+        io->failed = true;
+        io->failed_operation = "validate_edge_unique_identities";
+        io->native_error_kind = "input_contract";
+        io->native_error = ERROR_DUP_NAME;
+        char left_id[32];
+        char right_id[32];
+        char source_id[32];
+        char target_id[32];
+        (void)snprintf(left_id, sizeof(left_id), "%lld", (long long)left->id);
+        (void)snprintf(right_id, sizeof(right_id), "%lld", (long long)right->id);
+        (void)snprintf(source_id, sizeof(source_id), "%lld", (long long)left->source_id);
+        (void)snprintf(target_id, sizeof(target_id), "%lld", (long long)left->target_id);
+        cbm_log_error(
+            "sqlite_writer.edge_identity_duplicate", "code", "CBM_EDGE_IDENTITY_DUPLICATE",
+            "left_edge_id", left_id, "right_edge_id", right_id, "source_id", source_id, "target_id",
+            target_id, "type", safe_str(left->type), "local_name_gen", safe_str(left->local_name),
+            "preprocess_context_id_gen", safe_str(left->preprocess_context_id), "message",
+            "two direct-writer rows have the same complete schema-v5 edge identity", "remediation",
+            "repair graph-buffer edge deduplication; preserve the source corpus and do not "
+            "publish this staging database");
+        return false;
+    }
+    return true;
 }
 
 // --- Parallel sort support ---
@@ -2157,8 +2213,9 @@ static uint8_t *ecell_proj_source_type(WriterIo *io, const CBMDumpEdge *e, int *
                                                  out_len);
 }
 static uint8_t *ecell_src_tgt_type(WriterIo *io, const CBMDumpEdge *e, int *out_len) {
-    return build_index_entry_unique_2int_2text_rowid(io, e->source_id, e->target_id, e->type,
-                                                     safe_str(e->local_name), e->id, out_len);
+    return build_index_entry_unique_2int_3text_rowid(
+        io, e->source_id, e->target_id, e->type, safe_str(e->local_name),
+        safe_str(e->preprocess_context_id), e->id, out_len);
 }
 static uint8_t *ecell_url_path(WriterIo *io, const CBMDumpEdge *e, int *out_len) {
     const char *url = (e->url_path && e->url_path[0] != '\0') ? e->url_path : NULL;
@@ -2736,6 +2793,11 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
         free_sort_permutations(esorts, EDGE_SORT_THREADS);
         return writer_io_finish(io, sort_rc, false);
     }
+    if (!validate_edge_unique_identities(io, edges, edge_count, esorts[ESORT_SRC_TGT_TYPE].perm)) {
+        free_sort_permutations(nsorts, NODE_SORT_THREADS);
+        free_sort_permutations(esorts, EDGE_SORT_THREADS);
+        return writer_io_finish(io, ERR_SORT_FAILED, false);
+    }
 
     /* Phase 4-5: Build node + edge index B-trees */
     CBM_PROF_START(t_node_idx);
@@ -2858,11 +2920,11 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "CREATE INDEX idx_nodes_file ON nodes(project, file_path)"},
         {"index", "idx_nodes_qn", "nodes", idx_nodes_qn_root,
          "CREATE INDEX idx_nodes_qn ON nodes(project, qualified_name)"},
-        // local_name_gen + widened UNIQUE (#768): must stay semantically
+        // Edge generated discriminators + widened UNIQUE: must stay semantically
         // identical to init_schema in src/store/store.c, and the hand-built
         // sqlite_autoindex_edges_1 (cmp_edge_by_src_tgt_type +
         // ecell_src_tgt_type) must produce exactly the values SQLite computes
-        // for local_name_gen, or integrity_check fails on the dumped DB.
+        // for both generated identity columns, or integrity_check fails.
         {"table", "edges", "edges", edges_root,
          "CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT "
          "NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL "
@@ -2871,7 +2933,14 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "'{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS "
          "(json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS "
          "(CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') "
-         "ELSE '' END),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen)\n\t)"},
+         "ELSE '' END),\n\t\tpreprocess_context_id_gen TEXT GENERATED ALWAYS AS "
+         "(coalesce(CAST(json_extract(properties,'$.preprocess_context_id') AS TEXT),'')),\n\t\t"
+         "CHECK(type != 'IMPORTS' OR json_type(properties,'$.local_name') IS NULL OR "
+         "json_type(properties,'$.local_name') IN ('null','text')),\n\t\t"
+         "CHECK(json_type(properties,'$.preprocess_context_id') IS NULL OR "
+         "json_type(properties,'$.preprocess_context_id') IN ('null','text')),\n\t\t"
+         "UNIQUE(source_id, target_id, type, local_name_gen, "
+         "preprocess_context_id_gen)\n\t)"},
         {"index", "sqlite_autoindex_edges_1", "edges", autoindex_edges_root, NULL},
         {"index", "idx_edges_source", "edges", idx_edges_source_root,
          "CREATE INDEX idx_edges_source ON edges(source_id, type)"},

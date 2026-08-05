@@ -2718,6 +2718,7 @@ pub(crate) fn read_shadow_pipeline_rows(
             properties_json: edge.properties_json,
             url_path_gen: edge.url_path_gen,
             local_name_gen: edge.local_name_gen,
+            preprocess_context_id_gen: edge.preprocess_context_id_gen,
         })
         .collect::<Vec<_>>();
     let file_hashes = rows
@@ -2976,6 +2977,7 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
             dst: None,
             edge_type: edge.edge_type,
             local_name_gen: edge.local_name_gen,
+            preprocess_context_id_gen: edge.preprocess_context_id_gen,
             weight: 1.0,
             properties_json: edge.properties_json,
         })

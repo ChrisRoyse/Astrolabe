@@ -84,8 +84,8 @@ const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
 pub const CBM_FILE_HASH_ROW_SCHEMA: &str = "astrolabe-file-hash-v1";
 const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
 const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
-const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
-pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
+const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v2";
+pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v2";
 const SCHEMA_FILE_DIGEST_ROW: &str = "astrolabe-file-digest-v1";
 const SCHEMA_FILE_DIGEST_MANIFEST_V2: &str = "astrolabe-file-digest-manifest-v2";
 const SCHEMA_FILE_DIGEST_CHUNK_V2: &str = "astrolabe-file-digest-chunk-v2";
@@ -103,8 +103,9 @@ const FILE_DIGEST_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 // changes; folding edges into the source file's digest makes such a change invalidate the
 // digest instead of being wrongly preserved.) v1 manifests mismatch and fail open into one
 // labeled full reconcile. v3 folds the stable atom and byte-exact source
-// contract, so an exact body/span change can never reuse a v2 identity.
-const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v3";
+// contract, so an exact body/span change can never reuse a v2 identity. v4
+// folds the complete local-name + preprocessing-context edge identity.
+const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v4";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 /// Ledger payload schema for admitting historical symbol versions without
 /// mutating the live graph projection.
@@ -121,7 +122,7 @@ const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 /// (check-cross-process-vault.py). Mirrors LOWERED_DB_BUSY_TIMEOUT_MS
 /// (astrolabe-lower) and CONFIG_DB_BUSY_TIMEOUT_MS (astrolabe-server).
 const CBM_SOURCE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
-pub const CBM_SQLITE_SCHEMA_VERSION: i64 = 4;
+pub const CBM_SQLITE_SCHEMA_VERSION: i64 = 5;
 
 /// Import configuration for a CBM SQLite dump.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +798,7 @@ struct RawEdgeRow {
     properties: Value,
     properties_json: String,
     local_name_gen: String,
+    preprocess_context_id_gen: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1136,6 +1138,8 @@ pub(crate) struct EdgeGraphRow {
     pub(crate) edge_type: String,
     pub(crate) etype: u16,
     pub(crate) local_name_gen: String,
+    #[serde(default)]
+    pub(crate) preprocess_context_id_gen: String,
     pub(crate) weight: f32,
     pub(crate) props: Value,
     #[serde(default)]
@@ -1200,6 +1204,8 @@ pub struct CbmRawEdgeRow {
     pub edge_type: String,
     pub properties_json: String,
     pub local_name_gen: String,
+    #[serde(default)]
+    pub preprocess_context_id_gen: String,
     pub commit: String,
     pub sqlite_fingerprint_sha256: String,
 }
@@ -1236,6 +1242,7 @@ pub struct CbmGraphEdge {
     pub dst: Option<CxId>,
     pub edge_type: String,
     pub local_name_gen: String,
+    pub preprocess_context_id_gen: String,
     pub weight: f32,
     pub properties_json: String,
 }
@@ -1408,6 +1415,38 @@ fn validate_cbm_source_schema(connection: &Connection) -> IngestResult<()> {
     if !atom_unique || collapsed_qn_unique {
         return Err(invalid_sqlite(
             "CBM_ATOM_SCHEMA_REBUILD_REQUIRED: nodes must enforce UNIQUE(project, atom_id) and qualified_name must be non-unique; rebuild from source",
+        ));
+    }
+    let mut edge_indexes = connection
+        .prepare("SELECT name FROM pragma_index_list('edges') WHERE \"unique\"=1 ORDER BY name")
+        .map_err(|error| invalid_sqlite(format!("inspect edges identity indexes: {error}")))?;
+    let edge_index_names = edge_indexes
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| invalid_sqlite(format!("query edges identity indexes: {error}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| invalid_sqlite(format!("read edges identity index: {error}")))?;
+    let expected = [
+        "source_id",
+        "target_id",
+        "type",
+        "local_name_gen",
+        "preprocess_context_id_gen",
+    ];
+    let mut exact_edge_unique = false;
+    for name in edge_index_names {
+        let mut columns = connection
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+            .map_err(|error| invalid_sqlite(format!("inspect edges index {name:?}: {error}")))?;
+        let columns = columns
+            .query_map([&name], |row| row.get::<_, String>(0))
+            .map_err(|error| invalid_sqlite(format!("query edges index {name:?}: {error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| invalid_sqlite(format!("read edges index {name:?}: {error}")))?;
+        exact_edge_unique |= columns.iter().map(String::as_str).eq(expected);
+    }
+    if !exact_edge_unique {
+        return Err(invalid_sqlite(
+            "CBM_EDGE_SCHEMA_REBUILD_REQUIRED: edges must enforce UNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen); rebuild from exact source",
         ));
     }
     Ok(())
@@ -2228,7 +2267,7 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
         .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
     connection
         .execute_batch(
-            "PRAGMA user_version = 4;
+            "PRAGMA user_version = 5;
              CREATE TABLE projects (
                name TEXT PRIMARY KEY,
                indexed_at TEXT NOT NULL,
@@ -2275,7 +2314,13 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
                url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
                local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
                  THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
-               UNIQUE(source_id, target_id, type, local_name_gen)
+               preprocess_context_id_gen TEXT GENERATED ALWAYS AS (
+                 coalesce(CAST(json_extract(properties,'$.preprocess_context_id') AS TEXT),'')),
+               CHECK(type != 'IMPORTS' OR json_type(properties,'$.local_name') IS NULL OR
+                 json_type(properties,'$.local_name') IN ('null','text')),
+               CHECK(json_type(properties,'$.preprocess_context_id') IS NULL OR
+                 json_type(properties,'$.preprocess_context_id') IN ('null','text')),
+               UNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen)
              );
              CREATE TABLE project_summaries (
                project TEXT PRIMARY KEY,
@@ -2633,13 +2678,16 @@ fn snapshot_edge_rows(
                 edge.sqlite_edge_id
             )));
         }
-        let expected_local_name = row_sink_local_name_gen(&edge.edge_type, &properties);
+        let expected_local_name =
+            row_sink_local_name_gen(&edge.edge_type, &properties, edge.sqlite_edge_id)?;
         if edge.local_name_gen != expected_local_name {
             return Err(invalid_sqlite(format!(
                 "row-sink edge {} local_name_gen {:?} does not match properties-derived {:?}",
                 edge.sqlite_edge_id, edge.local_name_gen, expected_local_name
             )));
         }
+        let preprocess_context_id_gen =
+            row_sink_preprocess_context_id_gen(&properties, edge.sqlite_edge_id)?;
         Ok(RawEdgeRow {
             id: edge.sqlite_edge_id,
             project: edge.project.clone(),
@@ -2649,6 +2697,7 @@ fn snapshot_edge_rows(
             properties,
             properties_json: edge.properties_json.clone(),
             local_name_gen: edge.local_name_gen.clone(),
+            preprocess_context_id_gen,
         })
     })?;
     rows.sort_by(|left, right| {
@@ -2657,6 +2706,10 @@ fn snapshot_edge_rows(
             .then_with(|| left.target_id.cmp(&right.target_id))
             .then_with(|| left.edge_type.cmp(&right.edge_type))
             .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+            .then_with(|| {
+                left.preprocess_context_id_gen
+                    .cmp(&right.preprocess_context_id_gen)
+            })
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(rows)
@@ -2672,16 +2725,34 @@ fn validate_snapshot_schema(actual: &str, expected: &str, label: &str) -> Ingest
     }
 }
 
-fn row_sink_local_name_gen(edge_type: &str, properties: &Value) -> String {
-    if edge_type == "IMPORTS" {
-        properties
-            .get("local_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        String::new()
+fn edge_identity_text_property(
+    properties: &Value,
+    key: &str,
+    edge_id: i64,
+) -> IngestResult<String> {
+    match properties.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(value) => Err(invalid_sqlite(format!(
+            "edge {edge_id} identity property {key:?} must be text or null, observed {value}"
+        ))),
     }
+}
+
+fn row_sink_local_name_gen(
+    edge_type: &str,
+    properties: &Value,
+    edge_id: i64,
+) -> IngestResult<String> {
+    if edge_type == "IMPORTS" {
+        edge_identity_text_property(properties, "local_name", edge_id)
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn row_sink_preprocess_context_id_gen(properties: &Value, edge_id: i64) -> IngestResult<String> {
+    edge_identity_text_property(properties, "preprocess_context_id", edge_id)
 }
 
 fn validate_options(options: &SqliteImportOptions) -> IngestResult<()> {
@@ -3152,9 +3223,7 @@ fn read_edges(connection: &Connection, expected_project: &str) -> IngestResult<V
     let mut statement = connection
         .prepare(
             "SELECT id, project, source_id, target_id, type, COALESCE(properties, '{}'), \
-             CASE WHEN type = 'IMPORTS' AND json_valid(COALESCE(properties, '{}')) \
-             THEN COALESCE(CAST(json_extract(properties, '$.local_name') AS TEXT), '') \
-             ELSE '' END AS local_name_gen \
+             local_name_gen, preprocess_context_id_gen \
              FROM edges",
         )
         .map_err(|error| invalid_sqlite(format!("prepare edges query: {error}")))?;
@@ -3168,21 +3237,30 @@ fn read_edges(connection: &Connection, expected_project: &str) -> IngestResult<V
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })
         .map_err(|error| invalid_sqlite(format!("query edges: {error}")))?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, row_project, source_id, target_id, edge_type, properties_json, local_name_gen) =
-            row.map_err(|error| {
-                invalid_sqlite(format!(
-                    "read edges row: {error}; a non-UTF-8 text column violates the \
+        let (
+            id,
+            row_project,
+            source_id,
+            target_id,
+            edge_type,
+            properties_json,
+            local_name_gen,
+            preprocess_context_id_gen,
+        ) = row.map_err(|error| {
+            invalid_sqlite(format!(
+                "read edges row: {error}; a non-UTF-8 text column violates the \
                      cbm_json_escape UTF-8 write contract (#493) — the DB was written \
                      by a pre-contract indexer; delete the store and re-index with a \
                      current binary"
-                ))
-            })?;
+            ))
+        })?;
         if row_project != expected_project {
             return Err(invalid_sqlite(format!(
                 "edge {id} belongs to project {row_project:?}, expected {expected_project:?}"
@@ -3196,6 +3274,18 @@ fn read_edges(connection: &Connection, expected_project: &str) -> IngestResult<V
                 "edge {id} properties JSON must be an object"
             )));
         }
+        let expected_local_name = row_sink_local_name_gen(&edge_type, &properties, id)?;
+        if local_name_gen != expected_local_name {
+            return Err(invalid_sqlite(format!(
+                "edge {id} persisted local_name_gen {local_name_gen:?} differs from properties-derived {expected_local_name:?}"
+            )));
+        }
+        let expected_context = row_sink_preprocess_context_id_gen(&properties, id)?;
+        if preprocess_context_id_gen != expected_context {
+            return Err(invalid_sqlite(format!(
+                "edge {id} persisted preprocess_context_id_gen {preprocess_context_id_gen:?} differs from properties-derived {expected_context:?}"
+            )));
+        }
         out.push(RawEdgeRow {
             id,
             project: row_project,
@@ -3205,6 +3295,7 @@ fn read_edges(connection: &Connection, expected_project: &str) -> IngestResult<V
             properties,
             properties_json,
             local_name_gen,
+            preprocess_context_id_gen,
         });
     }
     out.sort_by(|left, right| {
@@ -3213,6 +3304,10 @@ fn read_edges(connection: &Connection, expected_project: &str) -> IngestResult<V
             .then_with(|| left.target_id.cmp(&right.target_id))
             .then_with(|| left.edge_type.cmp(&right.edge_type))
             .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+            .then_with(|| {
+                left.preprocess_context_id_gen
+                    .cmp(&right.preprocess_context_id_gen)
+            })
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(out)
@@ -3249,9 +3344,10 @@ pub struct CbmSqlitePipelineNode {
 
 /// A CBM pipeline edge row read back from a persisted CBM SQLite `edges` table.
 ///
-/// Mirrors `cbm_gbuf_row_edge_t`. `local_name_gen` is derived exactly as both the
-/// SQLite `local_name_gen` generated column and the graph-buffer sink derive it
-/// (the `local_name` property of an `IMPORTS` edge, empty otherwise);
+/// Mirrors `cbm_gbuf_row_edge_t` plus the schema-v5 generated identity readback.
+/// `local_name_gen` is the `local_name` property of an `IMPORTS` edge (empty
+/// otherwise); `preprocess_context_id_gen` is the context property for every
+/// edge (empty when absent).
 /// `url_path_gen` mirrors the `url_path_gen` generated column (`$.url_path`). Each
 /// edge's `source_id`/`target_id` are the persisted node ids, matching the ids the
 /// sink emitted.
@@ -3265,6 +3361,7 @@ pub struct CbmSqlitePipelineEdge {
     pub properties_json: String,
     pub url_path_gen: String,
     pub local_name_gen: String,
+    pub preprocess_context_id_gen: String,
 }
 
 /// An exact CBM `file_hashes` row read from the persisted source snapshot.
@@ -3360,8 +3457,7 @@ pub fn read_cbm_sqlite_pipeline_rows(
         .map(|edge| {
             // url_path_gen mirrors the SQLite `url_path_gen` generated column
             // (json_extract properties '$.url_path'). It is captured for row-shape
-            // fidelity with the sink even though the shadow import does not consume
-            // it (the downstream `CbmGraphEdge` carries only `local_name_gen`).
+            // fidelity with the sink even though the shadow import does not consume it.
             let url_path_gen = edge
                 .properties
                 .get("url_path")
@@ -3377,6 +3473,7 @@ pub fn read_cbm_sqlite_pipeline_rows(
                 properties_json: edge.properties_json,
                 url_path_gen,
                 local_name_gen: edge.local_name_gen,
+                preprocess_context_id_gen: edge.preprocess_context_id_gen,
             }
         })
         .collect();
@@ -3969,7 +4066,8 @@ fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
 /// file path, line span, byte-exact source contract, properties JSON, and node vector —
 /// plus, for every edge whose SOURCE node
 /// lives in this file, the edge's raw fields (id, endpoints, type, properties JSON,
-/// local_name_gen). Everything is length-prefixed so no field boundary is ambiguous,
+/// local_name_gen, preprocess_context_id_gen). Everything is length-prefixed so no field
+/// boundary is ambiguous,
 /// together with the digest domain and panel version. Node and edge order is normalized by
 /// id so the digest is independent of CBM's emission order. Deliberately conservative: it
 /// never excludes a field that could change the persisted rows, because an under-broad
@@ -4024,6 +4122,7 @@ fn file_content_digest(
         section(&mut hasher, edge.edge_type.as_bytes());
         section(&mut hasher, edge.properties_json.as_bytes());
         section(&mut hasher, edge.local_name_gen.as_bytes());
+        section(&mut hasher, edge.preprocess_context_id_gen.as_bytes());
     }
     hex_lower(hasher.finalize().as_slice())
 }
@@ -4477,6 +4576,7 @@ fn raw_edge_graph_rows(
             edge_type: edge.edge_type.clone(),
             properties_json: edge.properties_json.clone(),
             local_name_gen: edge.local_name_gen.clone(),
+            preprocess_context_id_gen: edge.preprocess_context_id_gen.clone(),
             commit: options.commit.clone(),
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };
@@ -4529,13 +4629,19 @@ fn prepare_edge_rows(
             ))
         })?;
         // A typed edge whose BOTH endpoints are digest-reused connects two unchanged files,
-        // so its persisted typed row (same src/dst CxIds, same kind/local_name_gen key, same
+        // so its persisted typed row (same src/dst CxIds and complete identity key, same
         // content-derived fields) is unchanged (#372). Carry it forward from persisted bytes
         // and fold its key into the "current" set; fail open to the encode path if its key is
         // absent. The whole-vault `verify_chain` covers provenance, mirroring #345's Base skip.
         if digest_reuse.contains_key(&edge.source_id)
             && digest_reuse.contains_key(&edge.target_id)
-            && let Ok(key) = edge_graph_key(src, dst, kind, &edge.local_name_gen)
+            && let Ok(key) = edge_graph_key(
+                src,
+                dst,
+                kind,
+                &edge.local_name_gen,
+                &edge.preprocess_context_id_gen,
+            )
             && existing_graph.contains_key(&key)
         {
             encode_skip.edge_rows_preserved += 1;
@@ -4554,13 +4660,20 @@ fn prepare_edge_rows(
             edge_type: edge.edge_type,
             etype: kind.code(),
             local_name_gen: edge.local_name_gen,
+            preprocess_context_id_gen: edge.preprocess_context_id_gen,
             weight,
             props: edge.properties,
             properties_json: Some(edge.properties_json),
             provenance: zero_ledger_ref(),
             commit: options.commit.clone(),
         };
-        let key = edge_graph_key(row.src, row.dst, kind, &row.local_name_gen)?;
+        let key = edge_graph_key(
+            row.src,
+            row.dst,
+            kind,
+            &row.local_name_gen,
+            &row.preprocess_context_id_gen,
+        )?;
         prepared.push(PreparedEdgeRow { key, row });
     }
     encode_skip.edge_rows_encoded = prepared.len();
@@ -5478,6 +5591,7 @@ fn edge_row_matches_prepared(row: &EdgeGraphRow, prepared: &PreparedEdgeRow) -> 
         && row.edge_type == prepared.row.edge_type
         && row.etype == prepared.row.etype
         && row.local_name_gen == prepared.row.local_name_gen
+        && row.preprocess_context_id_gen == prepared.row.preprocess_context_id_gen
         && (row.weight - prepared.row.weight).abs() <= f32::EPSILON
         && row.props == prepared.row.props
         && row.properties_json == prepared.row.properties_json
@@ -6449,6 +6563,7 @@ where
             dst: None,
             edge_type: row.edge_type,
             local_name_gen: row.local_name_gen,
+            preprocess_context_id_gen: row.preprocess_context_id_gen,
             weight: 1.0,
             properties_json: row.properties_json,
         })
@@ -6485,6 +6600,10 @@ where
             .then_with(|| left.target_node_id.cmp(&right.target_node_id))
             .then_with(|| left.edge_type.cmp(&right.edge_type))
             .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+            .then_with(|| {
+                left.preprocess_context_id_gen
+                    .cmp(&right.preprocess_context_id_gen)
+            })
     });
 
     let mut projects = filter_schema_project(
@@ -6909,6 +7028,48 @@ where
             "edge row {} props are not an object",
             hex_lower(key)
         ));
+    } else {
+        match row_sink_local_name_gen(&row.edge_type, &row.props, row.sqlite_edge_id) {
+            Ok(expected) if expected != row.local_name_gen => errors.push(format!(
+                "edge row {} local_name_gen differs from properties",
+                hex_lower(key)
+            )),
+            Err(error) => errors.push(format!(
+                "edge row {} has invalid local-name identity: {error}",
+                hex_lower(key)
+            )),
+            _ => {}
+        }
+        match row_sink_preprocess_context_id_gen(&row.props, row.sqlite_edge_id) {
+            Ok(expected) if expected != row.preprocess_context_id_gen => errors.push(format!(
+                "edge row {} preprocess_context_id_gen differs from properties",
+                hex_lower(key)
+            )),
+            Err(error) => errors.push(format!(
+                "edge row {} has invalid preprocessing-context identity: {error}",
+                hex_lower(key)
+            )),
+            _ => {}
+        }
+    }
+    if let Some(kind) = EdgeKind::from_cbm_type(&row.edge_type) {
+        match edge_graph_key(
+            row.src,
+            row.dst,
+            kind,
+            &row.local_name_gen,
+            &row.preprocess_context_id_gen,
+        ) {
+            Ok(expected) if expected != key => errors.push(format!(
+                "edge row {} key does not encode its complete identity",
+                hex_lower(key)
+            )),
+            Err(error) => errors.push(format!(
+                "edge row {} identity key cannot be derived: {error}",
+                hex_lower(key)
+            )),
+            _ => {}
+        }
     }
     if !ledger_ref_matches(vault, snapshot, &row.provenance)? {
         errors.push(format!(
@@ -7140,18 +7301,32 @@ pub(crate) fn edge_graph_key(
     dst: CxId,
     kind: EdgeKind,
     local_name_gen: &str,
+    preprocess_context_id_gen: &str,
 ) -> IngestResult<Vec<u8>> {
     let local_len = u32::try_from(local_name_gen.len()).map_err(|_| {
         invalid_sqlite("edge local_name_gen is too long to encode into Graph CF key")
     })?;
-    let mut key =
-        Vec::with_capacity(EDGE_ROW_PREFIX.len() + 16 + 16 + 2 + 4 + local_name_gen.len());
+    let context_len = u32::try_from(preprocess_context_id_gen.len()).map_err(|_| {
+        invalid_sqlite("edge preprocess_context_id_gen is too long to encode into Graph CF key")
+    })?;
+    let mut key = Vec::with_capacity(
+        EDGE_ROW_PREFIX.len()
+            + 16
+            + 16
+            + 2
+            + 4
+            + local_name_gen.len()
+            + 4
+            + preprocess_context_id_gen.len(),
+    );
     key.extend_from_slice(EDGE_ROW_PREFIX);
     key.extend_from_slice(src.as_bytes());
     key.extend_from_slice(dst.as_bytes());
     key.extend_from_slice(&kind.code().to_be_bytes());
     key.extend_from_slice(&local_len.to_be_bytes());
     key.extend_from_slice(local_name_gen.as_bytes());
+    key.extend_from_slice(&context_len.to_be_bytes());
+    key.extend_from_slice(preprocess_context_id_gen.as_bytes());
     Ok(key)
 }
 

@@ -39,8 +39,8 @@ typedef struct {
     uint8_t *source_bytes; /* byte-exact source when source_present */
     size_t source_len;
     bool source_borrowed; /* immutable source slab owns source_bytes when true */
-    char *source_sha256; /* heap-owned lowercase SHA-256 when source_present */
-    uint64_t start_byte; /* end-exclusive byte span within the indexed file */
+    char *source_sha256;  /* heap-owned lowercase SHA-256 when source_present */
+    uint64_t start_byte;  /* end-exclusive byte span within the indexed file */
     uint64_t end_byte;
     char *properties_json; /* heap-owned JSON string, "{}" default */
 } cbm_gbuf_node_t;
@@ -102,10 +102,12 @@ int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const cha
 /* Upsert a source-backed node while borrowing immutable bytes whose lifetime
  * encloses the graph buffer. Identity, hashing, row-sink, and persistence
  * semantics are identical; only the redundant source allocation is removed. */
-int64_t cbm_gbuf_upsert_source_node_borrowed(
-    cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
-    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
-    size_t source_len, uint64_t start_byte, uint64_t end_byte, const char *properties_json);
+int64_t cbm_gbuf_upsert_source_node_borrowed(cbm_gbuf_t *gb, const char *label, const char *name,
+                                             const char *qualified_name, const char *file_path,
+                                             int start_line, int end_line,
+                                             const uint8_t *source_bytes, size_t source_len,
+                                             uint64_t start_byte, uint64_t end_byte,
+                                             const char *properties_json);
 
 /* Resolve a source-backed node by the complete canonical identity frame. */
 const cbm_gbuf_node_t *cbm_gbuf_find_source_node(const cbm_gbuf_t *gb, const char *label,
@@ -183,9 +185,10 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
  * spans and unresolved sibling ambiguity poison persistence and set *failed.
  * Zero candidates are an ordinary miss so the pipeline can emit its counted
  * reference-edge skip. */
-const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
-    const cbm_gbuf_t *gb, const char *claimed_qn, const char *file_path, int line,
-    const char *operation, bool *failed);
+const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(const cbm_gbuf_t *gb,
+                                                        const char *claimed_qn,
+                                                        const char *file_path, int line,
+                                                        const char *operation, bool *failed);
 
 /* Match the successor of a changed atom for incremental edge re-resolution.
  * The semantic locator is exact (QN/path/label/name plus the prior signature
@@ -265,7 +268,8 @@ void cbm_gbuf_set_row_sink(cbm_gbuf_t *gb, cbm_gbuf_row_node_sink_fn node_cb,
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 
-/* Insert an edge. Deduplicates by (source_id, target_id, type).
+/* Insert an edge. Deduplicates by the schema-v5 tuple
+ * (source_id, target_id, type, IMPORTS local_name, preprocess_context_id).
  * A NULL properties_json is canonicalized to the JSON object "{}".
  * On duplicate, merges properties (later wins). Returns edge temp ID.
  * Returns 0 on error. */

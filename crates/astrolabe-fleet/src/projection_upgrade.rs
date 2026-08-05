@@ -42,7 +42,7 @@ use crate::state::RepoState;
 /// Cause-specific refusal for the explicit legacy projection upgrade.
 pub const ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED: &str = "ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED";
 
-const CURRENT_CBM_SCHEMA_VERSION: i64 = 4;
+const CURRENT_CBM_SCHEMA_VERSION: i64 = 5;
 const TRANSACTION_SCHEMA_V1: &str = "astrolabe.projection-upgrade.intent.v1";
 const TRANSACTION_SCHEMA: &str = "astrolabe.projection-upgrade.intent.v2";
 const MEMBER_SCHEMA: &str = "astrolabe.projection-upgrade.member.v1";
@@ -88,7 +88,7 @@ const CURRENT_NODE_COLUMNS: [&str; 15] = [
     "start_byte",
     "end_byte",
 ];
-const CURRENT_EDGE_COLUMNS: [&str; 8] = [
+const CURRENT_EDGE_COLUMNS: [&str; 9] = [
     "id",
     "project",
     "source_id",
@@ -97,6 +97,7 @@ const CURRENT_EDGE_COLUMNS: [&str; 8] = [
     "properties",
     "url_path_gen",
     "local_name_gen",
+    "preprocess_context_id_gen",
 ];
 
 /// Exact paths and mutation timestamp for one projection upgrade.
@@ -726,7 +727,7 @@ pub fn complete_projection_upgrade(
     if schema.kind != SchemaKind::Current {
         return Err(refusal(
             &preparation.repo,
-            "ordinary pipeline returned without a current v4 CBM database",
+            "ordinary pipeline returned without a current v5 CBM database",
         ));
     }
     let transaction_dir = store_dir
@@ -885,7 +886,7 @@ fn complete_current_refresh(
     if schema.kind != SchemaKind::Current {
         return Err(refusal(
             repo,
-            "current-refresh completion readback did not find a current v4 database",
+            "current-refresh completion readback did not find a current v5 database",
         ));
     }
     let symbol_canonical_schema =
@@ -1445,7 +1446,7 @@ fn inspect_schema(
         if edge_columns != CURRENT_EDGE_COLUMNS {
             return Err(refusal(
                 repo,
-                &format!("current v4 database has unexpected edge columns: {edge_columns:?}"),
+                &format!("current v5 database has unexpected edge columns: {edge_columns:?}"),
             ));
         }
         let identity_failures: i64 = connection
@@ -1467,7 +1468,7 @@ fn inspect_schema(
             return Err(refusal(
                 repo,
                 &format!(
-                    "current v4 database contains {identity_failures} invalid atom/source rows"
+                    "current v5 database contains {identity_failures} invalid atom/source rows"
                 ),
             ));
         }
@@ -1476,7 +1477,7 @@ fn inspect_schema(
         return Err(refusal(
             repo,
             &format!(
-                "SQLite schema is neither exact populated legacy nor current v4: user_version={user_version}, node_columns={node_columns:?}"
+                "SQLite schema is neither exact populated legacy nor current v5: user_version={user_version}, node_columns={node_columns:?}"
             ),
         ));
     };

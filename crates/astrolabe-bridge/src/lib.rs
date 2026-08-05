@@ -1465,6 +1465,7 @@ pub struct CbmPipelineEdgeRow {
     pub properties_json: String,
     pub url_path_gen: String,
     pub local_name_gen: String,
+    pub preprocess_context_id_gen: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1524,6 +1525,7 @@ pub fn pipeline_rows_success_response_value(rows: &CbmPipelineRows) -> serde_jso
             "properties_json": e.properties_json,
             "url_path_gen": e.url_path_gen,
             "local_name_gen": e.local_name_gen,
+            "preprocess_context_id_gen": e.preprocess_context_id_gen,
         })).collect::<Vec<_>>(),
         "file_hashes": rows.file_hashes.iter().map(|f| serde_json::json!({
             "project": f.project,
@@ -1667,16 +1669,47 @@ impl PipelineRowSinkState {
 
     fn push_edge(&mut self, row: &cbm_sys::cbm_gbuf_row_edge_t) -> Result<(), BridgeError> {
         self.ensure_callback_thread()?;
+        let properties_json =
+            required_borrowed_c_string(row.properties_json, "row_sink.edge.properties_json")?;
+        let properties: serde_json::Value =
+            serde_json::from_str(&properties_json).map_err(|error| {
+                envelope(
+                    "ASTRO_CBM_ROW_SINK_EDGE_PROPERTIES_INVALID",
+                    format!(
+                        "row-sink edge {} properties are not valid JSON: {error}",
+                        row.id
+                    ),
+                    "Preserve the source corpus and repair CBM edge-property serialization.",
+                )
+            })?;
+        if !properties.is_object() {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_EDGE_PROPERTIES_INVALID",
+                format!("row-sink edge {} properties are not a JSON object", row.id),
+                "Preserve the source corpus and repair CBM edge-property serialization.",
+            ));
+        }
+        let preprocess_context_id_gen = match properties.get("preprocess_context_id") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(value)) => value.clone(),
+            Some(value) => {
+                return Err(envelope(
+                    "ASTRO_CBM_ROW_SINK_EDGE_IDENTITY_INVALID",
+                    format!(
+                        "row-sink edge {} preprocess_context_id must be text or null, observed {value}",
+                        row.id
+                    ),
+                    "Repair the exact preprocessing-context identity and run a clean re-index.",
+                ));
+            }
+        };
         self.edges.push(CbmPipelineEdgeRow {
             id: row.id,
             project: required_borrowed_c_string(row.project, "row_sink.edge.project")?,
             source_id: row.source_id,
             target_id: row.target_id,
             edge_type: required_borrowed_c_string(row.type_, "row_sink.edge.type")?,
-            properties_json: required_borrowed_c_string(
-                row.properties_json,
-                "row_sink.edge.properties_json",
-            )?,
+            properties_json,
             url_path_gen: required_borrowed_c_string(
                 row.url_path_gen,
                 "row_sink.edge.url_path_gen",
@@ -1685,6 +1718,7 @@ impl PipelineRowSinkState {
                 row.local_name_gen,
                 "row_sink.edge.local_name_gen",
             )?,
+            preprocess_context_id_gen,
         });
         Ok(())
     }

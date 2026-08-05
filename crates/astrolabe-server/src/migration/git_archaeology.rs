@@ -2782,6 +2782,7 @@ fn parse_extract_edge(value: &Value) -> Result<CbmPipelineEdgeRow, String> {
         properties_json: str_field("properties_json")?,
         url_path_gen: str_field("url_path_gen")?,
         local_name_gen: str_field("local_name_gen")?,
+        preprocess_context_id_gen: str_field("preprocess_context_id_gen")?,
     })
 }
 

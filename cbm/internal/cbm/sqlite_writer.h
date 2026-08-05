@@ -31,13 +31,16 @@ typedef struct {
     int64_t source_id; // final sequential ID (1..N)
     int64_t target_id; // final sequential ID (1..N)
     const char *type;
-    const char *properties; // JSON string
-    const char *url_path;   // extracted from properties by Go (for idx_edges_url_path)
-    const char *local_name; // for IMPORTS edges: the UNESCAPED
-                            // json_extract(properties,'$.local_name') value; ""/NULL
-                            // otherwise. Feeds sqlite_autoindex_edges_1 — must match
-                            // what SQLite computes for the local_name_gen column or
-                            // integrity_check reports the row missing from the index.
+    const char *properties;            // JSON string
+    const char *url_path;              // extracted from properties by Go (for idx_edges_url_path)
+    const char *local_name;            // for IMPORTS edges: the UNESCAPED
+                                       // json_extract(properties,'$.local_name') value; ""/NULL
+                                       // otherwise.
+    const char *preprocess_context_id; // the UNESCAPED
+                                       // json_extract(properties,'$.preprocess_context_id')
+                                       // value; ""/NULL when absent. Both generated values
+                                       // feed sqlite_autoindex_edges_1 and must exactly match
+                                       // SQLite or integrity_check rejects the database.
 } CBMDumpEdge;
 
 typedef struct {

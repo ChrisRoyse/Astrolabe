@@ -249,7 +249,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::remove_file(&out).ok();
     let mut connection = Connection::open(&out)?;
     connection.execute_batch(
-        "PRAGMA user_version = 4;
+        "PRAGMA user_version = 5;
          CREATE TABLE projects (
              name TEXT PRIMARY KEY,
              indexed_at TEXT NOT NULL,
@@ -288,7 +288,13 @@ fn main() -> Result<(), Box<dyn Error>> {
              url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
              local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
                  THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
-             UNIQUE(source_id, target_id, type, local_name_gen)
+             preprocess_context_id_gen TEXT GENERATED ALWAYS AS (
+                 coalesce(CAST(json_extract(properties,'$.preprocess_context_id') AS TEXT),'')),
+             CHECK(type != 'IMPORTS' OR json_type(properties,'$.local_name') IS NULL OR
+                 json_type(properties,'$.local_name') IN ('null','text')),
+             CHECK(json_type(properties,'$.preprocess_context_id') IS NULL OR
+                 json_type(properties,'$.preprocess_context_id') IN ('null','text')),
+             UNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen)
          );
          CREATE TABLE node_vectors (
              node_id INTEGER PRIMARY KEY,

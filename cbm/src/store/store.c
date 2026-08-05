@@ -257,8 +257,7 @@ static int exec_sql(cbm_store_t *s, const char *sql) {
         if (s->errcode == SQLITE_OK) {
             s->errcode = rc;
         }
-        snprintf(s->errbuf, sizeof(s->errbuf), "exec: %s",
-                 err ? err : sqlite3_errmsg(s->db));
+        snprintf(s->errbuf, sizeof(s->errbuf), "exec: %s", err ? err : sqlite3_errmsg(s->db));
         sqlite3_free(err);
         return CBM_STORE_ERR;
     }
@@ -397,10 +396,58 @@ static int validate_node_identity_index(cbm_store_t *s) {
     return CBM_STORE_OK;
 }
 
+static int validate_edge_identity_index(cbm_store_t *s) {
+    sqlite3_stmt *indexes = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT name FROM pragma_index_list('edges') WHERE \"unique\"=1 "
+                           "ORDER BY name;",
+                           CBM_NOT_FOUND, &indexes, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    static const char *expected[] = {"source_id", "target_id", "type", "local_name_gen",
+                                     "preprocess_context_id_gen"};
+    bool exact_unique = false;
+    while (sqlite3_step(indexes) == SQLITE_ROW) {
+        const char *index_name = (const char *)sqlite3_column_text(indexes, 0);
+        sqlite3_stmt *columns = NULL;
+        if (sqlite3_prepare_v2(s->db, "SELECT name FROM pragma_index_info(?1) ORDER BY seqno;",
+                               CBM_NOT_FOUND, &columns, NULL) != SQLITE_OK) {
+            sqlite3_finalize(indexes);
+            return CBM_STORE_ERR;
+        }
+        bind_text(columns, SKIP_ONE, index_name);
+        bool matches = true;
+        size_t count = 0;
+        while (sqlite3_step(columns) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(columns, 0);
+            if (count >= sizeof(expected) / sizeof(expected[0]) || !name ||
+                strcmp(name, expected[count]) != 0) {
+                matches = false;
+            }
+            count++;
+        }
+        sqlite3_finalize(columns);
+        if (matches && count == sizeof(expected) / sizeof(expected[0])) {
+            exact_unique = true;
+        }
+    }
+    sqlite3_finalize(indexes);
+    if (!exact_unique) {
+        cbm_log_error(
+            "store.schema_edge_identity_refused", "code", "CBM_EDGE_SCHEMA_REBUILD_REQUIRED",
+            "message",
+            "edges identity does not enforce the complete local-name and preprocessing-context "
+            "tuple",
+            "remediation", "rebuild the incompatible store from exact source with schema v5");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int init_schema(cbm_store_t *s) {
     /* user_version == 0 is accepted only for a physically empty, just-created
      * store (SQLITE_OPEN_CREATE stamps 0 by default). It is never an in-place
-     * migration: v4 changes the canonical File-QN contract, and old rows cannot
+     * migration: v5 changes canonical node and edge identity contracts, and old rows cannot
      * be safely restamped without a complete source re-index. Any existing
      * application schema at version 0 is therefore refused below. */
     int initial_user_version = 0;
@@ -488,14 +535,16 @@ static int init_schema(cbm_store_t *s) {
         "  UNIQUE(project, atom_id)"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_nodes_qn ON nodes(project, qualified_name);"
-        /* local_name_gen (#768): IMPORTS edges carry one imported symbol's
+        /* Edge identity: IMPORTS edges carry one imported symbol's
          * local_name each, so uniqueness must discriminate on it — two named
          * imports from the same specifier are distinct edges. Non-IMPORTS
          * edges get '' (NOT NULL: NULLs never conflict in a UNIQUE index,
          * which would break their dedup entirely). Mirrors the graph-buffer
          * dedup key (make_edge_key) and the raw dump writer's DDL + hand-
-         * built sqlite_autoindex_edges_1 (internal/cbm/sqlite_writer.c) —
-         * keep all three in sync. */
+         * built sqlite_autoindex_edges_1 (internal/cbm/sqlite_writer.c).
+         * preprocess_context_id_gen independently preserves relationships
+         * emitted for distinct C compilation contexts. Keep every boundary in
+         * sync; neither discriminator subsumes the other. */
         "CREATE TABLE IF NOT EXISTS edges ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -506,7 +555,13 @@ static int init_schema(cbm_store_t *s) {
         "  url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),"
         "  local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'"
         "    THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),"
-        "  UNIQUE(source_id, target_id, type, local_name_gen)"
+        "  preprocess_context_id_gen TEXT GENERATED ALWAYS AS ("
+        "    coalesce(CAST(json_extract(properties,'$.preprocess_context_id') AS TEXT),'')),"
+        "  CHECK(type != 'IMPORTS' OR json_type(properties,'$.local_name') IS NULL OR"
+        "    json_type(properties,'$.local_name') IN ('null','text')),"
+        "  CHECK(json_type(properties,'$.preprocess_context_id') IS NULL OR"
+        "    json_type(properties,'$.preprocess_context_id') IN ('null','text')),"
+        "  UNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen)"
         ");"
         "CREATE TABLE IF NOT EXISTS project_summaries ("
         "  project TEXT PRIMARY KEY,"
@@ -537,23 +592,26 @@ static int init_schema(cbm_store_t *s) {
         return CBM_STORE_ERR;
     }
 
-    /* Schema-compat probe (#768): DBs created before the local_name_gen
-     * discriminator still enforce UNIQUE(source_id,target_id,type) and lack
-     * the column — the widened upsert in cbm_store_insert_edge can neither
-     * prepare nor let two named imports coexist against them. SQLite cannot
+    /* Schema-compat probe: old DBs lack one or both generated discriminators,
+     * and their narrower UNIQUE cannot preserve the complete edge corpus.
+     * SQLite cannot
      * ALTER a table-level UNIQUE constraint in place, so fail the open:
      * callers already treat an unopenable DB as incompatible (a full index
      * deletes + rebuilds it, artifact import refuses and falls back to a
      * reindex). Read-only query opens skip init_schema and keep working. */
     {
         sqlite3_stmt *probe = NULL;
-        if (sqlite3_prepare_v2(s->db, "SELECT local_name_gen FROM edges LIMIT 0;", CBM_NOT_FOUND,
-                               &probe, NULL) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(
+                s->db, "SELECT local_name_gen, preprocess_context_id_gen FROM edges LIMIT 0;",
+                CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
             cbm_log_warn("store.schema", "result", "incompatible", "missing",
-                         "edges.local_name_gen");
+                         "edges local/context identity columns");
             return CBM_STORE_ERR;
         }
         sqlite3_finalize(probe);
+    }
+    if (validate_edge_identity_index(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
 
     /* FTS5 contentless virtual table for BM25 full-text search.
@@ -957,10 +1015,9 @@ static void store_dispose_failed_open(cbm_store_t **store, const char *operation
     char sqlite_text[ST_BUF_16];
     snprintf(status_text, sizeof(status_text), "%d", (int)close_status);
     snprintf(sqlite_text, sizeof(sqlite_text), "%d", close_result.sqlite_close_code);
-    cbm_log_error("store.open_cleanup_failed", "code", "CBM_STORE_OPEN_CLEANUP_FAILED",
-                  "operation", operation ? operation : "unknown", "db_path",
-                  close_result.db_path, "close_status", status_text, "sqlite_error", sqlite_text,
-                  "connection_destroyed",
+    cbm_log_error("store.open_cleanup_failed", "code", "CBM_STORE_OPEN_CLEANUP_FAILED", "operation",
+                  operation ? operation : "unknown", "db_path", close_result.db_path,
+                  "close_status", status_text, "sqlite_error", sqlite_text, "connection_destroyed",
                   close_result.connection_destroyed ? "true" : "false", "remediation",
                   "preserve the database family and inspect the preceding exact close diagnostic");
     if (!close_result.connection_destroyed) {
@@ -1197,8 +1254,8 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
                       "preserve the database, WAL, and SHM together; resolve the reported SQLite "
                       "failure, then retry");
         if (retained_store) {
-            cbm_log_error("store.query_open_retained", "code", "CBM_STORE_CLOSE_FAILED",
-                          "db_path", db_path ? db_path : "", "message",
+            cbm_log_error("store.query_open_retained", "code", "CBM_STORE_CLOSE_FAILED", "db_path",
+                          db_path ? db_path : "", "message",
                           "query open failed and exact cleanup retained its connection",
                           "remediation",
                           "inspect the preceding close diagnostic; terminate this process before "
@@ -1471,8 +1528,7 @@ static bool store_integrity_map_database(sqlite3 *db, store_integrity_result_t *
  * caller supplies the SQL so this same primitive can prove both a mode-setting
  * result row and a later independent readback.  It never changes connection
  * ownership and always finalizes its local statement. */
-static int store_read_journal_mode_exact(sqlite3 *db, const char *sql,
-                                         const char *operation_prefix,
+static int store_read_journal_mode_exact(sqlite3 *db, const char *sql, const char *operation_prefix,
                                          char mode[CBM_STORE_NORMALIZE_MODE_MAX],
                                          char operation[CBM_STORE_VERIFY_OPERATION_MAX],
                                          char detail[CBM_STORE_VERIFY_DETAIL_MAX]) {
@@ -1607,16 +1663,13 @@ static int store_initialize_wal_index_normal(sqlite3 *db,
         snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX, "%s", sqlite3_errmsg(db));
         return rc;
     }
-    snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s",
-             "source.writer.normal_schema.read");
+    snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "%s", "source.writer.normal_schema.read");
     snprintf(detail, CBM_STORE_VERIFY_DETAIL_MAX,
-             "NORMAL-mode main-schema read finalized with rows=%lld",
-             (long long)schema_rows);
+             "NORMAL-mode main-schema read finalized with rows=%lld", (long long)schema_rows);
     return SQLITE_OK;
 }
 
-static bool store_check_snapshot_delete_journal(cbm_store_t *s,
-                                                store_integrity_result_t *result) {
+static bool store_check_snapshot_delete_journal(cbm_store_t *s, store_integrity_result_t *result) {
     char mode[CBM_STORE_NORMALIZE_MODE_MAX];
     char operation[CBM_STORE_VERIFY_OPERATION_MAX];
     char detail[CBM_STORE_VERIFY_DETAIL_MAX];
@@ -1948,11 +2001,10 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
              * operation. Callers must be able to distinguish a durable on-disk
              * incompatibility from an I/O verification failure without parsing
              * the human-readable detail string. */
-            store_integrity_set_failure(
-                result, STORE_INTEGRITY_FAILED,
-                user_version == 0 ? "application.user_version.unstamped"
-                                  : "application.user_version.unsupported",
-                SQLITE_OK, detail);
+            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                        user_version == 0 ? "application.user_version.unstamped"
+                                                          : "application.user_version.unsupported",
+                                        SQLITE_OK, detail);
         }
         sqlite3_finalize(stmt);
         return result->status;
@@ -1986,7 +2038,7 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
          "application.schema.nodes", "SELECT " ST_NODE_SELECT_COLUMNS " FROM nodes LIMIT 0;"},
         {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.edges",
          "SELECT id, project, source_id, target_id, type, properties, url_path_gen, "
-         "local_name_gen FROM edges LIMIT 0;"},
+         "local_name_gen, preprocess_context_id_gen FROM edges LIMIT 0;"},
         {STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD, "application.schema.edges",
          "SELECT project, source_id, target_id, type, properties FROM edges LIMIT 0;"},
         {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.project_summaries",
@@ -2064,8 +2116,7 @@ static void store_verify_set_error(cbm_store_verify_result_t *result,
     snprintf(result->detail, sizeof(result->detail), "%s", detail ? detail : "unspecified");
 }
 
-static void store_verify_set_close_error(cbm_store_verify_result_t *result,
-                                         const char *operation,
+static void store_verify_set_close_error(cbm_store_verify_result_t *result, const char *operation,
                                          const cbm_store_close_result_t *close_result) {
     int sqlite_error = close_result->sqlite_close_code;
     if (close_result->finalize_error_count > 0) {
@@ -2103,8 +2154,7 @@ static void store_close_windows_handle_or_abort(HANDLE *handle, const char *oper
         snprintf(error_text, sizeof(error_text), "%lu", (unsigned long)error);
         cbm_log_error("store.windows_handle.close_failed", "code",
                       "CBM_STORE_WINDOWS_HANDLE_CLOSE_FAILED", "operation",
-                      operation ? operation : "unknown", "native_error", error_text,
-                      "remediation",
+                      operation ? operation : "unknown", "native_error", error_text, "remediation",
                       "inspect the exact process generation and preserved database family; the "
                       "process will terminate so the kernel releases the retained handle");
         fflush(NULL);
@@ -2371,8 +2421,7 @@ typedef struct {
 } store_integrity_receipt_t;
 
 static bool store_receipt_journal_mode_valid(const char *mode) {
-    static const char *const MODES[] = {"delete", "truncate", "persist", "memory", "wal",
-                                        "off"};
+    static const char *const MODES[] = {"delete", "truncate", "persist", "memory", "wal", "off"};
     if (!mode || !mode[0]) {
         return false;
     }
@@ -2482,8 +2531,8 @@ static bool store_hash_frozen_identity(HANDLE source, cbm_store_verify_result_t 
 }
 
 static HANDLE store_open_writer_bound_member(const char *path, bool required, bool *present,
-                                              cbm_store_verify_result_t *result,
-                                              const char *operation) {
+                                             cbm_store_verify_result_t *result,
+                                             const char *operation) {
     *present = false;
     wchar_t *wide_path = cbm_utf8_to_wide_path(path);
     if (!wide_path) {
@@ -2529,8 +2578,7 @@ static HANDLE store_open_writer_bound_member(const char *path, bool required, bo
 }
 
 static bool store_writer_phase_operation(char operation[CBM_STORE_VERIFY_OPERATION_MAX],
-                                         const char *phase, const char *member,
-                                         const char *action,
+                                         const char *phase, const char *member, const char *action,
                                          cbm_store_verify_result_t *result) {
     if (!phase || phase[0] == '\0' || !member || member[0] == '\0' || !action ||
         action[0] == '\0') {
@@ -2540,8 +2588,8 @@ static bool store_writer_phase_operation(char operation[CBM_STORE_VERIFY_OPERATI
                                "writer generation diagnostic requires phase/member/action");
         return false;
     }
-    int wrote = snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "source.writer.%s.%s.%s",
-                         phase, member, action);
+    int wrote = snprintf(operation, CBM_STORE_VERIFY_OPERATION_MAX, "source.writer.%s.%s.%s", phase,
+                         member, action);
     if (wrote < 0 || wrote >= CBM_STORE_VERIFY_OPERATION_MAX) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
                                "source.writer.diagnostic_operation", ERROR_BUFFER_OVERFLOW,
@@ -2558,16 +2606,16 @@ typedef enum {
 } store_writer_bind_phase_t;
 
 static const char *store_writer_bind_phase_name(store_writer_bind_phase_t phase,
-                                                 cbm_store_verify_result_t *result) {
+                                                cbm_store_verify_result_t *result) {
     switch (phase) {
     case STORE_WRITER_BIND_PRE_SQL:
         return "pre_sql";
     case STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT:
         return "post_exclusive_commit";
     default:
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "source.writer.bind_phase", ERROR_INVALID_PARAMETER,
-                               SQLITE_MISUSE, "writer generation comparison phase is invalid");
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.bind_phase",
+                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               "writer generation comparison phase is invalid");
         return NULL;
     }
 }
@@ -2598,16 +2646,14 @@ static bool store_writer_matches_preflight(const char *db_path,
     if (!expected || expected->status != CBM_STORE_VERIFY_OK || !expected->db_present ||
         !expected->family_frozen || !expected->family_guard_release_complete ||
         expected->db_bytes == 0 || strlen(expected->db_sha256) != CBM_SHA256_HEX_LEN ||
-        (expected->wal_present &&
-         strlen(expected->wal_sha256) != CBM_SHA256_HEX_LEN) ||
-        (!expected->wal_present &&
-         (expected->wal_bytes != 0 || expected->wal_sha256[0] != '\0'))) {
+        (expected->wal_present && strlen(expected->wal_sha256) != CBM_SHA256_HEX_LEN) ||
+        (!expected->wal_present && (expected->wal_bytes != 0 || expected->wal_sha256[0] != '\0'))) {
         if (!store_writer_phase_operation(operation, phase, "family", "validate", result)) {
             return false;
         }
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, operation, ERROR_INVALID_DATA,
-                               SQLITE_MISUSE,
-                               "bound writer requires one successful exact frozen DB/WAL preflight");
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_IO_FAILED, operation, ERROR_INVALID_DATA, SQLITE_MISUSE,
+            "bound writer requires one successful exact frozen DB/WAL preflight");
         return false;
     }
 
@@ -2639,8 +2685,7 @@ static bool store_writer_matches_preflight(const char *db_path,
         store_close_windows_handle_or_abort(&db, "source.writer.phase_operation.db_close");
         return false;
     }
-    bool db_hashed =
-        store_hash_frozen_identity(db, result, operation, &db_bytes, db_sha256);
+    bool db_hashed = store_hash_frozen_identity(db, result, operation, &db_bytes, db_sha256);
     store_close_windows_handle_or_abort(&db, "source.writer.bind_db_close");
     if (!db_hashed) {
         return false;
@@ -2655,8 +2700,7 @@ static bool store_writer_matches_preflight(const char *db_path,
                  "expected_present=%d expected_bytes=%llu expected_sha256=%s "
                  "observed_present=%d observed_bytes=%llu observed_sha256=%s",
                  expected->db_present ? 1 : 0, (unsigned long long)expected->db_bytes,
-                 expected->db_sha256, db_present ? 1 : 0, (unsigned long long)db_bytes,
-                 db_sha256);
+                 expected->db_sha256, db_present ? 1 : 0, (unsigned long long)db_bytes, db_sha256);
         if (!store_writer_phase_operation(operation, phase, "db", "generation", result)) {
             return false;
         }
@@ -2725,18 +2769,17 @@ static bool store_writer_matches_preflight(const char *db_path,
         store_close_windows_handle_or_abort(&wal, "source.writer.phase_operation.wal_close");
         return false;
     }
-    bool wal_hashed =
-        store_hash_frozen_identity(wal, result, operation, &wal_bytes, wal_sha256);
+    bool wal_hashed = store_hash_frozen_identity(wal, result, operation, &wal_bytes, wal_sha256);
     store_close_windows_handle_or_abort(&wal, "source.writer.bind_wal_close");
     if (!wal_hashed) {
         return false;
     }
     result->wal_bytes = wal_bytes;
     snprintf(result->wal_sha256, sizeof(result->wal_sha256), "%s", wal_sha256);
-    bool sqlite_owned_empty_wal =
-        bind_phase == STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT && !expected->wal_present &&
-        wal_present && wal_bytes == 0 && strcmp(wal_sha256, EMPTY_SHA256) == 0 && journal_mode &&
-        strcmp(journal_mode, "wal") == 0;
+    bool sqlite_owned_empty_wal = bind_phase == STORE_WRITER_BIND_POST_EXCLUSIVE_COMMIT &&
+                                  !expected->wal_present && wal_present && wal_bytes == 0 &&
+                                  strcmp(wal_sha256, EMPTY_SHA256) == 0 && journal_mode &&
+                                  strcmp(journal_mode, "wal") == 0;
     if ((!expected->wal_present || wal_bytes != expected->wal_bytes ||
          strcmp(wal_sha256, expected->wal_sha256) != 0) &&
         !sqlite_owned_empty_wal) {
@@ -2818,8 +2861,8 @@ static store_receipt_state_t store_receipt_read(const char *path,
     DWORD read_error = eof_ok ? ERROR_SUCCESS : GetLastError();
     store_close_windows_handle_or_abort(&handle, "receipt.read");
     if (!eof_ok) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.read",
-                               read_error, SQLITE_OK,
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.read", read_error,
+                               SQLITE_OK,
                                "integrity receipt could not be read exactly through EOF");
         return STORE_RECEIPT_ERROR;
     }
@@ -2827,22 +2870,22 @@ static store_receipt_state_t store_receipt_read(const char *path,
 
     unsigned long long db_bytes = 0;
     int consumed = 0;
-    int parsed = sscanf(text,
-                        "cbm.store-integrity.v2\n"
-                        "verifier_revision=%d\n"
-                        "graph_schema=%d\n"
-                        "sqlite_version=%d\n"
-                        "sqlite_build_sha256=%64[0-9a-f]\n"
-                        "contract=%d\n"
-                        "db_bytes=%llu\n"
-                        "db_sha256=%64[0-9a-f]\n"
-                        "project=%4095[A-Za-z0-9_.-]\n"
-                        "journal_mode=%15[a-z]\n"
-                        "root_path=%4095[^\r\n]\n%n",
-                        &receipt->verifier_revision, &receipt->graph_schema,
-                        &receipt->sqlite_version, receipt->sqlite_build_sha256, &receipt->contract,
-                        &db_bytes, receipt->db_sha256, receipt->project, receipt->journal_mode,
-                        receipt->root_path, &consumed);
+    int parsed =
+        sscanf(text,
+               "cbm.store-integrity.v2\n"
+               "verifier_revision=%d\n"
+               "graph_schema=%d\n"
+               "sqlite_version=%d\n"
+               "sqlite_build_sha256=%64[0-9a-f]\n"
+               "contract=%d\n"
+               "db_bytes=%llu\n"
+               "db_sha256=%64[0-9a-f]\n"
+               "project=%4095[A-Za-z0-9_.-]\n"
+               "journal_mode=%15[a-z]\n"
+               "root_path=%4095[^\r\n]\n%n",
+               &receipt->verifier_revision, &receipt->graph_schema, &receipt->sqlite_version,
+               receipt->sqlite_build_sha256, &receipt->contract, &db_bytes, receipt->db_sha256,
+               receipt->project, receipt->journal_mode, receipt->root_path, &consumed);
     receipt->db_bytes = (uint64_t)db_bytes;
     if (parsed != 10 || consumed != (int)got ||
         !store_is_lower_sha256(receipt->sqlite_build_sha256) ||
@@ -2884,8 +2927,8 @@ static bool store_receipt_capture_facts(cbm_store_t *store, const char *expected
     journal_mode[0] = '\0';
     sqlite3_stmt *statement = NULL;
     int rc = sqlite3_prepare_v2(store ? store->db : NULL,
-                                "SELECT root_path FROM projects WHERE name = ?1;",
-                                CBM_NOT_FOUND, &statement, NULL);
+                                "SELECT root_path FROM projects WHERE name = ?1;", CBM_NOT_FOUND,
+                                &statement, NULL);
     if (rc == SQLITE_OK) {
         rc = sqlite3_bind_text(statement, 1, expected_project, CBM_NOT_FOUND, SQLITE_STATIC);
     }
@@ -2893,8 +2936,8 @@ static bool store_receipt_capture_facts(cbm_store_t *store, const char *expected
         if (statement) {
             sqlite3_finalize(statement);
         }
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "receipt.project_root.prepare", ERROR_SUCCESS, rc,
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.project_root.prepare",
+                               ERROR_SUCCESS, rc,
                                "content receipt could not bind the verified project root query");
         return false;
     }
@@ -2912,10 +2955,10 @@ static bool store_receipt_capture_facts(cbm_store_t *store, const char *expected
     if (!root || root_bytes <= 0 || (size_t)root_bytes >= CBM_STORE_VERIFY_PATH_MAX ||
         memchr(root, '\r', (size_t)root_bytes) || memchr(root, '\n', (size_t)root_bytes)) {
         sqlite3_finalize(statement);
-        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                               "receipt.project_root.representation", ERROR_INVALID_DATA,
-                               SQLITE_MISMATCH,
-                               "verified project root cannot be represented canonically in the receipt");
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_INTEGRITY_FAILED, "receipt.project_root.representation",
+            ERROR_INVALID_DATA, SQLITE_MISMATCH,
+            "verified project root cannot be represented canonically in the receipt");
         return false;
     }
     memcpy(root_path, root, (size_t)root_bytes);
@@ -2932,8 +2975,8 @@ static bool store_receipt_capture_facts(cbm_store_t *store, const char *expected
     }
     rc = sqlite3_finalize(statement);
     if (rc != SQLITE_OK) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "receipt.project_root.finalize", ERROR_SUCCESS, rc,
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.project_root.finalize",
+                               ERROR_SUCCESS, rc,
                                "verified project root statement did not finalize exactly");
         return false;
     }
@@ -2981,8 +3024,8 @@ static bool store_receipt_write(const char *path, store_integrity_contract_t con
                             "root_path=%s\n",
                             STORE_RECEIPT_VERIFIER_REVISION, CBM_GRAPH_SCHEMA_VERSION,
                             sqlite3_libversion_number(), sqlite_build_sha256, (int)contract,
-                            (unsigned long long)db_bytes, db_sha256, expected_project,
-                            journal_mode, root_path);
+                            (unsigned long long)db_bytes, db_sha256, expected_project, journal_mode,
+                            root_path);
     if (text_len <= 0 || (size_t)text_len >= sizeof(text)) {
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "receipt.serialize",
                                ERROR_BUFFER_OVERFLOW, SQLITE_TOOBIG,
@@ -3252,13 +3295,10 @@ static bool store_sqlite_corruption_code(int sqlite_error) {
 
 #endif /* _WIN32 */
 
-static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
-                                                          store_integrity_contract_t contract,
-                                                          const char *expected_project,
-                                                          bool open_live_source,
-                                                          bool require_delete_journal,
-                                                          cbm_store_t **out_store,
-                                                          cbm_store_verify_result_t *result) {
+static cbm_store_verify_status_t store_open_path_verified(
+    const char *db_path, store_integrity_contract_t contract, const char *expected_project,
+    bool open_live_source, bool require_delete_journal, cbm_store_t **out_store,
+    cbm_store_verify_result_t *result) {
     cbm_store_verify_result_t local_result;
     if (out_store) {
         *out_store = NULL;
@@ -3369,12 +3409,11 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
             if (receipt_hit && require_delete_journal &&
                 strcmp(receipt.journal_mode, "delete") != 0) {
                 char detail[CBM_STORE_VERIFY_DETAIL_MAX];
-                snprintf(detail, sizeof(detail),
-                         "content-bound journal_mode=%s expected=delete",
+                snprintf(detail, sizeof(detail), "content-bound journal_mode=%s expected=delete",
                          receipt.journal_mode);
                 store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED,
-                                       "receipt.journal_mode.delete_required",
-                                       ERROR_INVALID_DATA, SQLITE_MISMATCH, detail);
+                                       "receipt.journal_mode.delete_required", ERROR_INVALID_DATA,
+                                       SQLITE_MISMATCH, detail);
                 goto cleanup;
             }
         }
@@ -3404,9 +3443,9 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
                                        SQLITE_NOMEM, "snapshot WAL path could not be allocated");
                 goto cleanup;
             }
-            bool copied = store_copy_frozen_member(family.wal, snapshot_wal, result,
-                                                   "snapshot.copy_wal", &result->wal_bytes,
-                                                   result->wal_sha256);
+            bool copied =
+                store_copy_frozen_member(family.wal, snapshot_wal, result, "snapshot.copy_wal",
+                                         &result->wal_bytes, result->wal_sha256);
             free(snapshot_wal);
             if (!copied) {
                 goto cleanup;
@@ -3416,9 +3455,9 @@ static cbm_store_verify_status_t store_open_path_verified(const char *db_path,
         int sqlite_error = SQLITE_OK;
         char sqlite_detail[CBM_STORE_VERIFY_DETAIL_MAX] = "";
         cbm_store_t *retained_snapshot_store = NULL;
-        snapshot_store = store_open_path_query_internal(snapshot_db, &sqlite_error, sqlite_detail,
-                                                        sizeof(sqlite_detail),
-                                                        &retained_snapshot_store);
+        snapshot_store =
+            store_open_path_query_internal(snapshot_db, &sqlite_error, sqlite_detail,
+                                           sizeof(sqlite_detail), &retained_snapshot_store);
         if (!snapshot_store) {
             if (retained_snapshot_store) {
                 snapshot_store = retained_snapshot_store;
@@ -3512,8 +3551,7 @@ cleanup:;
         snapshot_connection_destroyed = false;
     } else if (snapshot_store) {
         cbm_store_close_result_t close_result;
-        cbm_store_close_status_t close_status =
-            cbm_store_close(&snapshot_store, &close_result);
+        cbm_store_close_status_t close_status = cbm_store_close(&snapshot_store, &close_result);
         snapshot_connection_destroyed = close_result.connection_destroyed != 0;
         if (close_status != CBM_STORE_CLOSE_OK) {
             store_verify_set_close_error(result, "snapshot.sqlite_close", &close_result);
@@ -3567,8 +3605,7 @@ cleanup:;
                     int wrote =
                         snprintf(operation, sizeof(operation), "source.%s", provenance.operation);
                     cbm_store_close_result_t close_result;
-                    cbm_store_close_status_t close_status =
-                        cbm_store_close(&opened, &close_result);
+                    cbm_store_close_status_t close_status = cbm_store_close(&opened, &close_result);
                     if (close_status != CBM_STORE_CLOSE_OK) {
                         if (opened) {
                             *out_store = opened;
@@ -3601,8 +3638,7 @@ cleanup:;
             bool output_close_failed = false;
             if (out_store && *out_store) {
                 cbm_store_close_result_t close_result;
-                cbm_store_close_status_t close_status =
-                    cbm_store_close(out_store, &close_result);
+                cbm_store_close_status_t close_status = cbm_store_close(out_store, &close_result);
                 if (close_status != CBM_STORE_CLOSE_OK) {
                     output_close_failed = true;
                     store_verify_set_close_error(result, "source.sqlite_close_after_guard_release",
@@ -3610,9 +3646,10 @@ cleanup:;
                 }
             }
             if (!output_close_failed) {
-                store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                                       "source.release_family_guards", release_error, SQLITE_OK,
-                                       "source DB/WAL freeze handles could not be released exactly");
+                store_verify_set_error(
+                    result, CBM_STORE_VERIFY_IO_FAILED, "source.release_family_guards",
+                    release_error, SQLITE_OK,
+                    "source DB/WAL freeze handles could not be released exactly");
             }
         } else if (result->cleanup_operation[0] == '\0') {
             result->cleanup_native_error = release_error;
@@ -3636,8 +3673,8 @@ cleanup:;
 }
 
 cbm_store_verify_status_t cbm_store_open_path_query_verified(const char *db_path,
-                                                              cbm_store_t **out_store,
-                                                              cbm_store_verify_result_t *result) {
+                                                             cbm_store_t **out_store,
+                                                             cbm_store_verify_result_t *result) {
     return store_open_path_verified(db_path, STORE_INTEGRITY_CONTRACT_QUERY, NULL, true, false,
                                     out_store, result);
 }
@@ -3723,8 +3760,7 @@ static void store_writer_close_after_failure(cbm_store_t **writer, cbm_store_t *
 
 static cbm_store_verify_status_t store_open_path_project_writer_existing_internal(
     const char *db_path, const char *project, cbm_store_t **out_store,
-    cbm_store_verify_result_t *result,
-    const cbm_store_verify_result_t *expected_family) {
+    cbm_store_verify_result_t *result, const cbm_store_verify_result_t *expected_family) {
     cbm_store_verify_result_t local_result;
     if (out_store) {
         *out_store = NULL;
@@ -3771,18 +3807,17 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
     }
 
     int no_checkpoint_on_close = 0;
-    rc = sqlite3_db_config(writer->db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1,
-                           &no_checkpoint_on_close);
+    rc =
+        sqlite3_db_config(writer->db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, &no_checkpoint_on_close);
     if (rc != SQLITE_OK || no_checkpoint_on_close != 1) {
         char detail[CBM_STORE_VERIFY_DETAIL_MAX];
         snprintf(detail, sizeof(detail),
                  "sqlite3_db_config_rc=%d no_checkpoint_on_close_readback=%d expected=1", rc,
                  no_checkpoint_on_close);
-        store_verify_set_error(
-            result, CBM_STORE_VERIFY_IO_FAILED,
-            rc == SQLITE_OK ? "source.writer.no_checkpoint_on_close_readback"
-                            : "source.writer.no_checkpoint_on_close_enable",
-            0, rc == SQLITE_OK ? SQLITE_MISMATCH : rc, detail);
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                               rc == SQLITE_OK ? "source.writer.no_checkpoint_on_close_readback"
+                                               : "source.writer.no_checkpoint_on_close_enable",
+                               0, rc == SQLITE_OK ? SQLITE_MISMATCH : rc, detail);
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
         store_writer_close_after_failure(&writer, out_store, result,
@@ -3796,9 +3831,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
      * the database yet. Compare the exact preflight DB/WAL generation at this
      * point so mismatch refusal cannot create SHM, checkpoint, or otherwise
      * touch the replacement family. */
-    if (expected_family &&
-        !store_writer_matches_preflight(db_path, expected_family, result,
-                                        STORE_WRITER_BIND_PRE_SQL, NULL)) {
+    if (expected_family && !store_writer_matches_preflight(db_path, expected_family, result,
+                                                           STORE_WRITER_BIND_PRE_SQL, NULL)) {
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
         store_writer_close_after_failure(&writer, out_store, result,
@@ -3807,9 +3841,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
     }
 #else
     if (expected_family) {
-        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "source.writer.bind_platform", 0, SQLITE_MISUSE,
-                               "writer generation binding requires native Windows");
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.writer.bind_platform", 0,
+                               SQLITE_MISUSE, "writer generation binding requires native Windows");
         store_writer_close_after_failure(&writer, out_store, result,
                                          "source.writer.sqlite_close_after_bind_platform");
         return result->status;
@@ -3895,9 +3928,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
                                lock_detail);
         store_log_open_failure(db_path, result->operation, writer->db, result->sqlite_error,
                                result->detail);
-        store_writer_close_after_failure(
-            &writer, out_store, result,
-            "source.writer.sqlite_close_after_post_lock_journal_mode");
+        store_writer_close_after_failure(&writer, out_store, result,
+                                         "source.writer.sqlite_close_after_post_lock_journal_mode");
         return result->status;
     }
     /* Close the comparison-to-lock race as a second, independent generation
@@ -3991,8 +4023,8 @@ static cbm_store_verify_status_t store_open_path_project_writer_existing_interna
                                ? STORE_INTEGRITY_OK
                                : integrity_result.status;
     } else {
-        integrity_status = store_check_integrity_detailed(
-            writer, STORE_INTEGRITY_CONTRACT_QUERY, project, &integrity_result);
+        integrity_status = store_check_integrity_detailed(writer, STORE_INTEGRITY_CONTRACT_QUERY,
+                                                          project, &integrity_result);
     }
     if (integrity_status != STORE_INTEGRITY_OK) {
         char operation[CBM_STORE_VERIFY_OPERATION_MAX];
@@ -4033,9 +4065,8 @@ cbm_store_verify_status_t cbm_store_open_path_project_writer_existing(
 }
 
 cbm_store_verify_status_t cbm_store_open_path_project_writer_existing_bound(
-    const char *db_path, const char *project,
-    const cbm_store_verify_result_t *expected_family, cbm_store_t **out_store,
-    cbm_store_verify_result_t *result) {
+    const char *db_path, const char *project, const cbm_store_verify_result_t *expected_family,
+    cbm_store_t **out_store, cbm_store_verify_result_t *result) {
     if (!expected_family) {
         cbm_store_verify_result_t local_result;
         if (!result) {
@@ -4043,16 +4074,16 @@ cbm_store_verify_status_t cbm_store_open_path_project_writer_existing_bound(
         }
         store_verify_result_init(result);
         store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
-                               "source.writer.validate_expected_family",
-                               ERROR_INVALID_PARAMETER, SQLITE_MISUSE,
+                               "source.writer.validate_expected_family", ERROR_INVALID_PARAMETER,
+                               SQLITE_MISUSE,
                                "bound writer requires a non-null frozen preflight result");
         if (out_store) {
             *out_store = NULL;
         }
         return result->status;
     }
-    return store_open_path_project_writer_existing_internal(
-        db_path, project, out_store, result, expected_family);
+    return store_open_path_project_writer_existing_internal(db_path, project, out_store, result,
+                                                            expected_family);
 }
 
 cbm_store_verify_status_t cbm_store_open_path_graph_verified(const char *db_path,
@@ -4095,8 +4126,7 @@ static void store_close_copy_path(cbm_store_close_result_t *result, const char *
     size_t path_bytes = strlen(db_path);
     result->db_path_bytes = (uint64_t)path_bytes;
     int wrote = snprintf(result->db_path, sizeof(result->db_path), "%s", db_path);
-    result->db_path_truncated =
-        wrote < 0 || (size_t)wrote >= sizeof(result->db_path) ? 1U : 0U;
+    result->db_path_truncated = wrote < 0 || (size_t)wrote >= sizeof(result->db_path) ? 1U : 0U;
 }
 
 static void store_close_record_finalize_error(cbm_store_close_result_t *result,
@@ -4113,9 +4143,8 @@ static void store_close_record_finalize_error(cbm_store_close_result_t *result,
     char sqlite_text[ST_BUF_16];
     snprintf(sqlite_text, sizeof(sqlite_text), "%d", sqlite_error);
     cbm_log_error("store.close_finalize_failed", "code", "CBM_STORE_CLOSE_FINALIZE_FAILED",
-                  "db_path", result->db_path, "statement", error->statement_name,
-                  "sqlite_error", sqlite_text, "sqlite_detail", sqlite3_errstr(sqlite_error),
-                  "remediation",
+                  "db_path", result->db_path, "statement", error->statement_name, "sqlite_error",
+                  sqlite_text, "sqlite_detail", sqlite3_errstr(sqlite_error), "remediation",
                   "inspect the statement execution failure; physical close remains independently "
                   "result-bearing");
 }
@@ -4135,14 +4164,13 @@ static void store_close_capture_first_outstanding(cbm_store_close_result_t *resu
     size_t sql_bytes = strlen(sql);
     result->first_outstanding_sql_bytes = (uint64_t)sql_bytes;
     cbm_sha256_hex(sql, sql_bytes, result->first_outstanding_sql_sha256);
-    int wrote = snprintf(result->first_outstanding_sql,
-                         sizeof(result->first_outstanding_sql), "%s", sql);
+    int wrote =
+        snprintf(result->first_outstanding_sql, sizeof(result->first_outstanding_sql), "%s", sql);
     result->first_outstanding_sql_truncated =
         wrote < 0 || (size_t)wrote >= sizeof(result->first_outstanding_sql) ? 1U : 0U;
 }
 
-cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
-                                         cbm_store_close_result_t *result) {
+cbm_store_close_status_t cbm_store_close(cbm_store_t **store, cbm_store_close_result_t *result) {
     if (!result) {
         cbm_log_error("store.close_refused", "code", "CBM_STORE_CLOSE_RESULT_REQUIRED",
                       "remediation", "provide one caller-owned fixed-width close result");
@@ -4207,8 +4235,7 @@ cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
         STORE_CLOSE_SLOT(stmt_delete_file_hashes),
     };
 #undef STORE_CLOSE_SLOT
-    _Static_assert(sizeof(cached) / sizeof(cached[0]) ==
-                       CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT,
+    _Static_assert(sizeof(cached) / sizeof(cached[0]) == CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT,
                    "close contract must enumerate every cached statement");
 
     for (size_t i = 0; i < sizeof(cached) / sizeof(cached[0]); i++) {
@@ -4248,10 +4275,10 @@ cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
             snprintf(count_text, sizeof(count_text), "%llu",
                      (unsigned long long)result->outstanding_statement_count);
             cbm_log_error(
-                "store.close_refused", "code", "CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS",
-                "db_path", result->db_path, "outstanding_statements", count_text,
-                "first_sql_sha256", result->first_outstanding_sql_sha256, "first_sql",
-                result->first_outstanding_sql, "connection_destroyed", "false", "remediation",
+                "store.close_refused", "code", "CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS", "db_path",
+                result->db_path, "outstanding_statements", count_text, "first_sql_sha256",
+                result->first_outstanding_sql_sha256, "first_sql", result->first_outstanding_sql,
+                "connection_destroyed", "false", "remediation",
                 "finalize the exact reported statement owner, then retry closure through the same "
                 "store pointer");
             return result->status;
@@ -4273,8 +4300,8 @@ cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
     free(s);
     *store = NULL;
     result->connection_destroyed = 1U;
-    result->status = result->finalize_error_count > 0 ? CBM_STORE_CLOSE_FINALIZE_FAILED
-                                                      : CBM_STORE_CLOSE_OK;
+    result->status =
+        result->finalize_error_count > 0 ? CBM_STORE_CLOSE_FINALIZE_FAILED : CBM_STORE_CLOSE_OK;
     return result->status;
 }
 
@@ -4293,13 +4320,12 @@ void cbm_store_close_required(cbm_store_t **store, const char *operation) {
     snprintf(outstanding_text, sizeof(outstanding_text), "%llu",
              (unsigned long long)result.outstanding_statement_count);
     cbm_log_error(
-        "store.required_close_failed", "code", "CBM_STORE_REQUIRED_CLOSE_FAILED",
-        "operation", operation ? operation : "transient_store.close", "db_path",
-        result.db_path, "close_status", status_text, "sqlite_error", sqlite_text,
-        "connection_destroyed", result.connection_destroyed ? "true" : "false",
-        "outstanding_statements", outstanding_text, "first_sql_sha256",
-        result.first_outstanding_sql_sha256, "first_sql", result.first_outstanding_sql,
-        "remediation",
+        "store.required_close_failed", "code", "CBM_STORE_REQUIRED_CLOSE_FAILED", "operation",
+        operation ? operation : "transient_store.close", "db_path", result.db_path, "close_status",
+        status_text, "sqlite_error", sqlite_text, "connection_destroyed",
+        result.connection_destroyed ? "true" : "false", "outstanding_statements", outstanding_text,
+        "first_sql_sha256", result.first_outstanding_sql_sha256, "first_sql",
+        result.first_outstanding_sql, "remediation",
         "fix the exact transient-store ownership defect; this process terminates instead of "
         "discarding a live owner or claiming success");
     fflush(NULL);
@@ -4396,10 +4422,11 @@ static void store_normalize_result_init(cbm_store_normalize_result_t *result) {
     result->wal_remaining_frames = -1;
 }
 
-static cbm_store_normalize_status_t store_normalize_fail(
-    cbm_store_t *s, cbm_store_normalize_result_t *result,
-    cbm_store_normalize_status_t status, int sqlite_error, const char *operation,
-    const char *detail) {
+static cbm_store_normalize_status_t store_normalize_fail(cbm_store_t *s,
+                                                         cbm_store_normalize_result_t *result,
+                                                         cbm_store_normalize_status_t status,
+                                                         int sqlite_error, const char *operation,
+                                                         const char *detail) {
     result->status = status;
     result->sqlite_error = sqlite_error;
     snprintf(result->operation, sizeof(result->operation), "%s",
@@ -4415,16 +4442,14 @@ static cbm_store_normalize_status_t store_normalize_fail(
     snprintf(status_text, sizeof(status_text), "%d", (int)status);
     snprintf(sqlite_text, sizeof(sqlite_text), "%d", sqlite_error);
     snprintf(log_text, sizeof(log_text), "%d", result->wal_log_frames);
-    snprintf(checkpointed_text, sizeof(checkpointed_text), "%d",
-             result->wal_checkpointed_frames);
+    snprintf(checkpointed_text, sizeof(checkpointed_text), "%d", result->wal_checkpointed_frames);
     snprintf(remaining_text, sizeof(remaining_text), "%d", result->wal_remaining_frames);
-    cbm_log_error("store.normalize_journal_failed", "code", "CBM_STORE_NORMALIZE_FAILED",
-                  "db_path", s && s->db_path ? s->db_path : "", "status", status_text,
-                  "operation", result->operation, "sqlite_error", sqlite_text,
-                  "journal_mode_before", result->journal_mode_before, "journal_mode_after",
-                  result->journal_mode_after, "wal_log_frames", log_text,
-                  "wal_checkpointed_frames", checkpointed_text, "wal_remaining_frames",
-                  remaining_text, "detail", result->detail, "remediation",
+    cbm_log_error("store.normalize_journal_failed", "code", "CBM_STORE_NORMALIZE_FAILED", "db_path",
+                  s && s->db_path ? s->db_path : "", "status", status_text, "operation",
+                  result->operation, "sqlite_error", sqlite_text, "journal_mode_before",
+                  result->journal_mode_before, "journal_mode_after", result->journal_mode_after,
+                  "wal_log_frames", log_text, "wal_checkpointed_frames", checkpointed_text,
+                  "wal_remaining_frames", remaining_text, "detail", result->detail, "remediation",
                   "preserve the existing writer and database family; resolve the exact reported "
                   "journal operation, then retry normalization");
     return result->status;
@@ -4440,8 +4465,8 @@ cbm_store_normalize_status_t cbm_store_normalize_journal_mode_delete(
     }
     store_normalize_result_init(result);
     if (!s || !s->db) {
-        return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_INVALID_ARGUMENT,
-                                    SQLITE_MISUSE, "journal.validate_connection",
+        return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_INVALID_ARGUMENT, SQLITE_MISUSE,
+                                    "journal.validate_connection",
                                     "journal normalization requires a live store connection");
     }
 
@@ -4456,9 +4481,9 @@ cbm_store_normalize_status_t cbm_store_normalize_journal_mode_delete(
 
     char read_operation[CBM_STORE_VERIFY_OPERATION_MAX];
     char read_detail[CBM_STORE_VERIFY_DETAIL_MAX];
-    int rc = store_read_journal_mode_exact(
-        s->db, "PRAGMA main.journal_mode;", "journal.read_before",
-        result->journal_mode_before, read_operation, read_detail);
+    int rc =
+        store_read_journal_mode_exact(s->db, "PRAGMA main.journal_mode;", "journal.read_before",
+                                      result->journal_mode_before, read_operation, read_detail);
     if (rc != SQLITE_OK) {
         return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_JOURNAL_READ_FAILED, rc,
                                     read_operation, read_detail);
@@ -4510,8 +4535,7 @@ cbm_store_normalize_status_t cbm_store_normalize_journal_mode_delete(
 
     char set_mode[CBM_STORE_NORMALIZE_MODE_MAX];
     rc = store_read_journal_mode_exact(s->db, "PRAGMA main.journal_mode=DELETE;",
-                                       "journal.set_delete", set_mode, read_operation,
-                                       read_detail);
+                                       "journal.set_delete", set_mode, read_operation, read_detail);
     if (rc != SQLITE_OK) {
         return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_SET_DELETE_FAILED, rc,
                                     read_operation, read_detail);
@@ -4521,14 +4545,14 @@ cbm_store_normalize_status_t cbm_store_normalize_journal_mode_delete(
         char detail[CBM_STORE_VERIFY_DETAIL_MAX];
         snprintf(detail, sizeof(detail), "journal_mode setter returned %s expected=delete",
                  set_mode);
-        return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_SET_DELETE_FAILED,
-                                    SQLITE_BUSY, "journal.set_delete.result", detail);
+        return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_SET_DELETE_FAILED, SQLITE_BUSY,
+                                    "journal.set_delete.result", detail);
     }
 
     char readback_mode[CBM_STORE_NORMALIZE_MODE_MAX];
-    rc = store_read_journal_mode_exact(s->db, "PRAGMA main.journal_mode;",
-                                       "journal.readback_delete", readback_mode, read_operation,
-                                       read_detail);
+    rc =
+        store_read_journal_mode_exact(s->db, "PRAGMA main.journal_mode;", "journal.readback_delete",
+                                      readback_mode, read_operation, read_detail);
     if (rc != SQLITE_OK) {
         return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_READBACK_FAILED, rc,
                                     read_operation, read_detail);
@@ -4536,10 +4560,9 @@ cbm_store_normalize_status_t cbm_store_normalize_journal_mode_delete(
     snprintf(result->journal_mode_after, sizeof(result->journal_mode_after), "%s", readback_mode);
     if (strcmp(readback_mode, "delete") != 0) {
         char detail[CBM_STORE_VERIFY_DETAIL_MAX];
-        snprintf(detail, sizeof(detail), "journal_mode readback=%s expected=delete",
-                 readback_mode);
-        return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_READBACK_FAILED,
-                                    SQLITE_MISMATCH, "journal.readback_delete.result", detail);
+        snprintf(detail, sizeof(detail), "journal_mode readback=%s expected=delete", readback_mode);
+        return store_normalize_fail(s, result, CBM_STORE_NORMALIZE_READBACK_FAILED, SQLITE_MISMATCH,
+                                    "journal.readback_delete.result", detail);
     }
 
     result->status = CBM_STORE_NORMALIZE_OK;
@@ -4616,11 +4639,10 @@ static void store_dump_close_destination(cbm_store_t *source, sqlite3 **destinat
     snprintf(source->errbuf, sizeof(source->errbuf),
              "dump destination physical close failed: operation=%s sqlite_error=%s staged=%s",
              operation ? operation : "unknown", sqlite_text, staged_path ? staged_path : "");
-    cbm_log_error("store.dump_close_failed", "code", "CBM_STORE_DUMP_CLOSE_FAILED",
-                  "operation", operation ? operation : "unknown", "staged_path",
-                  staged_path ? staged_path : "", "sqlite_error", sqlite_text,
-                  "sqlite_detail", sqlite3_errmsg(*destination), "message", source->errbuf,
-                  "remediation",
+    cbm_log_error("store.dump_close_failed", "code", "CBM_STORE_DUMP_CLOSE_FAILED", "operation",
+                  operation ? operation : "unknown", "staged_path", staged_path ? staged_path : "",
+                  "sqlite_error", sqlite_text, "sqlite_detail", sqlite3_errmsg(*destination),
+                  "message", source->errbuf, "remediation",
                   "preserve the staged database bytes and inspect unfinished SQLite resources; "
                   "do not unlink or publish the staged file");
     /* This legacy integer-return API has no destination-owner channel.  A
@@ -4670,8 +4692,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
     if (rc != SQLITE_DONE || finish_rc != SQLITE_OK) {
         snprintf(s->errbuf, sizeof(s->errbuf),
-                 "dump: backup failed: step_sqlite_error=%d finish_sqlite_error=%d", rc,
-                 finish_rc);
+                 "dump: backup failed: step_sqlite_error=%d finish_sqlite_error=%d", rc, finish_rc);
         store_dump_close_destination(s, &dest_db, tmp_path, "dump.backup_cleanup");
         (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
@@ -5324,14 +5345,15 @@ int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int cou
 /* ── Edge CRUD ──────────────────────────────────────────────────── */
 
 int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
-    /* Conflict target includes local_name_gen (#768) so IMPORTS edges with
-     * different local_name coexist while re-inserting the same import still
-     * upserts. Must match the table's UNIQUE constraint in init_schema. */
+    /* Conflict target includes both generated identity discriminators so named
+     * imports and preprocessing-context-specific relationships coexist while an
+     * exact semantic edge still upserts. Must match init_schema exactly. */
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_insert_edge,
                        "INSERT INTO edges (project, source_id, target_id, type, properties) "
                        "VALUES (?1, ?2, ?3, ?4, ?5) "
-                       "ON CONFLICT(source_id, target_id, type, local_name_gen) DO UPDATE SET "
+                       "ON CONFLICT(source_id, target_id, type, local_name_gen, "
+                       "preprocess_context_id_gen) DO UPDATE SET "
                        "properties = json_patch(properties, ?5) "
                        "RETURNING id;");
     if (!stmt) {

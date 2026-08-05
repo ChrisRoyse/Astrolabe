@@ -1912,7 +1912,7 @@ unsafe extern "C" {
         buf_size: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-pub const CBM_GRAPH_SCHEMA_VERSION: _bindgen_ty_1 = 4;
+pub const CBM_GRAPH_SCHEMA_VERSION: _bindgen_ty_1 = 5;
 pub type _bindgen_ty_1 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

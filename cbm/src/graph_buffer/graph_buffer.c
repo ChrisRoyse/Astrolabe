@@ -202,10 +202,9 @@ static bool valid_utf8_text(const char *text) {
 
 /* ── Internal types ──────────────────────────────────────────────── */
 
-/* Edge key for dedup hash table — composite key as string "srcID:tgtID:type",
- * plus ":local_name" for IMPORTS edges (#768). 256 bytes fit two int64s, the
- * type and a ~200-char local_name verbatim; longer local_names are re-keyed
- * with a hash of the full name in make_edge_key (never silently truncated). */
+/* Edge key for the dedup hash table. The canonical, length-framed semantic
+ * identity is SHA-256 encoded, so arbitrary UTF-8 local names and preprocessing
+ * context ids cannot become ambiguous or truncate in this fixed buffer. */
 #define EDGE_KEY_BUF CBM_SZ_256
 
 /* Per-type or per-key edge list stored in hash tables as values */
@@ -348,72 +347,71 @@ static void make_id_key(char *buf, size_t bufsz, int64_t id) {
     snprintf(buf, bufsz, "%lld", (long long)id);
 }
 
-/* FNV-1a 64-bit over a byte slice — for re-keying oversized local_names. */
-static uint64_t fnv1a64(const char *s, size_t len) {
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; i++) {
-        h ^= (uint8_t)s[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-/* Code IMPORTS edges carry exactly one imported symbol's local_name (#768): two
- * named imports from the same specifier resolve to the same (source,
- * target) pair but are distinct symbols. Key on local_name too so the
- * second import doesn't dedup-collide with and overwrite the first —
- * every pass that walks IMPORTS edges (pass_calls.c, pass_usages.c,
- * pass_semantic.c, pass_lsp_cross.c) expects one local_name per edge, so
- * losing an edge here silently breaks cross-file call resolution for
- * whichever symbol got dropped, not just "who imports X" queries. Unbound
- * resource and unbound-code IMPORTS deliberately have no local_name and
- * therefore deduplicate by exact (source,target,type). Other edge types keep the same plain key:
- * collapsing repeat
- * edges of the same type between the same two nodes (e.g. multiple call
- * sites) into one is the existing, intended dedup behavior there.
- *
- * A local_name too long for the key buffer is re-keyed with an FNV-1a hash
- * of the FULL name instead of being truncated — a truncated key would
- * collide two long names sharing a prefix and silently drop an edge again.
- * The hash key is prefixed with byte 0x01, which cannot appear in the raw
- * JSON slice (control characters must be \u-escaped in JSON), so hash keys
- * can never collide with verbatim keys. */
-static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type,
+/* Edge identity is the same five-part tuple persisted by schema v5:
+ * source, target, type, IMPORTS local name, preprocessing context id. Each
+ * discriminator is independent; a context-bearing IMPORTS edge must retain
+ * both. Parsing through yyjson matches SQLite json_extract's unescaped text
+ * semantics. Non-text identity fields fail closed instead of collapsing to an
+ * empty discriminator. */
+static bool make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type,
                           const char *properties_json) {
-    if (properties_json) {
-        static const char context_key[] = "\"preprocess_context_id\":\"";
-        const char *context = strstr(properties_json, context_key);
-        if (context) {
-            context += sizeof(context_key) - 1;
-            const char *end = strchr(context, '"');
-            size_t context_len = end ? (size_t)(end - context) : strlen(context);
-            int n = snprintf(buf, bufsz, "%lld:%lld:%s:context:%.*s", (long long)src,
-                             (long long)tgt, type, (int)context_len, context);
-            if (n < 0 || (size_t)n >= bufsz) {
-                snprintf(buf, bufsz, "%lld:%lld:%s:context:\x01%016llx", (long long)src,
-                         (long long)tgt, type,
-                         (unsigned long long)fnv1a64(context, context_len));
-            }
-            return;
+    const char *json = canonical_properties_json(properties_json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    const char *local_name = "";
+    if (type && strcmp(type, "IMPORTS") == 0) {
+        yyjson_val *value = yyjson_obj_get(root, "local_name");
+        if (value && !yyjson_is_null(value) && !yyjson_is_str(value)) {
+            yyjson_doc_free(doc);
+            return false;
+        }
+        if (value && yyjson_is_str(value)) {
+            local_name = yyjson_get_str(value);
         }
     }
-    if (properties_json && strcmp(type, "IMPORTS") == 0) {
-        static const char local_name_key[] = "\"local_name\":\"";
-        const char *ln = strstr(properties_json, local_name_key);
-        if (ln) {
-            ln += sizeof(local_name_key) - 1;
-            const char *end = strchr(ln, '"');
-            size_t ln_len = end ? (size_t)(end - ln) : strlen(ln);
-            int n = snprintf(buf, bufsz, "%lld:%lld:%s:%.*s", (long long)src, (long long)tgt, type,
-                             (int)ln_len, ln);
-            if (n < 0 || (size_t)n >= bufsz) {
-                snprintf(buf, bufsz, "%lld:%lld:%s:\x01%016llx", (long long)src, (long long)tgt,
-                         type, (unsigned long long)fnv1a64(ln, ln_len));
-            }
-            return;
-        }
+    const char *context_id = "";
+    yyjson_val *context = yyjson_obj_get(root, "preprocess_context_id");
+    if (context && !yyjson_is_null(context) && !yyjson_is_str(context)) {
+        yyjson_doc_free(doc);
+        return false;
     }
-    snprintf(buf, bufsz, "%lld:%lld:%s", (long long)src, (long long)tgt, type);
+    if (context && yyjson_is_str(context)) {
+        context_id = yyjson_get_str(context);
+    }
+
+    cbm_sha256_ctx hash;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_init(&hash);
+    static const char domain[] = "astrolabe.cbm.edge-identity.v5";
+    hash_frame(&hash, domain, sizeof(domain) - 1);
+    hash_u64(&hash, (uint64_t)src);
+    hash_u64(&hash, (uint64_t)tgt);
+    hash_frame(&hash, type, strlen(type));
+    hash_frame(&hash, local_name, strlen(local_name));
+    hash_frame(&hash, context_id, strlen(context_id));
+    cbm_sha256_final(&hash, digest);
+    yyjson_doc_free(doc);
+
+    static const char digits[] = "0123456789abcdef";
+    if (bufsz < 3 + (CBM_SHA256_DIGEST_LEN * 2)) {
+        return false;
+    }
+    buf[0] = 'e';
+    buf[1] = ':';
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        buf[2 + (i * 2)] = digits[digest[i] >> 4];
+        buf[3 + (i * 2)] = digits[digest[i] & 15];
+    }
+    buf[2 + (sizeof(digest) * 2)] = '\0';
+    return true;
 }
 
 static void make_src_type_key(char *buf, size_t bufsz, int64_t src, const char *type) {
@@ -550,7 +548,16 @@ static void remove_node_from_ptr_array(node_ptr_array_t *arr, int64_t node_id) {
 static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
 
-    make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type, e->properties_json);
+    if (!make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type, e->properties_json)) {
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error("gbuf.edge_identity_failed", "code", "CBM_EDGE_IDENTITY_INVALID", "type",
+                      e->type ? e->type : "", "message",
+                      "an existing edge no longer yields the exact schema-v5 identity tuple",
+                      "remediation",
+                      "preserve the source corpus, repair the edge identity properties, and run a "
+                      "clean re-index");
+        return;
+    }
     const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
     cbm_ht_delete(gb->edge_by_key, key);
     free((void *)ekey);
@@ -1044,8 +1051,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
                                     const char *qualified_name, const char *file_path,
                                     int start_line, int end_line, bool source_present,
                                     bool borrow_source, const uint8_t *source_bytes,
-                                    size_t source_len,
-                                    uint64_t start_byte, uint64_t end_byte,
+                                    size_t source_len, uint64_t start_byte, uint64_t end_byte,
                                     const char *properties_json) {
     const char *canonical_file_path = canonical_identity_text(file_path);
     const char *json = canonical_properties_json(properties_json);
@@ -1187,10 +1193,12 @@ int64_t cbm_gbuf_upsert_source_node(cbm_gbuf_t *gb, const char *label, const cha
                                 properties_json);
 }
 
-int64_t cbm_gbuf_upsert_source_node_borrowed(
-    cbm_gbuf_t *gb, const char *label, const char *name, const char *qualified_name,
-    const char *file_path, int start_line, int end_line, const uint8_t *source_bytes,
-    size_t source_len, uint64_t start_byte, uint64_t end_byte, const char *properties_json) {
+int64_t cbm_gbuf_upsert_source_node_borrowed(cbm_gbuf_t *gb, const char *label, const char *name,
+                                             const char *qualified_name, const char *file_path,
+                                             int start_line, int end_line,
+                                             const uint8_t *source_bytes, size_t source_len,
+                                             uint64_t start_byte, uint64_t end_byte,
+                                             const char *properties_json) {
     return upsert_node_internal(gb, label, name, qualified_name, file_path, start_line, end_line,
                                 true, true, source_bytes, source_len, start_byte, end_byte,
                                 properties_json);
@@ -1286,8 +1294,7 @@ int cbm_gbuf_replace_source_container_properties(cbm_gbuf_t *gb, const char *lab
                                                  const char *file_path,
                                                  const char *properties_json) {
     const char *json = canonical_properties_json(properties_json);
-    cbm_gbuf_node_t *node =
-        (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
+    cbm_gbuf_node_t *node = (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
     if (!gb || !node || !valid_properties_object(json)) {
         if (gb) {
             atomic_store(&gb->resolution_failed, true);
@@ -1304,8 +1311,8 @@ int cbm_gbuf_replace_source_container_properties(cbm_gbuf_t *gb, const char *lab
     if (!copy) {
         atomic_store(&gb->resolution_failed, true);
         cbm_log_error("gbuf.source_container_properties_refused", "code",
-                      "CBM_SOURCE_CONTAINER_PROPERTIES_ALLOC_FAILED", "label", label,
-                      "file_path", file_path, "message",
+                      "CBM_SOURCE_CONTAINER_PROPERTIES_ALLOC_FAILED", "label", label, "file_path",
+                      file_path, "message",
                       "replacement source-container properties could not be retained",
                       "remediation", "free memory and retry the complete corpus");
         return GB_ERR;
@@ -1319,8 +1326,7 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
                                                const char *file_path,
                                                const char *properties_patch_json) {
     const char *patch_json = canonical_properties_json(properties_patch_json);
-    cbm_gbuf_node_t *node =
-        (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
+    cbm_gbuf_node_t *node = (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
     yyjson_doc *base_doc = NULL;
     yyjson_doc *patch_doc = NULL;
     yyjson_mut_doc *merged_doc = NULL;
@@ -1344,11 +1350,10 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
     base_doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
     patch_doc = yyjson_read(patch_json, strlen(patch_json), 0);
     merged_doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *merged =
-        base_doc && patch_doc && merged_doc
-            ? yyjson_merge_patch(merged_doc, yyjson_doc_get_root(base_doc),
-                                 yyjson_doc_get_root(patch_doc))
-            : NULL;
+    yyjson_mut_val *merged = base_doc && patch_doc && merged_doc
+                                 ? yyjson_merge_patch(merged_doc, yyjson_doc_get_root(base_doc),
+                                                      yyjson_doc_get_root(patch_doc))
+                                 : NULL;
     if (merged && yyjson_mut_is_obj(merged)) {
         yyjson_mut_doc_set_root(merged_doc, merged);
         merged_json = yyjson_mut_write(merged_doc, 0, NULL);
@@ -1361,8 +1366,8 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
     } else {
         atomic_store(&gb->resolution_failed, true);
         cbm_log_error("gbuf.source_container_properties_merge_refused", "code",
-                      "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_FAILED", "label", label,
-                      "file_path", file_path, "message",
+                      "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_FAILED", "label", label, "file_path",
+                      file_path, "message",
                       "the RFC 7386 property composition could not be retained as object JSON",
                       "remediation", "free memory, preserve the complete corpus, and retry");
     }
@@ -1645,12 +1650,10 @@ static bool reference_owner_candidate(const cbm_gbuf_t *gb, const cbm_gbuf_node_
 }
 
 static bool reference_owner_span_valid(const cbm_gbuf_node_t *node) {
-    return node->atom_id && node->atom_id[0] && node->qualified_name &&
-           node->qualified_name[0] && node->source_sha256 && node->source_sha256[0] &&
-           node->start_line > 0 && node->end_line >= node->start_line &&
-           node->end_byte > node->start_byte &&
-           node->end_byte - node->start_byte == (uint64_t)node->source_len &&
-           node->source_bytes;
+    return node->atom_id && node->atom_id[0] && node->qualified_name && node->qualified_name[0] &&
+           node->source_sha256 && node->source_sha256[0] && node->start_line > 0 &&
+           node->end_line >= node->start_line && node->end_byte > node->start_byte &&
+           node->end_byte - node->start_byte == (uint64_t)node->source_len && node->source_bytes;
 }
 
 static void log_reference_owner_candidate(const char *event, const char *code,
@@ -1669,22 +1672,21 @@ static void log_reference_owner_candidate(const char *event, const char *code,
     snprintf(end_line_buf, sizeof(end_line_buf), "%d", candidate->end_line);
     snprintf(start_byte_buf, sizeof(start_byte_buf), "%llu",
              (unsigned long long)candidate->start_byte);
-    snprintf(end_byte_buf, sizeof(end_byte_buf), "%llu",
-             (unsigned long long)candidate->end_byte);
+    snprintf(end_byte_buf, sizeof(end_byte_buf), "%llu", (unsigned long long)candidate->end_byte);
     cbm_log_error(event, "code", code, "operation", operation, "claimed_qualified_name",
                   claimed_qn ? claimed_qn : "", "file_path", file_path, "line", line_buf,
                   "candidate_ordinal", ordinal_buf, "atom_id",
                   candidate->atom_id ? candidate->atom_id : "", "qualified_name",
                   candidate->qualified_name ? candidate->qualified_name : "", "label",
                   candidate->label ? candidate->label : "", "start_line", start_line_buf,
-                  "end_line", end_line_buf, "start_byte", start_byte_buf, "end_byte",
-                  end_byte_buf, "source_sha256",
-                  candidate->source_sha256 ? candidate->source_sha256 : "");
+                  "end_line", end_line_buf, "start_byte", start_byte_buf, "end_byte", end_byte_buf,
+                  "source_sha256", candidate->source_sha256 ? candidate->source_sha256 : "");
 }
 
-const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
-    const cbm_gbuf_t *gb, const char *claimed_qn, const char *file_path, int line,
-    const char *operation, bool *failed) {
+const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(const cbm_gbuf_t *gb,
+                                                        const char *claimed_qn,
+                                                        const char *file_path, int line,
+                                                        const char *operation, bool *failed) {
     if (failed) {
         *failed = false;
     }
@@ -1696,8 +1698,8 @@ const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
             cbm_log_error("gbuf.reference_source_location_invalid", "code",
                           "CBM_REFERENCE_SOURCE_LOCATION_INVALID", "operation",
                           operation ? operation : "", "claimed_qualified_name",
-                          claimed_qn ? claimed_qn : "", "file_path",
-                          file_path ? file_path : "", "line", line_buf, "message",
+                          claimed_qn ? claimed_qn : "", "file_path", file_path ? file_path : "",
+                          "line", line_buf, "message",
                           "reference source ownership requires an exact path and positive "
                           "1-based source line",
                           "remediation",
@@ -1803,8 +1805,8 @@ const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
     atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
     cbm_log_error("gbuf.reference_source_location_ambiguous", "code",
                   "CBM_REFERENCE_SOURCE_LOCATION_AMBIGUOUS", "operation", operation,
-                  "claimed_qualified_name", claimed_qn ? claimed_qn : "", "file_path",
-                  file_path, "line", line_buf, "candidate_count", count_buf, "message",
+                  "claimed_qualified_name", claimed_qn ? claimed_qn : "", "file_path", file_path,
+                  "line", line_buf, "candidate_count", count_buf, "message",
                   "the source line intersects incomparable stable callable atoms and no unique "
                   "exact qualified-name candidate exists",
                   "remediation",
@@ -1813,8 +1815,8 @@ const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(
     int ordinal = 0;
     for (int i = 0; i < file_nodes->count; i++) {
         const cbm_gbuf_node_t *candidate = file_nodes->items[i];
-        if (!reference_owner_candidate(gb, candidate, file_path) ||
-            line < candidate->start_line || line > candidate->end_line) {
+        if (!reference_owner_candidate(gb, candidate, file_path) || line < candidate->start_line ||
+            line > candidate->end_line) {
             continue;
         }
         log_reference_owner_candidate("gbuf.reference_source_location_candidate",
@@ -2376,7 +2378,16 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     /* Check for dedup */
     char key[EDGE_KEY_BUF];
-    make_edge_key(key, sizeof(key), source_id, target_id, type, json);
+    if (!make_edge_key(key, sizeof(key), source_id, target_id, type, json)) {
+        atomic_store(&gb->resolution_failed, true);
+        cbm_log_error(
+            "gbuf.edge_refused", "code", "CBM_EDGE_IDENTITY_INVALID", "type", type, "message",
+            "edge local_name/preprocess_context_id identity fields must be JSON text or null",
+            "remediation",
+            "repair the exact edge properties so every identity discriminator is textual, then "
+            "re-index");
+        return 0;
+    }
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
@@ -2511,8 +2522,17 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         if (strcmp(e->type, type) == 0) {
             char key[EDGE_KEY_BUF];
-            make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
-                          e->properties_json);
+            if (!make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
+                               e->properties_json)) {
+                atomic_store(&gb->resolution_failed, true);
+                cbm_log_error("gbuf.edge_identity_failed", "code", "CBM_EDGE_IDENTITY_INVALID",
+                              "type", e->type ? e->type : "", "message",
+                              "an edge selected for deletion has an invalid schema-v5 identity",
+                              "remediation",
+                              "preserve the source corpus and rebuild the graph from valid edge "
+                              "properties");
+                return GB_ERR;
+            }
             const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
             cbm_ht_delete(gb->edge_by_key, key);
             free((void *)ekey);
@@ -2835,6 +2855,10 @@ static char *extract_local_name(const char *props) {
     return extract_prop_string(props, "\"local_name\"", "local_name");
 }
 
+static char *extract_preprocess_context_id(const char *props) {
+    return extract_prop_string(props, "\"preprocess_context_id\"", "preprocess_context_id");
+}
+
 /* Remap a temp edge ID to its final sequential ID, or 0 if out of range. */
 static int64_t remap_id(const int64_t *temp_to_final, int64_t max_temp_id, int64_t temp_id) {
     return (temp_id > 0 && temp_id < max_temp_id) ? temp_to_final[temp_id] : 0;
@@ -2967,11 +2991,11 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
     return dump_nodes;
 }
 
-/* Build dump-ready edge array with remapped IDs. Returns url_paths and
- * local_names (heap string arrays owned by the caller) via out params. */
+/* Build dump-ready edge array with remapped IDs. Returns generated-column
+ * source strings (heap arrays owned by the caller) via out params. */
 static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_final,
                                      int64_t max_temp_id, int *out_count, char ***out_url_paths,
-                                     char ***out_local_names) {
+                                     char ***out_local_names, char ***out_context_ids) {
     /* Count valid edges (both endpoints resolved) */
     int valid_edges = 0;
     for (int i = 0; i < gb->edges.count; i++) {
@@ -2986,14 +3010,16 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
     CBMDumpEdge *dump_edges = malloc(edge_cap * sizeof(CBMDumpEdge));
     char **url_paths = calloc(edge_cap, sizeof(char *));
     char **local_names = calloc(edge_cap, sizeof(char *));
-    if (!dump_edges || !url_paths || !local_names) {
-        /* #579: these three arrays are sized to the valid-edge count and indexed
+    char **context_ids = calloc(edge_cap, sizeof(char *));
+    if (!dump_edges || !url_paths || !local_names || !context_ids) {
+        /* #579: these arrays are sized to the valid-edge count and indexed
          * unconditionally in the loop below; any NULL would be a hard access
          * violation. Fail closed with a structured error and signal the caller
          * (NULL return, *out_count = 0) so the dump aborts instead of crashing. */
         free(dump_edges);
         free(url_paths);
         free(local_names);
+        free(context_ids);
         cbm_log_error("gbuf.dump.edge_alloc_failed", "code", "CBM_DUMP_EDGE_ALLOC_FAILED",
                       "operation", "build_dump_edges", "detail",
                       "paired dump edge arrays allocation failed", "message",
@@ -3002,6 +3028,7 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
         *out_count = 0;
         *out_url_paths = NULL;
         *out_local_names = NULL;
+        *out_context_ids = NULL;
         return NULL;
     }
     int idx = 0;
@@ -3023,6 +3050,9 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
                                : NULL;
         local_names[idx] = local_name;
 
+        char *context_id = extract_preprocess_context_id(e->properties_json);
+        context_ids[idx] = context_id;
+
         const char *props = canonical_properties_json(e->properties_json);
         dump_edges[idx] = (CBMDumpEdge){
             .id = idx + SKIP_ONE,
@@ -3033,6 +3063,7 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
             .properties = props,
             .url_path = url_path ? url_path : "",
             .local_name = local_name ? local_name : "",
+            .preprocess_context_id = context_id ? context_id : "",
         };
         idx++;
     }
@@ -3040,6 +3071,7 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
     *out_count = idx;
     *out_url_paths = url_paths;
     *out_local_names = local_names;
+    *out_context_ids = context_ids;
     return dump_edges;
 }
 
@@ -3091,12 +3123,13 @@ static void log_dump_summary(int node_count, int edge_count) {
     cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
 }
 
-static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
-                                CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes, int node_count,
-                                int64_t *temp_to_final) {
+static void free_dump_resources(char **url_paths, char **local_names, char **context_ids,
+                                int edge_count, CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
+                                int node_count, int64_t *temp_to_final) {
     for (int i = 0; i < edge_count; i++) {
         free(url_paths[i]);
         free(local_names[i]);
+        free(context_ids[i]);
     }
     /* #503: name/qualified_name/file_path are the sanitized owned copies built in
      * build_dump_nodes (properties/label/project stay borrowed from the gbuf). */
@@ -3109,6 +3142,7 @@ static void free_dump_resources(char **url_paths, char **local_names, int edge_c
     }
     free(url_paths);
     free(local_names);
+    free(context_ids);
     free(dump_edges);
     free(dump_nodes);
     free(temp_to_final);
@@ -3312,7 +3346,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         return CBM_NOT_FOUND;
     }
     if (validate_dump_edge_endpoints(gb, temp_to_final, max_temp_id) != 0) {
-        free_dump_resources(NULL, NULL, 0, NULL, dump_nodes, node_idx, temp_to_final);
+        free_dump_resources(NULL, NULL, NULL, 0, NULL, dump_nodes, node_idx, temp_to_final);
         free(src_nodes);
         return CBM_NOT_FOUND;
     }
@@ -3333,19 +3367,20 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int edge_idx = 0;
     char **url_paths = NULL;
     char **local_names = NULL;
+    char **context_ids = NULL;
     CBMDumpEdge *dump_edges = NULL;
     bool has_row_sink = gbuf_has_row_sink(gb);
     if (has_row_sink) {
         CBM_PROF_START(t_build_edges_sink);
-        dump_edges =
-            build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
+        dump_edges = build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths,
+                                      &local_names, &context_ids);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges_sink, edge_idx);
         if (!dump_edges) {
             /* #579: edge dump arrays allocation failed (structured error already
              * logged). No file writer has opened on this row-sink path, so nothing
              * is persisted; release the transients and fail closed. */
-            free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
-                                temp_to_final);
+            free_dump_resources(url_paths, local_names, context_ids, edge_idx, dump_edges,
+                                dump_nodes, node_idx, temp_to_final);
             free(src_nodes);
             return CBM_NOT_FOUND;
         }
@@ -3356,8 +3391,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
             sink_rc = emit_row_sink_edges(gb, dump_edges, edge_idx);
         }
         if (sink_rc != 0) {
-            free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
-                                temp_to_final);
+            free_dump_resources(url_paths, local_names, context_ids, edge_idx, dump_edges,
+                                dump_nodes, node_idx, temp_to_final);
             free(src_nodes);
             return sink_rc;
         }
@@ -3371,8 +3406,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * uninitialized budget from ever triggering the free). */
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
-        free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
-                            temp_to_final);
+        free_dump_resources(url_paths, local_names, context_ids, edge_idx, dump_edges, dump_nodes,
+                            node_idx, temp_to_final);
         free(src_nodes);
         return CBM_NOT_FOUND;
     }
@@ -3404,8 +3439,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
 
     if (rc == 0 && !has_row_sink) {
         CBM_PROF_START(t_build_edges);
-        dump_edges =
-            build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
+        dump_edges = build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths,
+                                      &local_names, &context_ids);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
         if (!dump_edges) {
             /* #579: edge dump arrays allocation failed (structured error already
@@ -3449,8 +3484,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
 
     log_dump_summary(node_idx, edge_idx);
-    free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
-                        temp_to_final);
+    free_dump_resources(url_paths, local_names, context_ids, edge_idx, dump_edges, dump_nodes,
+                        node_idx, temp_to_final);
     free(src_nodes);
     return rc;
 }
