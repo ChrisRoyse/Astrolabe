@@ -282,24 +282,24 @@ def expected_exports(path: Path) -> tuple[list[str], str]:
     return symbols, sha256(data)
 
 
-def validate_pe_refptr_globals(
+def validate_pe_relocation_globals(
     *,
     unexpected: list[str],
+    expected: list[str],
     records: list[tuple[str, str, str]],
     section_names: set[str],
     objdump: str,
     reloc: Path,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
     record_types = {name: symbol_type for name, symbol_type, _origin in records}
-    validated: list[dict[str, str]] = []
-    for symbol in unexpected:
+    expected_set = set(expected)
+    refptr_symbols = sorted(symbol for symbol in unexpected if PE_REFPTR.fullmatch(symbol))
+    other_symbols = sorted(set(unexpected) - set(refptr_symbols))
+    validated_refptrs: list[dict[str, str]] = []
+    target_refptrs: dict[str, list[str]] = {}
+    for symbol in refptr_symbols:
         match = PE_REFPTR.fullmatch(symbol)
-        if match is None:
-            refuse(
-                "ASTRO_LIBCBM_EXPORT_RELOC_MISMATCH",
-                f"unexpected non-API global is not PE relocation scaffolding: {symbol}",
-                "localize the internal definition or add the required cbm_* API to the exact manifest",
-            )
+        assert match is not None
         if record_types.get(symbol) != "R":
             refuse(
                 "ASTRO_LIBCBM_REFPTR_SYMBOL_TYPE_INVALID",
@@ -355,7 +355,8 @@ def validate_pe_refptr_globals(
                 f"PE relocation scaffold {symbol} targets {relocation_target!r}, expected {target!r}",
                 "inspect the COFF relocation and refuse aliasing or target drift",
             )
-        validated.append(
+        target_refptrs.setdefault(target, []).append(symbol)
+        validated_refptrs.append(
             {
                 "symbol": symbol,
                 "symbol_type": "R",
@@ -365,7 +366,40 @@ def validate_pe_refptr_globals(
                 "target": target,
             }
         )
-    return validated
+
+    validated_targets: list[dict[str, object]] = []
+    for symbol in other_symbols:
+        referenced_by = target_refptrs.get(symbol)
+        if referenced_by is None:
+            refuse(
+                "ASTRO_LIBCBM_EXPORT_RELOC_MISMATCH",
+                f"unexpected non-API global is not the target of a validated PE refptr: {symbol}",
+                "localize the internal definition or restore the exact relocation scaffold that requires it",
+            )
+        symbol_type = record_types.get(symbol)
+        if symbol_type != "R":
+            refuse(
+                "ASTRO_LIBCBM_RELOCATION_TARGET_TYPE_INVALID",
+                f"defined PE refptr target {symbol} has nm type {symbol_type!r}, expected 'R'",
+                "keep relocation-required internal data read-only or expose an intentional cbm_* API through the manifest",
+            )
+        validated_targets.append(
+            {
+                "symbol": symbol,
+                "symbol_type": symbol_type,
+                "referenced_by": sorted(referenced_by),
+            }
+        )
+
+    defined_targets = {target["symbol"] for target in validated_targets}
+    for target, referenced_by in sorted(target_refptrs.items()):
+        if target in record_types and target not in expected_set and target not in defined_targets:
+            refuse(
+                "ASTRO_LIBCBM_RELOCATION_TARGET_UNCLASSIFIED",
+                f"defined target {target} of {referenced_by} was not classified",
+                "inspect the exact COFF symbol type and preserve a complete relocation audit",
+            )
+    return validated_refptrs, validated_targets
 
 
 def verify(args: argparse.Namespace) -> None:
@@ -407,8 +441,9 @@ def verify(args: argparse.Namespace) -> None:
             f"relocatable globals are missing manifest exports: {missing[:3]}",
             "inspect ld retention and input relocations; never archive an unlocalized object",
         )
-    relocation_required_globals = validate_pe_refptr_globals(
+    relocation_scaffolds, relocation_defined_targets = validate_pe_relocation_globals(
         unexpected=unexpected,
+        expected=expected,
         records=records,
         section_names=section_names,
         objdump=args.objdump,
@@ -416,7 +451,7 @@ def verify(args: argparse.Namespace) -> None:
     )
     reloc_data = read_bytes(args.reloc, "localized relocatable object")
     audit = {
-        "format": "astrolabe.libcbm-export-reloc.v2",
+        "format": "astrolabe.libcbm-export-reloc.v3",
         "reloc": {
             "path": args.reloc.as_posix(),
             "bytes": len(reloc_data),
@@ -430,8 +465,10 @@ def verify(args: argparse.Namespace) -> None:
             "count": len(expected),
             "api_defined_globals_match": True,
             "all_defined_globals_classified": True,
-            "relocation_required_global_count": len(relocation_required_globals),
-            "relocation_required_globals": relocation_required_globals,
+            "relocation_scaffold_count": len(relocation_scaffolds),
+            "relocation_scaffolds": relocation_scaffolds,
+            "relocation_defined_target_count": len(relocation_defined_targets),
+            "relocation_defined_targets": relocation_defined_targets,
         },
     }
     durable_write(args.audit, json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8"))
