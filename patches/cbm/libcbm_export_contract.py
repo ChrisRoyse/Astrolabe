@@ -422,11 +422,15 @@ def coff_refptr_structurals(
         if (
             symbol["storage_class"] != COFF_CLASS_EXTERNAL
             or int(symbol["section_number"]) <= 0
+            or int(symbol["value"]) != 0
+            or int(symbol["symbol_type"]) != 0
+            or int(symbol["auxiliary_count"]) != 0
         ):
             refuse(
                 "ASTRO_LIBCBM_COFF_REFPTR_SYMBOL_INVALID",
-                f"refptr {name} storage_class={symbol['storage_class']}, section={symbol['section_number']}",
-                "restore the defined external COMDAT selection symbol; never hide malformed refptr state",
+                f"refptr {name} storage_class={symbol['storage_class']}, section={symbol['section_number']}, "
+                f"value={symbol['value']}, type={symbol['symbol_type']}, aux={symbol['auxiliary_count']}",
+                "restore the zero-valued untyped external COMDAT selection symbol with no auxiliary record",
             )
         section_number = int(symbol["section_number"])
         section = sections[section_number]
@@ -442,29 +446,18 @@ def coff_refptr_structurals(
                 f"relocations={section['relocation_count']}",
                 "restore the exact dedicated COMDAT refptr section with one relocation",
             )
-        section_definitions = [
+        section_symbols = [
             candidate
             for candidate in symbols
             if candidate["storage_class"] == COFF_CLASS_STATIC
             and int(candidate["section_number"]) == section_number
-            and candidate["name"] == expected_section_name
-            and int(candidate["value"]) == 0
-            and int(candidate["symbol_type"]) == 0
-            and int(candidate["auxiliary_count"]) == 1
         ]
-        if len(section_definitions) != 1:
+        if section_symbols:
             refuse(
                 "ASTRO_LIBCBM_COFF_REFPTR_SECTION_SYMBOL_INVALID",
-                f"refptr {name} has {len(section_definitions)} canonical section-definition symbols",
-                "restore the one static section symbol and its one auxiliary COMDAT record",
-            )
-        section_definition = section_definitions[0]
-        expected_comdat_index = int(section_definition["index"]) + 2
-        if int(symbol["index"]) != expected_comdat_index:
-            refuse(
-                "ASTRO_LIBCBM_COFF_REFPTR_COMDAT_ORDER_INVALID",
-                f"refptr {name} symbol index={symbol['index']}, expected={expected_comdat_index}",
-                "restore the COMDAT selection symbol immediately after the section auxiliary record",
+                f"refptr {name} retains {len(section_symbols)} static symbols in its section: "
+                f"{[candidate['name'] for candidate in section_symbols[:3]]}",
+                "use the complete pinned GNU ld -r partial link, which consumes the section definition while preserving the COMDAT selector",
             )
         relocation_offset = int(section["relocation_offset"])
         virtual_address, target_index, relocation_type = struct.unpack_from(
@@ -490,7 +483,7 @@ def coff_refptr_structurals(
                 "symbol_index": int(symbol["index"]),
                 "section": expected_section_name,
                 "section_index": section_number,
-                "section_definition_index": int(section_definition["index"]),
+                "section_definition": "absent-after-complete-partial-link",
                 "relocation_offset": 0,
                 "relocation_type": relocation_type,
                 "target": expected_target,
