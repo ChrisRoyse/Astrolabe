@@ -2252,20 +2252,50 @@ function Read-AstroResidentCohortPlan {
             "resident-cohort plan JSON is invalid: $($_.Exception.Message)" `
             'publish one exact issue-scoped cohort plan object'
     }
-    $planProperties = @(
+    $basePlanProperties = @(
         'schema', 'issue', 'resident_count', 'cache_directory', 'store_paths',
         'prime_request', 'prime_expected_substring', 'indexer_arguments',
         'indexer_expected_substring', 'reopen_request',
         'reopen_expected_substring', 'response_timeout_ms', 'holder_timeout_ms',
         'indexer_timeout_ms', 'resident_exit_timeout_ms'
     )
+    $schema = [string]$plan.schema
+    $planProperties = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v1') {
+        $basePlanProperties
+    }
+    elseif ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v2') {
+        @($basePlanProperties) + 'phase_store_owner_contract'
+    }
+    else {
+        Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            "resident-cohort plan schema '$schema' is not supported" `
+            'publish an exact v1 retained-SQLite plan or v2 explicit phase-owner plan'
+    }
     Assert-AstroExactObjectProperties $plan $planProperties `
         'ASTRO_FSV_COHORT_PLAN_INVALID' 'resident-cohort plan'
-    if ([string]$plan.schema -cne 'astrolabe.native-fsv-resident-cohort-plan.v1' -or
-        [int]$plan.issue -ne $ExpectedIssue) {
+    if ([int]$plan.issue -ne $ExpectedIssue) {
         Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
             "resident-cohort plan schema/issue does not match issue #$ExpectedIssue" `
             'publish a fresh plan bound to the driving issue'
+    }
+    $phaseStoreOwnerContract = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v1') {
+        [ordered]@{ prime = 'residents'; reopen = 'residents' }
+    }
+    else {
+        Assert-AstroExactObjectProperties $plan.phase_store_owner_contract `
+            @('prime', 'reopen') 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+            'phase_store_owner_contract'
+        $contract = [ordered]@{}
+        foreach ($phase in @('prime', 'reopen')) {
+            $value = [string]$plan.phase_store_owner_contract.$phase
+            if ($value -cne 'residents' -and $value -cne 'absent') {
+                Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+                    "phase_store_owner_contract.$phase must be exactly 'residents' or 'absent', observed '$value'" `
+                    'declare the exact expected Restart Manager owner set for every resident phase'
+            }
+            $contract[$phase] = $value
+        }
+        $contract
     }
     $residentCount = [int]$plan.resident_count
     if ($residentCount -lt 2 -or $residentCount -gt 16 -or
@@ -2386,6 +2416,7 @@ function Read-AstroResidentCohortPlan {
         holder_timeout_ms = [int]$timeouts.holder_timeout_ms
         indexer_timeout_ms = [int]$timeouts.indexer_timeout_ms
         resident_exit_timeout_ms = [int]$timeouts.resident_exit_timeout_ms
+        phase_store_owner_contract = $phaseStoreOwnerContract
     }
 }
 
@@ -2515,6 +2546,17 @@ function Wait-AstroCohortStoreOwners {
     Fail-Astro 'ASTRO_FSV_COHORT_OWNER_MISMATCH' `
         "store-owner phase '$Phase' did not reach two stable exact snapshots (expected=$expectedSignature; attempts=$($attempts | ConvertTo-Json -Depth 12 -Compress))" `
         'preserve the cohort/store/session and inspect the exact PID/start-ticks holder chronology'
+}
+
+function Get-AstroCohortExpectedStoreOwners {
+    param(
+        [Parameter(Mandatory)][ValidateSet('residents', 'absent')][string]$Contract,
+        [Parameter(Mandatory)][object[]]$ResidentIdentities
+    )
+    if ($Contract -ceq 'residents') {
+        return ,@($ResidentIdentities)
+    }
+    return ,@()
 }
 
 function Wait-AstroCohortSidecarsAbsent {
@@ -2990,6 +3032,7 @@ function Invoke-AstroResidentCohort {
             issue = $IssueNumber; resident_count = $plan.resident_count
             plan = [ordered]@{ path = $plan.path; sha256 = $plan.sha256_before }
             store_paths = $plan.store_paths
+            phase_store_owner_contract = $plan.phase_store_owner_contract
         })
 
         for ($ordinal = 1; $ordinal -le $plan.resident_count; $ordinal++) {
@@ -3154,11 +3197,16 @@ function Invoke-AstroResidentCohort {
         }
         $residentIdentities = @($processStates | Where-Object role -ceq 'resident' |
             Sort-Object ordinal | ForEach-Object { $_.identity })
+        $primeExpectedOwners = Get-AstroCohortExpectedStoreOwners `
+            $plan.phase_store_owner_contract.prime $residentIdentities
         $primeOwners = Wait-AstroCohortStoreOwners $plan.store_paths `
-            $residentIdentities $plan.holder_timeout_ms 'five-residents-primed'
+            $primeExpectedOwners $plan.holder_timeout_ms `
+            "prime-$($plan.phase_store_owner_contract.prime)"
         $storeChronology.Add($primeOwners)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
-            event = 'store_owner_snapshot'; evidence = $primeOwners
+            event = 'store_owner_snapshot'; phase = 'prime'
+            contract = $plan.phase_store_owner_contract.prime
+            evidence = $primeOwners
         })
 
         $indexer = @($processStates | Where-Object role -ceq 'indexer')[0]
@@ -3214,11 +3262,16 @@ function Invoke-AstroResidentCohort {
                 $state.native $plan.reopen_request $plan.reopen_expected_substring `
                 $plan.response_timeout_ms 'reopen' $state.ordinal $StandardOutputPath))
         }
+        $reopenExpectedOwners = Get-AstroCohortExpectedStoreOwners `
+            $plan.phase_store_owner_contract.reopen $residentIdentities
         $reopenedOwners = Wait-AstroCohortStoreOwners $plan.store_paths `
-            $residentIdentities $plan.holder_timeout_ms 'five-residents-reopened'
+            $reopenExpectedOwners $plan.holder_timeout_ms `
+            "reopen-$($plan.phase_store_owner_contract.reopen)"
         $storeChronology.Add($reopenedOwners)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
-            event = 'store_owner_snapshot'; evidence = $reopenedOwners
+            event = 'store_owner_snapshot'; phase = 'reopen'
+            contract = $plan.phase_store_owner_contract.reopen
+            evidence = $reopenedOwners
         })
 
         foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
@@ -3347,6 +3400,7 @@ function Invoke-AstroResidentCohort {
             cohort_plan = [ordered]@{
                 path = $plan.path; sha256_before = $plan.sha256_before
                 sha256_after = $planHashAfter; stable = $planStable
+                phase_store_owner_contract = $plan.phase_store_owner_contract
             }
             live_state = [ordered]@{
                 path = $LiveStatePath; published = $true
@@ -3530,6 +3584,7 @@ function Invoke-AstroResidentCohort {
                         sha256_after = if (Test-AstroPathLongPath -LiteralPath $plan.path -PathType Leaf) {
                             File-Sha256 $plan.path
                         } else { $null }
+                        phase_store_owner_contract = $plan.phase_store_owner_contract
                     }
                     live_state = [ordered]@{
                         path = $LiveStatePath; published = $liveStatePublished
