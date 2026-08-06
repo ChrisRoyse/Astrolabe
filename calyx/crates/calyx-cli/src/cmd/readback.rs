@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::sst::SstReader;
 use calyx_aster::vault::encode::decode_write_batch;
+use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_aster::wal::{replay_dir_read_only_after, replay_segment_read_only};
 use calyx_core::CalyxError;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ enum ReadbackCommand {
         vault: PathBuf,
         cf: String,
         key_hex: String,
+        historical: Option<HistoricalCfRow>,
     },
     CfRows {
         vault: PathBuf,
@@ -35,6 +37,13 @@ enum ReadbackCommand {
         vault: PathBuf,
         seq: u64,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoricalCfRow {
+    seq: u64,
+    vault_id: String,
+    vault_salt: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +98,39 @@ fn parse(args: &[String]) -> CliResult<ReadbackCommand> {
                 vault: vault.into(),
                 cf: cf.clone(),
                 key_hex: key.clone(),
+                historical: None,
+            })
+        }
+        [
+            _,
+            flag,
+            vault,
+            cf_flag,
+            cf,
+            key_flag,
+            key,
+            seq_flag,
+            seq,
+            vault_id_flag,
+            vault_id,
+            vault_salt_flag,
+            vault_salt,
+        ] if flag == "--cf-row"
+            && cf_flag == "--cf"
+            && key_flag == "--key"
+            && seq_flag == "--seq"
+            && vault_id_flag == "--vault-id"
+            && vault_salt_flag == "--vault-salt" =>
+        {
+            Ok(ReadbackCommand::CfRow {
+                vault: vault.into(),
+                cf: cf.clone(),
+                key_hex: key.clone(),
+                historical: Some(HistoricalCfRow {
+                    seq: parse_seq(seq)?,
+                    vault_id: vault_id.clone(),
+                    vault_salt: vault_salt.clone(),
+                }),
             })
         }
         [_, flag, vault, cf_flag, cf, keys_flag, keys_file]
@@ -107,7 +149,7 @@ fn parse(args: &[String]) -> CliResult<ReadbackCommand> {
             })
         }
         _ => Err(CliError::usage(
-            "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> | --cf-rows <vault> --cf <cf-name> --keys-file <json> | --wal <segment-path> | --ledger <vault> --seq <n>)",
+            "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> [--seq <n> --vault-id <id> --vault-salt <salt>] | --cf-rows <vault> --cf <cf-name> --keys-file <json> | --wal <segment-path> | --ledger <vault> --seq <n>)",
         )),
     }
 }
@@ -116,7 +158,12 @@ fn run(command: ReadbackCommand) -> CliResult {
     match command {
         ReadbackCommand::Hex(path) => readback_hex(&path),
         ReadbackCommand::VaultTree(path) => vault_tree::readback_vault_tree(&path),
-        ReadbackCommand::CfRow { vault, cf, key_hex } => readback_cf_row(&vault, &cf, &key_hex),
+        ReadbackCommand::CfRow {
+            vault,
+            cf,
+            key_hex,
+            historical,
+        } => readback_cf_row(&vault, &cf, &key_hex, historical.as_ref()),
         ReadbackCommand::CfRows {
             vault,
             cf,
@@ -132,18 +179,55 @@ fn readback_hex(path: &Path) -> CliResult {
     print_hex_dump(0, &bytes).map(|_| ())
 }
 
-fn readback_cf_row(vault: &Path, cf_name: &str, key_hex: &str) -> CliResult {
+fn readback_cf_row(
+    vault: &Path,
+    cf_name: &str,
+    key_hex: &str,
+    historical: Option<&HistoricalCfRow>,
+) -> CliResult {
     ensure_manifested_vault(vault)?;
     let cf = ops::parse_cf(cf_name).map_err(CliError::usage)?;
     let key = parse_hex_bytes(key_hex, "--key")?;
-    let value = latest_cf_row(vault, cf, &key)?.ok_or_else(|| {
+    let value = match historical {
+        Some(historical) => historical_cf_row(vault, cf, &key, historical)?,
+        None => latest_cf_row(vault, cf, &key)?,
+    }
+    .ok_or_else(|| {
         CalyxError::aster_corrupt_shard(format!(
-            "CF {} row key {} not found",
+            "CF {} row key {} not found{}",
             cf.name(),
-            hex_bytes(&key)
+            hex_bytes(&key),
+            historical
+                .map(|historical| format!(" at MVCC sequence {}", historical.seq))
+                .unwrap_or_default(),
         ))
     })?;
     print_hex_dump(0, &value).map(|_| ())
+}
+
+fn historical_cf_row(
+    vault: &Path,
+    cf: ColumnFamily,
+    key: &[u8],
+    historical: &HistoricalCfRow,
+) -> CliResult<Option<Vec<u8>>> {
+    let vault_id = historical
+        .vault_id
+        .parse::<calyx_core::VaultId>()
+        .map_err(|error| CliError::usage(format!("invalid --vault-id: {error}")))?;
+    let store = AsterVault::open(
+        vault,
+        vault_id,
+        historical.vault_salt.as_bytes().to_vec(),
+        VaultOptions {
+            restore_mvcc_rows: true,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(vec![cf]),
+            ..VaultOptions::default()
+        },
+    )?;
+    Ok(store.read_cf_at(historical.seq, cf, key)?)
 }
 
 fn readback_cf_rows(vault: &Path, cf_name: &str, keys_file: &Path) -> CliResult {

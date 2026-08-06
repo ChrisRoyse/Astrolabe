@@ -48,11 +48,12 @@ pub use label_seeds::{
 };
 
 pub use graph_projection::{
-    ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
+    ASTRO_GRAPH_PROJECTION_CORRUPT, CompositeKernelProjectionVerifyReport,
+    CompositeKernelSegmentEvidence, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
     GraphProjectionCsr, GraphProjectionCsrEdge, GraphProjectionKind,
     GraphProjectionMaterializeEntry, GraphProjectionMaterializeReport, GraphProjectionNode,
-    ensure_graph_projection_csr, materialize_graph_projection, materialize_graph_projections,
-    read_graph_projection_csr,
+    SimOnlyKernelEdgeEvidence, ensure_graph_projection_csr, materialize_graph_projection,
+    materialize_graph_projections, read_graph_projection_csr, verify_composite_kernel_projection,
 };
 pub use kernel_artifact::{
     ASTRO_KERNEL_ARTIFACT_PERSIST_READBACK, ASTRO_KERNEL_GRAPH_ADAPTER_REFUSED,

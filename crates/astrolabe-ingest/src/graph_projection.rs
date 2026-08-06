@@ -10,6 +10,7 @@ use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::sqlite_import::{
     ASTRO_INGEST_READBACK_MISMATCH, EDGE_ROW_PREFIX, EdgeGraphRow, SCHEMA_EDGE_ROW,
@@ -313,6 +314,88 @@ pub struct GraphProjectionMaterializeReport {
     pub projections: Vec<GraphProjectionMaterializeEntry>,
 }
 
+/// Raw persisted-row evidence for one composite-kernel CSR region.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompositeKernelSegmentEvidence {
+    /// Kernel CF key as lowercase hexadecimal.
+    pub key_hex: String,
+    /// Region byte encoded into the segment key/header.
+    pub region: u8,
+    /// Exact persisted segment byte length.
+    pub value_len: usize,
+    /// SHA-256 of the exact persisted segment bytes.
+    pub value_sha256: String,
+    /// BLAKE3 of the exact persisted segment bytes, matched to the manifest.
+    pub value_blake3: String,
+}
+
+/// One persisted SIM edge whose endpoints have no typed structural edge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SimOnlyKernelEdgeEvidence {
+    /// Raw Graph CF SIM-row key as lowercase hexadecimal.
+    pub sim_row_key_hex: String,
+    /// SHA-256 of the exact persisted SIM-row value bytes.
+    pub sim_row_value_sha256: String,
+    /// Exact persisted SIM-row value length.
+    pub sim_row_value_len: usize,
+    /// Stable source-atom identity from the SIM row.
+    pub source_id: String,
+    /// Stable target-atom identity from the SIM row.
+    pub target_id: String,
+    /// Source CxId resolved through the persisted node map.
+    pub source_cx_id: CxId,
+    /// Target CxId resolved through the persisted node map.
+    pub target_cx_id: CxId,
+    /// Persisted similarity edge type.
+    pub etype: u16,
+    /// Exact source SIM weight bits.
+    pub source_weight_bits: u32,
+    /// Exact projected kernel-graph weight bits.
+    pub projected_weight_bits: u32,
+    /// Ledger reference physically carried by the persisted CSR edge.
+    pub projection_ledger_ref: String,
+}
+
+/// Independent deep-verification report for the complete typed+SIM kernel graph.
+///
+/// The verifier reconstructs the expected CSR from the current raw Graph rows and
+/// requires exact equality with the decoded persisted CSR. It therefore proves
+/// more than a source-fingerprint match: every projected node, offset, edge,
+/// weight, type, and ledger pointer must be the value the raw source rows imply.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompositeKernelProjectionVerifyReport {
+    /// MVCC sequence independently read during verification.
+    pub snapshot_seq: Seq,
+    /// Typed structural source rows included in the reconstruction.
+    pub source_typed_edge_rows: usize,
+    /// SIM source rows included in the reconstruction.
+    pub source_sim_edge_rows: usize,
+    /// Raw source-family fingerprint framing every typed and SIM key/value byte.
+    pub source_fingerprint_blake3: String,
+    /// Whether a persisted kernel CSR exists. False is valid only for no sources.
+    pub csr_present: bool,
+    /// Persisted CSR node count.
+    pub node_count: usize,
+    /// Persisted typed CSR edge count.
+    pub edge_count: usize,
+    /// Persisted association edge count after edge-type collapse.
+    pub association_edge_count: usize,
+    /// CSR edges carrying a similarity edge type.
+    pub projected_similarity_edge_count: usize,
+    /// SIM rows whose ordered endpoints have no typed structural edge.
+    pub sim_only_source_edge_count: usize,
+    /// Raw kernel-CSR manifest key, when a CSR exists.
+    pub manifest_key_hex: Option<String>,
+    /// Exact persisted manifest byte length.
+    pub manifest_value_len: Option<usize>,
+    /// SHA-256 of the exact persisted manifest bytes.
+    pub manifest_value_sha256: Option<String>,
+    /// Independently read and hash-checked persisted segment rows.
+    pub segments: Vec<CompositeKernelSegmentEvidence>,
+    /// Deterministic first SIM-only relationship, proven in the persisted CSR.
+    pub representative_sim_only_edge: Option<SimOnlyKernelEdgeEvidence>,
+}
+
 #[derive(Clone, Debug)]
 struct SourceEdges {
     rows: Vec<SourceEdgeRow>,
@@ -488,6 +571,258 @@ where
             }
             Ok(Some(csr))
         }
+    }
+}
+
+/// Independently verifies the persisted composite kernel projection against all
+/// current typed and SIM Graph CF source rows and returns hash-bound physical
+/// evidence suitable for operational inspection.
+///
+/// A missing CSR is accepted only when both source families are empty. Any
+/// non-empty source with no CSR is stale derived state and fails closed. When a
+/// CSR exists, this function rebuilds the entire expected CSR from the raw rows
+/// and requires exact structural equality with the persisted decode; source
+/// fingerprint equality alone is not treated as proof.
+pub fn verify_composite_kernel_projection<C>(
+    vault: &AsterVault<C>,
+) -> IngestResult<CompositeKernelProjectionVerifyReport>
+where
+    C: Clock,
+{
+    let snapshot_seq = vault.latest_seq();
+    let source = read_source_edges(vault)?;
+    let persisted = read_graph_projection_csr(vault, GraphProjectionKind::KernelGraph)?;
+    let Some(csr) = persisted else {
+        if !source.rows.is_empty() {
+            return Err(projection_corrupt(format!(
+                "{} source rows exist (typed={}, SIM={}) but the composite kernel CSR is absent",
+                source.rows.len(),
+                source.typed_edge_rows,
+                source.sim_edge_rows,
+            )));
+        }
+        return Ok(CompositeKernelProjectionVerifyReport {
+            snapshot_seq,
+            source_typed_edge_rows: 0,
+            source_sim_edge_rows: 0,
+            source_fingerprint_blake3: hex_lower(&source.fingerprint),
+            csr_present: false,
+            node_count: 0,
+            edge_count: 0,
+            association_edge_count: 0,
+            projected_similarity_edge_count: 0,
+            sim_only_source_edge_count: 0,
+            manifest_key_hex: None,
+            manifest_value_len: None,
+            manifest_value_sha256: None,
+            segments: Vec::new(),
+            representative_sim_only_edge: None,
+        });
+    };
+
+    let expected = build_projection_csr(GraphProjectionKind::KernelGraph, &source)?;
+    if csr != expected {
+        return Err(projection_corrupt(
+            "persisted kernel_graph CSR does not exactly equal the CSR independently rebuilt from current typed and SIM Graph CF rows",
+        ));
+    }
+
+    let manifest_key = manifest_key(GraphProjectionKind::KernelGraph);
+    let manifest_bytes = vault
+        .read_cf_at(snapshot_seq, ColumnFamily::Kernel, &manifest_key)?
+        .ok_or_else(|| {
+            projection_corrupt("kernel_graph CSR manifest disappeared during deep verification")
+        })?;
+    let manifest =
+        serde_json::from_slice::<ProjectionManifest>(&manifest_bytes).map_err(|error| {
+            projection_corrupt(format!(
+                "decode kernel_graph CSR manifest during deep verification: {error}"
+            ))
+        })?;
+    validate_manifest(GraphProjectionKind::KernelGraph, &manifest)?;
+
+    let mut segments = Vec::with_capacity(manifest.regions.len());
+    for region in &manifest.regions {
+        let key = segment_key(GraphProjectionKind::KernelGraph, region.region);
+        let bytes = vault
+            .read_cf_at(snapshot_seq, ColumnFamily::Kernel, &key)?
+            .ok_or_else(|| {
+                projection_corrupt(format!(
+                    "kernel_graph CSR segment {} disappeared during deep verification",
+                    region.region
+                ))
+            })?;
+        let value_blake3 = blake3::hash(&bytes).to_hex().to_string();
+        if bytes.len() != region.total_bytes || value_blake3 != region.stream_blake3 {
+            return Err(projection_corrupt(format!(
+                "kernel_graph CSR segment {} physical bytes disagree with manifest: bytes={} expected={} blake3={} expected={}",
+                region.region,
+                bytes.len(),
+                region.total_bytes,
+                value_blake3,
+                region.stream_blake3,
+            )));
+        }
+        segments.push(CompositeKernelSegmentEvidence {
+            key_hex: hex_key(&key),
+            region: region.region,
+            value_len: bytes.len(),
+            value_sha256: sha256_hex(&bytes),
+            value_blake3,
+        });
+    }
+
+    let typed_endpoint_pairs = source
+        .rows
+        .iter()
+        .filter(|row| row.family == SourceFamily::Typed)
+        .map(|row| undirected_endpoint_pair(row.src, row.dst))
+        .collect::<BTreeSet<_>>();
+    let sim_only_source_edge_count = source
+        .rows
+        .iter()
+        .filter(|row| {
+            row.family == SourceFamily::Similarity
+                && !typed_endpoint_pairs.contains(&undirected_endpoint_pair(row.src, row.dst))
+        })
+        .count();
+    let projected_similarity_edge_count = csr
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge_kind_from_code(edge.etype),
+                Some(EdgeKind::SimilarTo | EdgeKind::SemanticallyRelated)
+            )
+        })
+        .count();
+    let representative_sim_only_edge = representative_sim_only_edge(
+        vault,
+        snapshot_seq,
+        &csr,
+        &typed_endpoint_pairs,
+        sim_only_source_edge_count,
+    )?;
+
+    Ok(CompositeKernelProjectionVerifyReport {
+        snapshot_seq,
+        source_typed_edge_rows: source.typed_edge_rows,
+        source_sim_edge_rows: source.sim_edge_rows,
+        source_fingerprint_blake3: hex_lower(&source.fingerprint),
+        csr_present: true,
+        node_count: csr.nodes.len(),
+        edge_count: csr.edges.len(),
+        association_edge_count: csr.association_edge_count,
+        projected_similarity_edge_count,
+        sim_only_source_edge_count,
+        manifest_key_hex: Some(hex_key(&manifest_key)),
+        manifest_value_len: Some(manifest_bytes.len()),
+        manifest_value_sha256: Some(sha256_hex(&manifest_bytes)),
+        segments,
+        representative_sim_only_edge,
+    })
+}
+
+fn representative_sim_only_edge<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    csr: &GraphProjectionCsr,
+    typed_endpoint_pairs: &BTreeSet<(CxId, CxId)>,
+    sim_only_source_edge_count: usize,
+) -> IngestResult<Option<SimOnlyKernelEdgeEvidence>>
+where
+    C: Clock,
+{
+    if sim_only_source_edge_count == 0 {
+        return Ok(None);
+    }
+    let resolved = crate::sqlite_import::read_global_atom_cx_ids(vault)?;
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(SIM_EDGE_ROW_V2_PREFIX),
+    )? {
+        let row = serde_json::from_slice::<SimEdgeSourceRow>(&value).map_err(|error| {
+            projection_corrupt(format!(
+                "decode SIM edge row {} while selecting deep-verification witness: {error}",
+                hex_key(&key)
+            ))
+        })?;
+        let src = resolve_sim_endpoint(&resolved, &row.source_id, &key, "source")?;
+        let dst = resolve_sim_endpoint(&resolved, &row.target_id, &key, "target")?;
+        if typed_endpoint_pairs.contains(&undirected_endpoint_pair(src, dst)) {
+            continue;
+        }
+        let kind = edge_kind_from_code(row.etype).ok_or_else(|| {
+            projection_corrupt(format!(
+                "SIM edge row {} has unknown etype {} while selecting deep-verification witness",
+                hex_key(&key),
+                row.etype
+            ))
+        })?;
+        let source_weight = f32::from_bits(row.weight_bits);
+        let projected_weight = GraphProjectionKind::KernelGraph
+            .projected_weight(kind, source_weight)
+            .ok_or_else(|| {
+                projection_corrupt(format!(
+                    "SIM edge row {} did not project into the composite kernel graph",
+                    hex_key(&key)
+                ))
+            })?;
+        let source_index = csr
+            .nodes
+            .binary_search_by_key(&src, |node| node.id)
+            .map_err(|_| {
+                projection_corrupt(format!(
+                    "SIM-only witness source {src} has no persisted CSR node"
+                ))
+            })?;
+        let edge = csr.edges[csr.offsets[source_index]..csr.offsets[source_index + 1]]
+            .iter()
+            .find(|edge| edge.dst == dst && edge.etype == row.etype)
+            .ok_or_else(|| {
+                projection_corrupt(format!(
+                    "SIM-only witness {} -> {} etype={} is absent from the persisted CSR",
+                    src, dst, row.etype
+                ))
+            })?;
+        // Multiple learned families may collapse onto the same
+        // (source,target,etype) edge. The projection keeps their maximum
+        // weight, so only the raw row that actually determines that maximum
+        // is a valid byte-level witness for the persisted CSR edge.
+        if edge.weight.to_bits() != projected_weight.to_bits() {
+            continue;
+        }
+        let projection_ledger_ref = edge.ledger_ref().ok_or_else(|| {
+            projection_corrupt(format!(
+                "SIM-only witness {} -> {} etype={} has no persisted CSR ledger attestation",
+                src, dst, row.etype
+            ))
+        })?;
+        return Ok(Some(SimOnlyKernelEdgeEvidence {
+            sim_row_key_hex: hex_key(&key),
+            sim_row_value_sha256: sha256_hex(&value),
+            sim_row_value_len: value.len(),
+            source_id: row.source_id,
+            target_id: row.target_id,
+            source_cx_id: src,
+            target_cx_id: dst,
+            etype: row.etype,
+            source_weight_bits: row.weight_bits,
+            projected_weight_bits: projected_weight.to_bits(),
+            projection_ledger_ref,
+        }));
+    }
+    Err(projection_corrupt(format!(
+        "counted {sim_only_source_edge_count} SIM-only source edges but could not select a persisted witness"
+    )))
+}
+
+fn undirected_endpoint_pair(left: CxId, right: CxId) -> (CxId, CxId) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
     }
 }
 
@@ -1885,6 +2220,17 @@ fn hex_key(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }

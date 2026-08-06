@@ -1052,6 +1052,18 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
         &vault_id,
         &vault_salt,
     )?;
+    let projection_vault = migration::open_shadow_vault_historical_read_only(
+        Path::new(&vault),
+        &vault_id,
+        &vault_salt,
+        vec![
+            calyx_aster::cf::ColumnFamily::Graph,
+            calyx_aster::cf::ColumnFamily::Kernel,
+            calyx_aster::cf::ColumnFamily::Ledger,
+        ],
+    )?;
+    let composite_kernel_projection =
+        astrolabe_ingest::verify_composite_kernel_projection(&projection_vault)?;
     if raw_json {
         let mut payload = serde_json::to_value(&report)?;
         let object = payload
@@ -1061,10 +1073,14 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
             "complete_associations".to_string(),
             serde_json::to_value(&complete_associations)?,
         );
+        object.insert(
+            "composite_kernel_projection".to_string(),
+            serde_json::to_value(&composite_kernel_projection)?,
+        );
         println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!(
-            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={} sqlite_edge_rows={} ledger_chain_status={} ledger_rows={} ledger_payload_rows={} base_ledger_pairs={} association_constellations={} association_pairs={} association_computed={} association_typed_incompatible={} association_witness_state_hash={}",
+            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={} sqlite_edge_rows={} ledger_chain_status={} ledger_rows={} ledger_payload_rows={} base_ledger_pairs={} association_constellations={} association_pairs={} association_computed={} association_typed_incompatible={} association_witness_state_hash={} composite_typed_edges={} composite_sim_edges={} composite_sim_only={} composite_nodes={} composite_edges={} composite_source_fingerprint={}",
             report.series_rows,
             report.reverse_rows,
             report.qn_index_rows,
@@ -1083,6 +1099,12 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
             complete_associations.computed_pair_count,
             complete_associations.typed_incompatible_pair_count,
             complete_associations.witness_state_hash,
+            composite_kernel_projection.source_typed_edge_rows,
+            composite_kernel_projection.source_sim_edge_rows,
+            composite_kernel_projection.sim_only_source_edge_count,
+            composite_kernel_projection.node_count,
+            composite_kernel_projection.edge_count,
+            composite_kernel_projection.source_fingerprint_blake3,
         );
     }
     Ok(0)
