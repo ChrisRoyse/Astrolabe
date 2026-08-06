@@ -53,7 +53,12 @@ impl LedgerPointReadTrace {
     }
 }
 
-pub(super) fn read_sst_ledger_rows(
+/// Resolves Ledger rows through the targeted immutable-SST tiers only.
+///
+/// The caller must attempt the manifest-bounded WAL tail before invoking
+/// [`read_sst_ledger_rows_complete`]. That ordering prevents a healthy
+/// unflushed Ledger head from being mislabeled as an SST-index degradation.
+pub(super) fn read_sst_ledger_rows_indexed(
     ledger_dirs: &[PathBuf],
     wanted: &BTreeSet<u64>,
     rows: &mut BTreeMap<u64, Vec<u8>>,
@@ -141,9 +146,21 @@ pub(super) fn read_sst_ledger_rows(
         trace.record("named_scan", 0, 0, 0, Instant::now());
     }
 
-    // Tier 4 (`complete_scan`): the semantic source of truth — every ledger
-    // SST. Correct but O(total files); a healthy vault must resolve every
-    // seq before this tier (FSV asserts `wanted == 0` here from the trace).
+    Ok(())
+}
+
+/// Resolves any rows still absent after indexed SST lookup and the
+/// manifest-bounded WAL tail by scanning the complete immutable SST set.
+///
+/// This is the semantic SST source of truth, but it is O(total files). The
+/// trace always records the tier, including `wanted == 0` when the indexed
+/// SST or WAL-tail paths resolved the request without exhaustive work.
+pub(super) fn read_sst_ledger_rows_complete(
+    ledger_dirs: &[PathBuf],
+    wanted: &BTreeSet<u64>,
+    rows: &mut BTreeMap<u64, Vec<u8>>,
+    trace: &mut LedgerPointReadTrace,
+) -> CalyxResult<()> {
     let unresolved = unresolved_seqs(wanted, rows);
     if !unresolved.is_empty() {
         let started = Instant::now();

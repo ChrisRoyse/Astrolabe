@@ -21,7 +21,7 @@ use crate::sst::SstEntry;
 use crate::vault::encode::decode_write_batch;
 use crate::wal::{replay_dir_after, stream_records};
 pub use point_read::{LedgerPointReadTierStats, LedgerPointReadTrace};
-use point_read::{read_sst_ledger_rows, unresolved_seqs};
+use point_read::{read_sst_ledger_rows_complete, read_sst_ledger_rows_indexed, unresolved_seqs};
 
 /// Read-only snapshot of a vault's Ledger column family (SSTs + WAL).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,14 +152,18 @@ pub(crate) fn read_ledger_seqs_unlocked_traced(
     }
     let layout = AsterVaultLayout::read_with_tiering(vault, tiering_policy)?;
     let mut rows = BTreeMap::new();
-    if !layout.ledger_cf_dirs.is_empty() {
-        read_sst_ledger_rows(&layout.ledger_cf_dirs, seqs, &mut rows, &mut trace)?;
-    }
+    read_sst_ledger_rows_indexed(&layout.ledger_cf_dirs, seqs, &mut rows, &mut trace)?;
+
+    // The manifest durable sequence is the exact boundary between immutable
+    // SST state and the live WAL tail. Give that bounded tail its rightful
+    // chance before the exhaustive SST source-of-truth scan: a freshly
+    // committed Ledger head normally lives only in WAL, so scanning every SST
+    // first is both wasted work and a false signal that the SST index degraded.
     let unresolved = unresolved_seqs(seqs, &rows);
     if layout.has_wal && !unresolved.is_empty() {
         let started = std::time::Instant::now();
         let before = rows.len();
-        read_wal_ledger_rows(vault, &unresolved, &mut rows)?;
+        read_wal_ledger_rows_after_floor(vault, &unresolved, &mut rows)?;
         trace.record(
             "wal_tail",
             unresolved.len(),
@@ -167,6 +171,30 @@ pub(crate) fn read_ledger_seqs_unlocked_traced(
             0,
             started,
         );
+    } else {
+        trace.record("wal_tail", 0, 0, 0, std::time::Instant::now());
+    }
+
+    // Historical rows that are not in the indexed SST tiers are resolved from
+    // the complete immutable SST inventory before consulting retained,
+    // pre-manifest WAL segments. This keeps SSTs authoritative for durable
+    // history while preserving the old retained-WAL recovery semantics.
+    read_sst_ledger_rows_complete(&layout.ledger_cf_dirs, seqs, &mut rows, &mut trace)?;
+
+    let unresolved = unresolved_seqs(seqs, &rows);
+    if layout.has_wal && !unresolved.is_empty() {
+        let started = std::time::Instant::now();
+        let before = rows.len();
+        read_retained_wal_ledger_rows(vault, &unresolved, &mut rows)?;
+        trace.record(
+            "wal_retained",
+            unresolved.len(),
+            rows.len() - before,
+            0,
+            started,
+        );
+    } else {
+        trace.record("wal_retained", 0, 0, 0, std::time::Instant::now());
     }
     Ok((
         rows.into_iter()
@@ -174,19 +202,6 @@ pub(crate) fn read_ledger_seqs_unlocked_traced(
             .collect(),
         trace,
     ))
-}
-
-fn read_wal_ledger_rows(
-    vault: &Path,
-    wanted: &BTreeSet<u64>,
-    rows: &mut BTreeMap<u64, Vec<u8>>,
-) -> CalyxResult<()> {
-    read_wal_ledger_rows_after_floor(vault, wanted, rows)?;
-    let unresolved = unresolved_seqs(wanted, rows);
-    if !unresolved.is_empty() {
-        read_retained_wal_ledger_rows(vault, &unresolved, rows)?;
-    }
-    Ok(())
 }
 
 fn read_wal_ledger_rows_after_floor(
