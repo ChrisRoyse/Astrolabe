@@ -61,8 +61,13 @@ const LOWERED_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
 /// Stable refusal code: the lowered artifact file is absent on disk.
 pub const ASTRO_LOWER_ARTIFACT_MISSING: &str = "ASTRO_LOWER_ARTIFACT_MISSING";
 /// Stable refusal code: the artifact's `astro_meta` row is missing, duplicated,
-/// undecodable, or disagrees with the ledgered lowering manifest.
+/// undecodable, or malformed.
 pub const ASTRO_LOWER_ARTIFACT_META_INVALID: &str = "ASTRO_LOWER_ARTIFACT_META_INVALID";
+/// Stable refusal code: the artifact has one readable, structurally valid
+/// `astro_meta` row, but its frozen artifact schema differs from the current
+/// producer. The artifact must never be served; a publication transaction may
+/// regenerate it from the independently verified vault in private stage state.
+pub const ASTRO_LOWER_ARTIFACT_SCHEMA_STALE: &str = "ASTRO_LOWER_ARTIFACT_SCHEMA_STALE";
 /// Stable refusal code: no ledgered lowering manifest in this vault binds the
 /// artifact's claimed vault fingerprint for the requested project.
 pub const ASTRO_LOWER_ARTIFACT_UNBOUND: &str = "ASTRO_LOWER_ARTIFACT_UNBOUND";
@@ -626,9 +631,11 @@ fn read_astro_meta(path: &Path) -> LowerResult<AstroMetaRow> {
         ));
     };
     if schema != ASTRO_META_SCHEMA {
-        return Err(meta_invalid(format!(
-            "astro_meta schema is {schema}; expected {ASTRO_META_SCHEMA}."
-        )));
+        return Err(LowerError::refused(
+            ASTRO_LOWER_ARTIFACT_SCHEMA_STALE,
+            format!("astro_meta schema is {schema}; expected {ASTRO_META_SCHEMA}."),
+            ARTIFACT_VERIFY_REMEDIATION,
+        ));
     }
     let panel_version = match panel_version {
         None => None,

@@ -91,6 +91,7 @@ type ShadowNoopValidation = (String, String, Vec<(String, String)>);
 
 #[derive(Debug, Clone)]
 struct SeedLowerRepair {
+    reason: &'static str,
     prior: ShadowLowerState,
     repaired: ShadowLowerState,
 }
@@ -99,7 +100,7 @@ impl SeedLowerRepair {
     fn evidence_json(&self) -> Value {
         json!({
             "schema": "astrolabe.shadow-seed-lower-repair.v1",
-            "reason": astrolabe_lower::ASTRO_LOWER_ARTIFACT_STALE,
+            "reason": self.reason,
             "prior": self.prior.evidence_json(),
             "repaired": self.repaired.evidence_json(),
             "live_generation_mutated": false,
@@ -1061,9 +1062,17 @@ impl ShadowPublication {
                             Ok(None)
                         }
                         Err(error)
-                            if error.code()
-                                == Some(astrolabe_lower::ASTRO_LOWER_ARTIFACT_STALE) =>
+                            if matches!(
+                                error.code(),
+                                Some(
+                                    astrolabe_lower::ASTRO_LOWER_ARTIFACT_STALE
+                                        | astrolabe_lower::ASTRO_LOWER_ARTIFACT_SCHEMA_STALE
+                                )
+                            ) =>
                         {
+                            let repair_reason = error.code().ok_or_else(|| -> DynError {
+                                "ASTRO_SHADOW_PUBLICATION_SEED_LOWER_REPAIR_CODE_MISSING: a typed regenerable lowered-artifact refusal lost its machine code; remediation: preserve the staged generation and repair the error contract before retrying".into()
+                            })?;
                             drop(staged_vault);
                             let writable_vault = open_shadow_vault_writable(
                                 &staged_vault_dir,
@@ -1093,7 +1102,11 @@ impl ShadowPublication {
                                 &repaired,
                                 &readback,
                             )?;
-                            Ok(Some(SeedLowerRepair { prior, repaired }))
+                            Ok(Some(SeedLowerRepair {
+                                reason: repair_reason,
+                                prior,
+                                repaired,
+                            }))
                         }
                         Err(error) => Err(format!(
                             "ASTRO_SHADOW_PUBLICATION_SEED_LOWERED_UNVERIFIED: staged lowered artifact and vault manifest do not verify for project {:?}: {error}. Remediation: do not publish this generation; inspect the live lowered artifact, vault lowering manifest, config binding, and ledger chain, then rebuild from source",
