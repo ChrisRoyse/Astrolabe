@@ -32,6 +32,15 @@ enum ReadbackCommand {
         cf: String,
         keys_file: PathBuf,
     },
+    MvccCfProbe {
+        vault: PathBuf,
+        selected_cf: String,
+        read_cf: String,
+        key_hex: Option<String>,
+        seq: u64,
+        vault_id: String,
+        vault_salt: String,
+    },
     WalSegment(PathBuf),
     Ledger {
         vault: PathBuf,
@@ -69,6 +78,22 @@ struct CfRowsReadbackRow {
     value_hex: String,
 }
 
+#[derive(Debug, Serialize)]
+struct MvccCfProbeReadback {
+    schema: &'static str,
+    vault: String,
+    selected_cf: String,
+    read_cf: String,
+    seq: u64,
+    operation: &'static str,
+    found: Option<bool>,
+    row_count: Option<usize>,
+    value_len: Option<usize>,
+    value_sha256: Option<String>,
+    value_hex: Option<String>,
+    row_stream_sha256: Option<String>,
+}
+
 pub(crate) fn try_run(args: &[String]) -> Option<CliResult> {
     if args.first().map(String::as_str) != Some("readback") {
         return None;
@@ -82,7 +107,7 @@ pub(crate) fn try_run(args: &[String]) -> Option<CliResult> {
 fn owns_form(args: &[String]) -> bool {
     matches!(
         args.get(1).map(String::as_str),
-        Some("--hex" | "--vault-tree" | "--cf-row" | "--cf-rows" | "--ledger")
+        Some("--hex" | "--vault-tree" | "--cf-row" | "--cf-rows" | "--mvcc-cf-probe" | "--ledger")
     ) || matches!(args.get(1).map(String::as_str), Some("--wal")) && args.len() == 3
 }
 
@@ -142,6 +167,71 @@ fn parse(args: &[String]) -> CliResult<ReadbackCommand> {
                 keys_file: keys_file.into(),
             })
         }
+        [
+            _,
+            flag,
+            vault,
+            selected_flag,
+            selected_cf,
+            read_flag,
+            read_cf,
+            seq_flag,
+            seq,
+            vault_id_flag,
+            vault_id,
+            vault_salt_flag,
+            vault_salt,
+        ] if flag == "--mvcc-cf-probe"
+            && selected_flag == "--selected-cf"
+            && read_flag == "--read-cf"
+            && seq_flag == "--seq"
+            && vault_id_flag == "--vault-id"
+            && vault_salt_flag == "--vault-salt" =>
+        {
+            Ok(ReadbackCommand::MvccCfProbe {
+                vault: vault.into(),
+                selected_cf: selected_cf.clone(),
+                read_cf: read_cf.clone(),
+                key_hex: None,
+                seq: parse_seq(seq)?,
+                vault_id: vault_id.clone(),
+                vault_salt: vault_salt.clone(),
+            })
+        }
+        [
+            _,
+            flag,
+            vault,
+            selected_flag,
+            selected_cf,
+            read_flag,
+            read_cf,
+            key_flag,
+            key,
+            seq_flag,
+            seq,
+            vault_id_flag,
+            vault_id,
+            vault_salt_flag,
+            vault_salt,
+        ] if flag == "--mvcc-cf-probe"
+            && selected_flag == "--selected-cf"
+            && read_flag == "--read-cf"
+            && key_flag == "--key"
+            && seq_flag == "--seq"
+            && vault_id_flag == "--vault-id"
+            && vault_salt_flag == "--vault-salt" =>
+        {
+            Ok(ReadbackCommand::MvccCfProbe {
+                vault: vault.into(),
+                selected_cf: selected_cf.clone(),
+                read_cf: read_cf.clone(),
+                key_hex: Some(key.clone()),
+                seq: parse_seq(seq)?,
+                vault_id: vault_id.clone(),
+                vault_salt: vault_salt.clone(),
+            })
+        }
         [_, flag, vault, seq_flag, seq] if flag == "--ledger" && seq_flag == "--seq" => {
             Ok(ReadbackCommand::Ledger {
                 vault: vault.into(),
@@ -149,7 +239,7 @@ fn parse(args: &[String]) -> CliResult<ReadbackCommand> {
             })
         }
         _ => Err(CliError::usage(
-            "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> [--seq <n> --vault-id <id> --vault-salt <salt>] | --cf-rows <vault> --cf <cf-name> --keys-file <json> | --wal <segment-path> | --ledger <vault> --seq <n>)",
+            "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> [--seq <n> --vault-id <id> --vault-salt <salt>] | --cf-rows <vault> --cf <cf-name> --keys-file <json> | --mvcc-cf-probe <vault> --selected-cf <cf-name> --read-cf <cf-name> [--key <hex-key>] --seq <n> --vault-id <id> --vault-salt <salt> | --wal <segment-path> | --ledger <vault> --seq <n>)",
         )),
     }
 }
@@ -169,6 +259,23 @@ fn run(command: ReadbackCommand) -> CliResult {
             cf,
             keys_file,
         } => readback_cf_rows(&vault, &cf, &keys_file),
+        ReadbackCommand::MvccCfProbe {
+            vault,
+            selected_cf,
+            read_cf,
+            key_hex,
+            seq,
+            vault_id,
+            vault_salt,
+        } => mvcc_cf_probe(
+            &vault,
+            &selected_cf,
+            &read_cf,
+            key_hex.as_deref(),
+            seq,
+            &vault_id,
+            &vault_salt,
+        ),
         ReadbackCommand::WalSegment(path) => readback_wal_segment(&path),
         ReadbackCommand::Ledger { vault, seq } => readback_ledger(&vault, seq),
     }
@@ -298,6 +405,74 @@ fn readback_cf_rows(vault: &Path, cf_name: &str, keys_file: &Path) -> CliResult 
         cf: cf.name().to_string(),
         rows,
     })
+}
+
+fn mvcc_cf_probe(
+    vault: &Path,
+    selected_cf_name: &str,
+    read_cf_name: &str,
+    key_hex: Option<&str>,
+    seq: u64,
+    vault_id: &str,
+    vault_salt: &str,
+) -> CliResult {
+    ensure_manifested_vault(vault)?;
+    let selected_cf = ops::parse_cf(selected_cf_name).map_err(CliError::usage)?;
+    let read_cf = ops::parse_cf(read_cf_name).map_err(CliError::usage)?;
+    let vault_id = vault_id
+        .parse::<calyx_core::VaultId>()
+        .map_err(|error| CliError::usage(format!("invalid --vault-id: {error}")))?;
+    let store = AsterVault::open(
+        vault,
+        vault_id,
+        vault_salt.as_bytes().to_vec(),
+        VaultOptions {
+            restore_mvcc_rows: true,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(vec![selected_cf]),
+            ..VaultOptions::default()
+        },
+    )?;
+
+    let mut report = MvccCfProbeReadback {
+        schema: "calyx.mvcc-cf-probe.v1",
+        vault: vault.display().to_string(),
+        selected_cf: selected_cf.name().to_string(),
+        read_cf: read_cf.name().to_string(),
+        seq,
+        operation: if key_hex.is_some() { "point" } else { "scan" },
+        found: None,
+        row_count: None,
+        value_len: None,
+        value_sha256: None,
+        value_hex: None,
+        row_stream_sha256: None,
+    };
+
+    if let Some(key_hex) = key_hex {
+        let key = parse_hex_bytes(key_hex, "--key")?;
+        let value = store.read_cf_at(seq, read_cf, &key)?;
+        report.found = Some(value.is_some());
+        if let Some(value) = value {
+            report.value_len = Some(value.len());
+            report.value_sha256 = Some(hex_bytes(&Sha256::digest(&value)));
+            report.value_hex = Some(hex_bytes(&value));
+        }
+    } else {
+        let rows = store.scan_cf_at(seq, read_cf)?;
+        let mut hasher = Sha256::new();
+        for (key, value) in &rows {
+            hasher.update((key.len() as u64).to_be_bytes());
+            hasher.update(key);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        report.row_count = Some(rows.len());
+        report.row_stream_sha256 = Some(hex_bytes(&hasher.finalize()));
+    }
+
+    print_json(&report)
 }
 
 fn readback_ledger(vault: &Path, seq: u64) -> CliResult {
