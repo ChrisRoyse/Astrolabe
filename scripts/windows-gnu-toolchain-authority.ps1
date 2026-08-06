@@ -9298,13 +9298,27 @@ finally {
             }
             else {
                 $shutdownWatch = [Diagnostics.Stopwatch]::StartNew()
+                $remainingProtectingChildren = @()
+                $remainingNonProtectingChildren = @()
                 do {
                     $remainingJobChildren = @(
                         $treeRecorder.GetActiveProcessIds() |
                             Where-Object { $_ -ne $PID } |
                             Sort-Object -Unique
                     )
-                    if ($remainingJobChildren.Count -eq 0) { break }
+                    $remainingProtectingChildren = @()
+                    $remainingNonProtectingChildren = @()
+                    foreach ($remainingPid in $remainingJobChildren) {
+                        $class = Get-AstroCleanupProtectionClass `
+                            -OwnerPid $remainingPid
+                        if ($class.Protection -ceq 'not_required') {
+                            $remainingNonProtectingChildren += $class
+                        }
+                        else {
+                            $remainingProtectingChildren += [int]$remainingPid
+                        }
+                    }
+                    if ($remainingProtectingChildren.Count -eq 0) { break }
                     Start-Sleep `
                         -Milliseconds $SccacheShutdownPollMilliseconds
                 } while (
@@ -9312,9 +9326,9 @@ finally {
                         $SccacheShutdownDrainSeconds
                 )
                 $shutdownWatch.Stop()
-                if ($remainingJobChildren.Count -ne 0) {
+                if ($remainingProtectingChildren.Count -ne 0) {
                     $liveDescriptions = [Collections.Generic.List[string]]::new()
-                    foreach ($livePid in $remainingJobChildren) {
+                    foreach ($livePid in $remainingProtectingChildren) {
                         $probe = Get-AstroProcessIdentityProbe $livePid
                         $rows = @(Get-CimInstance `
                             -ClassName Win32_Process `
@@ -9347,7 +9361,21 @@ finally {
                     $cleanupErrors += "SCCACHE[ASTRO_CACHE_SHUTDOWN_DRAIN_TIMEOUT]: {code=ASTRO_CACHE_SHUTDOWN_DRAIN_TIMEOUT; message=`"the exact Job retained child generation(s) $($liveDescriptions -join '; ') after the graceful sccache shutdown RPC and $($shutdownWatch.ElapsedMilliseconds) ms of a $($SccacheShutdownDrainSeconds * 1000) ms deadline`"; remediation=`"preserve every owned byte; diagnose the named exact process generations and sccache server logs, then use tracker-bound recovery only after the owner and Job are inactive`"}"
                 }
                 else {
-                    Write-Output "SCCACHE[ASTRO_CACHE_SHUTDOWN_DRAINED]: elapsed_ms=$($shutdownWatch.ElapsedMilliseconds); deadline_ms=$($SccacheShutdownDrainSeconds * 1000); pre_stop_dynamic_members=$($preStopDynamicMembers.Count); terminal_job_children=0"
+                    if ($remainingNonProtectingChildren.Count -gt 0) {
+                        $nonProtectingDescriptions = @(
+                            $remainingNonProtectingChildren |
+                                ForEach-Object {
+                                    'pid={0},ticks={1},image={2},reason={3}' -f @(
+                                        $_.Pid,
+                                        $_.ProcessStartUtcTicks,
+                                        $_.ImagePath,
+                                        $_.Reason
+                                    )
+                                }
+                        )
+                        Write-Output "SCCACHE[ASTRO_CACHE_NON_PROTECTING_CHILDREN]: count=$($remainingNonProtectingChildren.Count); members=$($nonProtectingDescriptions -join '; ')"
+                    }
+                    Write-Output "SCCACHE[ASTRO_CACHE_SHUTDOWN_DRAINED]: elapsed_ms=$($shutdownWatch.ElapsedMilliseconds); deadline_ms=$($SccacheShutdownDrainSeconds * 1000); pre_stop_dynamic_members=$($preStopDynamicMembers.Count); terminal_protecting_children=0; terminal_non_protecting_children=$($remainingNonProtectingChildren.Count)"
                 }
                 $remainingListeners = @(
                     Get-NetTCPConnection `
@@ -9408,14 +9436,37 @@ finally {
                 throw "in-process and independently opened Job Object membership differ (in_process=$($terminalJobPids -join ','), external=$($externalPids -join ','))"
             }
             $terminalChildren = @($terminalJobPids | Where-Object { $_ -ne $PID })
-            if ($terminalChildren.Count -gt 0) {
-                $deferCleanupForLiveChildren = $true
-                $cleanupErrors += "exact-session Job Object still contains child PID(s) after the recorder stop barrier: $($terminalChildren -join ', ')"
-            }
             $manifestLivePids = @($attributionProbe.LivePids)
+            $manifestNonProtecting = @($attributionProbe.NonProtecting)
+            $manifestNonProtectingPids = @(
+                $manifestNonProtecting | ForEach-Object { [int]$_.Pid }
+            )
+            $unclassifiedTerminalChildren = @(
+                $terminalChildren | Where-Object {
+                    $manifestLivePids -notcontains $_ -and
+                    $manifestNonProtectingPids -notcontains $_
+                }
+            )
+            if ($unclassifiedTerminalChildren.Count -gt 0) {
+                $deferCleanupForLiveChildren = $true
+                $cleanupErrors += "exact-session Job Object contains unclassified child PID(s) after the recorder stop barrier: $($unclassifiedTerminalChildren -join ', ')"
+            }
             if ($manifestLivePids.Count -gt 0) {
                 $deferCleanupForLiveChildren = $true
                 $cleanupErrors += "strict attribution manifest still reports live child PID(s): $($manifestLivePids -join ', ')"
+            }
+            if ($manifestNonProtecting.Count -gt 0) {
+                $terminalNonProtectingDescriptions = @(
+                    $manifestNonProtecting | ForEach-Object {
+                        'pid={0},ticks={1},image={2},reason={3}' -f @(
+                            $_.Pid,
+                            $_.ProcessStartUtcTicks,
+                            $_.ImagePath,
+                            $_.Reason
+                        )
+                    }
+                )
+                Write-Output "NO_ESCAPE[ASTRO_NON_PROTECTING_CHILDREN]: count=$($manifestNonProtecting.Count); members=$($terminalNonProtectingDescriptions -join '; ')"
             }
         }
         catch {

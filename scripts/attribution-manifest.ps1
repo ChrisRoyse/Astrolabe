@@ -1886,6 +1886,151 @@ function Test-AstroPidAlive {
         'observed'
 }
 
+function Get-AstroCleanupProtectionClass {
+    # #539: a VCTIP telemetry uploader can remain in the launcher's Job after
+    # every compiler and sccache process has exited. It does not consume target,
+    # source, TEMP, or launcher state. Classify it as non-protecting only when
+    # two process-identity reads agree and the live process has the exact
+    # no-argument MSVC toolset VCTIP shape. Every ambiguity remains protecting.
+    param([Parameter(Mandatory)][int]$OwnerPid)
+
+    try {
+        $before = Get-AstroProcessIdentityProbe -OwnerPid $OwnerPid
+        if ($before.State -ceq 'absent') {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = $null
+                Protection = 'not_required'
+                ImagePath = $null
+                Reason = 'process exited before classification'
+            }
+        }
+        if ($before.State -cne 'observed') {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = $null
+                Protection = 'unevaluable'
+                ImagePath = $null
+                Reason = "process identity is $($before.State): $($before.Error)"
+            }
+        }
+        $rows = @(Get-CimInstance -ClassName Win32_Process `
+            -Filter "ProcessId = $OwnerPid" -ErrorAction Stop)
+        if ($rows.Count -ne 1) {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+                Protection = 'unevaluable'
+                ImagePath = $null
+                Reason = "process row count is $($rows.Count), expected 1"
+            }
+        }
+        $imagePath = [string]$rows[0].ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($imagePath)) {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+                Protection = 'unevaluable'
+                ImagePath = $null
+                Reason = 'image path unreadable'
+            }
+        }
+        $imagePath = [IO.Path]::GetFullPath($imagePath)
+        if (-not [string]::Equals(
+                [IO.Path]::GetFileName($imagePath),
+                'VCTIP.EXE',
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or $imagePath -cnotmatch
+                '\\VC\\Tools\\MSVC\\[^\\]+\\bin\\Host[^\\]+\\[^\\]+\\VCTIP\.EXE$') {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+                Protection = 'required'
+                ImagePath = $imagePath
+                Reason = 'not an MSVC toolset VCTIP telemetry uploader'
+            }
+        }
+        $commandLine = [string]$rows[0].CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+                Protection = 'unevaluable'
+                ImagePath = $imagePath
+                Reason = 'command line unreadable'
+            }
+        }
+        $trimmed = $commandLine.Trim()
+        $token = $null
+        $remainder = $null
+        if ($trimmed.StartsWith('"', [StringComparison]::Ordinal)) {
+            $closing = $trimmed.IndexOf('"', 1)
+            if ($closing -gt 0) {
+                $token = $trimmed.Substring(1, $closing - 1)
+                $remainder = $trimmed.Substring($closing + 1)
+            }
+        }
+        else {
+            $space = $trimmed.IndexOf(' ')
+            if ($space -lt 0) {
+                $token = $trimmed
+                $remainder = ''
+            }
+            else {
+                $token = $trimmed.Substring(0, $space)
+                $remainder = $trimmed.Substring($space)
+            }
+        }
+        $tokenPath = if ([string]::IsNullOrWhiteSpace([string]$token)) {
+            $null
+        }
+        else { [IO.Path]::GetFullPath([string]$token) }
+        if ($null -eq $tokenPath -or
+            -not [string]::IsNullOrWhiteSpace([string]$remainder) -or
+            -not [string]::Equals(
+                $tokenPath,
+                $imagePath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+                Protection = 'required'
+                ImagePath = $imagePath
+                Reason = 'VCTIP command line is not the exact no-argument image path'
+            }
+        }
+        $after = Get-AstroProcessIdentityProbe -OwnerPid $OwnerPid
+        if ($after.State -cne 'observed' -or
+            [long]$after.ProcessStartUtcTicks -ne
+                [long]$before.ProcessStartUtcTicks) {
+            return [pscustomobject]@{
+                Pid = $OwnerPid
+                ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+                Protection = 'unevaluable'
+                ImagePath = $imagePath
+                Reason = "process generation changed during classification (state=$($after.State), ticks=$($after.ProcessStartUtcTicks))"
+            }
+        }
+        return [pscustomobject]@{
+            Pid = $OwnerPid
+            ProcessStartUtcTicks = [long]$before.ProcessStartUtcTicks
+            Protection = 'not_required'
+            ImagePath = $imagePath
+            Reason = 'exact no-argument MSVC toolset VCTIP telemetry uploader (#539)'
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Pid = $OwnerPid
+            ProcessStartUtcTicks = $null
+            Protection = 'unevaluable'
+            ImagePath = $null
+            Reason = "classification failed: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-AstroLiveAttributedPids {
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
@@ -1910,11 +2055,21 @@ function Get-AstroLiveAttributedPids {
             $jobPids -notcontains $SelfPid) {
             throw 'ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_JOB_OWNER_MISMATCH]: exact live launcher is not an observed member of its named Job Object'
         }
-        [int[]]$protecting = @($jobPids | Where-Object { $_ -ne $SelfPid })
+        $protecting = [Collections.Generic.List[int]]::new()
+        $nonProtecting = [Collections.Generic.List[object]]::new()
+        foreach ($candidate in @($jobPids | Where-Object { $_ -ne $SelfPid })) {
+            $class = Get-AstroCleanupProtectionClass -OwnerPid $candidate
+            if ($class.Protection -ceq 'not_required') {
+                $nonProtecting.Add($class)
+            }
+            else {
+                $protecting.Add([int]$candidate)
+            }
+        }
         return [pscustomobject]@{
             ManifestReadable = $true
-            LivePids = $protecting
-            NonProtecting = @()
+            LivePids = [int[]]@($protecting | Sort-Object -Unique)
+            NonProtecting = @($nonProtecting | Sort-Object Pid -Unique)
             OwnerProbe = $probe.OwnerProbe
             JobObjectProbe = $probe.JobObjectProbe
             CleanupAuthorizedForExactSelf = $protecting.Count -eq 0
