@@ -389,6 +389,7 @@ function Open-AstroAttributionArchiveLease {
         $ManifestProbe.Kind -cne 'manifest') {
         throw 'LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_MANIFEST_UNEVALUABLE]: one strict final-manifest probe is required'
     }
+    $jobMembership = $null
     if ($AuthorityMode -ceq 'live-owner') {
         if ($ManifestProbe.Parsed.SchemaVersion -ne 3 -or
             -not $ManifestProbe.Parsed.KillOnJobCloseBound -or
@@ -396,10 +397,11 @@ function Open-AstroAttributionArchiveLease {
             $ManifestProbe.Parsed.LauncherPid -ne $PID) {
             throw 'LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_LIVE_AUTHORITY_INVALID]: live archive requires the exact self-owned v3 KILL_ON_JOB_CLOSE manifest'
         }
-        [int[]]$jobPids = @($ManifestProbe.JobObjectProbe.ProcessIds)
-        if ($ManifestProbe.JobObjectProbe.State -cne 'observed' -or
-            $jobPids.Count -ne 1 -or $jobPids[0] -ne $PID) {
-            throw "LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_LIVE_JOB_OCCUPIED]: state=$($ManifestProbe.JobObjectProbe.State); pids=$($jobPids -join ',')"
+        $jobMembership = Get-AstroCleanupJobMembership `
+            -JobObjectProbe $ManifestProbe.JobObjectProbe `
+            -SelfPid $PID
+        if (-not $jobMembership.CleanupAuthorizedForExactSelf) {
+            throw "LAUNCHER_ARCHIVE[ASTRO_LAUNCHER_ARCHIVE_LIVE_JOB_OCCUPIED]: state=$($ManifestProbe.JobObjectProbe.State); all_pids=$($jobMembership.JobPids -join ','); protecting_pids=$($jobMembership.ProtectingPids -join ',')"
         }
         if ($null -eq $ExpectedBytes -or $ExpectedBytes.Length -eq 0 -or
             $ManifestProbe.Snapshot.Length -ne $ExpectedBytes.Length -or
@@ -453,6 +455,7 @@ function Open-AstroAttributionArchiveLease {
             Snapshot = $snapshot
             Parsed = $parsed
             ManifestProbe = $ManifestProbe
+            JobMembership = $jobMembership
             Archived = $false
         }
     }
