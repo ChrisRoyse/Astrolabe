@@ -321,50 +321,62 @@ pub(crate) fn optimizer_recent_changes_json_result(
         vec![ColumnFamily::Ledger],
     )?;
     let snapshot = vault.snapshot();
-    // #96: read only the ledger tail instead of walking every entry per status
-    // call. The `ledger_seq` watermark is persisted at import time and the ledger
-    // is append-only within a vault generation, so the live head is >= the
-    // watermark and the range [watermark - (limit-1), ..) always contains the
-    // true last `limit` entries. Every degradation from the tail path is labeled
-    // in the `scan` object; an underfilled tail (e.g. a watermark ahead of the
-    // visible ledger after a rebuild race) falls back to the labeled full scan
-    // rather than under-reporting recent changes.
-    let watermark = read_config_u64(cache_dir, project, "ledger_seq")?;
-    let (raw_rows, scan) = match watermark {
-        Some(head) => {
-            let tail_start = head.saturating_sub(OPTIMIZER_RECENT_CHANGE_LIMIT as u64 - 1);
+    // #96/#522: the current external Ledger head is the O(1) tail authority.
+    // A shadow publication checkpoint is an immutable historical prefix and may
+    // legitimately trail later kernel/guard/optimizer commits; using it as the
+    // live head both over-scanned and conflated writer ownership. Underfilled or
+    // anchor-divergent reads now refuse instead of falling back to a full scan.
+    let anchor = calyx_aster::ledger_head::read_head_anchor(&vault_dir)?;
+    let (raw_rows, scan, expected_rows, expected_tip_hash) = match anchor {
+        Some(anchor) => {
+            let tail_start = anchor
+                .height
+                .saturating_sub(OPTIMIZER_RECENT_CHANGE_LIMIT as u64);
             let range = KeyRange {
                 start: ledger_key(tail_start),
                 end: None,
             };
             let rows = vault.scan_cf_range_at(snapshot, ColumnFamily::Ledger, &range)?;
-            if tail_start == 0 || rows.len() >= OPTIMIZER_RECENT_CHANGE_LIMIT {
-                let scan = json!({
-                    "mode": "ledger_tail",
-                    "watermark_source": metadata_key(project, "ledger_seq"),
-                    "watermark_seq": head,
-                    "range_start_seq": tail_start,
-                });
-                (rows, scan)
-            } else {
-                let rows = vault.scan_cf_at(snapshot, ColumnFamily::Ledger)?;
-                let scan = json!({
-                    "mode": "full",
-                    "reason": "tail_scan_underfilled",
-                    "watermark_seq": head,
-                    "range_start_seq": tail_start,
-                });
-                (rows, scan)
+            let expected_rows = usize::try_from(anchor.height - tail_start).map_err(
+                |error| -> DynError {
+                    format!(
+                        "ASTRO_OPTIMIZER_LEDGER_HEAD_INVALID: project {project:?} tail length cannot fit usize: {error}; remediation: inspect the external Ledger head and vault sequence range"
+                    )
+                    .into()
+                },
+            )?;
+            if rows.len() != expected_rows {
+                return Err(format!(
+                    "ASTRO_OPTIMIZER_LEDGER_TAIL_MISMATCH: project {project:?} external head height={} requires {expected_rows} rows from seq {tail_start}, but the selected-CF snapshot returned {}; remediation: retry after the concurrent writer completes, then repair or rebuild if the mismatch persists",
+                    anchor.height,
+                    rows.len(),
+                )
+                .into());
             }
+            let scan = json!({
+                "mode": "ledger_tail",
+                "head_source": calyx_aster::ledger_head::head_anchor_path(&vault_dir),
+                "head_height": anchor.height,
+                "head_seq": anchor.height.checked_sub(1),
+                "range_start_seq": tail_start,
+            });
+            (rows, scan, expected_rows, Some(anchor.tip_hash))
         }
         None => {
             let rows = vault.scan_cf_at(snapshot, ColumnFamily::Ledger)?;
+            if !rows.is_empty() {
+                return Err(format!(
+                    "ASTRO_OPTIMIZER_LEDGER_HEAD_MISSING: project {project:?} selected-CF snapshot contains {} Ledger rows but the external head anchor is absent; remediation: preserve the vault and rebuild its Ledger head from authoritative source",
+                    rows.len()
+                )
+                .into());
+            }
             let scan = json!({
-                "mode": "full",
-                "reason": "no persisted ledger_seq watermark",
-                "watermark_source": metadata_key(project, "ledger_seq"),
+                "mode": "empty",
+                "head_source": calyx_aster::ledger_head::head_anchor_path(&vault_dir),
+                "head_height": 0,
             });
-            (rows, scan)
+            (rows, scan, 0, None)
         }
     };
     let mut entries = Vec::new();
@@ -390,7 +402,32 @@ pub(crate) fn optimizer_recent_changes_json_result(
         }
         entries.push(entry);
     }
+    if entries.len() != expected_rows {
+        return Err(format!(
+            "ASTRO_OPTIMIZER_LEDGER_TAIL_MISMATCH: project {project:?} decoded {} entries but the head-bound tail requires {expected_rows}; remediation: preserve the vault and repair the Ledger CF",
+            entries.len()
+        )
+        .into());
+    }
     entries.sort_by_key(|entry| entry.seq);
+    for pair in entries.windows(2) {
+        if pair[1].seq != pair[0].seq.saturating_add(1) || pair[1].prev_hash != pair[0].entry_hash {
+            return Err(format!(
+                "ASTRO_OPTIMIZER_LEDGER_TAIL_CHAIN_BROKEN: project {project:?} tail entries {} and {} are not a consecutive hash-chain pair; remediation: preserve the vault and run astrolabe verify --deep before serving optimizer state",
+                pair[0].seq,
+                pair[1].seq,
+            )
+            .into());
+        }
+    }
+    if let Some(expected_tip_hash) = expected_tip_hash
+        && entries.last().map(|entry| entry.entry_hash) != Some(expected_tip_hash)
+    {
+        return Err(format!(
+            "ASTRO_OPTIMIZER_LEDGER_TAIL_TIP_MISMATCH: project {project:?} decoded tail does not end at the external Ledger head hash; remediation: preserve the vault and run astrolabe verify --deep before serving optimizer state"
+        )
+        .into());
+    }
     let total_rows = entries.len();
     let mut tail = entries
         .iter()

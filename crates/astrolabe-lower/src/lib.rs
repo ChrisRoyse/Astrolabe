@@ -43,8 +43,8 @@ pub use team_artifact::{
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const ASTRO_LOWER_ACTOR: &str = "astrolabe-lower";
 pub const ASTRO_LOWERED_SQLITE_MANIFEST_PREFIX: &[u8] = b"astrolabe:lowered-sqlite:v1:";
-pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v3";
-pub const ASTRO_META_SCHEMA: &str = "astrolabe-astro-meta-v2";
+pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v4";
+pub const ASTRO_META_SCHEMA: &str = "astrolabe-astro-meta-v3";
 pub const DEFAULT_LOWERED_AT: &str = "1970-01-01T00:00:00Z";
 
 /// SQLITE_BUSY retry window for the throwaway lowered-artifact db (#76). Since the
@@ -70,8 +70,8 @@ pub const ASTRO_LOWER_ARTIFACT_UNBOUND: &str = "ASTRO_LOWER_ARTIFACT_UNBOUND";
 /// the ledgered lowering manifest committed to.
 pub const ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH: &str =
     "ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH";
-/// Stable refusal code: the artifact was lowered from an older vault state than
-/// the vault's current content fingerprint.
+/// Stable refusal code: the artifact's exact projected rows differ from the
+/// vault's current projection content.
 pub const ASTRO_LOWER_ARTIFACT_STALE: &str = "ASTRO_LOWER_ARTIFACT_STALE";
 /// Stable refusal code: the lowered artifact SQLite file could not be opened for
 /// writing at its resolved cache path — most often because the cache directory
@@ -333,8 +333,8 @@ where
 {
     let graph = read_cbm_graph_snapshot_at(vault, &options.project, snapshot)?;
     let source_ledger_head_hash = source_ledger_head_hash_at(vault, snapshot)?;
-    let vault_fingerprint_sha256 = snapshot_fingerprint(&graph, &source_ledger_head_hash);
     let lowered = LoweredRows::from_snapshot(graph, similarity_edges)?;
+    let vault_fingerprint_sha256 = lowered_projection_fingerprint(&lowered);
 
     write_sqlite_artifact(
         output_path,
@@ -372,7 +372,7 @@ pub struct AsOfLoweredArtifact {
     pub skipped_edges: usize,
     /// SHA-256 of the artifact bytes on disk.
     pub artifact_sha256: String,
-    /// Vault content fingerprint at the snapshot.
+    /// Exact lowered-projection content fingerprint at the snapshot.
     pub vault_fingerprint_sha256: String,
     /// Non-lowering ledger head hash visible at the snapshot.
     pub source_ledger_head_hash: String,
@@ -437,7 +437,8 @@ pub struct LoweredArtifactVerification {
     pub artifact_path: PathBuf,
     /// SHA-256 of the artifact bytes read back from disk during verification.
     pub artifact_sha256: String,
-    /// Vault content fingerprint recorded in `astro_meta` and the manifest.
+    /// Exact lowered-projection content fingerprint recorded in `astro_meta`
+    /// and the manifest.
     pub vault_fingerprint_sha256: String,
     /// Non-lowering ledger head hash the artifact was lowered from.
     pub source_ledger_head_hash: String,
@@ -522,9 +523,10 @@ where
         ));
     }
 
-    let current_head = source_ledger_head_hash_at(vault, vault.latest_seq())?;
     let current_snapshot = read_cbm_graph_snapshot(vault, project)?;
-    let current_fingerprint = snapshot_fingerprint(&current_snapshot, &current_head);
+    let current_similarity_edges = read_similarity_edge_rows(vault)?;
+    let current_rows = LoweredRows::from_snapshot(current_snapshot, current_similarity_edges)?;
+    let current_fingerprint = lowered_projection_fingerprint(&current_rows);
     if current_fingerprint != meta.vault_fingerprint {
         return Err(LowerError::refused(
             ASTRO_LOWER_ARTIFACT_STALE,
@@ -1327,19 +1329,22 @@ fn lowered_manifest_key(project: &str, vault_fingerprint_sha256: &str) -> Vec<u8
     key
 }
 
-fn snapshot_fingerprint(snapshot: &CbmGraphSnapshot, source_ledger_head_hash: &str) -> String {
+/// Content identity of every source row that is materialized into the lowered
+/// artifact. The capture-time Ledger head is intentionally excluded: it remains
+/// separately bound as provenance in `astro_meta` and the ledgered manifest, but
+/// later kernel/guard/optimizer-only appends do not change this projection.
+fn lowered_projection_fingerprint(rows: &LoweredRows) -> String {
     let mut hasher = Sha256::new();
-    update_str(&mut hasher, "astrolabe-cbm-snapshot-v3");
-    update_str(&mut hasher, &snapshot.project);
-    update_str(&mut hasher, source_ledger_head_hash);
-    update_opt_u32(&mut hasher, snapshot.panel_version);
-    for project in &snapshot.projects {
+    update_str(&mut hasher, "astrolabe-lowered-projection-v4");
+    update_str(&mut hasher, &rows.project);
+    update_opt_u32(&mut hasher, rows.panel_version);
+    for project in &rows.projects {
         update_str(&mut hasher, &project.project);
         update_str(&mut hasher, &project.indexed_at);
         update_str(&mut hasher, &project.root_path);
     }
-    for node in &snapshot.nodes {
-        update_i64(&mut hasher, node.source_node_id);
+    for node in &rows.nodes {
+        update_i64(&mut hasher, node.id);
         update_str(&mut hasher, &node.project);
         update_str(&mut hasher, &node.label);
         update_str(&mut hasher, &node.name);
@@ -1351,34 +1356,37 @@ fn snapshot_fingerprint(snapshot: &CbmGraphSnapshot, source_ledger_head_hash: &s
         hasher.update([u8::from(node.source_present)]);
         update_bytes(&mut hasher, &node.source_bytes);
         update_str(&mut hasher, &node.source_sha256);
-        hasher.update(node.start_byte.to_be_bytes());
-        hasher.update(node.end_byte.to_be_bytes());
+        update_i64(&mut hasher, node.start_byte);
+        update_i64(&mut hasher, node.end_byte);
         update_str(&mut hasher, &node.properties_json);
         update_bytes_opt(&mut hasher, node.node_vector.as_deref());
     }
-    for edge in &snapshot.edges {
-        update_i64(&mut hasher, edge.sqlite_edge_id);
-        update_i64(&mut hasher, edge.source_node_id);
-        update_i64(&mut hasher, edge.target_node_id);
+    for edge in &rows.edges {
+        update_i64(&mut hasher, edge.id);
+        update_str(&mut hasher, &edge.project);
+        update_i64(&mut hasher, edge.source_id);
+        update_i64(&mut hasher, edge.target_id);
         update_str(&mut hasher, &edge.edge_type);
-        update_str(&mut hasher, &edge.local_name_gen);
-        update_str(&mut hasher, &edge.preprocess_context_id_gen);
         update_str(&mut hasher, &edge.properties_json);
     }
-    for file_hash in &snapshot.file_hashes {
+    hasher.update((rows.skipped_edges as u64).to_be_bytes());
+    for file_hash in &rows.file_hashes {
+        update_str(&mut hasher, &file_hash.project);
         update_str(&mut hasher, &file_hash.rel_path);
         update_str(&mut hasher, &file_hash.sha256);
         update_i64(&mut hasher, file_hash.mtime_ns);
         update_i64(&mut hasher, file_hash.size);
     }
-    for summary in &snapshot.project_summaries {
+    for summary in &rows.project_summaries {
+        update_str(&mut hasher, &summary.project);
         update_str(&mut hasher, &summary.summary);
         update_str(&mut hasher, &summary.source_hash);
         update_str(&mut hasher, &summary.created_at);
         update_str(&mut hasher, &summary.updated_at);
     }
-    for token_vector in &snapshot.token_vectors {
+    for token_vector in &rows.token_vectors {
         update_i64(&mut hasher, token_vector.id);
+        update_str(&mut hasher, &token_vector.project);
         update_str(&mut hasher, &token_vector.token);
         update_bytes(&mut hasher, &token_vector.vector);
         update_i64(&mut hasher, token_vector.idf);

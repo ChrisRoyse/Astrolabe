@@ -19,8 +19,10 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
         .map(PathBuf::from)
         .unwrap_or_else(|| lowered_sqlite_path(cache_dir, project));
     let fingerprint = read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?;
-    let ledger_seq = read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?
-        .and_then(|value| value.parse::<u64>().ok());
+    let shadow_ledger_checkpoint = configured_vault_dir
+        .exists()
+        .then(|| read_shadow_ledger_checkpoint(cache_dir, project))
+        .transpose()?;
     let new_cx_ids = read_config_value(cache_dir, &metadata_key(project, "new_cx_ids"))?
         .and_then(|value| value.parse::<usize>().ok());
     let reused_cx_ids = read_config_value(cache_dir, &metadata_key(project, "reused_cx_ids"))?
@@ -37,19 +39,20 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
     // #96: one chain verify per index_status response. The result computed here is
     // shared with the content-freshness gate below instead of that gate re-walking
     // the whole ledger a second time within the same call.
-    let (verify_status, verify_intact) = if configured_vault_dir.exists() {
+    let (verify_status, verify_intact, ledger_head, ledger_rows) = if configured_vault_dir.exists()
+    {
         match astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir) {
             Ok(report) => {
                 let intact = report.is_intact();
-                (report.status, intact)
+                let ledger_head = report.checked_range_end.checked_sub(1);
+                let ledger_rows = Some(report.ledger_rows);
+                (report.status, intact, ledger_head, ledger_rows)
             }
-            Err(error) => (format!("error:{error}"), false),
+            Err(error) => (format!("error:{error}"), false, None, None),
         }
     } else {
-        ("missing".to_string(), false)
+        ("missing".to_string(), false, None, None)
     };
-    let ledger_rows = read_config_value(cache_dir, &metadata_key(project, "ledger_rows"))?
-        .and_then(|value| value.parse::<u64>().ok());
     let lowered_exists = lowered_path.exists();
     // Content-verified shadow freshness (#93): recomputes the live CBM SQLite
     // fingerprint and compares it to the persisted watermark rather than trusting
@@ -69,7 +72,7 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
         project,
         &verify_status,
         lowered_exists,
-        ledger_seq,
+        ledger_head,
         ledger_rows,
         Some(&background_lane),
         Some(&periodic_verify),
@@ -78,7 +81,9 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
     Ok(json!({
         "calyx": "shadow",
         "vault_fingerprint": fingerprint,
-        "vault_ledger_head": ledger_seq,
+        "vault_ledger_head": ledger_head,
+        "vault_ledger_rows": ledger_rows,
+        "shadow_ledger_checkpoint": shadow_ledger_checkpoint,
         "panel_version": panel_version,
         "shadow_import": shadow_import_current_summary(&content_verdict),
         "background_lane": background_lane,
@@ -167,7 +172,9 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
                 .unwrap_or_else(|| SHADOW_VAULT_ID.to_string()),
             "salt": read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
                 .unwrap_or_else(|| vault_salt(project)),
-            "ledger_head": ledger_seq,
+            "ledger_head": ledger_head,
+            "ledger_rows": ledger_rows,
+            "shadow_ledger_checkpoint": shadow_ledger_checkpoint,
             "verify_chain": verify_status,
         },
     }))

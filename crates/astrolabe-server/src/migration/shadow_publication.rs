@@ -83,6 +83,9 @@ type PublicationConfigReadback = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 type ShadowNoopValidation = (String, String, Vec<(String, String)>);
 
@@ -271,18 +274,14 @@ impl ShadowPublication {
                 Vec::new(),
             )?;
             let chain = verify_chain(&vault)?;
-            if !chain.is_intact()
-                || vault.latest_seq() != outcome.ledger_seq
-                || chain.ledger_rows != outcome.ledger_rows_after
-            {
+            let staged_ledger_checkpoint =
+                capture_shadow_ledger_checkpoint(&staged_vault, &vault, &chain, &self.project)?;
+            if staged_ledger_checkpoint != outcome.shadow_ledger_checkpoint {
                 return Err(format!(
-                    "ASTRO_SHADOW_PUBLICATION_VAULT_READBACK_MISMATCH: staged vault verification for project {:?} is status={:?}, latest_seq={}, ledger_rows={}; outcome binds latest_seq={}, ledger_rows={}. Remediation: abort this generation and inspect the staged writer that changed the vault after outcome construction",
+                    "ASTRO_SHADOW_PUBLICATION_VAULT_READBACK_MISMATCH: staged vault verification for project {:?} produced checkpoint {:?}; outcome binds {:?}. Remediation: abort this generation and inspect the staged writer that changed the vault after outcome construction",
                     self.project,
-                    chain.status,
-                    vault.latest_seq(),
-                    chain.ledger_rows,
-                    outcome.ledger_seq,
-                    outcome.ledger_rows_after,
+                    staged_ledger_checkpoint,
+                    outcome.shadow_ledger_checkpoint,
                 )
                 .into());
             }
@@ -507,6 +506,15 @@ impl ShadowPublication {
                         SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY,
                     ),
                 )?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, SHADOW_LEDGER_CHECKPOINT_KEY),
+                )?,
+                read_config_value(&self.live_cache, &metadata_key(&self.project, "ledger_seq"))?,
+                read_config_value(
+                    &self.live_cache,
+                    &metadata_key(&self.project, "ledger_rows"),
+                )?,
             ))
         })();
         let (
@@ -516,6 +524,9 @@ impl ShadowPublication {
             persisted_publication_generation,
             persisted_index_admission_identity,
             persisted_index_admission_publication_generation,
+            persisted_shadow_ledger_checkpoint,
+            persisted_legacy_ledger_seq,
+            persisted_legacy_ledger_rows,
         ) = match config_readback {
             Ok(readback) => readback,
             Err(error) => {
@@ -534,6 +545,7 @@ impl ShadowPublication {
         let expected_watermark =
             format_shadow_watermark(&outcome.content_freshness_watermark_sha256);
         let expected_index_admission_identity = index_admission_identity.record_json()?;
+        let expected_shadow_ledger_checkpoint = outcome.shadow_ledger_checkpoint.record_json()?;
         if persisted_source.as_deref() != Some(outcome.sqlite_path.to_string_lossy().as_ref())
             || persisted_watermark.as_deref() != Some(expected_watermark.as_str())
             || persisted_symbol_schema.as_deref() != Some(SYMBOL_CANONICAL_TAG)
@@ -542,6 +554,10 @@ impl ShadowPublication {
                 != Some(expected_index_admission_identity.as_str())
             || persisted_index_admission_publication_generation.as_deref()
                 != Some(self.generation.as_str())
+            || persisted_shadow_ledger_checkpoint.as_deref()
+                != Some(expected_shadow_ledger_checkpoint.as_str())
+            || persisted_legacy_ledger_seq.is_some()
+            || persisted_legacy_ledger_rows.is_some()
         {
             self.write_journal(
                 "committed_readback_failed",
@@ -558,6 +574,10 @@ impl ShadowPublication {
                     "expected_index_admission_identity": expected_index_admission_identity,
                     "persisted_index_admission_publication_generation": persisted_index_admission_publication_generation,
                     "expected_index_admission_publication_generation": self.generation,
+                    "persisted_shadow_ledger_checkpoint": persisted_shadow_ledger_checkpoint,
+                    "expected_shadow_ledger_checkpoint": expected_shadow_ledger_checkpoint,
+                    "persisted_legacy_ledger_seq": persisted_legacy_ledger_seq,
+                    "persisted_legacy_ledger_rows": persisted_legacy_ledger_rows,
                 }),
             )?;
             return Err(format!(
@@ -581,6 +601,9 @@ impl ShadowPublication {
                 "config_publication_generation": persisted_publication_generation,
                 "config_index_admission_identity": persisted_index_admission_identity,
                 "config_index_admission_publication_generation": persisted_index_admission_publication_generation,
+                "config_shadow_ledger_checkpoint": persisted_shadow_ledger_checkpoint,
+                "config_legacy_ledger_seq_absent": persisted_legacy_ledger_seq.is_none(),
+                "config_legacy_ledger_rows_absent": persisted_legacy_ledger_rows.is_none(),
                 "seed_lower_repair": self
                     .seed_lower_repair
                     .as_ref()
@@ -704,18 +727,18 @@ impl ShadowPublication {
             let vault =
                 open_shadow_vault_read_only(&live_vault, &vault_id, &vault_salt, Vec::new())?;
             let verification = verify_chain(&vault)?;
-            if !verification.is_intact()
-                || vault.latest_seq() != outcome.ledger_seq
-                || verification.ledger_rows != outcome.ledger_rows_after
-            {
+            let live_ledger_checkpoint = capture_shadow_ledger_checkpoint(
+                &live_vault,
+                &vault,
+                &verification,
+                &self.project,
+            )?;
+            if live_ledger_checkpoint != outcome.shadow_ledger_checkpoint {
                 return Err(format!(
-                    "ASTRO_SHADOW_NOOP_VAULT_MISMATCH: live vault verification for project {:?} is status={:?}, latest_seq={}, ledger_rows={}; unchanged staged outcome expected latest_seq={}, ledger_rows={}; remediation: preserve both generations, inspect the exact ledger divergence, and rebuild from source",
+                    "ASTRO_SHADOW_NOOP_VAULT_MISMATCH: live vault verification for project {:?} produced checkpoint {:?}; unchanged staged outcome requires {:?}; remediation: preserve both generations, inspect the exact ledger divergence, and rebuild from source",
                     self.project,
-                    verification.status,
-                    vault.latest_seq(),
-                    verification.ledger_rows,
-                    outcome.ledger_seq,
-                    outcome.ledger_rows_after
+                    live_ledger_checkpoint,
+                    outcome.shadow_ledger_checkpoint,
                 )
                 .into());
             }
@@ -770,8 +793,7 @@ impl ShadowPublication {
             json!({
                 "source_sha256": source_hash,
                 "lowered_sha256": lowered_hash,
-                "ledger_seq": outcome.ledger_seq,
-                "ledger_rows": outcome.ledger_rows_after,
+                "validated_live_ledger_state": outcome.shadow_ledger_checkpoint,
                 "live_generation_preserved": true,
                 "stage_publication_skipped": true,
             }),
@@ -1345,6 +1367,9 @@ fn publication_recovery_relevant_config_rows(
 ) -> Result<Vec<(String, String)>, DynError> {
     let mut keys = action_metadata_keys(project);
     keys.push(metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY));
+    keys.push(metadata_key(project, SHADOW_LEDGER_CHECKPOINT_KEY));
+    keys.push(metadata_key(project, "ledger_seq"));
+    keys.push(metadata_key(project, "ledger_rows"));
     keys.sort();
     keys.dedup();
     let mut rows = Vec::new();

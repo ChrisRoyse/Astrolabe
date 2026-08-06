@@ -38,6 +38,14 @@ pub(crate) const SHADOW_PUBLICATION_GENERATION_KEY: &str = "shadow_publication_g
 /// while atomically advancing the action-derived metadata that was proven over it.
 pub(crate) const SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY: &str =
     "index_admission_publication_generation";
+/// Versioned immutable ledger-prefix witness owned by one published shadow generation.
+///
+/// This is deliberately not the mutable vault head: kernel, guard, optimizer, and other
+/// derived writers may append valid Ledger-paired commits after shadow publication. A
+/// no-op admission proves this exact prefix still exists before accepting that suffix.
+pub(crate) const SHADOW_LEDGER_CHECKPOINT_KEY: &str = "shadow_ledger_checkpoint_json";
+pub(crate) const SHADOW_LEDGER_CHECKPOINT_SCHEMA: &str = "astrolabe.shadow-ledger-checkpoint.v1";
+pub(crate) const SHADOW_LEDGER_TIP_HASH_ALGORITHM: &str = "blake3-256";
 /// The required row-stream import failed. No alternate representation is
 /// accepted: it would hide the failed source and could publish incomplete
 /// kernel/provenance state.
@@ -66,6 +74,55 @@ pub(crate) const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow impor
 pub(crate) const SHADOW_LOWERED_MISSING_REMEDIATION: &str = "the lowered artifact is absent; rerun index_repository with calyx=\"shadow\" to rebuild it from current source";
 pub(crate) const SHADOW_VERIFY_NOT_INTACT_REMEDIATION: &str = "the vault ledger chain does not verify intact; quarantine the vault and rerun index_repository with calyx=\"shadow\" to rebuild from current source";
 pub(crate) const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since the last shadow import; rerun index_repository with calyx=\"shadow\" so the vault, the lowered artifact, and the row-sink-derived surfaces (provenance, security screen, skill tree, bridges, kernel context, anomalies) are all rebuilt from current source. index_status will not reconcile this for you: it has no CBM tool runner and would have to overwrite those surfaces with \"unavailable\"";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShadowLedgerCheckpoint {
+    pub(crate) schema: String,
+    /// Aster MVCC commit at which the shadow generation was complete.
+    pub(crate) mvcc_commit_seq: u64,
+    /// Exclusive Ledger sequence at that commit.
+    pub(crate) ledger_height: u64,
+    pub(crate) tip_hash_algorithm: String,
+    /// Canonical lower-hex Ledger entry hash at `ledger_height - 1`, or the
+    /// all-zero genesis hash when the ledger is empty.
+    pub(crate) tip_hash_hex: String,
+}
+
+impl ShadowLedgerCheckpoint {
+    pub(crate) fn tip_seq(&self) -> Option<u64> {
+        self.ledger_height.checked_sub(1)
+    }
+
+    pub(crate) fn record_json(&self) -> Result<String, DynError> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn validate_contract(&self, project: &str) -> Result<(), DynError> {
+        let valid_hash = self.tip_hash_hex.len() == 64
+            && self
+                .tip_hash_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.tip_hash_hex == self.tip_hash_hex.to_ascii_lowercase();
+        if self.schema != SHADOW_LEDGER_CHECKPOINT_SCHEMA
+            || self.tip_hash_algorithm != SHADOW_LEDGER_TIP_HASH_ALGORITHM
+            || !valid_hash
+            || (self.ledger_height == 0 && self.tip_hash_hex != "0".repeat(64))
+            || (self.ledger_height != 0 && self.tip_hash_hex == "0".repeat(64))
+        {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_INVALID: project {project:?} has checkpoint schema={:?}, height={}, tip_hash_algorithm={:?}, tip_hash_hex={:?}; remediation: preserve the generation and rebuild it from authoritative source so an exact versioned ledger-prefix witness is published",
+                self.schema,
+                self.ledger_height,
+                self.tip_hash_algorithm,
+                self.tip_hash_hex,
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowImportOutcome {
@@ -121,8 +178,7 @@ pub(crate) struct ShadowImportOutcome {
     /// Unforgeable readback witness for the SQLite/row-sink import mutation.
     pub(crate) import_fsv: Option<astrolabe_domain::fsv::FsvAck>,
     pub(crate) cx_id_set_sha256: String,
-    pub(crate) ledger_seq: u64,
-    pub(crate) ledger_rows_after: u64,
+    pub(crate) shadow_ledger_checkpoint: ShadowLedgerCheckpoint,
     pub(crate) verify_chain_status: String,
     pub(crate) vault_import_source: String,
     pub(crate) vault_import_fallback_reason: Option<String>,
@@ -1456,6 +1512,8 @@ pub(crate) fn shadow_index_admission_identity(
             "git_source_fingerprint_version": astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_VERSION,
             "shadow_watermark_algo": SHADOW_WATERMARK_ALGO,
             "shadow_watermark_version": SHADOW_WATERMARK_VERSION,
+            "shadow_ledger_checkpoint_schema": SHADOW_LEDGER_CHECKPOINT_SCHEMA,
+            "shadow_ledger_tip_hash_algorithm": SHADOW_LEDGER_TIP_HASH_ALGORITHM,
         },
         "producer_executable_sha256": producer_executable_sha256,
     });
@@ -2006,6 +2064,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         let git_archaeology =
             read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
         let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
+        let shadow_ledger_checkpoint =
+            capture_shadow_ledger_checkpoint(&vault_dir, &vault, &verify, project)?;
         return Ok(ShadowImportOutcome {
             publication_required: false,
             metadata_publication_required,
@@ -2043,8 +2103,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             series_mutated_rows: report.series_mutated_rows,
             import_fsv: report.fsv.clone(),
             cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
-            ledger_seq: vault.latest_seq(),
-            ledger_rows_after: verify.ledger_rows,
+            shadow_ledger_checkpoint,
             verify_chain_status: verify.status,
             vault_import_source,
             vault_import_fallback_reason,
@@ -2230,10 +2289,16 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     }
     let total_records = (report.sqlite_nodes as u64).saturating_add(report.sqlite_edges as u64);
     let search_scale = search_scale_summary(search_scale_settings, total_records)?;
+    let shadow_ledger_checkpoint =
+        capture_shadow_ledger_checkpoint(&vault_dir, &vault, &verify, project)?;
+    let shadow_ledger_head = LedgerPointer::new(
+        shadow_ledger_checkpoint.tip_seq().unwrap_or(0),
+        shadow_ledger_checkpoint.tip_hash_hex.clone(),
+    );
     let provenance = provenance_surface_with_chain(
         shadow_import.provenance,
         &lower_state.vault_fingerprint_sha256,
-        lower_state.manifest_seq,
+        &shadow_ledger_head,
         &verify,
     );
 
@@ -2266,8 +2331,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         series_mutated_rows: report.series_mutated_rows,
         import_fsv: report.fsv.clone(),
         cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
-        ledger_seq: vault.latest_seq(),
-        ledger_rows_after: verify.ledger_rows,
+        shadow_ledger_checkpoint,
         verify_chain_status: verify.status,
         vault_import_source: shadow_import.source,
         vault_import_fallback_reason: shadow_import.fallback_reason,
@@ -3499,6 +3563,172 @@ fn read_lower_config_usize(
         .transpose()
 }
 
+pub(crate) fn capture_shadow_ledger_checkpoint<C>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    chain: &astrolabe_ingest::VerifyChainReport,
+    project: &str,
+) -> Result<ShadowLedgerCheckpoint, DynError>
+where
+    C: Clock,
+{
+    if !chain.is_intact() {
+        return Err(format!(
+            "ASTRO_SHADOW_LEDGER_CHECKPOINT_CHAIN_NOT_INTACT: project {project:?} cannot capture a shadow checkpoint from ledger status {:?}; remediation: preserve the vault, inspect the reported chain break, and rebuild from authoritative source",
+            chain.status
+        )
+        .into());
+    }
+    let anchor = calyx_aster::ledger_head::read_head_anchor(vault_dir)?;
+    let (ledger_height, tip_hash) = match anchor {
+        Some(anchor) => {
+            if anchor.height != chain.ledger_rows
+                || anchor.height != chain.checked_range_end
+                || chain.count != anchor.height
+            {
+                return Err(format!(
+                    "ASTRO_SHADOW_LEDGER_CHECKPOINT_HEAD_MISMATCH: project {project:?} external ledger head height={} does not equal verified rows={}, checked_end={}, count={}; remediation: preserve the vault and repair or rebuild its head anchor before publishing a shadow generation",
+                    anchor.height,
+                    chain.ledger_rows,
+                    chain.checked_range_end,
+                    chain.count,
+                )
+                .into());
+            }
+            (anchor.height, anchor.tip_hash)
+        }
+        None if chain.ledger_rows == 0 && chain.checked_range_end == 0 && chain.count == 0 => {
+            (0, [0_u8; 32])
+        }
+        None => {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_HEAD_MISSING: project {project:?} verified {} ledger rows but has no external head anchor; remediation: preserve the vault and rebuild its ledger from authoritative source before publishing",
+                chain.ledger_rows
+            )
+            .into());
+        }
+    };
+
+    if let Some(tip_seq) = ledger_height.checked_sub(1) {
+        let bytes = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(tip_seq))?
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_SHADOW_LEDGER_CHECKPOINT_TIP_MISSING: project {project:?} external head names height={ledger_height}, but Ledger seq {tip_seq} is absent at MVCC seq {}; remediation: preserve the vault and rebuild from authoritative source",
+                    vault.latest_seq()
+                )
+                .into()
+            })?;
+        let entry = decode_ledger(&bytes).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_TIP_CORRUPT: project {project:?} Ledger seq {tip_seq} cannot be decoded: {error}; remediation: preserve the vault and rebuild from authoritative source"
+            )
+            .into()
+        })?;
+        if entry.seq != tip_seq || !entry.verify() || entry.entry_hash != tip_hash {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_TIP_MISMATCH: project {project:?} external head at seq {tip_seq} does not match its canonical Ledger row (entry_seq={}, entry_verified={}, entry_hash={}, anchor_hash={}); remediation: preserve the vault and rebuild from authoritative source",
+                entry.seq,
+                entry.verify(),
+                hex_lower(&entry.entry_hash),
+                hex_lower(&tip_hash),
+            )
+            .into());
+        }
+    }
+
+    let checkpoint = ShadowLedgerCheckpoint {
+        schema: SHADOW_LEDGER_CHECKPOINT_SCHEMA.to_string(),
+        mvcc_commit_seq: vault.latest_seq(),
+        ledger_height,
+        tip_hash_algorithm: SHADOW_LEDGER_TIP_HASH_ALGORITHM.to_string(),
+        tip_hash_hex: hex_lower(&tip_hash),
+    };
+    checkpoint.validate_contract(project)?;
+    Ok(checkpoint)
+}
+
+pub(crate) fn read_shadow_ledger_checkpoint(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<ShadowLedgerCheckpoint, DynError> {
+    let key = metadata_key(project, SHADOW_LEDGER_CHECKPOINT_KEY);
+    let raw = required_shadow_config_value(cache_dir, project, SHADOW_LEDGER_CHECKPOINT_KEY)?;
+    let checkpoint = serde_json::from_str::<ShadowLedgerCheckpoint>(&raw).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_INVALID: persisted metadata {key:?} is not a valid strict checkpoint: {error}; remediation: preserve the generation and rebuild it from authoritative source"
+            )
+            .into()
+        },
+    )?;
+    checkpoint.validate_contract(project)?;
+    Ok(checkpoint)
+}
+
+fn validate_shadow_ledger_checkpoint_suffix<C>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    chain: &astrolabe_ingest::VerifyChainReport,
+    project: &str,
+    expected: &ShadowLedgerCheckpoint,
+) -> Result<ShadowLedgerCheckpoint, DynError>
+where
+    C: Clock,
+{
+    expected.validate_contract(project)?;
+    let current = capture_shadow_ledger_checkpoint(vault_dir, vault, chain, project)?;
+    if current.mvcc_commit_seq < expected.mvcc_commit_seq
+        || current.ledger_height < expected.ledger_height
+        || (current.mvcc_commit_seq == expected.mvcc_commit_seq
+            && current.ledger_height != expected.ledger_height)
+        || (current.mvcc_commit_seq > expected.mvcc_commit_seq
+            && current.ledger_height == expected.ledger_height)
+    {
+        return Err(format!(
+            "ASTRO_SHADOW_LEDGER_CHECKPOINT_REGRESSED: project {project:?} current checkpoint is mvcc_seq={}, ledger_height={}, while the published shadow prefix requires mvcc_seq={}, ledger_height={}; remediation: preserve the mixed generation and inspect the exact unpaired, truncated, or regressed vault mutation before rebuilding from source",
+            current.mvcc_commit_seq,
+            current.ledger_height,
+            expected.mvcc_commit_seq,
+            expected.ledger_height,
+        )
+        .into());
+    }
+
+    if let Some(tip_seq) = expected.tip_seq() {
+        let bytes = vault
+            .read_cf_at(
+                expected.mvcc_commit_seq,
+                ColumnFamily::Ledger,
+                &ledger_key(tip_seq),
+            )?
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_MISSING: project {project:?} published shadow prefix requires Ledger seq {tip_seq} at historical MVCC seq {}, but it is absent; remediation: preserve the vault and rebuild from authoritative source",
+                    expected.mvcc_commit_seq,
+                )
+                .into()
+            })?;
+        let entry = decode_ledger(&bytes).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_CORRUPT: project {project:?} published shadow tip at Ledger seq {tip_seq} cannot be decoded: {error}; remediation: preserve the vault and rebuild from authoritative source"
+            )
+            .into()
+        })?;
+        let actual_hash = hex_lower(&entry.entry_hash);
+        if entry.seq != tip_seq || !entry.verify() || actual_hash != expected.tip_hash_hex {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_MISMATCH: project {project:?} published shadow tip requires seq={tip_seq}, hash={}, but current readback has seq={}, verified={}, hash={actual_hash}; remediation: preserve the rewritten prefix and rebuild from authoritative source",
+                expected.tip_hash_hex,
+                entry.seq,
+                entry.verify(),
+            )
+            .into());
+        }
+    }
+    Ok(current)
+}
+
 fn read_required_shadow_json(
     cache_dir: &Path,
     project: &str,
@@ -3666,23 +3896,25 @@ pub(crate) fn try_shadow_index_noop_admission(
     )?);
     let vault_id = required_shadow_config_value(cache_dir, project, "vault_id")?;
     let vault_salt = required_shadow_config_value(cache_dir, project, "vault_salt")?;
-    let expected_ledger_seq = required_shadow_config_u64(cache_dir, project, "ledger_seq")?;
-    let expected_ledger_rows = required_shadow_config_u64(cache_dir, project, "ledger_rows")?;
+    let expected_ledger_checkpoint = read_shadow_ledger_checkpoint(cache_dir, project)?;
+    for legacy in ["ledger_seq", "ledger_rows"] {
+        if read_config_value(cache_dir, &metadata_key(project, legacy))?.is_some() {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_LEGACY_ALIAS_PRESENT: project {project:?} still contains retired config key {legacy:?} beside the strict checkpoint; remediation: preserve the mixed metadata and run one current-producer rebuild so the atomic publication transaction retires the alias"
+            )
+            .into());
+        }
+    }
     let vault =
         open_shadow_vault_read_only(&configured_vault_dir, &vault_id, &vault_salt, Vec::new())?;
     let chain = verify_chain(&vault)?;
-    if !chain.is_intact()
-        || vault.latest_seq() != expected_ledger_seq
-        || chain.ledger_rows != expected_ledger_rows
-    {
-        return Err(format!(
-            "ASTRO_SHADOW_NOOP_VAULT_MISMATCH: project {project:?} physical vault readback is status={:?}, latest_seq={}, ledger_rows={}; config binds latest_seq={expected_ledger_seq}, ledger_rows={expected_ledger_rows}; remediation: preserve the mixed generation and rebuild only after inspecting the exact ledger divergence",
-            chain.status,
-            vault.latest_seq(),
-            chain.ledger_rows
-        )
-        .into());
-    }
+    let current_ledger_checkpoint = validate_shadow_ledger_checkpoint_suffix(
+        &configured_vault_dir,
+        &vault,
+        &chain,
+        project,
+        &expected_ledger_checkpoint,
+    )?;
     let lowered_verification =
         verify_lowered_artifact(&vault, &lowered_path, project).map_err(|error| -> DynError {
             format!(
@@ -3866,8 +4098,8 @@ pub(crate) fn try_shadow_index_noop_admission(
         project,
         &chain.status,
         true,
-        Some(expected_ledger_seq),
-        Some(expected_ledger_rows),
+        current_ledger_checkpoint.tip_seq(),
+        Some(current_ledger_checkpoint.ledger_height),
         None,
         None,
     );
@@ -3965,10 +4197,23 @@ pub(crate) fn try_shadow_index_noop_admission(
             ),
             ("vault_id".to_string(), Value::String(vault_id)),
             ("vault_salt".to_string(), Value::String(vault_salt)),
-            ("ledger_seq".to_string(), Value::from(expected_ledger_seq)),
+            (
+                "ledger_seq".to_string(),
+                current_ledger_checkpoint
+                    .tip_seq()
+                    .map_or(Value::Null, Value::from),
+            ),
             (
                 "ledger_rows_after".to_string(),
-                Value::from(expected_ledger_rows),
+                Value::from(current_ledger_checkpoint.ledger_height),
+            ),
+            (
+                "shadow_ledger_checkpoint".to_string(),
+                serde_json::to_value(&expected_ledger_checkpoint)?,
+            ),
+            (
+                "current_ledger_checkpoint".to_string(),
+                serde_json::to_value(&current_ledger_checkpoint)?,
             ),
             ("verify_chain".to_string(), Value::String(chain.status)),
             ("fsv".to_string(), Value::Null),
@@ -4228,8 +4473,9 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, 
         "vault_dir": outcome.vault_dir,
         "vault_id": outcome.vault_id,
         "vault_salt": outcome.vault_salt,
-        "ledger_seq": outcome.ledger_seq,
-        "ledger_rows_after": outcome.ledger_rows_after,
+        "ledger_seq": outcome.shadow_ledger_checkpoint.tip_seq(),
+        "ledger_rows_after": outcome.shadow_ledger_checkpoint.ledger_height,
+        "shadow_ledger_checkpoint": outcome.shadow_ledger_checkpoint,
         "verify_chain": outcome.verify_chain_status,
         "fsv": outcome.import_fsv.as_ref().map(fsv_ack_envelope),
         "panel_version": SHADOW_PANEL_VERSION,
@@ -4292,8 +4538,8 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, 
             outcome_project_label(outcome),
             &outcome.verify_chain_status,
             outcome.lowered_sqlite_path.exists(),
-            Some(outcome.ledger_seq),
-            Some(outcome.ledger_rows_after),
+            outcome.shadow_ledger_checkpoint.tip_seq(),
+            Some(outcome.shadow_ledger_checkpoint.ledger_height),
             None,
             None,
         ),
@@ -4684,8 +4930,10 @@ pub(crate) fn persist_shadow_publication_at(
         ),
         (LOWERING_PENDING_KEY, "false".to_string()),
         (LOWERING_DEBOUNCE_STATUS_KEY, lowering_status_json),
-        ("ledger_seq", outcome.ledger_seq.to_string()),
-        ("ledger_rows", outcome.ledger_rows_after.to_string()),
+        (
+            SHADOW_LEDGER_CHECKPOINT_KEY,
+            outcome.shadow_ledger_checkpoint.record_json()?,
+        ),
         ("panel_version", SHADOW_PANEL_VERSION.to_string()),
         ("symbol_canonical_schema", SYMBOL_CANONICAL_TAG.to_string()),
         ("structural_only", outcome.structural_only.to_string()),
@@ -4716,6 +4964,15 @@ pub(crate) fn persist_shadow_publication_at(
         tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
             params![metadata_key(project, key), value],
+        )?;
+    }
+    // Retire the ambiguous pre-v1 aliases. They held a historical shadow
+    // publication checkpoint, while readers treated them as the mutable live
+    // Ledger head and the lowering lane could overwrite one with a manifest seq.
+    for legacy in ["ledger_seq", "ledger_rows"] {
+        tx.execute(
+            "DELETE FROM config WHERE key = ?",
+            params![metadata_key(project, legacy)],
         )?;
     }
     if let Some(head) = outcome.git_archaeology.get("head").and_then(Value::as_str) {

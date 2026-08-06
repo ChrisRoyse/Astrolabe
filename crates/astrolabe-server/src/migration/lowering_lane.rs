@@ -158,7 +158,6 @@ pub(crate) fn persist_regenerated_lowering(
         ("lowered_nodes", report.node_count.to_string()),
         ("lowered_edges", report.edge_count.to_string()),
         ("lowered_skipped_edges", report.skipped_edges.to_string()),
-        ("ledger_seq", report.manifest_seq.to_string()),
     ] {
         tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",

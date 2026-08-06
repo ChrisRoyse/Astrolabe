@@ -29,18 +29,22 @@ pub(crate) fn optimizer_status_json_at(
     astrolabe_anneal_env: Option<&str>,
 ) -> Result<Value, DynError> {
     let (vault_dir, vault_id, _vault_salt) = shadow_vault_config_at(cache_dir, project)?;
-    let ledger_head = read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?
-        .and_then(|value| value.parse::<u64>().ok());
-    let ledger_rows = read_config_value(cache_dir, &metadata_key(project, "ledger_rows"))?
-        .and_then(|value| value.parse::<u64>().ok());
-    let verify_status = if vault_dir.exists() {
+    let (verify_status, ledger_head, ledger_rows) = if vault_dir.exists() {
         match astrolabe_ingest::verify_chain_vault_path(&vault_dir) {
-            Ok(report) => report.status,
-            Err(error) => format!("error:{error}"),
+            Ok(report) => (
+                report.status,
+                report.checked_range_end.checked_sub(1),
+                Some(report.ledger_rows),
+            ),
+            Err(error) => (format!("error:{error}"), None, None),
         }
     } else {
-        "missing".to_string()
+        ("missing".to_string(), None, None)
     };
+    let shadow_ledger_checkpoint = vault_dir
+        .exists()
+        .then(|| read_shadow_ledger_checkpoint(cache_dir, project))
+        .transpose()?;
     let background_lane = background_lane_status_at(cache_dir, project)?;
     let kill_switch = optimizer_kill_switch_json(astrolabe_anneal_env);
     let global_freeze = kill_switch["global_freeze"].as_bool().unwrap_or(false);
@@ -70,12 +74,12 @@ pub(crate) fn optimizer_status_json_at(
             "chain_verify": verify_status,
             "ledger_head": ledger_head,
             "ledger_rows": ledger_rows,
+            "shadow_ledger_checkpoint": shadow_ledger_checkpoint,
             "metadata_refs": [
                 metadata_key(project, "vault_dir"),
                 metadata_key(project, "vault_id"),
                 metadata_key(project, "vault_salt"),
-                metadata_key(project, "ledger_seq"),
-                metadata_key(project, "ledger_rows"),
+                metadata_key(project, SHADOW_LEDGER_CHECKPOINT_KEY),
                 metadata_key(project, "optimizer_freezes_json"),
                 metadata_key(project, "optimizer_deficits_json"),
                 metadata_key(project, "optimizer_proposals_json")

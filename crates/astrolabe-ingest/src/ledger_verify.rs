@@ -67,6 +67,16 @@ where
 
 /// Opens a physical durable Aster ledger view and verifies its hash chain.
 pub fn verify_chain_vault_path(vault_dir: impl AsRef<Path>) -> IngestResult<VerifyChainReport> {
+    Ok(verify_chain_and_head_vault_path(vault_dir)?.0)
+}
+
+/// Opens one physical durable Ledger snapshot and returns both its verified
+/// chain report and the exact external head anchor copied under the same commit
+/// lock. Callers that need a current `(height, tip hash)` must use this paired
+/// read instead of combining a historical subsystem checkpoint with the live log.
+pub fn verify_chain_and_head_vault_path(
+    vault_dir: impl AsRef<Path>,
+) -> IngestResult<(VerifyChainReport, Option<LedgerHeadAnchor>)> {
     let vault_dir = vault_dir.as_ref();
     if !vault_dir.exists() {
         return Err(IngestError::InvalidInput(format!(
@@ -80,11 +90,13 @@ pub fn verify_chain_vault_path(vault_dir: impl AsRef<Path>) -> IngestResult<Veri
             if error.code == "CALYX_LEDGER_CORRUPT"
                 && error.message.contains("requires real Aster ledger state") =>
         {
-            return Ok(empty_report());
+            return Ok((empty_report(), None));
         }
         Err(error) => return Err(error.into()),
     };
-    verify_store_chain(&store)
+    let anchor = store.head_anchor()?;
+    let report = verify_store_chain(&store)?;
+    Ok((report, anchor))
 }
 
 pub(crate) fn verify_ledger_pairing<C>(

@@ -606,26 +606,25 @@ pub(crate) fn freshness_from_value(value: &Value) -> Option<Freshness> {
 pub(crate) fn provenance_surface_with_chain(
     mut surface: Value,
     vault_fingerprint: &str,
-    ledger_seq: u64,
+    ledger_head: &LedgerPointer,
     verify: &astrolabe_ingest::VerifyChainReport,
 ) -> Value {
     if surface.get("status").and_then(Value::as_str) == Some("unavailable") {
         return surface;
     }
-    let ledger_head = LedgerPointer::new(ledger_seq, vault_fingerprint);
     let chain = chain_verification_from_report(verify, ledger_head.clone());
     if let Some(store) = surface.get_mut("store").and_then(Value::as_object_mut) {
         store.insert(
             "vault_fingerprint".to_string(),
             Value::String(vault_fingerprint.to_string()),
         );
-        store.insert("ledger_head".to_string(), ledger_pointer_json(&ledger_head));
+        store.insert("ledger_head".to_string(), ledger_pointer_json(ledger_head));
         store.insert("chain".to_string(), chain_verification_json(&chain));
         refresh_manifest_vault_fingerprints(store, vault_fingerprint);
-        refresh_derived_lineage_ledgers(store, &ledger_head);
+        refresh_derived_lineage_ledgers(store, ledger_head);
     }
     surface["vault_fingerprint"] = Value::String(vault_fingerprint.to_string());
-    surface["ledger_head"] = ledger_pointer_json(&ledger_head);
+    surface["ledger_head"] = ledger_pointer_json(ledger_head);
     surface["chain"] = chain_verification_json(&chain);
     // #209: the chain just swapped in is a *different* verification result from the one the
     // surface was originally labeled against — this is the surface that gets persisted, so
@@ -929,12 +928,12 @@ pub(crate) fn provenance_store_for_project(
         )
         .into());
     }
-    let verify = astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)?;
+    let (verify, ledger_anchor) =
+        astrolabe_ingest::verify_chain_and_head_vault_path(&configured_vault_dir)?;
     // Verify-relevant metadata must be present and well-formed. A missing fingerprint
-    // used to silently fall back to the ledger chain hash and a corrupt `ledger_seq`
-    // silently fell back to the persisted head seq, fabricating verification inputs and
-    // a freshness watermark. Both now fail closed with a coded `{code,message,remediation}`
-    // error rather than reading as verified/fresh.
+    // used to silently fall back to the ledger chain hash. The current Ledger
+    // pointer is read from the physical head anchor under the same snapshot as
+    // chain verification; a shadow publication checkpoint is not a live head.
     let chain_hash = astrolabe_provenance::require_verify_metadata(
         "lowered_vault_fingerprint_sha256",
         read_config_value(
@@ -943,11 +942,26 @@ pub(crate) fn provenance_store_for_project(
         )?
         .as_deref(),
     )?;
-    let ledger_seq = astrolabe_provenance::require_ledger_seq(
-        "ledger_seq",
-        read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?.as_deref(),
-    )?;
-    let ledger_head = LedgerPointer::new(ledger_seq, chain_hash.clone());
+    let ledger_anchor = ledger_anchor.ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_PROVENANCE_LEDGER_HEAD_MISSING: project {project:?} has no physical Ledger head anchor; remediation: preserve the vault and rebuild it from authoritative source before serving provenance"
+        )
+        .into()
+    })?;
+    if ledger_anchor.height == 0
+        || ledger_anchor.height != verify.ledger_rows
+        || ledger_anchor.height != verify.checked_range_end
+    {
+        return Err(format!(
+            "ASTRO_PROVENANCE_LEDGER_HEAD_MISMATCH: project {project:?} physical head height={} does not equal verified rows={} and checked_end={}; remediation: preserve the vault and repair or rebuild the Ledger before serving provenance",
+            ledger_anchor.height,
+            verify.ledger_rows,
+            verify.checked_range_end,
+        )
+        .into());
+    }
+    let ledger_head =
+        LedgerPointer::new(ledger_anchor.height - 1, hex_lower(&ledger_anchor.tip_hash));
     store.vault_fingerprint = chain_hash;
     store.ledger_head = ledger_head.clone();
     store.chain = chain_verification_from_report(&verify, ledger_head);
