@@ -2031,6 +2031,50 @@ function Get-AstroCleanupProtectionClass {
     }
 }
 
+function Get-AstroCleanupJobMembership {
+    # Interpret one independently queried Job snapshot through the same
+    # cleanup-protection policy at every launcher barrier.  Raw Job membership
+    # remains the causal source of truth; classification only distinguishes the
+    # exact inert VCTIP shape from children that can still consume owned state.
+    # Any missing owner, unreadable Job, or ambiguous child remains preserving.
+    param(
+        [Parameter(Mandatory)]$JobObjectProbe,
+        [Parameter(Mandatory)][int]$SelfPid
+    )
+
+    if ($JobObjectProbe.State -cne 'observed') {
+        throw "ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_JOB_UNEVALUABLE]: Job Object state is '$($JobObjectProbe.State)' ($($JobObjectProbe.Error))"
+    }
+    [int[]]$jobPids = @(
+        $JobObjectProbe.ProcessIds | Sort-Object -Unique
+    )
+    if ($jobPids -notcontains $SelfPid) {
+        throw "ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_JOB_OWNER_MISMATCH]: exact cleanup caller PID $SelfPid is not a member of its observed Job Object (pids=$($jobPids -join ','))"
+    }
+
+    $protecting = [Collections.Generic.List[object]]::new()
+    $nonProtecting = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($jobPids | Where-Object { $_ -ne $SelfPid })) {
+        $class = Get-AstroCleanupProtectionClass -OwnerPid $candidate
+        if ($class.Protection -ceq 'not_required') {
+            $nonProtecting.Add($class)
+        }
+        else {
+            $protecting.Add($class)
+        }
+    }
+    return [pscustomobject]@{
+        JobPids = [int[]]$jobPids
+        Protecting = @($protecting | Sort-Object Pid -Unique)
+        ProtectingPids = [int[]]@(
+            $protecting | ForEach-Object { [int]$_.Pid } |
+                Sort-Object -Unique
+        )
+        NonProtecting = @($nonProtecting | Sort-Object Pid -Unique)
+        CleanupAuthorizedForExactSelf = $protecting.Count -eq 0
+    }
+}
+
 function Get-AstroLiveAttributedPids {
     param(
         [Parameter(Mandatory)][string]$ManifestPath,
@@ -2055,24 +2099,17 @@ function Get-AstroLiveAttributedPids {
             $jobPids -notcontains $SelfPid) {
             throw 'ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_JOB_OWNER_MISMATCH]: exact live launcher is not an observed member of its named Job Object'
         }
-        $protecting = [Collections.Generic.List[int]]::new()
-        $nonProtecting = [Collections.Generic.List[object]]::new()
-        foreach ($candidate in @($jobPids | Where-Object { $_ -ne $SelfPid })) {
-            $class = Get-AstroCleanupProtectionClass -OwnerPid $candidate
-            if ($class.Protection -ceq 'not_required') {
-                $nonProtecting.Add($class)
-            }
-            else {
-                $protecting.Add([int]$candidate)
-            }
-        }
+        $membership = Get-AstroCleanupJobMembership `
+            -JobObjectProbe $probe.JobObjectProbe `
+            -SelfPid $SelfPid
         return [pscustomobject]@{
             ManifestReadable = $true
-            LivePids = [int[]]@($protecting | Sort-Object -Unique)
-            NonProtecting = @($nonProtecting | Sort-Object Pid -Unique)
+            LivePids = [int[]]$membership.ProtectingPids
+            NonProtecting = @($membership.NonProtecting)
             OwnerProbe = $probe.OwnerProbe
             JobObjectProbe = $probe.JobObjectProbe
-            CleanupAuthorizedForExactSelf = $protecting.Count -eq 0
+            CleanupAuthorizedForExactSelf =
+                $membership.CleanupAuthorizedForExactSelf
         }
     }
 
@@ -2130,11 +2167,11 @@ function Remove-AstroAttributionManifest {
             $preflight.Parsed.LauncherProcessStartUtcTicks) {
         throw "ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_OWN_CLEANUP_OWNER_MISMATCH]: caller is not the exact live manifest generation (owner_state=$($preflight.OwnerProbe.State), pid=$PID, expected_ticks=$($preflight.Parsed.LauncherProcessStartUtcTicks), observed_ticks=$($selfProbe.ProcessStartUtcTicks))"
     }
-    [int[]]$preflightJobPids = @($preflight.JobObjectProbe.ProcessIds)
-    if ($preflight.JobObjectProbe.State -cne 'observed' -or
-        $preflightJobPids.Count -ne 1 -or
-        $preflightJobPids[0] -ne $PID) {
-        throw "ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_OWN_CLEANUP_JOB_OCCUPIED]: normal own cleanup requires the exact named Job Object to contain only launcher PID $PID (state=$($preflight.JobObjectProbe.State), pids=$($preflightJobPids -join ','), error=$($preflight.JobObjectProbe.Error))"
+    $preflightMembership = Get-AstroCleanupJobMembership `
+        -JobObjectProbe $preflight.JobObjectProbe `
+        -SelfPid $PID
+    if (-not $preflightMembership.CleanupAuthorizedForExactSelf) {
+        throw "ASTRO_ATTRIBUTION[ASTRO_ATTRIBUTION_OWN_CLEANUP_JOB_OCCUPIED]: normal own cleanup found protecting Job child PID(s) $($preflightMembership.ProtectingPids -join ',') (all_pids=$($preflightMembership.JobPids -join ','))"
     }
 
     $handle = $null
@@ -2183,12 +2220,12 @@ function Remove-AstroAttributionManifest {
             -LauncherProcessStartUtcTicks `
                 $parsed.LauncherProcessStartUtcTicks
         $jobFinal = Get-AstroLauncherJobObjectProbe -Name $parsed.JobObjectName
-        [int[]]$jobFinalPids = @($jobFinal.ProcessIds)
+        $jobFinalMembership = Get-AstroCleanupJobMembership `
+            -JobObjectProbe $jobFinal `
+            -SelfPid $PID
         if ($ownerFinal.State -cne 'exact-live' -or
-            $jobFinal.State -cne 'observed' -or
-            $jobFinalPids.Count -ne 1 -or
-            $jobFinalPids[0] -ne $PID) {
-            throw "own-cleanup owner/Job Object state changed before exact deletion (owner=$($ownerFinal.State), job=$($jobFinal.State), pids=$($jobFinalPids -join ','))"
+            -not $jobFinalMembership.CleanupAuthorizedForExactSelf) {
+            throw "own-cleanup owner/Job Object state changed before exact deletion (owner=$($ownerFinal.State), job=$($jobFinal.State), all_pids=$($jobFinalMembership.JobPids -join ','), protecting_pids=$($jobFinalMembership.ProtectingPids -join ','))"
         }
         [AstroLauncherLockNative]::FlushExactFile($handle)
         [AstroLauncherLockNative]::DeleteExactFileHandle($handle)

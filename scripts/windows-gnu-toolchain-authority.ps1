@@ -786,11 +786,11 @@ function Complete-LauncherLockCleanupTransaction {
             }
         }
         $jobProbe = Get-AstroLauncherJobObjectProbe -Name $JobObjectName
-        [int[]]$jobPids = @($jobProbe.ProcessIds | Sort-Object -Unique)
-        if ($jobProbe.State -ne 'observed' -or
-            $jobPids.Count -ne 1 -or
-            $jobPids[0] -ne $ExpectedPid) {
-            throw "final named Job Object requery is not exact launcher-only state (state=$($jobProbe.State), pids=$($jobPids -join ','), error=$($jobProbe.Error))"
+        $jobMembership = Get-AstroCleanupJobMembership `
+            -JobObjectProbe $jobProbe `
+            -SelfPid $ExpectedPid
+        if (-not $jobMembership.CleanupAuthorizedForExactSelf) {
+            throw "final named Job Object requery has protecting child PID(s) $($jobMembership.ProtectingPids -join ',') (all_pids=$($jobMembership.JobPids -join ','))"
         }
         $retained = Assert-AstroLauncherLockLeaseCurrent $Transaction.LeaseHandle
         $transitions = Get-AstroLauncherLockTransitions $Transaction.LockPath
@@ -899,6 +899,7 @@ function Complete-LauncherLockCleanupTransaction {
         Completed = $Transaction.Completed
         MutexReleased = $Transaction.Released
         TerminalPathState = $deleted.TerminalPathState
+        NonProtectingJobChildren = @($jobMembership.NonProtecting)
     }
 }
 
@@ -9514,16 +9515,30 @@ finally {
         try {
             # Recorder Stop/readback completed above while its Job handle remains retained.
             # Before the first destructive target/TEMP operation, independently require
-            # exact kernel membership {PID}.
+            # exact kernel membership consisting only of this launcher and any
+            # independently classified non-protecting VCTIP generation.
             $preCleanupJobProbe = Get-AstroLauncherJobObjectProbe `
                 -Name $launcherTreeJobObjectName
-            $preCleanupJobPids = @(
-                $preCleanupJobProbe.ProcessIds | Sort-Object -Unique
-            )
-            if ($preCleanupJobProbe.State -ne 'observed' -or
-                $preCleanupJobPids.Count -ne 1 -or
-                $preCleanupJobPids[0] -ne $PID) {
-                throw "named Job Object membership is not exact launcher-only state before cleanup (state=$($preCleanupJobProbe.State), pids=$($preCleanupJobPids -join ','), error=$($preCleanupJobProbe.Error))"
+            $preCleanupJobMembership = Get-AstroCleanupJobMembership `
+                -JobObjectProbe $preCleanupJobProbe `
+                -SelfPid $PID
+            if (-not
+                $preCleanupJobMembership.CleanupAuthorizedForExactSelf) {
+                throw "named Job Object has protecting child PID(s) before cleanup ($($preCleanupJobMembership.ProtectingPids -join ',')); all_pids=$($preCleanupJobMembership.JobPids -join ',')"
+            }
+            if ($preCleanupJobMembership.NonProtecting.Count -gt 0) {
+                $preCleanupNonProtectingDescriptions = @(
+                    $preCleanupJobMembership.NonProtecting |
+                        ForEach-Object {
+                            'pid={0},ticks={1},image={2},reason={3}' -f @(
+                                $_.Pid,
+                                $_.ProcessStartUtcTicks,
+                                $_.ImagePath,
+                                $_.Reason
+                            )
+                        }
+                )
+                Write-Output "NO_ESCAPE[ASTRO_PRE_CLEANUP_NON_PROTECTING_CHILDREN]: count=$($preCleanupJobMembership.NonProtecting.Count); members=$($preCleanupNonProtectingDescriptions -join '; ')"
             }
         }
         catch {
@@ -10022,6 +10037,20 @@ finally {
                     -not $protocolCleanup.MutexReleased -or
                     $protocolCleanup.TerminalPathState -cne 'absent') {
                     throw "terminal cleanup transaction returned incomplete state (state=$($protocolCleanup.State), disposition_set=$($protocolCleanup.DispositionSet), completed=$($protocolCleanup.Completed), mutex_released=$($protocolCleanup.MutexReleased), terminal=$($protocolCleanup.TerminalPathState))"
+                }
+                if ($protocolCleanup.NonProtectingJobChildren.Count -gt 0) {
+                    $terminalNonProtectingDescriptions = @(
+                        $protocolCleanup.NonProtectingJobChildren |
+                            ForEach-Object {
+                                'pid={0},ticks={1},image={2},reason={3}' -f @(
+                                    $_.Pid,
+                                    $_.ProcessStartUtcTicks,
+                                    $_.ImagePath,
+                                    $_.Reason
+                                )
+                            }
+                    )
+                    Write-Output "NO_ESCAPE[ASTRO_TERMINAL_NON_PROTECTING_CHILDREN]: count=$($protocolCleanup.NonProtectingJobChildren.Count); members=$($terminalNonProtectingDescriptions -join '; ')"
                 }
                 Write-Output "LAUNCHER_LOCK[ASTRO_LAUNCHER_CLEANUP_COMPLETE]: transition absent last; file_id=$($protocolCleanup.FileId); sha256=$($protocolCleanup.Sha256); terminal=$($protocolCleanup.TerminalPathState); mutex_released=$($protocolCleanup.MutexReleased)"
                 $launcherLockRemoved = $true
