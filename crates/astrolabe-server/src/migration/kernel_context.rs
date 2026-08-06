@@ -116,6 +116,10 @@ where
             "rows_readback_verified": report.rows_readback_verified,
             "ledger_paired": report.ledger_paired,
             "commit_seq": report.commit_seq,
+            "ledger_ref": {
+                "seq": report.ledger_ref.seq,
+                "entry_hash": hex_lower(&report.ledger_ref.hash),
+            },
             "trust": if report.anchor_grounded { "verified" } else { "provisional" },
             "freshness": "fresh",
             "provenance": [

@@ -32,7 +32,7 @@ use astrolabe_kernel::{
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId, Seq};
+use calyx_core::{Clock, CxId, LedgerRef, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 
 use crate::graph_projection::{
@@ -88,6 +88,12 @@ pub struct KernelArtifactPersistReport {
     pub members_hash_key: Vec<u8>,
     /// Commit sequence of the write.
     pub commit_seq: Seq,
+    /// Exact append-only Ledger identity verified at `commit_seq`.
+    ///
+    /// This is deliberately separate from [`Self::commit_seq`]: the Aster MVCC
+    /// commit sequence and the Ledger entry sequence are independent counters
+    /// and must never be treated as interchangeable provenance identities.
+    pub ledger_ref: LedgerRef,
     /// Kernel CF rows re-read and byte-verified after the commit (always 3 on
     /// success: kernel.json, index.json, members-hash).
     pub rows_readback_verified: usize,
@@ -234,7 +240,7 @@ where
         ActorId::Service(KERNEL_ARTIFACT_ACTOR.to_string()),
     )?;
 
-    let rows_readback_verified = verify_kernel_artifact_readback(
+    let (rows_readback_verified, ledger_ref) = verify_kernel_artifact_readback(
         vault,
         commit_seq,
         artifact,
@@ -258,6 +264,7 @@ where
         index_json_key: index_key,
         members_hash_key: members_key,
         commit_seq,
+        ledger_ref,
         rows_readback_verified,
         ledger_paired: true,
     })
@@ -292,7 +299,7 @@ fn verify_kernel_artifact_readback<C>(
     index_bytes: &[u8],
     members_key: &[u8],
     ledger_bytes: &[u8],
-) -> IngestResult<usize>
+) -> IngestResult<(usize, LedgerRef)>
 where
     C: Clock,
 {
@@ -327,11 +334,23 @@ where
     // The paired Kernel ledger entry must exist at the commit snapshot, name the
     // kernel-build actor and scope subject, and carry the same members-hash
     // payload bytes as the persisted members-hash row (one serializer).
-    let (_key, entry_bytes) = calyx_aster::ledger_view::newest_pairable_ledger(
+    let (key, entry_bytes) = calyx_aster::ledger_view::newest_pairable_ledger(
         vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
     )?
     .ok_or_else(|| readback_refused("Ledger CF empty at kernel artifact commit snapshot"))?;
     let entry = decode(&entry_bytes)?;
+    if !entry.verify() {
+        return Err(readback_refused(
+            "paired ledger entry failed its hash-chain self-verification",
+        ));
+    }
+    if key.as_slice() != entry.seq.to_be_bytes().as_slice() {
+        return Err(readback_refused(format!(
+            "paired ledger key {} does not encode entry sequence {}",
+            hex_lower(&key),
+            entry.seq
+        )));
+    }
     if entry.kind != EntryKind::Kernel {
         return Err(readback_refused(
             "paired ledger entry has the wrong entry kind",
@@ -354,7 +373,13 @@ where
         ));
     }
 
-    Ok(3)
+    Ok((
+        3,
+        LedgerRef {
+            seq: entry.seq,
+            hash: entry.entry_hash,
+        },
+    ))
 }
 
 fn read_back_row<C>(
@@ -427,4 +452,14 @@ fn readback_refused(message: impl Into<String>) -> IngestError {
         message,
         READBACK_REMEDIATION,
     )
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }

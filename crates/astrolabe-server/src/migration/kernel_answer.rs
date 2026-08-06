@@ -309,6 +309,7 @@ fn get_kernel_build_response_json(project: &str, summary: &Value) -> Value {
             "rows_readback_verified": summary.get("rows_readback_verified"),
             "ledger_paired": summary.get("ledger_paired"),
             "commit_seq": summary.get("commit_seq"),
+            "ledger_ref": summary.get("ledger_ref"),
             "trust": summary.get("trust"),
             "freshness": summary.get("freshness"),
             "provenance": summary.get("provenance"),
