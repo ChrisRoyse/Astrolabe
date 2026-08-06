@@ -304,9 +304,6 @@ impl From<astrolabe_lower::LoweredSqliteReport> for ShadowLowerState {
     }
 }
 
-static SHADOW_EMBEDDING_TABLE: OnceLock<PanelResult<astrolabe_panel::StaticEmbeddingTable>> =
-    OnceLock::new();
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ShadowRefreshStatus {
     Current,
@@ -341,19 +338,13 @@ impl SlotRuntime for ShadowSlotRuntime {
                     | astrolabe_panel::semantic::SemanticKind::LatentProse
             ) {
                 let framed = astrolabe_panel::semantic::latent_embedding_input(rule, value)?;
-                let table = SHADOW_EMBEDDING_TABLE
-                    .get_or_init(astrolabe_panel::StaticEmbeddingTable::load_default)
-                    .as_ref()
-                    .map_err(Clone::clone)?;
+                let table = astrolabe_panel::shared_default_static_embedding_table()?;
                 return table.embed_text(&framed);
             }
             return astrolabe_panel::semantic::encode_structured_value(rule, value);
         }
         if matches!(slot.slot, 18..=20) {
-            let table = SHADOW_EMBEDDING_TABLE
-                .get_or_init(astrolabe_panel::StaticEmbeddingTable::load_default)
-                .as_ref()
-                .map_err(Clone::clone)?;
+            let table = astrolabe_panel::shared_default_static_embedding_table()?;
             return astrolabe_panel::encode_static_embedding_slot(
                 slot.slot_id(),
                 &shadow_embedding_input(input)?,

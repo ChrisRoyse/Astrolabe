@@ -85,9 +85,10 @@ pub use answer::{
     ASTRO_KERNEL_ANSWER_TRACE_MISMATCH, ASTRO_KERNEL_ANSWER_UNGROUNDED, AnswerConfig,
     AnswerDeficit, AnswerEdge, AnswerHop, AnswerNode, AnswerRefusal, AnswerResolution,
     CALYX_KERNEL_ANSWER_LEDGER_REQUIRED, KERNEL_ANSWER_KNOB_REGISTRY_VERSION, KERNEL_ANSWER_KNOBS,
-    KERNEL_ANSWER_REFUSAL_SCHEMA, KERNEL_ANSWER_SCHEMA, KERNEL_GAP_REPORT_SCHEMA, KernelAnswer,
-    KernelGap, KernelGapReport, answer_artifact_bytes, answer_query, attenuation_at,
-    kernel_gap_report, verify_answer_trace, weight_to_permille,
+    KERNEL_ANSWER_REFUSAL_SCHEMA, KERNEL_ANSWER_SCHEMA, KERNEL_GAP_REPORT_SCHEMA,
+    KNOB_ANSWER_INDEX_CACHE_ENTRIES, KernelAnswer, KernelGap, KernelGapReport,
+    answer_artifact_bytes, answer_query, attenuation_at, kernel_gap_report, verify_answer_trace,
+    weight_to_permille,
 };
 
 /// Change blast-radius reach through the kernel graph and its risk composition

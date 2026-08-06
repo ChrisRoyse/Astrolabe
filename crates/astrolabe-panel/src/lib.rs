@@ -25,6 +25,7 @@ pub use embeddings::{
     NOMIC_EMBED_DIM, NOMIC_TOKEN_COUNT, NOMIC_TOKEN_TABLE_SHA256, NOMIC_VECTOR_BLOB_SHA256,
     StaticEmbeddingInput, StaticEmbeddingLens, StaticEmbeddingTable, encode_static_embedding_slot,
     fixture_static_embedding_input, nomic_weights_identity, s18_s20_lenses,
+    shared_default_static_embedding_table, shared_default_static_embedding_table_load_count,
 };
 pub use lenses::{
     ApiCall, ApiFamily, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,

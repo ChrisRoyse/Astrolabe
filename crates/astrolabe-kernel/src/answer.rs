@@ -61,6 +61,8 @@ pub const KNOB_ANSWER_ATTENUATION_PERMILLE: &str = "kernel.answer.hop_attenuatio
 pub const KNOB_ANSWER_MAX_HOPS: &str = "kernel.answer.max_hops";
 /// Knob name: minimum hop score (permille) below which a hop is pruned.
 pub const KNOB_ANSWER_MIN_HOP_SCORE_PERMILLE: &str = "kernel.answer.min_hop_score_permille";
+/// Knob name: maximum exact member-index generations retained per server process.
+pub const KNOB_ANSWER_INDEX_CACHE_ENTRIES: &str = "kernel.answer.index_cache_entries";
 
 /// Full permille scale: `1000` permille denotes `1.0` (an unattenuated hop 0).
 pub const ANSWER_PERMILLE_SCALE: u64 = 1_000;
@@ -96,6 +98,16 @@ pub const KERNEL_ANSWER_KNOBS: &[U64KnobDeclaration] = &[
         unit: "permille",
         source: SOURCE,
         rationale: "hop-score floor; a hop attenuated below this permille adds no grounded signal and truncates the path",
+    },
+    U64KnobDeclaration {
+        registry_version: KERNEL_ANSWER_KNOB_REGISTRY_VERSION,
+        name: KNOB_ANSWER_INDEX_CACHE_ENTRIES,
+        default: 16,
+        min: 1,
+        max: 128,
+        unit: "exact index generations",
+        source: "issue #996 one-PC 4-5 concurrent-project operating target",
+        rationale: "retains multiple current and just-retired project generations without unbounded HNSW memory growth; replace the seed with a measured byte-budget policy after real fleet peak-memory telemetry is accumulated",
     },
 ];
 

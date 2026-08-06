@@ -66,12 +66,16 @@ pub use drift_producer::{
     run_index_time_drift,
 };
 pub use kernel_index::{
-    ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_MEMBER_ABSENT, ASTRO_KERNEL_INDEX_NO_MEMBERS,
-    ASTRO_KERNEL_INDEX_STALE, ASTRO_KERNEL_INDEX_VAULT, ASTRO_KERNEL_QUERY_UNRESOLVED,
-    KERNEL_INDEX_RECALL_GATE_PERMILLE, KERNEL_MEMBER_INDEX_SCHEMA, KernelIndexKind,
-    KernelMemberIndex, KernelQueryMatch, KernelQueryResult, KernelRecallMeasurement,
-    build_kernel_member_index, kernel_query_members, kernel_scoped_semantic_query,
-    measure_kernel_index_recall,
+    ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_CORRUPT, ASTRO_KERNEL_INDEX_MEMBER_ABSENT,
+    ASTRO_KERNEL_INDEX_NO_MEMBERS, ASTRO_KERNEL_INDEX_PERSIST, ASTRO_KERNEL_INDEX_STALE,
+    ASTRO_KERNEL_INDEX_VAULT, ASTRO_KERNEL_QUERY_UNRESOLVED, KERNEL_INDEX_RECALL_GATE_PERMILLE,
+    KERNEL_MEMBER_INDEX_CF_PREFIX, KERNEL_MEMBER_INDEX_SCHEMA, KernelIndexKind,
+    KernelMemberBinding, KernelMemberIndex, KernelMemberIndexDescriptor,
+    KernelMemberIndexPersistReport, KernelQueryMatch, KernelQueryResult, KernelRecallMeasurement,
+    LoadedKernelMemberIndex, build_kernel_member_index, kernel_query_loaded_members,
+    kernel_query_members, kernel_scoped_semantic_query, measure_kernel_index_recall,
+    persist_kernel_member_index, read_persisted_kernel_member_index,
+    read_persisted_kernel_member_index_descriptor,
 };
 pub use signal_cards::{
     SIGNAL_AXIS_STRUCTURAL_DEGREE, SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes,

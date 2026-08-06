@@ -537,8 +537,8 @@ pub(crate) fn embed_query_slots(
 
 /// Loads the frozen static-embedding table, mapping a load failure to a coded
 /// fail-closed tool error (the caller returns it verbatim).
-fn load_embedding_table() -> Result<StaticEmbeddingTable, Result<String, DynError>> {
-    StaticEmbeddingTable::load_default().map_err(|error| {
+fn load_embedding_table() -> Result<&'static StaticEmbeddingTable, Result<String, DynError>> {
+    astrolabe_panel::shared_default_static_embedding_table().map_err(|error| {
         coded_error(
             ASTRO_SEARCH_FUSION_TABLE,
             format!(

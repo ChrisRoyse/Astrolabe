@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "multi-vector")]
 use calyx_core::content_address;
@@ -79,6 +80,37 @@ pub struct StaticEmbeddingTable {
     token_to_index: HashMap<String, usize>,
     vectors: Vec<i8>,
     weights_sha: [u8; 32],
+}
+
+/// One hash-verified frozen table for the entire process generation (#996).
+///
+/// The nomic files are content-addressed constants: rereading 31 MiB, hashing
+/// both files, and rebuilding the token map cannot produce a different valid
+/// table inside one process. Cache both success and the structured failure so
+/// concurrent callers perform exactly one verification and a broken contract
+/// remains a stable fail-closed result rather than an I/O retry loop.
+static SHARED_DEFAULT_TABLE: OnceLock<PanelResult<StaticEmbeddingTable>> = OnceLock::new();
+static SHARED_DEFAULT_TABLE_LOAD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the process-generation frozen static embedding table.
+///
+/// The returned value is shared immutably by import and every query surface.
+/// Initialization failure is cached and cloned verbatim; there is no alternate
+/// table, path-order retry, or reduced embedding mode.
+pub fn shared_default_static_embedding_table() -> PanelResult<&'static StaticEmbeddingTable> {
+    SHARED_DEFAULT_TABLE
+        .get_or_init(|| {
+            SHARED_DEFAULT_TABLE_LOAD_COUNT.fetch_add(1, Ordering::Relaxed);
+            StaticEmbeddingTable::load_default()
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Physical initialization attempts for the shared frozen table. Once the
+/// process has resolved the table this remains exactly one, including failures.
+pub fn shared_default_static_embedding_table_load_count() -> u64 {
+    SHARED_DEFAULT_TABLE_LOAD_COUNT.load(Ordering::Relaxed)
 }
 
 /// One candidate directory in the declared nomic-data resolution order.

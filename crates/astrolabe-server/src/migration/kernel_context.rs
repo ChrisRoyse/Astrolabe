@@ -102,32 +102,106 @@ where
         &config,
         &options,
     ) {
-        Ok(report) => json!({
-            "schema": KERNEL_ARTIFACT_PERSIST_SCHEMA,
-            "status": "persisted",
-            "scope_id": report.scope_id,
-            "members_hash": report.members_hash,
-            "member_count": report.member_count,
-            "node_count": report.node_count,
-            "recall_permille": report.recall_permille,
-            "recall_gated": report.recall_gated,
-            "anchor_grounded": report.anchor_grounded,
-            "trusted_anchor_count": trusted_anchor_count,
-            "rows_readback_verified": report.rows_readback_verified,
-            "ledger_paired": report.ledger_paired,
-            "commit_seq": report.commit_seq,
-            "ledger_ref": {
-                "seq": report.ledger_ref.seq,
-                "entry_hash": hex_lower(&report.ledger_ref.hash),
-            },
-            "trust": if report.anchor_grounded { "verified" } else { "provisional" },
-            "freshness": "fresh",
-            "provenance": [
-                format!("kernel-artifact:scope={scope_id}"),
-                "vault:ColumnFamily::Kernel".to_string(),
-                "anchors:effective_anchor_trust_map(#352)".to_string(),
-            ],
-        }),
+        Ok(report) => {
+            // #996: publication is not complete until the exact member HNSW and
+            // CxId↔atom table are persisted and independently read back. Query
+            // serving never builds this state synchronously.
+            let artifact = match astrolabe_ingest::read_persisted_kernel_artifact(vault, &scope_id)
+            {
+                Ok(Some(artifact)) => artifact,
+                Ok(None) => {
+                    return kernel_artifact_persist_unavailable(
+                        &scope_id,
+                        "kernel artifact disappeared before member-index publication",
+                    );
+                }
+                Err(error) => {
+                    return kernel_artifact_persist_unavailable(
+                        &scope_id,
+                        &format!("read persisted kernel artifact for member-index build: {error}"),
+                    );
+                }
+            };
+            let member_ids = artifact
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect::<Vec<_>>();
+            let member_index = match astrolabe_weave::build_kernel_member_index(
+                vault,
+                project,
+                &member_ids,
+                &artifact.members_hash,
+                astrolabe_weave::search_index::IndexKnobs::defaults(0x4B45_524E_454C_0001),
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    return kernel_artifact_persist_unavailable(
+                        &scope_id,
+                        &format!("build exact kernel-member index: {error}"),
+                    );
+                }
+            };
+            let member_index_report = match astrolabe_weave::persist_kernel_member_index(
+                vault,
+                project,
+                &scope_id,
+                &member_index,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    return kernel_artifact_persist_unavailable(
+                        &scope_id,
+                        &format!("persist exact kernel-member index: {error}"),
+                    );
+                }
+            };
+            json!({
+                "schema": KERNEL_ARTIFACT_PERSIST_SCHEMA,
+                "status": "persisted",
+                "scope_id": report.scope_id,
+                "members_hash": report.members_hash,
+                "member_count": report.member_count,
+                "node_count": report.node_count,
+                "recall_permille": report.recall_permille,
+                "recall_gated": report.recall_gated,
+                "anchor_grounded": report.anchor_grounded,
+                "trusted_anchor_count": trusted_anchor_count,
+                "rows_readback_verified": report.rows_readback_verified,
+                "ledger_paired": report.ledger_paired,
+                "commit_seq": report.commit_seq,
+                "ledger_ref": {
+                    "seq": report.ledger_ref.seq,
+                    "entry_hash": hex_lower(&report.ledger_ref.hash),
+                },
+                "member_index": {
+                    "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
+                    "index_kind": member_index.index_kind.as_str(),
+                    "base_seq": member_index.base_seq,
+                    "indexed_member_count": member_index.indexed_member_count,
+                    "missing_vector_members": member_index.missing_vector_members,
+                    "semantic_dim": member_index.semantic_dim,
+                    "descriptor_blake3": member_index_report.descriptor_blake3,
+                    "bindings_blake3": member_index_report.bindings_blake3,
+                    "hnsw_artifact_blake3": member_index_report.hnsw_artifact_blake3,
+                    "commit_seq": member_index_report.commit_seq,
+                    "ledger_ref": {
+                        "seq": member_index_report.ledger_ref.seq,
+                        "entry_hash": hex_lower(&member_index_report.ledger_ref.hash),
+                    },
+                    "ledger_physical_tiers": member_index_report.ledger_physical_tiers,
+                    "rows_readback_verified": member_index_report.rows_readback_verified,
+                },
+                "trust": if report.anchor_grounded { "verified" } else { "provisional" },
+                "freshness": "fresh",
+                "provenance": [
+                    format!("kernel-artifact:scope={scope_id}"),
+                    "vault:ColumnFamily::Kernel".to_string(),
+                    "anchors:effective_anchor_trust_map(#352)".to_string(),
+                    "calyx:HnswIndex::to_artifact_bytes(#996)".to_string(),
+                ],
+            })
+        }
         Err(error) => kernel_artifact_persist_unavailable(
             &scope_id,
             &format!("kernel build not persisted: {error}"),

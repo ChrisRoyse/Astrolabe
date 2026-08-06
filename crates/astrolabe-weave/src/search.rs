@@ -504,7 +504,9 @@ pub struct SearchError {
 }
 
 impl SearchError {
-    pub(crate) fn new(code: &'static str, message: String, remediation: &'static str) -> Self {
+    /// Creates a structured fail-closed search error for callers that compose
+    /// weave operations into a higher-level serving path.
+    pub fn new(code: &'static str, message: String, remediation: &'static str) -> Self {
         Self {
             code,
             message,

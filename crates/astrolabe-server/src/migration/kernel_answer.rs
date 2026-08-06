@@ -44,6 +44,8 @@ pub(crate) const ASTRO_KERNEL_BUILD_UNAVAILABLE: &str = "ASTRO_KERNEL_BUILD_UNAV
 /// does not exist; this one means the state could not be determined at all, and
 /// neither is ever answered with a membership-manifest substitute.
 pub(crate) const ASTRO_KERNEL_INDEX_UNAVAILABLE: &str = "ASTRO_KERNEL_INDEX_UNAVAILABLE";
+/// Refusal: the process-local exact-generation index cache cannot be evaluated.
+pub(crate) const ASTRO_KERNEL_INDEX_CACHE_POISONED: &str = "ASTRO_KERNEL_INDEX_CACHE_POISONED";
 /// Refusal: `kernel_answer` requires a non-empty query.
 pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_REQUIRED: &str = "ASTRO_KERNEL_ANSWER_QUERY_REQUIRED";
 /// Refusal: the query carried no token the frozen embedding table knows, so it
@@ -57,6 +59,43 @@ pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_OOV: &str = "ASTRO_KERNEL_ANSWER_QUER
 pub(crate) const ASTRO_KERNEL_ANSWER_ADAPTER_PENDING: &str = "ASTRO_KERNEL_ANSWER_ADAPTER_PENDING";
 
 const GET_KERNEL_MODES: [&str; 4] = ["read", "gaps", "quadrant", "build"];
+type KernelIndexLoad = Result<
+    std::sync::Arc<astrolabe_weave::LoadedKernelMemberIndex>,
+    astrolabe_weave::search::SearchError,
+>;
+type KernelIndexLoadCell = OnceLock<KernelIndexLoad>;
+
+#[derive(Default)]
+struct KernelIndexCache {
+    clock: u64,
+    entries: BTreeMap<String, (std::sync::Arc<KernelIndexLoadCell>, u64)>,
+}
+
+impl KernelIndexCache {
+    fn load_cell(&mut self, key: String) -> std::sync::Arc<KernelIndexLoadCell> {
+        self.clock = self.clock.saturating_add(1);
+        if let Some((cell, last_used)) = self.entries.get_mut(&key) {
+            *last_used = self.clock;
+            return std::sync::Arc::clone(cell);
+        }
+        let capacity = kernel_index_cache_entries();
+        if self.entries.len() >= capacity
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        let cell = std::sync::Arc::new(OnceLock::new());
+        self.entries
+            .insert(key, (std::sync::Arc::clone(&cell), self.clock));
+        cell
+    }
+}
+
+static KERNEL_INDEX_CACHE: OnceLock<Mutex<KernelIndexCache>> = OnceLock::new();
 
 pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     let args = serde_json::from_str::<Value>(args_json)?;
@@ -409,9 +448,6 @@ pub(crate) fn read_kernel_index_state(
     cache_dir: &Path,
     project: &str,
 ) -> Result<Option<Value>, DynError> {
-    use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
-    use astrolabe_weave::search_index::IndexKnobs;
-
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
     if !vault_dir.exists() {
         return Ok(None);
@@ -420,13 +456,7 @@ pub(crate) fn read_kernel_index_state(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![
-            ColumnFamily::Base,
-            ColumnFamily::Graph,
-            ColumnFamily::Kernel,
-            ColumnFamily::Kv,
-            ColumnFamily::slot(SLOT_CODE_SEMANTIC),
-        ],
+        vec![ColumnFamily::Kernel],
     )?;
     let scope_id = kernel_artifact_scope_id(project);
     let Some(artifact) = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?
@@ -434,37 +464,37 @@ pub(crate) fn read_kernel_index_state(
         return Ok(None);
     };
 
-    let member_cx_ids: Vec<_> = artifact.members.iter().map(|member| member.id).collect();
-    // Deterministic seed pinned per members_hash so the same member set yields the
-    // same index bytes (invariant 5).
-    let index = astrolabe_weave::build_kernel_member_index(
+    let Some(index) = astrolabe_weave::read_persisted_kernel_member_index(
         &vault,
         project,
-        &member_cx_ids,
+        &scope_id,
         &artifact.members_hash,
-        IndexKnobs::defaults(0x4B45_524E_454C_0001),
-    )?;
-
-    if index.index_kind != astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw
-        || index.manifest.is_none()
-    {
+    )?
+    else {
         return Ok(Some(kernel_index_absent_value(
-            Some(&index),
+            None,
+            "the kernel artifact exists but its exact persisted member-index generation is absent",
+        )));
+    };
+
+    if index.descriptor.index_kind != astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw {
+        return Ok(Some(kernel_index_absent_value(
+            None,
             &format!(
                 "{} of {} kernel member(s) carry a persisted S18 code-semantic vector, so no \
                  embedding-backed member index exists for members_hash {}",
-                index.indexed_member_count, artifact.member_count, artifact.members_hash
+                index.descriptor.indexed_member_count, artifact.member_count, artifact.members_hash
             ),
         )));
     }
     // The index is content-addressed by members_hash; serving it against a
     // different artifact would silently answer from another generation.
-    if index.members_hash != artifact.members_hash {
+    if index.descriptor.members_hash != artifact.members_hash {
         return Err(format!(
             "{}: kernel member index members_hash {} does not match the artifact members_hash {} \
              read through the same vault handle",
             astrolabe_weave::ASTRO_KERNEL_INDEX_STALE,
-            index.members_hash,
+            index.descriptor.members_hash,
             artifact.members_hash
         )
         .into());
@@ -473,21 +503,25 @@ pub(crate) fn read_kernel_index_state(
     Ok(Some(json!({
         "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
         "status": "served",
-        "index_kind": index.index_kind.as_str(),
-        "selection_reason": "physical embedding-backed manifest built for this artifact's exact members_hash and base_seq",
-        "members_hash": index.members_hash,
+        "index_kind": index.descriptor.index_kind.as_str(),
+        "selection_reason": "persisted checksum-validated Calyx HNSW for this artifact's exact project/scope/members_hash/base_seq",
+        "members_hash": index.descriptor.members_hash,
         "member_count": artifact.member_count,
-        "indexed_member_count": index.indexed_member_count,
-        "missing_vector_members": index.missing_vector_members,
-        "semantic_dim": index.semantic_dim,
-        "base_seq": index.base_seq,
+        "indexed_member_count": index.descriptor.indexed_member_count,
+        "missing_vector_members": index.descriptor.missing_vector_members,
+        "semantic_dim": index.descriptor.semantic_dim,
+        "base_seq": index.descriptor.base_seq,
+        "binding_count": index.descriptor.binding_count,
+        "bindings_blake3": index.descriptor.bindings_blake3,
+        "hnsw_artifact_bytes": index.descriptor.hnsw_artifact_bytes,
+        "hnsw_artifact_blake3": index.descriptor.hnsw_artifact_blake3,
         "backend": "hnsw",
         "trust": "verified",
         "freshness": "fresh",
         "provenance": [
             format!("kernel-artifact:scope={}", artifact.scope_id),
             "vault:slot(SLOT_CODE_SEMANTIC)".to_string(),
-            "astrolabe_weave::build_kernel_member_index(#344)".to_string(),
+            "astrolabe_weave::read_persisted_kernel_member_index(#996)".to_string(),
         ],
     })))
 }
@@ -654,7 +688,6 @@ pub(crate) fn build_kernel_answer_inputs(
     project: &str,
     query: &str,
 ) -> Result<Option<KernelAnswerInputs>, DynError> {
-    use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
     if !vault_dir.exists() {
         return Ok(None);
@@ -664,17 +697,11 @@ pub(crate) fn build_kernel_answer_inputs(
         &vault_id,
         &vault_salt,
         vec![
-            ColumnFamily::Base,
             ColumnFamily::Graph,
             ColumnFamily::Kernel,
-            // Composite projection verification binds every persisted SIM row
-            // to its exact astrolabe-sim-edges attestation.
+            // Composite projection and retained-snapshot provenance both bind
+            // their exact Ledger rows. Query ranking itself reads Kernel only.
             ColumnFamily::Ledger,
-            ColumnFamily::Kv,
-            // #880: the query is resolved against the members' persisted S18
-            // vectors through this same handle, so the ranking and the artifact
-            // are read from one generation.
-            ColumnFamily::slot(SLOT_CODE_SEMANTIC),
         ],
     )?;
     let scope_id = kernel_artifact_scope_id(project);
@@ -771,33 +798,26 @@ fn resolve_query_candidates<C>(
 where
     C: Clock,
 {
-    use astrolabe_panel::{
-        StaticEmbeddingInput, StaticEmbeddingTable, encode_static_embedding_slot,
-    };
+    use astrolabe_panel::{StaticEmbeddingInput, encode_static_embedding_slot};
     use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
-    use astrolabe_weave::search_index::{IndexKnobs, split_identifier_tokens};
+    use astrolabe_weave::search_index::split_identifier_tokens;
 
-    let member_cx_ids: Vec<CxId> = artifact.members.iter().map(|member| member.id).collect();
-    // Same deterministic seed the get_kernel index surface pins, so the index a
-    // query ranks against is byte-identical to the one get_kernel reports.
-    let index = astrolabe_weave::build_kernel_member_index(
-        vault,
-        project,
-        &member_cx_ids,
-        &artifact.members_hash,
-        IndexKnobs::defaults(0x4B45_524E_454C_0001),
-    )?;
-
+    let total_started = std::time::Instant::now();
+    let usage_before = vault.process_usage_snapshot()?;
     // Embed the query into S18 with the frozen table the corpus was measured
-    // with. An Absent embedding means no query token is in vocabulary.
-    let table = StaticEmbeddingTable::load_default()?;
+    // with. This deliberately happens before touching project index state: an
+    // OOV query refuses without loading or constructing an unrelated index.
+    let table_started = std::time::Instant::now();
+    let table = astrolabe_panel::shared_default_static_embedding_table()?;
+    let table_resolution_ms = elapsed_millis(table_started.elapsed());
+    let encoding_started = std::time::Instant::now();
     let input = StaticEmbeddingInput {
         body_tokens: split_identifier_tokens(query),
         doc_tokens: Vec::new(),
         name: query.to_string(),
         qualified_name: query.to_string(),
     };
-    let encoded = encode_static_embedding_slot(SLOT_CODE_SEMANTIC, &input, &table)?;
+    let encoded = encode_static_embedding_slot(SLOT_CODE_SEMANTIC, &input, table)?;
     let SlotVector::Dense {
         data: query_vector, ..
     } = encoded
@@ -809,36 +829,78 @@ where
         )
         .into());
     };
+    let query_encoding_ms = elapsed_millis(encoding_started.elapsed());
 
-    let k = index.indexed_member_count as u64;
-    let ranked =
-        astrolabe_weave::kernel_query_members(&index, &artifact.members_hash, &query_vector, k, k)?;
-
-    // Map ranked source-atom ids back to CxIds through the same snapshot the
-    // index resolved its members from; a match with no live CxId is dropped and
-    // counted, never silently treated as a different member.
-    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
-    let cx_by_symbol: BTreeMap<&str, CxId> = snapshot
-        .nodes
-        .iter()
-        .filter_map(|node| node.cx_id.map(|cx| (node.atom_id.as_str(), cx)))
-        .collect();
+    let descriptor_started = std::time::Instant::now();
+    let descriptor = astrolabe_weave::read_persisted_kernel_member_index_descriptor(
+        vault,
+        project,
+        &artifact.scope_id,
+        &artifact.members_hash,
+    )?
+    .ok_or_else(|| {
+        astrolabe_weave::search::SearchError::new(
+            astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
+            format!(
+                "kernel artifact {} has no persisted member-index generation",
+                artifact.members_hash
+            ),
+            "Rebuild the kernel so descriptor/map/HNSW rows are published before serving queries.",
+        )
+    })?;
+    let descriptor_read_ms = elapsed_millis(descriptor_started.elapsed());
+    let cache_key = kernel_index_cache_key(&descriptor)?;
+    let cache = KERNEL_INDEX_CACHE.get_or_init(|| Mutex::new(KernelIndexCache::default()));
+    let (load_cell, cache_entries) = {
+        let mut cache = cache.lock().map_err(|_| kernel_index_cache_poisoned())?;
+        let cell = cache.load_cell(cache_key);
+        (cell, cache.entries.len())
+    };
+    let artifact_load_started = std::time::Instant::now();
+    let mut artifact_loaded_this_query = false;
+    let index = load_cell
+        .get_or_init(|| {
+            artifact_loaded_this_query = true;
+            let loaded = astrolabe_weave::read_persisted_kernel_member_index(
+                vault,
+                project,
+                &artifact.scope_id,
+                &artifact.members_hash,
+            )?
+            .ok_or_else(|| {
+                astrolabe_weave::search::SearchError::new(
+                    astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
+                    "member-index descriptor disappeared before full artifact load".to_string(),
+                    "Preserve the vault and rebuild the exact kernel generation.",
+                )
+            })?;
+            Ok(std::sync::Arc::new(loaded))
+        })
+        .clone()?;
+    let index_cache_hit = !artifact_loaded_this_query;
+    let index_artifact_load_ms = elapsed_millis(artifact_load_started.elapsed());
+    let k = index.descriptor.indexed_member_count as u64;
+    let ranking_started = std::time::Instant::now();
+    let ranked = astrolabe_weave::kernel_query_loaded_members(
+        &index,
+        &artifact.members_hash,
+        &query_vector,
+        k,
+        k,
+    )?;
+    let ann_ranking_ms = elapsed_millis(ranking_started.elapsed());
+    let process_usage = vault.process_usage_snapshot()?.phase_since(usage_before);
+    let total_ms = elapsed_millis(total_started.elapsed());
 
     let mut matched_ids: Vec<CxId> = Vec::with_capacity(ranked.matches.len());
-    let mut unresolved: Vec<&str> = Vec::new();
     let mut ranked_json: Vec<Value> = Vec::with_capacity(ranked.matches.len());
     for candidate in &ranked.matches {
-        match cx_by_symbol.get(candidate.symbol_id.as_str()) {
-            Some(cx) => {
-                matched_ids.push(*cx);
-                ranked_json.push(json!({
-                    "rank": candidate.rank,
-                    "symbol_id": candidate.symbol_id,
-                    "cx_id": cx.to_string(),
-                }));
-            }
-            None => unresolved.push(candidate.symbol_id.as_str()),
-        }
+        matched_ids.push(candidate.cx_id);
+        ranked_json.push(json!({
+            "rank": candidate.rank,
+            "symbol_id": candidate.symbol_id,
+            "cx_id": candidate.cx_id.to_string(),
+        }));
     }
 
     let evidence = json!({
@@ -847,24 +909,87 @@ where
         "query": query,
         "embedded_slot": SLOT_CODE_SEMANTIC.get(),
         "query_vector_dim": query_vector.len(),
-        "index_kind": index.index_kind.as_str(),
+        "index_kind": index.descriptor.index_kind.as_str(),
         "members_hash": ranked.members_hash,
         "base_seq": ranked.base_seq,
+        "descriptor_bindings_blake3": index.descriptor.bindings_blake3,
+        "descriptor_hnsw_artifact_blake3": index.descriptor.hnsw_artifact_blake3,
+        "hnsw_artifact_bytes": index.descriptor.hnsw_artifact_bytes,
+        "index_cache_hit": index_cache_hit,
+        "index_artifact_loads_this_query": u64::from(artifact_loaded_this_query),
+        "hnsw_rebuilds_this_query": 0,
+        "graph_snapshot_reads_this_query": 0,
+        "embedding_table_process_load_count": astrolabe_panel::shared_default_static_embedding_table_load_count(),
+        "phase_timings_ms": {
+            "embedding_table_resolution": table_resolution_ms,
+            "query_encoding": query_encoding_ms,
+            "descriptor_read": descriptor_read_ms,
+            "index_artifact_load_or_wait": index_artifact_load_ms,
+            "ann_ranking": ann_ranking_ms,
+            "total": total_ms,
+        },
+        "process_usage": {
+            "kernel_time_100ns": process_usage.kernel_time_100ns,
+            "user_time_100ns": process_usage.user_time_100ns,
+            "read_operations": process_usage.read_operations,
+            "read_bytes": process_usage.read_bytes,
+            "write_operations": process_usage.write_operations,
+            "write_bytes": process_usage.write_bytes,
+            "page_faults": process_usage.page_faults,
+            "working_set_bytes_after": process_usage.working_set_bytes_after,
+            "peak_working_set_bytes_after": process_usage.peak_working_set_bytes_after,
+            "private_bytes_after": process_usage.private_bytes_after,
+            "peak_private_bytes_after": process_usage.peak_private_bytes_after,
+        },
+        "cache": {
+            "knob_registry_version": KERNEL_ANSWER_KNOB_REGISTRY_VERSION,
+            "capacity_entries": kernel_index_cache_entries(),
+            "resident_generation_cells": cache_entries,
+            "single_flight": true,
+        },
         "member_count": artifact.member_count,
         "indexed_member_count": ranked.indexed_member_count,
-        "missing_vector_members": index.missing_vector_members,
+        "missing_vector_members": index.descriptor.missing_vector_members,
         "ranked_member_count": matched_ids.len(),
-        "unresolved_symbol_ids": unresolved,
+        "unresolved_symbol_ids": [],
         "ranked_members": ranked_json,
         "trust": "verified",
         "freshness": "fresh",
         "provenance": [
             format!("kernel-artifact:scope={}", artifact.scope_id),
-            "vault:slot(SLOT_CODE_SEMANTIC)".to_string(),
-            "astrolabe_weave::kernel_query_members(#880)".to_string(),
+            "vault:Kernel/member-index descriptor+bindings+HNSW".to_string(),
+            "astrolabe_weave::kernel_query_loaded_members(#996)".to_string(),
         ],
     });
     Ok((matched_ids, evidence))
+}
+
+fn kernel_index_cache_key(
+    descriptor: &astrolabe_weave::KernelMemberIndexDescriptor,
+) -> Result<String, DynError> {
+    let bytes = serde_json::to_vec(descriptor)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn kernel_index_cache_poisoned() -> astrolabe_weave::search::SearchError {
+    astrolabe_weave::search::SearchError::new(
+        ASTRO_KERNEL_INDEX_CACHE_POISONED,
+        "kernel index cache mutex is poisoned, so resident generations cannot be evaluated"
+            .to_string(),
+        "Restart the Astrolabe server and inspect the preceding panic before serving more kernel answers.",
+    )
+}
+
+fn kernel_index_cache_entries() -> usize {
+    KERNEL_ANSWER_KNOBS
+        .iter()
+        .find(|knob| knob.name == KNOB_ANSWER_INDEX_CACHE_ENTRIES)
+        .expect("kernel answer index-cache knob is declared")
+        .default as usize
+}
+
+fn elapsed_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Joins per-`CxId` provenance references and the serving-vault ledger head out of
