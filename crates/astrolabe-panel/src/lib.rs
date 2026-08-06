@@ -58,12 +58,18 @@ pub const PANEL_SCHEMA_ID: &str = "astro.panel.v1";
 pub const PANEL_SCHEMA_ID_V2: &str = "astro.panel.v2";
 /// Panel schema id emitted by the v3 exhaustive code-memory semantic roster.
 pub const PANEL_SCHEMA_ID_V3: &str = "astro.panel.v3";
+/// Panel schema id emitted by the v4 semantic-input-bound roster.
+pub const PANEL_SCHEMA_ID_V4: &str = "astro.panel.v4";
 /// First Astrolabe panel version.
 pub const DEFAULT_PANEL_VERSION: u32 = 1;
 /// Second Astrolabe panel version — adds the S23 `layer_role` frozen slot (#180a).
 pub const PANEL_V2_VERSION: u32 = 2;
 /// Third Astrolabe panel version — exhaustive typed CBM semantic atom coverage.
 pub const PANEL_V3_VERSION: u32 = 3;
+/// Fourth Astrolabe panel version — binds every measured node semantic input into CxId.
+pub const PANEL_V4_VERSION: u32 = 4;
+/// Current exhaustive code-memory panel version.
+pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V4_VERSION;
 /// Frozen seed registry schema identifier.
 pub const ASTRO_SEED_REGISTRY_SCHEMA: &str = "astro.seed_registry.v1";
 /// Frozen seed registry artifact kind.
@@ -794,6 +800,13 @@ pub static PANEL_V3_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
     slots
 });
 
+/// Frozen v4 slot roster. The lens roster and every lens identity remain
+/// byte-identical to v3; v4 versions the node constellation identity contract so
+/// the complete measured semantic input, including source-generation handles,
+/// is bound into CxId.
+pub static PANEL_V4_SLOTS: LazyLock<Vec<PanelSlotSpec>> =
+    LazyLock::new(|| PANEL_V3_SLOTS.iter().copied().collect());
+
 /// Returns the frozen v1 slot roster.
 pub fn default_panel_slots() -> &'static [PanelSlotSpec] {
     PANEL_V1_SLOTS
@@ -809,6 +822,11 @@ pub fn default_panel_v3_slots() -> &'static [PanelSlotSpec] {
     &PANEL_V3_SLOTS
 }
 
+/// Returns the frozen v4 roster including exhaustive CBM semantic slots.
+pub fn default_panel_v4_slots() -> &'static [PanelSlotSpec] {
+    &PANEL_V4_SLOTS
+}
+
 /// Returns the frozen slot roster for a panel roster version.
 ///
 /// Fails closed for a version that has no frozen roster rather than silently
@@ -818,10 +836,11 @@ pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> 
         DEFAULT_PANEL_VERSION => Ok(PANEL_V1_SLOTS),
         PANEL_V2_VERSION => Ok(&PANEL_V2_SLOTS),
         PANEL_V3_VERSION => Ok(&PANEL_V3_SLOTS),
+        PANEL_V4_VERSION => Ok(&PANEL_V4_SLOTS),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen slot roster"),
-            "Measure with panel version 1 (S0-S22), 2 (S0-S23), or 3 (S0-S185).",
+            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 (S0-S185), or 4 (S0-S185 with semantic-input-bound identity).",
         )),
     }
 }
@@ -832,10 +851,11 @@ pub fn schema_id_for_version(version: u32) -> PanelResult<&'static str> {
         DEFAULT_PANEL_VERSION => Ok(PANEL_SCHEMA_ID),
         PANEL_V2_VERSION => Ok(PANEL_SCHEMA_ID_V2),
         PANEL_V3_VERSION => Ok(PANEL_SCHEMA_ID_V3),
+        PANEL_V4_VERSION => Ok(PANEL_SCHEMA_ID_V4),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen schema id"),
-            "Measure with panel version 1, 2, or 3.",
+            "Measure with panel version 1, 2, 3, or 4.",
         )),
     }
 }
@@ -892,12 +912,12 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
     Ok(sha256_digest(&[&bytes]))
 }
 
-/// Returns a slot specification by id, searching the v3 superset roster.
+/// Returns a slot specification by id, searching the current superset roster.
 ///
 /// Older rosters are byte-identical prefixes, so their consumers see the same
 /// answer while v3 semantic slots additionally resolve.
 pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
-    PANEL_V3_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
+    PANEL_V4_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
 }
 
 /// Returns the default frozen contracts for every v1 slot.
@@ -1070,7 +1090,7 @@ pub struct PanelInput {
     pub properties: serde_json::Value,
     /// Exact scalar measurements preserved beside the vector panel.
     pub scalars: BTreeMap<String, f64>,
-    /// CBM row family for panel-v3 semantic slots. `None` is valid only for
+    /// CBM row family for panel-v3+ semantic slots. `None` is valid only for
     /// pre-v3 measurement.
     pub semantic_family: Option<semantic::SemanticFamily>,
     /// Typed semantic source values for present atoms, keyed by their frozen
@@ -1131,7 +1151,7 @@ impl PanelInput {
         self
     }
 
-    /// Attaches the exact panel-v3 semantic family and present-slot map.
+    /// Attaches the exact panel-v3+ semantic family and present-slot map.
     pub fn with_semantic_values(
         mut self,
         family: semantic::SemanticFamily,
@@ -1238,7 +1258,7 @@ fn absent_reason_label(reason: &AbsentReason) -> String {
 /// space; this bridges a gated lens key to its frozen [`SlotId`] so a per-repo
 /// admission set can be applied to a readout without touching the frozen roster.
 pub fn slot_spec_by_key(key: &str) -> Option<&'static PanelSlotSpec> {
-    PANEL_V3_SLOTS.iter().find(|slot| slot.key == key)
+    PANEL_V4_SLOTS.iter().find(|slot| slot.key == key)
 }
 
 impl PanelReadout {
@@ -1305,8 +1325,8 @@ fn validate_semantic_panel_input(version: u32, input: &PanelInput) -> PanelResul
         if input.semantic_family.is_some() || !input.semantic_values.is_empty() {
             return Err(PanelError::new(
                 ASTRO_PANEL_CONTRACT_INVALID,
-                format!("panel version {version} cannot accept panel-v3 semantic slots"),
-                "Use panel version 3 for exhaustive code-memory semantic measurement.",
+                format!("panel version {version} cannot accept exhaustive semantic slots"),
+                "Use the current semantic panel version for exhaustive code-memory measurement.",
             ));
         }
         return Ok(());
@@ -1320,7 +1340,7 @@ fn validate_semantic_panel_input(version: u32, input: &PanelInput) -> PanelResul
         }
         return Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
-            "panel-v3 semantic values have no exact row family",
+            "semantic values have no exact row family",
             "Classify the CBM source row before attaching semantic values.",
         ));
     };
@@ -1473,7 +1493,7 @@ impl PanelDriver {
                         presence_slot_id,
                         self.version
                     ),
-                    "Restore the exact frozen panel-v3 semantic roster before measurement.",
+                    "Restore the exact frozen semantic roster before measurement.",
                 )
             })?;
             let presence = semantic::encode_presence(family, rules)?;
@@ -1486,7 +1506,7 @@ impl PanelDriver {
                     PanelError::new(
                         ASTRO_PANEL_CONTRACT_INVALID,
                         format!("semantic slot {slot_id} is absent from the frozen roster"),
-                        "Restore the exact panel-v3 registry and slot roster before measurement.",
+                        "Restore the exact semantic registry and slot roster before measurement.",
                     )
                 })?;
                 let vector = runtime.measure_slot(slot, input)?;

@@ -15,8 +15,9 @@ use astrolabe_panel::semantic::{
     semantic_registry_sha256, semantic_rule, semantic_rule_by_slot,
 };
 use astrolabe_panel::{
-    PANEL_V3_VERSION, PanelDriver, PanelInput, SlotRuntime, default_panel_slots,
-    panel_slot_manifest_sha256, slots_for_version, validate_slot_vector_contract,
+    CURRENT_SEMANTIC_PANEL_VERSION, PANEL_V3_VERSION, PANEL_V4_VERSION, PanelDriver, PanelInput,
+    SlotRuntime, default_panel_slots, panel_slot_manifest_sha256, slots_for_version,
+    validate_slot_vector_contract,
 };
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
 use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
@@ -63,7 +64,7 @@ pub const ASTRO_MISSING_CBM_PROJECT_ROW: &str = "ASTRO_MISSING_CBM_PROJECT_ROW";
 /// Refusal code for a graph row whose exact-source reference, Blob-CF payload,
 /// digest, length, or byte span fails independent readback.
 pub const ASTRO_EXACT_SOURCE_INVALID: &str = "ASTRO_EXACT_SOURCE_INVALID";
-/// Refusal code for a CBM semantic atom absent from the frozen panel-v3 registry.
+/// Refusal code for a CBM semantic atom absent from the frozen semantic registry.
 pub const ASTRO_SEMANTIC_COVERAGE_GAP: &str = "ASTRO_SEMANTIC_COVERAGE_GAP";
 
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
@@ -100,6 +101,8 @@ const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_SEMANTIC_CONSTELLATION_ROW: &str = "astrolabe.semantic-constellation.v1";
 const SCHEMA_SEMANTIC_COVERAGE_ROW: &str = "astrolabe.semantic-coverage.v1";
 const SEMANTIC_CANONICAL_TAG: &str = "astrolabe.cbm.semantic-constellation.v1";
+/// Domain separator for panel-v4 node identity's complete semantic-input binding.
+const NODE_SEMANTIC_IDENTITY_TAG: &str = "astrolabe.cbm.node-semantic-identity.v1";
 
 fn semantic_coverage_refusal(
     message: impl Into<String>,
@@ -128,8 +131,9 @@ const FILE_DIGEST_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 // labeled full reconcile. v3 folds the stable atom and byte-exact source
 // contract, so an exact body/span change can never reuse a v2 identity. v4
 // folds the complete local-name + preprocessing-context edge identity. v5
-// additionally binds the independently measured generated URL-path column.
-const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v5";
+// additionally binds the independently measured generated URL-path column. v6
+// binds the complete measured node semantic input into the node CxId.
+const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v6";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 /// Ledger payload schema for admitting historical symbol versions without
 /// mutating the live graph projection.
@@ -5390,12 +5394,14 @@ where
     let worker_count = options.workers.min(nodes.len()).max(1);
     parallel_map(nodes, worker_count, |node| {
         let semantic_values = node_semantic_values(&node)?;
+        let identity = node_symbol_identity(&node, &semantic_values, options.panel_version)?;
         prepare_constellation(
             vault,
             runtime,
             options,
             driver,
             node,
+            identity,
             semantic_values,
             retention,
         )
@@ -5450,7 +5456,7 @@ where
         .iter()
         .map(|slot| slot.get())
         .collect();
-    let identity = node.symbol.identity(options.panel_version)?;
+    let identity = node_symbol_identity(&node, &semantic_values, options.panel_version)?;
     let reused = vault
         .read_cf_at(
             vault.latest_seq(),
@@ -5477,6 +5483,7 @@ where
         options,
         driver,
         node,
+        identity,
         semantic_values,
         retention,
     )?;
@@ -5699,6 +5706,46 @@ fn semantic_canonical_input_bytes(
         append_semantic_value(&mut out, value);
     }
     Ok(out)
+}
+
+/// Derives a node identity from every byte that can affect its measured panel.
+///
+/// Panel v3 introduced exhaustive semantic measurement after the original
+/// symbol canonical contract had already frozen. That left values such as the
+/// source-generation-local node id outside CxId: two rows could therefore share
+/// one CxId while carrying different frozen slot bytes. Panel v4 preserves the
+/// stable logical [`SeriesId`] but appends a domain-separated digest of the exact
+/// ordered semantic input to the canonical version bytes before deriving CxId.
+/// The digest avoids duplicating large source/prose atoms already present in the
+/// symbol canonical bytes and exact semantic sidecars.
+fn node_symbol_identity(
+    node: &ExtractedNode,
+    semantic_values: &BTreeMap<SlotId, SemanticValue>,
+    panel_version: u32,
+) -> IngestResult<SymbolIdentity> {
+    let mut identity = node.symbol.identity(panel_version)?;
+    if panel_version < PANEL_V4_VERSION {
+        return Ok(identity);
+    }
+    let semantic = semantic_canonical_input_bytes(
+        SemanticFamily::Node,
+        node.atom_id.as_str(),
+        semantic_values,
+    )?;
+    append_semantic_frame(
+        &mut identity.canonical_input_bytes,
+        NODE_SEMANTIC_IDENTITY_TAG.as_bytes(),
+    );
+    append_semantic_frame(
+        &mut identity.canonical_input_bytes,
+        &sha256_digest(&semantic),
+    );
+    identity.cx_id = cx_id_from_canonical(
+        &identity.canonical_input_bytes,
+        panel_version,
+        identity.vault_salt.as_bytes(),
+    )?;
+    Ok(identity)
 }
 
 fn semantic_exact_sidecars(
@@ -6554,6 +6601,7 @@ fn prepare_constellation<C, R>(
     options: &SqliteImportOptions,
     driver: &PanelDriver,
     node: ExtractedNode,
+    identity: SymbolIdentity,
     semantic_values: BTreeMap<SlotId, SemanticValue>,
     retention: InputRetention,
 ) -> IngestResult<PreparedConstellation>
@@ -6561,7 +6609,6 @@ where
     C: Clock,
     R: SlotRuntime,
 {
-    let identity = node.symbol.identity(options.panel_version)?;
     let semantic_value_slots = semantic_values.keys().copied().collect::<Vec<_>>();
     let legacy_slots_enabled = !node.label.is_structural();
     let mut input = PanelInput::with_available_slots(node.label, options.available_slots.clone())
@@ -8210,12 +8257,12 @@ where
             hex_lower(key)
         )));
     }
-    if row.panel_version != PANEL_V3_VERSION {
+    if row.panel_version != CURRENT_SEMANTIC_PANEL_VERSION {
         return Err(readback_mismatch(format!(
             "semantic constellation {} uses panel version {}, expected {}",
             hex_lower(key),
             row.panel_version,
-            PANEL_V3_VERSION
+            CURRENT_SEMANTIC_PANEL_VERSION
         )));
     }
     if row.registry_sha256 != hex_lower(&semantic_registry_sha256()) {
@@ -8311,7 +8358,7 @@ fn verify_semantic_coverage_row(key: &[u8], bytes: &[u8]) -> IngestResult<Semant
     let witness = serde_json::from_slice::<SemanticCoverageWitness>(bytes)?;
     if witness.schema != SCHEMA_SEMANTIC_COVERAGE_ROW
         || witness.project.trim().is_empty()
-        || witness.panel_version != PANEL_V3_VERSION
+        || witness.panel_version != CURRENT_SEMANTIC_PANEL_VERSION
     {
         return Err(readback_mismatch(format!(
             "semantic coverage {} has wrong schema, empty project, or panel version {}",
@@ -8438,7 +8485,9 @@ where
                             counts.constellation_rows += 1;
                             verify_node_map_matches_base(&row, &verified.constellation, errors);
                             if verified.constellation.panel_version >= PANEL_V3_VERSION {
-                                if verified.constellation.panel_version != PANEL_V3_VERSION {
+                                if verified.constellation.panel_version
+                                    != CURRENT_SEMANTIC_PANEL_VERSION
+                                {
                                     errors.push(format!(
                                         "node map {} uses unverified semantic panel version {}",
                                         row.node_id, verified.constellation.panel_version
@@ -8787,7 +8836,7 @@ where
     }
     for project in coverage_by_project.keys() {
         errors.push(format!(
-            "project {project:?} has panel-v3 semantic Base rows but no coverage witness"
+            "project {project:?} has exhaustive semantic Base rows but no coverage witness"
         ));
     }
     counts.semantic_slot_rows =
