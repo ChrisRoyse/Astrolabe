@@ -15,6 +15,7 @@ impl VersionedCfStore {
         F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
         E: From<calyx_core::CalyxError>,
     {
+        self.ensure_cf_selected(cf).map_err(E::from)?;
         self.ensure_snapshot_live(snapshot, clock)
             .map_err(E::from)?;
         if limit == 0 {

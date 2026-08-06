@@ -32,6 +32,10 @@ pub struct CfRouter {
     pub(super) existing_only: bool,
     pub(super) eager_lookup_cfs: BTreeSet<ColumnFamily>,
     pub(super) eager_lookup_all: bool,
+    /// Exact read capability for a selected-CF handle. `None` means the
+    /// router was opened over the complete vault; `Some` means every access
+    /// outside this set must fail instead of synthesizing an empty keyspace.
+    selected_cfs: Option<BTreeSet<ColumnFamily>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +72,7 @@ impl CfRouter {
         }
         let mut router = Self::new_existing(vault_dir, memtable_byte_cap)?;
         router.eager_lookup_cfs = selected.clone();
+        router.selected_cfs = Some(selected.clone());
         for cf in &selected {
             router.ensure_existing_cf(*cf)?;
         }
@@ -110,6 +115,7 @@ impl CfRouter {
         }
         let mut router = Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy)?;
         router.eager_lookup_cfs = selected.clone();
+        router.selected_cfs = Some(selected.clone());
         for cf in &selected {
             router.ensure_cf(*cf)?;
         }
@@ -178,6 +184,7 @@ impl CfRouter {
             existing_only: false,
             eager_lookup_cfs: BTreeSet::new(),
             eager_lookup_all: false,
+            selected_cfs: None,
         })
     }
 
@@ -210,7 +217,14 @@ impl CfRouter {
             existing_only: true,
             eager_lookup_cfs: BTreeSet::new(),
             eager_lookup_all: false,
+            selected_cfs: None,
         })
+    }
+
+    /// Returns the exact column-family capability of a selected-CF router.
+    /// Full-vault routers return `None`.
+    pub(crate) fn selected_cfs(&self) -> Option<&BTreeSet<ColumnFamily>> {
+        self.selected_cfs.as_ref()
     }
 
     /// Raw write with no commit domain; see [`Self::put_at`].

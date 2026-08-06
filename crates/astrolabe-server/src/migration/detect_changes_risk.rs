@@ -100,6 +100,9 @@ pub(crate) fn grounded_risk_block(
             ColumnFamily::Graph,
             ColumnFamily::Base,
             ColumnFamily::Kernel,
+            // Composite reach verification refuses SIM rows whose source
+            // ledger attestation is unavailable on this handle.
+            ColumnFamily::Ledger,
         ],
     )?;
     let evidence = OracleEvidence::from_vault(&vault)?;

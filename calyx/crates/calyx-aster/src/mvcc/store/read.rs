@@ -9,6 +9,7 @@ impl VersionedCfStore {
         key: &[u8],
         clock: &dyn Clock,
     ) -> Result<Option<Vec<u8>>> {
+        self.ensure_cf_selected(cf)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         self.ensure_unbarriered(cf, key)?;
         {
@@ -31,6 +32,7 @@ impl VersionedCfStore {
         key: &[u8],
         clock: &dyn Clock,
     ) -> Result<Option<Seq>> {
+        self.ensure_cf_selected(cf)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         self.ensure_unbarriered(cf, key)?;
         let table = self.rows.read().expect("mvcc row table poisoned");
@@ -56,6 +58,9 @@ impl VersionedCfStore {
         reads: &[CfRead],
         clock: &dyn Clock,
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        for read in reads {
+            self.ensure_cf_selected(read.cf)?;
+        }
         self.ensure_snapshot_live(snapshot, clock)?;
         for read in reads {
             self.ensure_unbarriered(read.cf, &read.key)?;
@@ -82,6 +87,7 @@ impl VersionedCfStore {
         E: From<calyx_core::CalyxError>,
         F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
     {
+        self.ensure_cf_selected(cf).map_err(E::from)?;
         self.ensure_snapshot_live(snapshot, clock)
             .map_err(E::from)?;
         if keys.windows(2).any(|pair| pair[0].1 > pair[1].1) {
@@ -286,6 +292,7 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         clock: &dyn Clock,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_cf_selected(cf)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut rows = self.router_latest_rows(snapshot, cf, None)?;
         self.overlay_table_rows(snapshot, cf, None, &mut rows);
@@ -303,6 +310,7 @@ impl VersionedCfStore {
         range: &KeyRange,
         clock: &dyn Clock,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_cf_selected(cf)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut rows = self.router_latest_rows(snapshot, cf, Some(range))?;
         self.overlay_table_rows(snapshot, cf, Some(range), &mut rows);
@@ -320,6 +328,7 @@ impl VersionedCfStore {
         range: &KeyRange,
         clock: &dyn Clock,
     ) -> Result<Vec<Vec<u8>>> {
+        self.ensure_cf_selected(cf)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut keys = self.router_latest_keys(snapshot, cf, range)?;
         self.overlay_table_keys(snapshot, cf, range, &mut keys);
@@ -339,6 +348,7 @@ impl VersionedCfStore {
         limit: usize,
         clock: &dyn Clock,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_cf_selected(cf)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -395,6 +405,28 @@ impl VersionedCfStore {
             .expect("mvcc read barriers poisoned");
         if let Some(error) = first_blocking(&barriers, cf, key) {
             return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn ensure_cf_selected(&self, cf: ColumnFamily) -> Result<()> {
+        if let Some(selected) = &self.selected_cfs
+            && !selected.contains(&cf)
+        {
+            let selected_names = selected
+                .iter()
+                .map(|selected_cf| selected_cf.name())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(CalyxError {
+                code: CALYX_ASTER_CF_NOT_SELECTED,
+                message: format!(
+                    "column family {} was not opened by this selected-CF vault handle; selected=[{}]",
+                    cf.name(),
+                    selected_names
+                ),
+                remediation: "open a new read-only vault handle whose selected_cfs explicitly includes every column family required by the operation",
+            });
         }
         Ok(())
     }

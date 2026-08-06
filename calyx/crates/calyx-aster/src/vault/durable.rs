@@ -55,6 +55,8 @@ pub struct VaultOptions {
     pub read_only: bool,
     /// Restricts router recovery to a concrete CF set for read-only handles.
     /// This keeps analytical/search reads from enumerating unrelated large CFs.
+    /// Any point, batch, or range read of a CF outside this set fails with
+    /// `CALYX_ASTER_CF_NOT_SELECTED`; it never reports synthetic absence.
     pub selected_cfs: Option<Vec<ColumnFamily>>,
 }
 

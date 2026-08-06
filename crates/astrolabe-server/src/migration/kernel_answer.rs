@@ -667,6 +667,9 @@ pub(crate) fn build_kernel_answer_inputs(
             ColumnFamily::Base,
             ColumnFamily::Graph,
             ColumnFamily::Kernel,
+            // Composite projection verification binds every persisted SIM row
+            // to its exact astrolabe-sim-edges attestation.
+            ColumnFamily::Ledger,
             ColumnFamily::Kv,
             // #880: the query is resolved against the members' persisted S18
             // vectors through this same handle, so the ranking and the artifact

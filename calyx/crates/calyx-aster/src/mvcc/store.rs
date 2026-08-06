@@ -31,6 +31,10 @@ const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
 pub const CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC: &str =
     "CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC";
 
+/// A selected-CF vault handle was asked to read a column family it did not
+/// open. Absence cannot be inferred from an unavailable keyspace.
+pub const CALYX_ASTER_CF_NOT_SELECTED: &str = "CALYX_ASTER_CF_NOT_SELECTED";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VersionedValue {
     seq: Seq,
@@ -200,6 +204,10 @@ pub struct VersionedCfStore {
     next_lease_id: AtomicU64,
     rows: RwLock<RowTable>,
     router: RwLock<Option<CfRouter>>,
+    /// Read capability inherited from a selected-CF durable router. Keeping it
+    /// at the MVCC boundary also covers replayed in-memory rows: an unselected
+    /// CF can never leak through the WAL overlay or masquerade as empty.
+    selected_cfs: Option<BTreeSet<ColumnFamily>>,
     router_latest_readback: AtomicBool,
     read_barriers: RwLock<Vec<ReadBarrier>>,
     leases: LeaseRegistry,
@@ -216,6 +224,7 @@ impl VersionedCfStore {
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(None),
+            selected_cfs: None,
             router_latest_readback: AtomicBool::new(false),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
@@ -227,12 +236,14 @@ impl VersionedCfStore {
 
     pub fn new_with_router(start_seq: Seq, router: CfRouter) -> Self {
         let resource_counters = router.resource_counters();
+        let selected_cfs = router.selected_cfs().cloned();
         Self {
             seqs: SeqAllocator::new(start_seq),
             derived_content_seq: AtomicU64::new(0),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(Some(router)),
+            selected_cfs,
             router_latest_readback: AtomicBool::new(false),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
