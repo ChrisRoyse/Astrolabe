@@ -62,7 +62,7 @@ pub enum IngestError {
         /// Human-readable refusal message.
         message: String,
         /// Operator-facing remediation.
-        remediation: &'static str,
+        remediation: String,
     },
     /// Caller supplied an invalid registry input.
     InvalidInput(String),
@@ -101,12 +101,12 @@ impl IngestError {
     pub fn refused(
         code: &'static str,
         message: impl Into<String>,
-        remediation: &'static str,
+        remediation: impl Into<String>,
     ) -> Self {
         Self::Refused {
             code,
             message: message.into(),
-            remediation,
+            remediation: remediation.into(),
         }
     }
 
@@ -133,6 +133,24 @@ impl IngestError {
                 "Quarantine the vault, inspect the named invariant violations, and rebuild from source bytes before serving reads.",
             ),
             Self::Json(_) | Self::InvalidInput(_) => None,
+        }
+    }
+
+    /// Returns the human-readable failure message without repeating the stable
+    /// code or remediation fields. Operational JSON surfaces use this accessor
+    /// so callers never have to parse [`Display`](fmt::Display) text to recover
+    /// a structured refusal.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Domain(err) => err.message().to_string(),
+            Self::Panel(err) => err.message().to_string(),
+            Self::Calyx(err) => err.message.to_string(),
+            Self::Json(err) => err.to_string(),
+            Self::Refused { message, .. } | Self::InvalidInput(message) => message.clone(),
+            Self::VerifyFailed(errors) => format!(
+                "series registry verify --deep failed: {}",
+                errors.join("; ")
+            ),
         }
     }
 }

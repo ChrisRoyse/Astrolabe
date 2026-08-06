@@ -72,6 +72,7 @@ const QUANTIZATION_GATE_REMEDIATION: &str = "Provide measured recall, panel-bits
 const LEGACY_CBM_EDGE_ROWS_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists complete astrolabe:cbm-edge:v1 raw edge rows before reading or lowering its graph snapshot.";
 const MISSING_CBM_PROJECT_ROW_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists an astrolabe:cbm-project:v1 row, and confirm the requested project name matches an imported project before reading or lowering its graph snapshot.";
 const EXACT_SOURCE_REMEDIATION: &str = "Preserve the vault, inspect the referenced cxinput:v1 Blob rows, and re-import the project from its exact CBM SQLite source before trusting graph source bytes.";
+const SEMANTIC_COVERAGE_REMEDIATION: &str = "Preserve the prior Calyx generation, add or correct the exact versioned typed lens rule named by this refusal, rebuild the panel, and re-ingest the same CBM source.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
 const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
@@ -99,6 +100,13 @@ const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_SEMANTIC_CONSTELLATION_ROW: &str = "astrolabe.semantic-constellation.v1";
 const SCHEMA_SEMANTIC_COVERAGE_ROW: &str = "astrolabe.semantic-coverage.v1";
 const SEMANTIC_CANONICAL_TAG: &str = "astrolabe.cbm.semantic-constellation.v1";
+
+fn semantic_coverage_refusal(
+    message: impl Into<String>,
+    remediation: impl Into<String>,
+) -> IngestError {
+    IngestError::refused(ASTRO_SEMANTIC_COVERAGE_GAP, message, remediation)
+}
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v3";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v2";
 const SCHEMA_FILE_DIGEST_ROW: &str = "astrolabe-file-digest-v1";
@@ -1276,16 +1284,20 @@ impl SemanticCoverageAccumulator {
         *self.family_constellations.entry(family).or_default() += 1;
         for slot_id in slots {
             let rule = semantic_rule_by_slot(*slot_id).ok_or_else(|| {
-                IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: coverage observed unregistered slot {slot_id}; remediation: repair the frozen registry before publication"
-                ))
+                semantic_coverage_refusal(
+                    format!("coverage observed unregistered slot {slot_id}"),
+                    "Repair the frozen registry before publication and re-ingest the preserved source.",
+                )
             })?;
             if rule.family != family {
-                return Err(IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: coverage observation for {} contains {} slot {slot_id}; remediation: repair typed row construction before publication",
-                    family.as_str(),
-                    rule.family.as_str()
-                )));
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "coverage observation for {} contains {} slot {slot_id}",
+                        family.as_str(),
+                        rule.family.as_str()
+                    ),
+                    "Repair typed row construction before publication and re-ingest the preserved source.",
+                ));
             }
             *self.rule_present.entry(rule.value_slot).or_default() += 1;
         }
@@ -1300,15 +1312,19 @@ impl SemanticCoverageAccumulator {
         self.observe_slots(family, &values.keys().copied().collect::<Vec<_>>())?;
         for (slot_id, value) in values {
             let rule = semantic_rule_by_slot(*slot_id).ok_or_else(|| {
-                IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: coverage observed unregistered slot {slot_id}; remediation: repair the frozen registry before publication"
-                ))
+                semantic_coverage_refusal(
+                    format!("coverage observed unregistered slot {slot_id}"),
+                    "Repair the frozen registry before publication and re-ingest the preserved source.",
+                )
             })?;
             if rule.family != family || rule.source_type != value.source_type() {
-                return Err(IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: coverage observation for {} slot {slot_id} disagrees with the registry; remediation: repair typed row construction before publication",
-                    family.as_str()
-                )));
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "coverage observation for {} slot {slot_id} disagrees with the registry",
+                        family.as_str()
+                    ),
+                    "Repair typed row construction before publication and re-ingest the preserved source.",
+                ));
             }
         }
         Ok(())
@@ -1372,14 +1388,18 @@ impl SemanticCoverageAccumulator {
         }
         let classified = total_encoded + total_embedded + total_imported;
         let uncovered = total_present.checked_sub(classified).ok_or_else(|| {
-            IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: classified semantic atoms exceed present atoms; remediation: repair coverage accounting before publication"
-            ))
+            semantic_coverage_refusal(
+                "classified semantic atoms exceed present atoms",
+                "Repair coverage accounting before publication and re-ingest the preserved source.",
+            )
         })?;
         if uncovered != 0 || classified != total_present {
-            return Err(IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: present={total_present} encoded={total_encoded} embedded={total_embedded} imported_vector={total_imported} uncovered={uncovered}; remediation: add frozen lens rules until uncovered is exactly zero"
-            )));
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "present={total_present} encoded={total_encoded} embedded={total_embedded} imported_vector={total_imported} uncovered={uncovered}"
+                ),
+                "Add frozen lens rules until uncovered is exactly zero, rebuild the panel, and re-ingest the preserved source.",
+            ));
         }
         let slot_manifest_sha256 = panel_slot_manifest_sha256(panel_version)?;
         Ok(SemanticCoverageWitness {
@@ -5536,20 +5556,63 @@ fn insert_semantic_value(
 ) -> IngestResult<()> {
     let source_type = value.source_type();
     let rule = semantic_rule(family, path, source_type).ok_or_else(|| {
-        IngestError::InvalidInput(format!(
-            "{ASTRO_SEMANTIC_COVERAGE_GAP}: unregistered CBM semantic atom family={} path={path:?} type={}; remediation: add an explicit versioned typed lens rule and rebuild the panel before ingesting this schema",
-            family.as_str(),
-            source_type.as_str()
-        ))
+        IngestError::refused(
+            ASTRO_SEMANTIC_COVERAGE_GAP,
+            format!(
+                "unregistered CBM semantic atom family={} path={path:?} type={}",
+                family.as_str(),
+                source_type.as_str()
+            ),
+            SEMANTIC_COVERAGE_REMEDIATION,
+        )
     })?;
     if values.insert(SlotId::new(rule.value_slot), value).is_some() {
-        return Err(IngestError::InvalidInput(format!(
-            "{ASTRO_SEMANTIC_COVERAGE_GAP}: duplicate semantic value slot S{} for family={} path={path:?}; remediation: keep every atomic path bound to one collision-free frozen slot",
-            rule.value_slot,
-            family.as_str()
-        )));
+        return Err(IngestError::refused(
+            ASTRO_SEMANTIC_COVERAGE_GAP,
+            format!(
+                "duplicate semantic value slot S{} for family={} path={path:?}",
+                rule.value_slot,
+                family.as_str()
+            ),
+            "Keep every atomic path bound to one collision-free frozen slot, rebuild the panel, and re-ingest the preserved source.",
+        ));
     }
     Ok(())
+}
+
+fn insert_observed_semantic_value(
+    values: &mut BTreeMap<SlotId, SemanticValue>,
+    family: SemanticFamily,
+    row_identity: &str,
+    path: &str,
+    value: SemanticValue,
+) -> IngestResult<()> {
+    let source_type = value.source_type();
+    if semantic_rule(family, path, source_type).is_none() {
+        let expected = SEMANTIC_RULES
+            .iter()
+            .filter(|rule| rule.family == family && rule.path == path)
+            .map(|rule| {
+                format!(
+                    "S{}:{}:{}:{:?}",
+                    rule.value_slot,
+                    rule.slot_key,
+                    rule.source_type.as_str(),
+                    rule.kind.shape()
+                )
+            })
+            .collect::<Vec<_>>();
+        return Err(IngestError::refused(
+            ASTRO_SEMANTIC_COVERAGE_GAP,
+            format!(
+                "{row_identity} has unregistered semantic atom family={} path={path:?} observed_type={} expected_lenses={expected:?}",
+                family.as_str(),
+                source_type.as_str()
+            ),
+            SEMANTIC_COVERAGE_REMEDIATION,
+        ));
+    }
+    insert_semantic_value(values, family, path, value)
 }
 
 fn semantic_json_number(
@@ -5565,9 +5628,11 @@ fn semantic_json_number(
     {
         return Ok(SemanticValue::Real(value));
     }
-    Err(IngestError::InvalidInput(format!(
-        "{ASTRO_SEMANTIC_COVERAGE_GAP}: {row_identity} atom {path} is not a finite signed-integer or real JSON number; remediation: preserve the source and version the registry with its exact numeric type"
-    )))
+    Err(IngestError::refused(
+        ASTRO_SEMANTIC_COVERAGE_GAP,
+        format!("{row_identity} atom {path} is not a finite signed-integer or real JSON number"),
+        "Preserve the source value, add its exact finite numeric type to the versioned semantic registry, rebuild the panel, and re-ingest without coercion.",
+    ))
 }
 
 fn append_semantic_frame(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -5604,10 +5669,10 @@ fn semantic_canonical_input_bytes(
     values: &BTreeMap<SlotId, SemanticValue>,
 ) -> IngestResult<Vec<u8>> {
     if source_key.trim().is_empty() {
-        return Err(IngestError::InvalidInput(format!(
-            "{ASTRO_SEMANTIC_COVERAGE_GAP}: {} semantic row has an empty source key; remediation: bind every source row to its exact primary key",
-            family.as_str()
-        )));
+        return Err(semantic_coverage_refusal(
+            format!("{} semantic row has an empty source key", family.as_str()),
+            "Bind every source row to its exact primary key and re-ingest the preserved source.",
+        ));
     }
     let mut out = Vec::new();
     append_semantic_frame(&mut out, SEMANTIC_CANONICAL_TAG.as_bytes());
@@ -5616,15 +5681,19 @@ fn semantic_canonical_input_bytes(
     append_semantic_frame(&mut out, &(values.len() as u64).to_be_bytes());
     for (slot_id, value) in values {
         let rule = semantic_rule_by_slot(*slot_id).ok_or_else(|| {
-            IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: canonical semantic row contains unregistered slot {slot_id}; remediation: repair the frozen registry before identity derivation"
-            ))
+            semantic_coverage_refusal(
+                format!("canonical semantic row contains unregistered slot {slot_id}"),
+                "Repair the frozen registry before identity derivation and re-ingest the preserved source.",
+            )
         })?;
         if rule.family != family || rule.source_type != value.source_type() {
-            return Err(IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: canonical {} row slot {slot_id} disagrees with frozen family/type; remediation: repair typed row construction before identity derivation",
-                family.as_str()
-            )));
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "canonical {} row slot {slot_id} disagrees with frozen family/type",
+                    family.as_str()
+                ),
+                "Repair typed row construction before identity derivation and re-ingest the preserved source.",
+            ));
         }
         append_semantic_frame(&mut out, &slot_id.get().to_be_bytes());
         append_semantic_value(&mut out, value);
@@ -5639,9 +5708,10 @@ fn semantic_exact_sidecars(
     let mut metadata = BTreeMap::new();
     for (slot_id, value) in values {
         let rule = semantic_rule_by_slot(*slot_id).ok_or_else(|| {
-            IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: sidecar construction contains unregistered slot {slot_id}; remediation: repair the frozen registry"
-            ))
+            semantic_coverage_refusal(
+                format!("sidecar construction contains unregistered slot {slot_id}"),
+                "Repair the frozen registry and re-ingest the preserved source.",
+            )
         })?;
         let exact = match value {
             SemanticValue::Boolean(value) => {
@@ -5658,10 +5728,10 @@ fn semantic_exact_sidecars(
             SemanticValue::IntegerArray(values) => serde_json::to_string(values)?,
             SemanticValue::Real(value) => {
                 if !value.is_finite() {
-                    return Err(IngestError::InvalidInput(format!(
-                        "{ASTRO_SEMANTIC_COVERAGE_GAP}: {} is non-finite; remediation: repair the source value before measurement",
-                        rule.path
-                    )));
+                    return Err(semantic_coverage_refusal(
+                        format!("{} is non-finite", rule.path),
+                        "Repair the source value before measurement and retry the unchanged import.",
+                    ));
                 }
                 scalars.insert(rule.path.to_string(), *value);
                 value.to_string()
@@ -5678,9 +5748,10 @@ fn semantic_exact_sidecars(
 fn semantic_modality(values: &BTreeMap<SlotId, SemanticValue>) -> IngestResult<Modality> {
     for slot_id in values.keys() {
         let rule = semantic_rule_by_slot(*slot_id).ok_or_else(|| {
-            IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: modality construction contains unregistered slot {slot_id}; remediation: repair the frozen registry"
-            ))
+            semantic_coverage_refusal(
+                format!("modality construction contains unregistered slot {slot_id}"),
+                "Repair the frozen registry and re-ingest the preserved source.",
+            )
         })?;
         if matches!(
             rule.kind,
@@ -5726,13 +5797,25 @@ where
     metadata.insert("semantic.family".to_string(), family.as_str().to_string());
     metadata.insert("semantic.source_key".to_string(), source_key.clone());
     metadata.insert("input_hash_blake3".to_string(), hex_lower(&input_hash));
-    let readout = driver.measure(
-        &PanelInput::with_available_slots(SymbolLabel::Project, std::iter::empty())
-            .with_scalars(scalars)
-            .with_semantic_values(family, values)
-            .with_legacy_slots_enabled(false),
-        runtime,
-    )?;
+    let readout = driver
+        .measure(
+            &PanelInput::with_available_slots(SymbolLabel::Project, std::iter::empty())
+                .with_scalars(scalars)
+                .with_semantic_values(family, values)
+                .with_legacy_slots_enabled(false),
+            runtime,
+        )
+        .map_err(|error| {
+            IngestError::refused(
+                error.code(),
+                format!(
+                    "{} semantic row source_key={source_key:?} slots={slot_ids:?} failed frozen lens measurement: {}",
+                    family.as_str(),
+                    error.message()
+                ),
+                error.remediation(),
+            )
+        })?;
     let input_ref = match retention {
         InputRetention::Persist => InputRef {
             hash: input_hash,
@@ -5771,12 +5854,15 @@ where
     constellation.validate_schema()?;
     let measured_slot_ids = constellation.slots.keys().copied().collect::<Vec<_>>();
     if measured_slot_ids != slot_ids {
-        return Err(IngestError::InvalidInput(format!(
-            "{ASTRO_SEMANTIC_COVERAGE_GAP}: measured {} row {source_key:?} emitted slot roster {:?}, expected {:?}; remediation: repair panel dispatch before publication",
-            family.as_str(),
-            measured_slot_ids,
-            slot_ids
-        )));
+        return Err(semantic_coverage_refusal(
+            format!(
+                "measured {} row {source_key:?} emitted slot roster {:?}, expected {:?}",
+                family.as_str(),
+                measured_slot_ids,
+                slot_ids
+            ),
+            "Repair panel dispatch before publication and re-ingest the preserved source.",
+        ));
     }
     Ok(PreparedSemanticConstellation {
         family,
@@ -5895,26 +5981,35 @@ fn node_semantic_values(node: &ExtractedNode) -> IngestResult<BTreeMap<SlotId, S
 
     let properties = node.symbol.properties_json.parse::<Value>()?;
     let object = properties.as_object().ok_or_else(|| {
-        IngestError::InvalidInput(format!(
-            "{ASTRO_SEMANTIC_COVERAGE_GAP}: node {node_id} properties are not an object; remediation: rebuild the CBM SQLite source with object-valued properties"
-        ))
+        semantic_coverage_refusal(
+            format!("node {node_id} properties are not an object"),
+            "Rebuild the CBM SQLite source with object-valued properties and retry the unchanged import.",
+        )
     })?;
     for (key, raw) in object {
         let base_path = format!("properties.{key}");
         match raw {
-            Value::Bool(value) => insert_semantic_value(
+            Value::Bool(value) => insert_observed_semantic_value(
                 &mut values,
                 family,
+                &format!("node {node_id}"),
                 &base_path,
                 SemanticValue::Boolean(*value),
             )?,
             Value::Number(number) => {
                 let value = semantic_json_number(number, &format!("node {node_id}"), &base_path)?;
-                insert_semantic_value(&mut values, family, &base_path, value)?;
+                insert_observed_semantic_value(
+                    &mut values,
+                    family,
+                    &format!("node {node_id}"),
+                    &base_path,
+                    value,
+                )?;
             }
-            Value::String(value) => insert_semantic_value(
+            Value::String(value) => insert_observed_semantic_value(
                 &mut values,
                 family,
+                &format!("node {node_id}"),
                 &base_path,
                 SemanticValue::Text(value.clone()),
             )?,
@@ -5923,24 +6018,29 @@ fn node_semantic_values(node: &ExtractedNode) -> IngestResult<BTreeMap<SlotId, S
                 let mut strings = Vec::with_capacity(items.len());
                 for (index, item) in items.iter().enumerate() {
                     let value = item.as_str().ok_or_else(|| {
-                        IngestError::InvalidInput(format!(
-                            "{ASTRO_SEMANTIC_COVERAGE_GAP}: node {node_id} atom {child_path}[{index}] is not text; remediation: add an explicit typed child-path rule for the observed schema"
-                        ))
+                        semantic_coverage_refusal(
+                            format!(
+                                "node {node_id} atom {child_path}[{index}] is not text"
+                            ),
+                            "Add an explicit typed child-path rule for the observed schema, rebuild the panel, and retry the unchanged import.",
+                        )
                     })?;
                     strings.push(value.to_string());
                 }
-                insert_semantic_value(
+                insert_observed_semantic_value(
                     &mut values,
                     family,
+                    &format!("node {node_id}"),
                     &child_path,
                     SemanticValue::TextArray(strings),
                 )?;
             }
             Value::Null => {}
             Value::Object(_) => {
-                return Err(IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: node {node_id} atom {base_path} has unsupported JSON type object; remediation: decompose the value into explicit typed child-path rules before ingestion"
-                )));
+                return Err(semantic_coverage_refusal(
+                    format!("node {node_id} atom {base_path} has unsupported JSON type object"),
+                    "Decompose the value into explicit typed child-path rules, rebuild the panel, and retry the unchanged import.",
+                ));
             }
         }
     }
@@ -5991,37 +6091,48 @@ fn edge_semantic_values(edge: &RawEdgeRow) -> IngestResult<BTreeMap<SlotId, Sema
         ],
     )?;
     let object = edge.properties.as_object().ok_or_else(|| {
-        IngestError::InvalidInput(format!(
-            "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} properties are not an object; remediation: rebuild the CBM SQLite source with object-valued properties",
-            edge.id
-        ))
+        semantic_coverage_refusal(
+            format!("edge {} properties are not an object", edge.id),
+            "Rebuild the CBM SQLite source with object-valued properties and retry the unchanged import.",
+        )
     })?;
     for (key, raw) in object {
         let base_path = format!("properties.{key}");
         match raw {
             Value::Null => {}
-            Value::Bool(value) => insert_semantic_value(
+            Value::Bool(value) => insert_observed_semantic_value(
                 &mut values,
                 family,
+                &format!("edge {}", edge.id),
                 &base_path,
                 SemanticValue::Boolean(*value),
             )?,
             Value::Number(number) => {
                 let value = semantic_json_number(number, &format!("edge {}", edge.id), &base_path)?;
-                insert_semantic_value(&mut values, family, &base_path, value)?;
+                insert_observed_semantic_value(
+                    &mut values,
+                    family,
+                    &format!("edge {}", edge.id),
+                    &base_path,
+                    value,
+                )?;
             }
-            Value::String(value) => insert_semantic_value(
+            Value::String(value) => insert_observed_semantic_value(
                 &mut values,
                 family,
+                &format!("edge {}", edge.id),
                 &base_path,
                 SemanticValue::Text(value.clone()),
             )?,
             Value::Array(items) if key == "args" => {
                 let argument_count = i64::try_from(items.len()).map_err(|_| {
-                    IngestError::InvalidInput(format!(
-                        "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} properties.args length exceeds signed integer range; remediation: repair the source row before semantic publication",
-                        edge.id
-                    ))
+                    semantic_coverage_refusal(
+                        format!(
+                            "edge {} properties.args length exceeds signed integer range",
+                            edge.id
+                        ),
+                        "Repair the source row before semantic publication and retry the unchanged import.",
+                    )
                 })?;
                 insert_semantic_value(
                     &mut values,
@@ -6035,36 +6146,47 @@ fn edge_semantic_values(edge: &RawEdgeRow) -> IngestResult<BTreeMap<SlotId, Sema
                 let mut raw_values = Vec::new();
                 for (index, item) in items.iter().enumerate() {
                     let child = item.as_object().ok_or_else(|| {
-                        IngestError::InvalidInput(format!(
-                            "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} atom properties.args[{index}] is not an object; remediation: decompose the observed array item into frozen typed child paths",
-                            edge.id
-                        ))
+                        semantic_coverage_refusal(
+                            format!(
+                                "edge {} atom properties.args[{index}] is not an object",
+                                edge.id
+                            ),
+                            "Decompose the observed array item into frozen typed child paths, rebuild the panel, and retry the unchanged import.",
+                        )
                     })?;
                     for (child_key, child_value) in child {
                         match (child_key.as_str(), child_value) {
-                            ("i", Value::Number(number)) => integers.push(number.as_i64().ok_or_else(|| {
-                                IngestError::InvalidInput(format!(
-                                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} atom properties.args[{index}].i is not a signed integer; remediation: version the registry with its exact numeric type",
-                                    edge.id
-                                ))
-                            })?),
+                            ("i", Value::Number(number)) => integers.push(
+                                number.as_i64().ok_or_else(|| {
+                                    semantic_coverage_refusal(
+                                        format!(
+                                            "edge {} atom properties.args[{index}].i is not a signed integer",
+                                            edge.id
+                                        ),
+                                        "Version the registry with its exact numeric type, rebuild the panel, and retry the unchanged import.",
+                                    )
+                                })?,
+                            ),
                             ("e", Value::String(value)) => expressions.push(value.clone()),
                             ("k", Value::String(value)) => keys.push(value.clone()),
                             ("v", Value::String(value)) => raw_values.push(value.clone()),
                             (_, Value::Null) => {}
                             _ => {
-                                return Err(IngestError::InvalidInput(format!(
-                                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} has unregistered atom properties.args[{index}].{child_key} with JSON type {}; remediation: add an exact typed child-path rule before ingestion",
-                                    edge.id,
-                                    match child_value {
-                                        Value::Null => "null",
-                                        Value::Bool(_) => "boolean",
-                                        Value::Number(_) => "number",
-                                        Value::String(_) => "text",
-                                        Value::Array(_) => "array",
-                                        Value::Object(_) => "object",
-                                    }
-                                )));
+                                return Err(semantic_coverage_refusal(
+                                    format!(
+                                        "edge {} has unregistered atom properties.args[{index}].{child_key} with JSON type {}",
+                                        edge.id,
+                                        match child_value {
+                                            Value::Null => "null",
+                                            Value::Bool(_) => "boolean",
+                                            Value::Number(_) => "number",
+                                            Value::String(_) => "text",
+                                            Value::Array(_) => "array",
+                                            Value::Object(_) => "object",
+                                        }
+                                    ),
+                                    "Add an exact typed child-path rule, rebuild the panel, and retry the unchanged import.",
+                                ));
                             }
                         }
                     }
@@ -6103,10 +6225,13 @@ fn edge_semantic_values(edge: &RawEdgeRow) -> IngestResult<BTreeMap<SlotId, Sema
                 }
             }
             Value::Array(_) | Value::Object(_) => {
-                return Err(IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} atom {base_path} has an unregistered nested shape; remediation: decompose it into exact frozen typed child-path rules before ingestion",
-                    edge.id
-                )));
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "edge {} atom {base_path} has an unregistered nested shape",
+                        edge.id
+                    ),
+                    "Decompose it into exact frozen typed child-path rules, rebuild the panel, and retry the unchanged import.",
+                ));
             }
         }
     }
@@ -6155,10 +6280,13 @@ fn build_non_node_semantic_inputs(
             .copied()
             .map(|cx_id| vec![cx_id])
             .ok_or_else(|| {
-                IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: {} row {source_key:?} references missing project {project:?}; remediation: repair the CBM project relation before semantic publication",
-                    family.as_str()
-                ))
+                semantic_coverage_refusal(
+                    format!(
+                        "{} row {source_key:?} references missing project {project:?}",
+                        family.as_str()
+                    ),
+                    "Repair the CBM project relation before semantic publication and retry the unchanged import.",
+                )
             })
     };
     for file in &metadata.file_hashes {
@@ -6248,16 +6376,22 @@ fn build_non_node_semantic_inputs(
     }
     for edge in edges {
         let src = node_cx.get(&edge.source_id).copied().ok_or_else(|| {
-            IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} source node {} has no constellation; remediation: repair the CBM relation before semantic publication",
-                edge.id, edge.source_id
-            ))
+            semantic_coverage_refusal(
+                format!(
+                    "edge {} source node {} has no constellation",
+                    edge.id, edge.source_id
+                ),
+                "Repair the CBM relation before semantic publication and retry the unchanged import.",
+            )
         })?;
         let dst = node_cx.get(&edge.target_id).copied().ok_or_else(|| {
-            IngestError::InvalidInput(format!(
-                "{ASTRO_SEMANTIC_COVERAGE_GAP}: edge {} target node {} has no constellation; remediation: repair the CBM relation before semantic publication",
-                edge.id, edge.target_id
-            ))
+            semantic_coverage_refusal(
+                format!(
+                    "edge {} target node {} has no constellation",
+                    edge.id, edge.target_id
+                ),
+                "Repair the CBM relation before semantic publication and retry the unchanged import.",
+            )
         })?;
         rows.push(SemanticInputRow {
             family: SemanticFamily::Edge,
@@ -6380,16 +6514,22 @@ where
                 retention,
             )?;
             if prepared.cx_id != expected_cx {
-                return Err(IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: {} semantic identity changed between planning and measurement; remediation: preserve the source and repair nondeterministic canonicalization",
-                    prepared.family.as_str()
-                )));
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "{} semantic identity changed between planning and measurement",
+                        prepared.family.as_str()
+                    ),
+                    "Preserve the source, repair nondeterministic canonicalization, and retry the unchanged import.",
+                ));
             }
             if prepared.slot_ids != expected_slots {
-                return Err(IngestError::InvalidInput(format!(
-                    "{ASTRO_SEMANTIC_COVERAGE_GAP}: {} semantic slot roster changed between planning and measurement; remediation: preserve the source and repair nondeterministic panel dispatch",
-                    prepared.family.as_str()
-                )));
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "{} semantic slot roster changed between planning and measurement",
+                        prepared.family.as_str()
+                    ),
+                    "Preserve the source, repair nondeterministic panel dispatch, and retry the unchanged import.",
+                ));
             }
             Ok((prepared, (key, value)))
         },
@@ -6435,7 +6575,18 @@ where
     input.language = node.symbol.language.clone();
     input.signature = node.symbol.signature.clone();
     input.properties = serde_json::from_str(&node.symbol.properties_json)?;
-    let readout = driver.measure(&input, runtime)?;
+    let readout = driver.measure(&input, runtime).map_err(|error| {
+        IngestError::refused(
+            error.code(),
+            format!(
+                "node semantic row id={} qualified_name={:?} slots={semantic_value_slots:?} failed frozen lens measurement: {}",
+                node.id,
+                node.symbol.qualified_name,
+                error.message()
+            ),
+            error.remediation(),
+        )
+    })?;
     // #980: retain the exact complete property object. Every present atom is now
     // independently encoded, but the source bytes remain the reconstruction
     // authority for the zero-gap witness and schema-drift audit.

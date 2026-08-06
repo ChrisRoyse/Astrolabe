@@ -141,6 +141,7 @@ use shadow_watermark::*;
 
 mod shadow_import;
 use shadow_import::*;
+pub(crate) use shadow_import::{SHADOW_PANEL_VERSION, ShadowSlotRuntime, shadow_available_slots};
 
 mod shadow_publication;
 use shadow_publication::*;

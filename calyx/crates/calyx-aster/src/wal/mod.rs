@@ -23,6 +23,7 @@ pub(crate) use point_read::read_record_at;
 pub use replay::replay_dir;
 pub use replay::replay_dir_after;
 pub use replay::replay_dir_read_only_after;
+pub use replay::replay_segment_read_only;
 use replay::{replay_dir_locked, replay_dir_locked_after};
 pub(crate) use stream_replay::stream_records;
 

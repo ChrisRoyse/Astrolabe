@@ -37,6 +37,14 @@ pub fn replay_dir_read_only_after(
     replay_dir_read_only_locked_after(dir, replay_floor_seq)
 }
 
+/// Decodes one WAL segment without opening it for write or truncating a torn
+/// tail. Both standalone (`CXW1`) records and complete multi-record (`CXW2`)
+/// groups are returned as logical commits through the same authoritative
+/// decoder used by recovery.
+pub fn replay_segment_read_only(path: impl AsRef<Path>) -> Result<ReplayOutcome> {
+    replay_segment_read_only_after(path.as_ref(), 0)
+}
+
 pub(super) fn replay_dir_read_only_locked_after(
     dir: &Path,
     replay_floor_seq: u64,
@@ -45,58 +53,73 @@ pub(super) fn replay_dir_read_only_locked_after(
     let mut records = Vec::new();
 
     for (_, path) in segments {
-        let mut file = File::open(&path)
-            .map_err(|error| storage_error("open WAL segment read-only", error))?;
-        let mut offset = 0;
-        loop {
-            let header = match record::read_header_at(&mut file, offset)
-                .map_err(|error| storage_error("decode WAL header read-only", error))?
-            {
-                record::HeaderStatus::Complete(header) => header,
-                record::HeaderStatus::Eof => break,
-                record::HeaderStatus::Torn { offset, message } => {
-                    return Err(TornTail {
-                        segment_path: path.clone(),
+        let outcome = replay_segment_read_only_after(&path, replay_floor_seq)?;
+        if let Some(torn) = outcome.torn_tail {
+            return Err(torn.error());
+        }
+        records.extend(outcome.records);
+    }
+
+    Ok(ReplayOutcome {
+        records,
+        torn_tail: None,
+    })
+}
+
+fn replay_segment_read_only_after(path: &Path, replay_floor_seq: u64) -> Result<ReplayOutcome> {
+    let mut file =
+        File::open(path).map_err(|error| storage_error("open WAL segment read-only", error))?;
+    let mut records = Vec::new();
+    let mut offset = 0;
+    loop {
+        let header = match record::read_header_at(&mut file, offset)
+            .map_err(|error| storage_error("decode WAL header read-only", error))?
+        {
+            record::HeaderStatus::Complete(header) => header,
+            record::HeaderStatus::Eof => break,
+            record::HeaderStatus::Torn { offset, message } => {
+                return Ok(ReplayOutcome {
+                    records,
+                    torn_tail: Some(TornTail {
+                        segment_path: path.to_path_buf(),
                         offset,
                         code: CalyxErrorCode::AsterTornWal.code(),
                         message,
-                    }
-                    .error());
-                }
-            };
-            if header.seq <= replay_floor_seq {
-                offset = header.end_offset;
-                continue;
+                    }),
+                });
             }
-            match record::decode_logical_at(&mut file, offset)
-                .map_err(|error| storage_error("validate WAL record read-only", error))?
-            {
-                LogicalStatus::Complete(decoded) => {
-                    offset = decoded.end_offset;
-                    if decoded.seq > replay_floor_seq {
-                        records.push(ReplayRecord {
-                            seq: decoded.seq,
-                            payload: decoded.payload,
-                            segment_path: path.clone(),
-                            start_offset: decoded.start_offset,
-                            end_offset: decoded.end_offset,
-                        });
-                    }
-                }
-                LogicalStatus::Eof => break,
-                LogicalStatus::Torn { offset, message } => {
-                    return Err(TornTail {
-                        segment_path: path.clone(),
+        };
+        if header.seq <= replay_floor_seq {
+            offset = header.end_offset;
+            continue;
+        }
+        match record::decode_logical_at(&mut file, offset)
+            .map_err(|error| storage_error("validate WAL record read-only", error))?
+        {
+            LogicalStatus::Complete(decoded) => {
+                offset = decoded.end_offset;
+                records.push(ReplayRecord {
+                    seq: decoded.seq,
+                    payload: decoded.payload,
+                    segment_path: path.to_path_buf(),
+                    start_offset: decoded.start_offset,
+                    end_offset: decoded.end_offset,
+                });
+            }
+            LogicalStatus::Eof => break,
+            LogicalStatus::Torn { offset, message } => {
+                return Ok(ReplayOutcome {
+                    records,
+                    torn_tail: Some(TornTail {
+                        segment_path: path.to_path_buf(),
                         offset,
                         code: CalyxErrorCode::AsterTornWal.code(),
                         message,
-                    }
-                    .error());
-                }
+                    }),
+                });
             }
         }
     }
-
     Ok(ReplayOutcome {
         records,
         torn_tail: None,

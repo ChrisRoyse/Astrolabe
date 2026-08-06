@@ -207,6 +207,7 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
         connection_supervisor::INTERNAL_WORKER_ARG => run_server(),
         "hook-augment" => run_hook_augment(),
         "install" | "uninstall" | "update" => run_installer_command(args[0].as_str(), &args[1..]),
+        "ingest-cbm" => run_ingest_cbm(&args[1..]),
         "verify" => run_verify(&args[1..]),
         "--version" | "-V" => {
             println!("astrolabe {}", env!("CARGO_PKG_VERSION"));
@@ -303,7 +304,7 @@ fn cli_stderr_tracing_level() -> LevelFilter {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token is no longer supported and is refused (ASTRO_CLI_RAW_JSON_ARGV_REMOVED).\n`astrolabe cli <tool> --help` (or -h) prints the tool's arguments from its schema and exits without running the tool (#416).\n`astrolabe cli --json <tool>` prints the raw result JSON on stdout and exits 1 when the result is isError:true, else 0 (#419).\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
+        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | ingest-cbm --sqlite <db> --vault <dir> --project <name> --commit <id> --vault-id <id> --vault-salt <salt> [--json] | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token is no longer supported and is refused (ASTRO_CLI_RAW_JSON_ARGV_REMOVED).\n`astrolabe cli <tool> --help` (or -h) prints the tool's arguments from its schema and exits without running the tool (#416).\n`astrolabe cli --json <tool>` prints the raw result JSON on stdout and exits 1 when the result is isError:true, else 0 (#419).\n`ingest-cbm` imports one already-generated, frozen-schema CBM SQLite source through the production panel into a durable Calyx vault and fails closed before publication on coverage or vector drift.\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -924,6 +925,108 @@ fn print_verify_chain_report(report: &astrolabe_ingest::VerifyChainReport) {
 
 fn verify_chain_exit_code(report: &astrolabe_ingest::VerifyChainReport) -> i32 {
     if report.is_intact() { 0 } else { 1 }
+}
+
+fn run_ingest_cbm(args: &[String]) -> Result<i32, DynError> {
+    let mut args = args.to_vec();
+    let raw_json = strip_flag(&mut args, "--json");
+    let sqlite =
+        strip_flag_value(&mut args, "--sqlite").ok_or("ingest-cbm requires --sqlite <db>")?;
+    let vault_dir = strip_flag_value(&mut args, "--vault")
+        .or_else(|| strip_flag_value(&mut args, "--vault-dir"))
+        .ok_or("ingest-cbm requires --vault <dir>")?;
+    let project =
+        strip_flag_value(&mut args, "--project").ok_or("ingest-cbm requires --project")?;
+    let commit = strip_flag_value(&mut args, "--commit").ok_or("ingest-cbm requires --commit")?;
+    let vault_id = strip_flag_value(&mut args, "--vault-id")
+        .ok_or("ingest-cbm requires --vault-id")?
+        .parse::<calyx_core::VaultId>()?;
+    let vault_salt =
+        strip_flag_value(&mut args, "--vault-salt").ok_or("ingest-cbm requires --vault-salt")?;
+    let panel_version = strip_flag_value(&mut args, "--panel-version")
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(migration::SHADOW_PANEL_VERSION);
+    if !args.is_empty() {
+        return Err(format!("unknown ingest-cbm arguments: {}", args.join(" ")).into());
+    }
+
+    let vault = calyx_aster::vault::AsterVault::new_durable(
+        &vault_dir,
+        vault_id,
+        vault_salt.as_bytes().to_vec(),
+        calyx_aster::vault::VaultOptions::default(),
+    )?;
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .map_err(|error| {
+            format!(
+                "ASTRO_INGEST_PARALLELISM_UNAVAILABLE: failed to measure the host worker budget before importing CBM SQLite: {error}; remediation: correct the operating-system processor query failure and retry the unchanged source"
+            )
+        })?;
+    let options = astrolabe_ingest::SqliteImportOptions::new(&project, &commit, panel_version)
+        .with_workers(workers)
+        .with_available_slots(migration::shadow_available_slots());
+    match astrolabe_ingest::import_sqlite_to_vault(
+        &sqlite,
+        &vault,
+        &migration::ShadowSlotRuntime,
+        &options,
+    ) {
+        Ok(report) => {
+            if raw_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema": "astrolabe.ingest-cbm.v1",
+                        "status": "imported",
+                        "sqlite": sqlite,
+                        "vault": vault_dir,
+                        "project": project,
+                        "panel_version": panel_version,
+                        "report": report,
+                    }))?
+                );
+            } else {
+                println!(
+                    "CBM semantic import complete: project={} panel_version={} nodes={} semantic_constellations={} present_atoms={} uncovered_atoms={} seq={}",
+                    project,
+                    panel_version,
+                    report.sqlite_nodes,
+                    report.semantic_constellation_inputs,
+                    report.semantic_present_atoms,
+                    report.semantic_uncovered_atoms,
+                    report.seq,
+                );
+            }
+            Ok(0)
+        }
+        Err(error) => {
+            let code = error.code().unwrap_or("ASTRO_INGEST_INVALID");
+            let remediation = error.remediation().unwrap_or(
+                "Correct the named CBM source field or schema, preserve the prior vault generation, and retry the same import.",
+            );
+            if raw_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema": "astrolabe.error.v1",
+                        "status": "error",
+                        "code": code,
+                        "message": error.message(),
+                        "remediation": remediation,
+                        "sqlite": sqlite,
+                        "vault": vault_dir,
+                        "project": project,
+                        "panel_version": panel_version,
+                    }))?
+                );
+            } else {
+                eprintln!("{code}: {}; remediation: {remediation}", error.message());
+            }
+            Ok(1)
+        }
+    }
 }
 
 fn run_verify(args: &[String]) -> Result<i32, DynError> {

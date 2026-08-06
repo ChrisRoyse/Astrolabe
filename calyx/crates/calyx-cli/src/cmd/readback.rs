@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::sst::SstReader;
-use calyx_aster::storage_names::wal_segment_index;
 use calyx_aster::vault::encode::decode_write_batch;
+use calyx_aster::wal::{replay_dir_read_only_after, replay_segment_read_only};
 use calyx_core::CalyxError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,10 +15,6 @@ use crate::error::{CliError, CliResult};
 use crate::output::{WriteLineResult, print_hex_dump, print_json, print_line_result};
 use crate::readback_vault::ensure_native_aster_vault;
 use crate::{ops, vault_tree};
-
-const WAL_MAGIC: u32 = u32::from_le_bytes(*b"CXW1");
-const WAL_HEADER_LEN: usize = 20;
-const WAL_MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReadbackCommand {
@@ -39,20 +35,6 @@ enum ReadbackCommand {
         vault: PathBuf,
         seq: u64,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WalRecord {
-    seq: u64,
-    len: u32,
-    crc: u32,
-    payload: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum WalEvent {
-    Record(WalRecord),
-    TornTail { seq: Option<u64> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,35 +237,27 @@ fn readback_ledger(vault: &Path, seq: u64) -> CliResult {
 }
 
 fn readback_wal_segment(path: &Path) -> CliResult {
-    for event in wal_events(path)? {
-        match event {
-            WalEvent::Record(record) => {
-                if print_line_result(&format!(
-                    "WAL seq={} group=0 len={} crc={:08x}",
-                    record.seq, record.len, record.crc
-                ))? == WriteLineResult::ClosedPipe
-                {
-                    return Ok(());
-                }
-                if print_hex_dump(0, &record.payload)? == WriteLineResult::ClosedPipe {
-                    return Ok(());
-                }
-            }
-            WalEvent::TornTail { seq } => match seq {
-                Some(seq) => {
-                    if print_line_result(&format!("TORN_TAIL seq={seq}"))?
-                        == WriteLineResult::ClosedPipe
-                    {
-                        return Ok(());
-                    }
-                }
-                None => {
-                    if print_line_result("TORN_TAIL seq=unknown")? == WriteLineResult::ClosedPipe {
-                        return Ok(());
-                    }
-                }
-            },
+    let outcome = replay_segment_read_only(path)?;
+    for record in outcome.records {
+        if print_line_result(&format!(
+            "WAL seq={} logical=1 len={} start={} end={}",
+            record.seq,
+            record.payload.len(),
+            record.start_offset,
+            record.end_offset
+        ))? == WriteLineResult::ClosedPipe
+        {
+            return Ok(());
         }
+        if print_hex_dump(0, &record.payload)? == WriteLineResult::ClosedPipe {
+            return Ok(());
+        }
+    }
+    if let Some(torn) = outcome.torn_tail {
+        print_line_result(&format!(
+            "TORN_TAIL seq=unknown offset={} code={} message={}",
+            torn.offset, torn.code, torn.message
+        ))?;
     }
     Ok(())
 }
@@ -296,97 +270,14 @@ fn latest_cf_row(vault: &Path, cf: ColumnFamily, key: &[u8]) -> CliResult<Option
             value = Some(bytes);
         }
     }
-    for path in wal_segment_paths(&vault.join("wal"))? {
-        for event in wal_events(&path)? {
-            let WalEvent::Record(record) = event else {
-                continue;
-            };
-            for row in decode_write_batch(&record.payload)? {
-                if row.cf == cf && row.key == key {
-                    value = Some(row.value);
-                }
+    for record in replay_dir_read_only_after(vault.join("wal"), 0)?.records {
+        for row in decode_write_batch(&record.payload)? {
+            if row.cf == cf && row.key == key {
+                value = Some(row.value);
             }
         }
     }
     Ok(value)
-}
-
-fn wal_segment_paths(dir: &Path) -> CliResult<Vec<PathBuf>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if wal_segment_index(&path)?.is_some() {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn wal_events(path: &Path) -> CliResult<Vec<WalEvent>> {
-    let bytes = fs::read(path)?;
-    let mut events = Vec::new();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let remaining = bytes.len() - offset;
-        if remaining < WAL_HEADER_LEN {
-            events.push(WalEvent::TornTail { seq: None });
-            break;
-        }
-        let header = &bytes[offset..offset + WAL_HEADER_LEN];
-        let magic = u32::from_le_bytes(header[0..4].try_into().expect("magic width"));
-        if magic != WAL_MAGIC {
-            return Err(CalyxError::aster_torn_wal(format!(
-                "{} bad WAL magic 0x{magic:08x} at byte {offset}",
-                path.display()
-            ))
-            .into());
-        }
-        let seq = u64::from_le_bytes(header[4..12].try_into().expect("seq width"));
-        let len = u32::from_le_bytes(header[12..16].try_into().expect("len width"));
-        let crc = u32::from_le_bytes(header[16..20].try_into().expect("crc width"));
-        if len > WAL_MAX_RECORD_BYTES {
-            return Err(CalyxError::aster_torn_wal(format!(
-                "{} WAL record seq {seq} length {len} exceeds max {WAL_MAX_RECORD_BYTES}",
-                path.display()
-            ))
-            .into());
-        }
-        let payload_start = offset + WAL_HEADER_LEN;
-        let payload_end = payload_start + len as usize;
-        if payload_end > bytes.len() {
-            events.push(WalEvent::TornTail { seq: Some(seq) });
-            break;
-        }
-        let payload = bytes[payload_start..payload_end].to_vec();
-        let actual = wal_payload_crc(seq, len, &payload);
-        if actual != crc {
-            return Err(CalyxError::aster_torn_wal(format!(
-                "{} WAL crc mismatch for seq {seq}: expected {crc:08x}, got {actual:08x}",
-                path.display()
-            ))
-            .into());
-        }
-        events.push(WalEvent::Record(WalRecord {
-            seq,
-            len,
-            crc,
-            payload,
-        }));
-        offset = payload_end;
-    }
-    Ok(events)
-}
-
-fn wal_payload_crc(seq: u64, len: u32, payload: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&len.to_le_bytes());
-    hasher.update(payload);
-    hasher.finalize()
 }
 
 fn ensure_manifested_vault(vault: &Path) -> CliResult {
