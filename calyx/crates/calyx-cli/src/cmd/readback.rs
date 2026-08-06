@@ -1,13 +1,15 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::ledger_view::LedgerPointReadTrace;
 use calyx_aster::sst::SstReader;
 use calyx_aster::vault::encode::decode_write_batch;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_aster::wal::{replay_dir_read_only_after, replay_segment_read_only};
-use calyx_core::CalyxError;
+use calyx_core::{CalyxError, VaultId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -46,6 +48,20 @@ enum ReadbackCommand {
         vault: PathBuf,
         seq: u64,
     },
+    PhysicalLedger {
+        vault: PathBuf,
+        seqs_file: PathBuf,
+        vault_id: String,
+        vault_salt: String,
+        handle: PhysicalLedgerHandle,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalLedgerHandle {
+    ReadOnly,
+    Writable,
+    Volatile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +76,45 @@ struct HistoricalCfRow {
 struct CfRowsKeysFile {
     schema: String,
     keys_hex: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhysicalLedgerSeqsFile {
+    schema: String,
+    seqs: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PhysicalLedgerReadback {
+    schema: &'static str,
+    source_of_truth: &'static str,
+    vault: String,
+    handle: &'static str,
+    requested_seqs: Vec<u64>,
+    resolved_count: usize,
+    missing_seqs: Vec<u64>,
+    rows: Vec<PhysicalLedgerRowReadback>,
+    head: Option<PhysicalLedgerHeadReadback>,
+    trace: LedgerPointReadTrace,
+}
+
+#[derive(Debug, Serialize)]
+struct PhysicalLedgerRowReadback {
+    seq: u64,
+    value_len: usize,
+    value_sha256: String,
+    value_hex: String,
+    decoded_seq: u64,
+    prev_hash: String,
+    entry_hash: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PhysicalLedgerHeadReadback {
+    height: u64,
+    tip_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,7 +162,15 @@ pub(crate) fn try_run(args: &[String]) -> Option<CliResult> {
 fn owns_form(args: &[String]) -> bool {
     matches!(
         args.get(1).map(String::as_str),
-        Some("--hex" | "--vault-tree" | "--cf-row" | "--cf-rows" | "--mvcc-cf-probe" | "--ledger")
+        Some(
+            "--hex"
+                | "--vault-tree"
+                | "--cf-row"
+                | "--cf-rows"
+                | "--mvcc-cf-probe"
+                | "--ledger"
+                | "--physical-ledger",
+        )
     ) || matches!(args.get(1).map(String::as_str), Some("--wal")) && args.len() == 3
 }
 
@@ -238,8 +301,34 @@ fn parse(args: &[String]) -> CliResult<ReadbackCommand> {
                 seq: parse_seq(seq)?,
             })
         }
+        [
+            _,
+            flag,
+            vault,
+            seqs_flag,
+            seqs_file,
+            vault_id_flag,
+            vault_id,
+            vault_salt_flag,
+            vault_salt,
+            handle_flag,
+            handle,
+        ] if flag == "--physical-ledger"
+            && seqs_flag == "--seqs-file"
+            && vault_id_flag == "--vault-id"
+            && vault_salt_flag == "--vault-salt"
+            && handle_flag == "--handle" =>
+        {
+            Ok(ReadbackCommand::PhysicalLedger {
+                vault: vault.into(),
+                seqs_file: seqs_file.into(),
+                vault_id: vault_id.clone(),
+                vault_salt: vault_salt.clone(),
+                handle: parse_physical_ledger_handle(handle)?,
+            })
+        }
         _ => Err(CliError::usage(
-            "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> [--seq <n> --vault-id <id> --vault-salt <salt>] | --cf-rows <vault> --cf <cf-name> --keys-file <json> | --mvcc-cf-probe <vault> --selected-cf <cf-name> --read-cf <cf-name> [--key <hex-key>] --seq <n> --vault-id <id> --vault-salt <salt> | --wal <segment-path> | --ledger <vault> --seq <n>)",
+            "usage: calyx readback (--hex <file> | --vault-tree <dir> | --cf-row <vault> --cf <cf-name> --key <hex-key> [--seq <n> --vault-id <id> --vault-salt <salt>] | --cf-rows <vault> --cf <cf-name> --keys-file <json> | --mvcc-cf-probe <vault> --selected-cf <cf-name> --read-cf <cf-name> [--key <hex-key>] --seq <n> --vault-id <id> --vault-salt <salt> | --wal <segment-path> | --ledger <vault> --seq <n> | --physical-ledger <vault> --seqs-file <json> --vault-id <id> --vault-salt <salt> --handle <read-only|writable|volatile>)",
         )),
     }
 }
@@ -278,6 +367,13 @@ fn run(command: ReadbackCommand) -> CliResult {
         ),
         ReadbackCommand::WalSegment(path) => readback_wal_segment(&path),
         ReadbackCommand::Ledger { vault, seq } => readback_ledger(&vault, seq),
+        ReadbackCommand::PhysicalLedger {
+            vault,
+            seqs_file,
+            vault_id,
+            vault_salt,
+            handle,
+        } => readback_physical_ledger(&vault, &seqs_file, &vault_id, &vault_salt, handle),
     }
 }
 
@@ -493,6 +589,164 @@ fn readback_ledger(vault: &Path, seq: u64) -> CliResult {
         return Ok(());
     }
     print_hex_dump(0, &bytes).map(|_| ())
+}
+
+fn readback_physical_ledger(
+    vault: &Path,
+    seqs_file: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    handle: PhysicalLedgerHandle,
+) -> CliResult {
+    ensure_manifested_vault(vault)?;
+    let seqs = read_physical_ledger_seqs_file(seqs_file)?;
+    let vault_id = VaultId::from_str(vault_id)
+        .map_err(|error| CliError::usage(format!("invalid --vault-id: {error}")))?;
+
+    match handle {
+        PhysicalLedgerHandle::ReadOnly => {
+            let store = AsterVault::open(
+                vault,
+                vault_id,
+                vault_salt.as_bytes().to_vec(),
+                VaultOptions {
+                    restore_mvcc_rows: false,
+                    restore_ledger_hook: false,
+                    read_only: true,
+                    selected_cfs: Some(vec![ColumnFamily::Ledger]),
+                    ..VaultOptions::default()
+                },
+            )?;
+            let (physical_rows, trace) = store.read_physical_ledger_seqs(&seqs)?;
+            let resolved_seqs = physical_rows.keys().copied().collect::<BTreeSet<_>>();
+            let head =
+                store
+                    .retained_read_only_ledger_head()?
+                    .map(|head| PhysicalLedgerHeadReadback {
+                        height: head.height,
+                        tip_hash: hex_bytes(&head.tip_hash),
+                    });
+            let mut rows = Vec::with_capacity(physical_rows.len());
+            for (seq, row) in physical_rows {
+                let entry = calyx_ledger::decode(&row.bytes)?;
+                if entry.seq != seq || row.seq != seq {
+                    return Err(CalyxError::ledger_corrupt(format!(
+                        "physical Ledger key seq {seq} decoded as row {} / entry {}",
+                        row.seq, entry.seq
+                    ))
+                    .into());
+                }
+                rows.push(PhysicalLedgerRowReadback {
+                    seq,
+                    value_len: row.bytes.len(),
+                    value_sha256: hex_bytes(&Sha256::digest(&row.bytes)),
+                    value_hex: hex_bytes(&row.bytes),
+                    decoded_seq: entry.seq,
+                    prev_hash: hex_bytes(&entry.prev_hash),
+                    entry_hash: hex_bytes(&entry.entry_hash),
+                    kind: entry.kind.to_string(),
+                });
+            }
+            let missing_seqs = seqs
+                .iter()
+                .filter(|seq| !resolved_seqs.contains(seq))
+                .copied()
+                .collect::<Vec<_>>();
+            print_json(&PhysicalLedgerReadback {
+                schema: "calyx.physical-ledger-readback.v1",
+                source_of_truth: "retained read-only Aster snapshot over manifest/SST/WAL bytes and ledger_head/current.json",
+                vault: vault.display().to_string(),
+                handle: "read-only",
+                requested_seqs: seqs.iter().copied().collect(),
+                resolved_count: rows.len(),
+                missing_seqs,
+                rows,
+                head,
+                trace,
+            })
+        }
+        PhysicalLedgerHandle::Writable => {
+            let store = AsterVault::open(
+                vault,
+                vault_id,
+                vault_salt.as_bytes().to_vec(),
+                VaultOptions::default(),
+            )?;
+            let _ = store.retained_read_only_ledger_head()?;
+            Err(CalyxError {
+                code: "CALYX_RETAINED_LEDGER_SNAPSHOT_INVARIANT",
+                message: "write-capable handle unexpectedly supplied a retained read-only Ledger snapshot"
+                    .to_string(),
+                remediation: "preserve the vault and repair the retained-snapshot capability check",
+            }
+            .into())
+        }
+        PhysicalLedgerHandle::Volatile => {
+            let store = AsterVault::new(vault_id, vault_salt.as_bytes().to_vec());
+            let _ = store.retained_read_only_ledger_head()?;
+            Err(CalyxError {
+                code: "CALYX_RETAINED_LEDGER_SNAPSHOT_INVARIANT",
+                message: "volatile handle unexpectedly supplied a retained read-only Ledger snapshot"
+                    .to_string(),
+                remediation: "preserve the process state and repair the retained-snapshot capability check",
+            }
+            .into())
+        }
+    }
+}
+
+fn read_physical_ledger_seqs_file(path: &Path) -> CliResult<BTreeSet<u64>> {
+    const MAX_SEQS_FILE_BYTES: u64 = 1024 * 1024;
+    let metadata = fs::metadata(path).map_err(|error| {
+        CliError::io(format!(
+            "read --seqs-file metadata {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(CliError::usage(format!(
+            "--seqs-file must name a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_SEQS_FILE_BYTES {
+        return Err(CliError::usage(format!(
+            "--seqs-file is {} bytes; maximum is {MAX_SEQS_FILE_BYTES}",
+            metadata.len()
+        )));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| CliError::io(format!("read --seqs-file {}: {error}", path.display())))?;
+    let input: PhysicalLedgerSeqsFile = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::usage(format!(
+            "decode --seqs-file {} as strict JSON: {error}",
+            path.display()
+        ))
+    })?;
+    if input.schema != "calyx.physical-ledger-seqs.v1" {
+        return Err(CliError::usage(format!(
+            "--seqs-file schema must be calyx.physical-ledger-seqs.v1, got {:?}",
+            input.schema
+        )));
+    }
+    let seqs = input.seqs.iter().copied().collect::<BTreeSet<_>>();
+    if seqs.len() != input.seqs.len() {
+        return Err(CliError::usage(
+            "--seqs-file contains a duplicate Ledger sequence",
+        ));
+    }
+    Ok(seqs)
+}
+
+fn parse_physical_ledger_handle(value: &str) -> CliResult<PhysicalLedgerHandle> {
+    match value {
+        "read-only" => Ok(PhysicalLedgerHandle::ReadOnly),
+        "writable" => Ok(PhysicalLedgerHandle::Writable),
+        "volatile" => Ok(PhysicalLedgerHandle::Volatile),
+        _ => Err(CliError::usage(format!(
+            "invalid --handle {value:?}; expected read-only, writable, or volatile"
+        ))),
+    }
 }
 
 fn readback_wal_segment(path: &Path) -> CliResult {
