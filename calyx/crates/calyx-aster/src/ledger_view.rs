@@ -141,7 +141,7 @@ pub(crate) fn read_ledger_seqs_unlocked_with_tiering(
     Ok(read_ledger_seqs_unlocked_traced(vault, seqs, tiering_policy)?.0)
 }
 
-fn read_ledger_seqs_unlocked_traced(
+pub(crate) fn read_ledger_seqs_unlocked_traced(
     vault: &Path,
     seqs: &BTreeSet<u64>,
     tiering_policy: Option<&TieringPolicy>,

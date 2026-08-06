@@ -901,23 +901,7 @@ pub(crate) fn provenance_store_for_project(
     cache_dir: &Path,
     project: &str,
 ) -> Result<ProvenanceStore, DynError> {
-    let surface = read_provenance_metadata(cache_dir, project)?;
-    if surface.get("status").and_then(Value::as_str) == Some("unavailable") {
-        let reason = surface
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("provenance metadata unavailable");
-        let remediation = surface
-            .get("remediation")
-            .and_then(Value::as_str)
-            .unwrap_or("rerun index_repository with explicit provenance metadata");
-        return Err(format!("{reason}; remediation: {remediation}").into());
-    }
-    let mut store = provenance_store_from_json(
-        surface
-            .get("store")
-            .ok_or("stored provenance_json missing store")?,
-    )?;
+    let (store, chain_hash) = load_provenance_store(cache_dir, project)?;
     let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
         .map(PathBuf::from)
         .unwrap_or_else(|| vault_dir(cache_dir, project));
@@ -930,6 +914,47 @@ pub(crate) fn provenance_store_for_project(
     }
     let (verify, ledger_anchor) =
         astrolabe_ingest::verify_chain_and_head_vault_path(&configured_vault_dir)?;
+    bind_verified_ledger_head(project, store, chain_hash, verify, ledger_anchor)
+}
+
+/// Reads provenance metadata and the physical Ledger through the caller's
+/// retained read-only vault snapshot. This is the query-serving path: reopening
+/// the vault would attempt an exclusive commit-lock acquisition while the
+/// caller owns a shared snapshot lock.
+pub(crate) fn provenance_store_for_project_snapshot<C>(
+    cache_dir: &Path,
+    project: &str,
+    vault: &AsterVault<C>,
+) -> Result<ProvenanceStore, DynError>
+where
+    C: Clock,
+{
+    let (store, chain_hash) = load_provenance_store(cache_dir, project)?;
+    let (verify, ledger_anchor) = astrolabe_ingest::verify_chain_and_head(vault)?;
+    bind_verified_ledger_head(project, store, chain_hash, verify, ledger_anchor)
+}
+
+fn load_provenance_store(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<(ProvenanceStore, String), DynError> {
+    let surface = read_provenance_metadata(cache_dir, project)?;
+    if surface.get("status").and_then(Value::as_str) == Some("unavailable") {
+        let reason = surface
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("provenance metadata unavailable");
+        let remediation = surface
+            .get("remediation")
+            .and_then(Value::as_str)
+            .unwrap_or("rerun index_repository with explicit provenance metadata");
+        return Err(format!("{reason}; remediation: {remediation}").into());
+    }
+    let store = provenance_store_from_json(
+        surface
+            .get("store")
+            .ok_or("stored provenance_json missing store")?,
+    )?;
     // Verify-relevant metadata must be present and well-formed. A missing fingerprint
     // used to silently fall back to the ledger chain hash. The current Ledger
     // pointer is read from the physical head anchor under the same snapshot as
@@ -942,6 +967,16 @@ pub(crate) fn provenance_store_for_project(
         )?
         .as_deref(),
     )?;
+    Ok((store, chain_hash))
+}
+
+fn bind_verified_ledger_head(
+    project: &str,
+    mut store: ProvenanceStore,
+    chain_hash: String,
+    verify: astrolabe_ingest::VerifyChainReport,
+    ledger_anchor: Option<calyx_ledger::LedgerHeadAnchor>,
+) -> Result<ProvenanceStore, DynError> {
     let ledger_anchor = ledger_anchor.ok_or_else(|| -> DynError {
         format!(
             "ASTRO_PROVENANCE_LEDGER_HEAD_MISSING: project {project:?} has no physical Ledger head anchor; remediation: preserve the vault and rebuild it from authoritative source before serving provenance"

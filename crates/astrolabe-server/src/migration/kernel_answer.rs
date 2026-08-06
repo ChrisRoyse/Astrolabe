@@ -693,7 +693,8 @@ pub(crate) fn build_kernel_answer_inputs(
     // Per-node provenance references and the ledger head are required persisted
     // inputs. Store read failure is terminal; a zero-ledger substitute would make
     // the eventual refusal indistinguishable from genuine ungrounded state.
-    let (node_provenance, ledger) = kernel_answer_provenance(cache_dir, project, &artifact)?;
+    let (node_provenance, ledger) =
+        kernel_answer_provenance(cache_dir, project, &vault, &artifact)?;
 
     let member_by_id: BTreeMap<CxId, &astrolabe_kernel::KernelMember> = artifact
         .members
@@ -872,13 +873,17 @@ where
 /// parse as a `CxId` are joined (the enriched-index case). The provenance store is
 /// part of the answer source of truth, so an unavailable/corrupt store is returned
 /// to the caller as an error.
-fn kernel_answer_provenance(
+fn kernel_answer_provenance<C>(
     cache_dir: &Path,
     project: &str,
+    vault: &AsterVault<C>,
     _artifact: &astrolabe_kernel::KernelArtifact,
-) -> Result<(BTreeMap<CxId, String>, LedgerPointer), DynError> {
+) -> Result<(BTreeMap<CxId, String>, LedgerPointer), DynError>
+where
+    C: Clock,
+{
     let mut map = BTreeMap::new();
-    let store = provenance_store_for_project(cache_dir, project)?;
+    let store = provenance_store_for_project_snapshot(cache_dir, project, vault)?;
     for (symbol_id, lineage) in &store.symbols {
         let Ok(cx) = symbol_id.parse::<CxId>() else {
             continue;

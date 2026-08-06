@@ -40,6 +40,7 @@ mod temporal_xterm;
 use crate::cf::{
     CfRouter, ColumnFamily, KeyRange, RouterManifestHandoffReport, anchor_key, base_key, slot_key,
 };
+use crate::compaction::TieringPolicy;
 use crate::dedup::DedupPolicy;
 use crate::file_lock::FileLockGuard;
 use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
@@ -239,6 +240,7 @@ pub struct AsterVault<C = SystemClock> {
     rows: VersionedCfStore,
     durable: Option<DurableVault>,
     durable_root: Option<PathBuf>,
+    durable_tiering_policy: Option<TieringPolicy>,
     dedup_policy: DedupPolicy,
     retention_horizon: Mutex<RetentionHorizon>,
     ledger_hook: Option<AsterLedgerHook<C>>,
@@ -411,6 +413,7 @@ where
             rows: VersionedCfStore::default(),
             durable: None,
             durable_root: None,
+            durable_tiering_policy: None,
             dedup_policy: DedupPolicy::default(),
             retention_horizon: Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,

@@ -65,6 +65,24 @@ where
     verify_store_chain(&store)
 }
 
+/// Verifies the physical Ledger rows and external head anchor through one
+/// already-open read-only vault snapshot.
+///
+/// The vault retains the shared durable commit lock for this complete operation;
+/// no path reopen or lock upgrade occurs between copying the head and verifying
+/// the rows.
+pub fn verify_chain_and_head<C>(
+    vault: &AsterVault<C>,
+) -> IngestResult<(VerifyChainReport, Option<LedgerHeadAnchor>)>
+where
+    C: Clock,
+{
+    let store = vault.retained_read_only_ledger_store()?;
+    let anchor = store.head_anchor()?;
+    let report = verify_store_chain(&store)?;
+    Ok((report, anchor))
+}
+
 /// Opens a physical durable Aster ledger view and verifies its hash chain.
 pub fn verify_chain_vault_path(vault_dir: impl AsRef<Path>) -> IngestResult<VerifyChainReport> {
     Ok(verify_chain_and_head_vault_path(vault_dir)?.0)

@@ -68,7 +68,8 @@ pub use ledger_scan::{
 };
 pub use ledger_verify::{
     ASTRO_FSV_JANITOR_BUDGET_INVALID, JanitorCheckpoint, JanitorSliceReport, VerifyChainReport,
-    verify_chain, verify_chain_and_head_vault_path, verify_chain_slice, verify_chain_vault_path,
+    verify_chain, verify_chain_and_head, verify_chain_and_head_vault_path, verify_chain_slice,
+    verify_chain_vault_path,
 };
 pub use registry::{
     ASTRO_SERIES_REGISTRY_PREFIX, ASTRO_VERIFY_DEEP_FAILED, DeepVerifyReport, GitRenameStatus,

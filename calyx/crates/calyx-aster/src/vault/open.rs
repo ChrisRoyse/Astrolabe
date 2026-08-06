@@ -185,6 +185,7 @@ where
             rows,
             durable,
             durable_root: Some(vault_root),
+            durable_tiering_policy: options.tiering_policy.clone(),
             dedup_policy,
             retention_horizon: Mutex::new(retention_horizon),
             ledger_hook,
