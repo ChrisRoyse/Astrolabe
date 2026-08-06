@@ -70,7 +70,7 @@ use astrolabe_weave::{
     reconcile_complete_associations, recover_reactive_state, run_index_time_drift,
 };
 use calyx_aster::cf::{ColumnFamily, ledger_key, slot_key};
-use calyx_aster::ledger_view::parse_aster_ledger_seq;
+use calyx_aster::ledger_view::{LedgerPointReadTrace, parse_aster_ledger_seq};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Clock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};

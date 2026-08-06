@@ -3663,7 +3663,7 @@ fn validate_shadow_ledger_checkpoint_suffix<C>(
     chain: &astrolabe_ingest::VerifyChainReport,
     project: &str,
     expected: &ShadowLedgerCheckpoint,
-) -> Result<ShadowLedgerCheckpoint, DynError>
+) -> Result<(ShadowLedgerCheckpoint, Option<LedgerPointReadTrace>), DynError>
 where
     C: Clock,
 {
@@ -3686,21 +3686,58 @@ where
         .into());
     }
 
-    if let Some(tip_seq) = expected.tip_seq() {
-        let bytes = vault
-            .read_cf_at(
-                expected.mvcc_commit_seq,
-                ColumnFamily::Ledger,
-                &ledger_key(tip_seq),
-            )?
-            .ok_or_else(|| -> DynError {
+    let expected_tip_physical_read = if let Some(tip_seq) = expected.tip_seq() {
+        // The published checkpoint binds an immutable append-only Ledger key,
+        // not a mutable row whose old value must be reconstructed. Read that
+        // exact sequence from its manifest/WAL/SST durable home while the
+        // read-only vault's retained snapshot lock is still live. This proves
+        // the historical prefix without cold-loading the complete MVCC history.
+        let wanted = BTreeSet::from([tip_seq]);
+        let (rows, trace) = vault
+            .read_physical_ledger_seqs(&wanted)
+            .map_err(|error| -> DynError {
                 format!(
-                    "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_MISSING: project {project:?} published shadow prefix requires Ledger seq {tip_seq} at historical MVCC seq {}, but it is absent; remediation: preserve the vault and rebuild from authoritative source",
-                    expected.mvcc_commit_seq,
+                    "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_READ_FAILED: project {project:?} could not physically point-read published Ledger seq {tip_seq}: {error}; remediation: preserve the vault and repair its manifest/WAL/SST ledger read path before retrying"
                 )
                 .into()
             })?;
-        let entry = decode_ledger(&bytes).map_err(|error| -> DynError {
+        let complete_scan_wanted = trace
+            .tiers
+            .iter()
+            .filter(|tier| tier.tier == "complete_scan")
+            .map(|tier| tier.wanted)
+            .sum::<usize>();
+        if complete_scan_wanted != 0 {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_POINT_READ_DEGRADED: project {project:?} required a complete SST scan to resolve published Ledger seq {tip_seq}; remediation: preserve the vault and repair its commit-ordered ledger index before retrying unchanged-generation admission"
+            )
+            .into());
+        }
+        let resolved = trace.tiers.iter().map(|tier| tier.resolved).sum::<usize>();
+        if trace.tiers.is_empty() || resolved != 1 || rows.len() != 1 {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_READBACK_INCOMPLETE: project {project:?} physical point-read for published Ledger seq {tip_seq} produced rows={}, resolved={resolved}, tiers={:?}; remediation: preserve the vault and repair its physical ledger point-reader before retrying",
+                rows.len(),
+                trace.tiers,
+            )
+            .into());
+        }
+        let row = rows
+            .get(&tip_seq)
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_MISSING: project {project:?} published shadow prefix requires physical Ledger seq {tip_seq}, but it is absent; remediation: preserve the vault and rebuild from authoritative source",
+                )
+                .into()
+            })?;
+        if row.seq != tip_seq {
+            return Err(format!(
+                "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_ROW_ID_MISMATCH: project {project:?} requested physical Ledger seq {tip_seq}, but the durable row reports seq {}; remediation: preserve the vault and repair its physical ledger index before retrying",
+                row.seq,
+            )
+            .into());
+        }
+        let entry = decode_ledger(&row.bytes).map_err(|error| -> DynError {
             format!(
                 "ASTRO_SHADOW_LEDGER_CHECKPOINT_PREFIX_CORRUPT: project {project:?} published shadow tip at Ledger seq {tip_seq} cannot be decoded: {error}; remediation: preserve the vault and rebuild from authoritative source"
             )
@@ -3716,8 +3753,11 @@ where
             )
             .into());
         }
-    }
-    Ok(current)
+        Some(trace)
+    } else {
+        None
+    };
+    Ok((current, expected_tip_physical_read))
 }
 
 fn read_required_shadow_json(
@@ -3899,13 +3939,14 @@ pub(crate) fn try_shadow_index_noop_admission(
     let vault =
         open_shadow_vault_read_only(&configured_vault_dir, &vault_id, &vault_salt, Vec::new())?;
     let chain = verify_chain(&vault)?;
-    let current_ledger_checkpoint = validate_shadow_ledger_checkpoint_suffix(
-        &configured_vault_dir,
-        &vault,
-        &chain,
-        project,
-        &expected_ledger_checkpoint,
-    )?;
+    let (current_ledger_checkpoint, ledger_prefix_physical_read) =
+        validate_shadow_ledger_checkpoint_suffix(
+            &configured_vault_dir,
+            &vault,
+            &chain,
+            project,
+            &expected_ledger_checkpoint,
+        )?;
     let lowered_verification =
         verify_lowered_artifact(&vault, &lowered_path, project).map_err(|error| -> DynError {
             format!(
@@ -4144,6 +4185,14 @@ pub(crate) fn try_shadow_index_noop_admission(
             (
                 "sqlite_orphan_edges".to_string(),
                 Value::from(sqlite_orphan_edges as u64),
+            ),
+            (
+                "ledger_prefix_physical_read".to_string(),
+                serde_json::to_value(&ledger_prefix_physical_read)?,
+            ),
+            (
+                "ledger_prefix_mvcc_history_restored".to_string(),
+                Value::Bool(false),
             ),
             ("validation_wall_ms".to_string(), Value::from(elapsed_ms)),
             ("trust".to_string(), Value::String("verified".to_string())),
