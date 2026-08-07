@@ -823,6 +823,12 @@ void cbm_pipeline_set_ambiguous_reference_skips(cbm_pipeline_t *p, uint_least64_
  * before the caller frees it. */
 void cbm_pipeline_set_unresolved_reference_source_skips(cbm_pipeline_t *p, uint_least64_t skips);
 
+/* Count one dangling Rust `mod` declaration — zero candidate sources at either
+ * compiler-defined path (#1024). Returns the new total so the emitting site can
+ * put it in its own warn record. Atomic: the resolving pass runs concurrently
+ * across extraction workers that share this pipeline. */
+uint_least64_t cbm_pipeline_note_dangling_rust_module_skip(cbm_pipeline_t *p);
+
 /* Resolve the physical source owner of an extracted semantic reference.
  * An absent enclosing QN, or one exactly equal to the file's module QN, is a
  * top-level reference and belongs to the exact path-indexed File atom. A

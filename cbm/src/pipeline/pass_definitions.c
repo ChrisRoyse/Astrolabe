@@ -566,8 +566,16 @@ static void process_diagnostic(cbm_pipeline_ctx_t *ctx, const CBMParseDiagnostic
         cbm_log_error("diagnostic.identity_failed", "code", "CBM_DIAGNOSTIC_QN_OVERFLOW", "path",
                       rel, "message", "the parse diagnostic identity exceeded its graph buffer",
                       "remediation", "shorten the source path or diagnostic code and retry");
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_DIAGNOSTIC_QN_OVERFLOW",
-            "pipeline.diagnostic_identity");
+        {
+            const char *detail_keys[] = {"component", "file_path", "diagnostic_code", "node_type"};
+            const char *detail_vals[] = {"pipeline.definitions", rel ? rel : "", diag->code,
+                                         diag->node_type};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_DIAGNOSTIC_QN_OVERFLOW", "pipeline.diagnostic_identity",
+                "a parse-diagnostic qualified name exceeded its fixed identity buffer, so the "
+                "diagnostic atom could not be named canonically",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         free(file_qn);
         return;
     }

@@ -244,6 +244,15 @@ struct cbm_gbuf {
     int refusal_candidate_count;
     char refusal_candidate_atom_ids[CBM_GBUF_REFUSAL_CANDIDATE_MAX][CBM_SZ_128];
     int refusal_candidate_atom_id_count;
+    /* Site-supplied cause (#1024). Refusal sites already computed the paths and
+     * names that identify the failure; without these fields those reached only
+     * a worker log and the public diagnostic carried nothing but code +
+     * operation. Fixed storage keeps the record allocation-free on a failing
+     * path. An empty refusal_message means the reader keeps its generic text. */
+    char refusal_message[CBM_SZ_512];
+    char refusal_detail_keys[CBM_GBUF_REFUSAL_DETAIL_MAX][CBM_SZ_64];
+    char refusal_detail_vals[CBM_GBUF_REFUSAL_DETAIL_MAX][CBM_SZ_512];
+    int refusal_detail_count;
     /* Counted, labelled degradations — NOT failures (#727). A reference whose
      * source syntax resolves to several stable atoms in one semantic domain
      * (e.g. three `#[cfg]`-gated methods sharing a qualified name) cannot be
@@ -313,10 +322,12 @@ struct cbm_gbuf {
  * publish a terminal diagnostic instead of a bare "resolution failed" with the
  * evidence stranded in a worker log. First writer wins; the flag is raised
  * afterwards so any reader that sees the flag also sees a complete record. */
-static void gbuf_fail_resolution(cbm_gbuf_t *gb, const char *code, const char *operation,
-                                 const char *qualified_name, const char *file_path, int line,
-                                 int candidate_count, const char *const *candidate_atom_ids,
-                                 int candidate_atom_id_count) {
+static void gbuf_fail_resolution_full(cbm_gbuf_t *gb, const char *code, const char *operation,
+                                      const char *qualified_name, const char *file_path, int line,
+                                      int candidate_count, const char *const *candidate_atom_ids,
+                                      int candidate_atom_id_count, const char *message,
+                                      const char *const *detail_keys,
+                                      const char *const *detail_vals, size_t detail_count) {
     if (!gb) {
         return;
     }
@@ -344,9 +355,35 @@ static void gbuf_fail_resolution(cbm_gbuf_t *gb, const char *code, const char *o
                            candidate_atom_ids[i]);
             gb->refusal_candidate_atom_id_count = slot + SKIP_ONE;
         }
+        (void)snprintf(gb->refusal_message, sizeof(gb->refusal_message), "%s",
+                       message ? message : "");
+        gb->refusal_detail_count = 0;
+        for (size_t i = 0; detail_keys && detail_vals && i < detail_count &&
+                           gb->refusal_detail_count < CBM_GBUF_REFUSAL_DETAIL_MAX;
+             i++) {
+            if (!detail_keys[i] || !detail_keys[i][0] || !detail_vals[i]) {
+                continue;
+            }
+            int slot = gb->refusal_detail_count;
+            (void)snprintf(gb->refusal_detail_keys[slot], sizeof(gb->refusal_detail_keys[slot]),
+                           "%s", detail_keys[i]);
+            (void)snprintf(gb->refusal_detail_vals[slot], sizeof(gb->refusal_detail_vals[slot]),
+                           "%s", detail_vals[i]);
+            gb->refusal_detail_count = slot + SKIP_ONE;
+        }
         atomic_store(&gb->refusal_present, true);
     }
     atomic_store(&gb->resolution_failed, true);
+}
+
+/* Refusal whose cause is the retained identity alone: no site message and no
+ * site detail pairs. */
+static void gbuf_fail_resolution(cbm_gbuf_t *gb, const char *code, const char *operation,
+                                 const char *qualified_name, const char *file_path, int line,
+                                 int candidate_count, const char *const *candidate_atom_ids,
+                                 int candidate_atom_id_count) {
+    gbuf_fail_resolution_full(gb, code, operation, qualified_name, file_path, line, candidate_count,
+                              candidate_atom_ids, candidate_atom_id_count, NULL, NULL, NULL, 0);
 }
 
 /* Refusal with no candidate identity beyond its code/operation. */
@@ -362,9 +399,11 @@ static void gbuf_fail_resolution_code(cbm_gbuf_t *gb, const char *code, const ch
 static void gbuf_propagate_refusal(cbm_gbuf_t *dst, const cbm_gbuf_t *src) {
     cbm_gbuf_refusal_t refusal;
     if (cbm_gbuf_get_refusal(src, &refusal)) {
-        gbuf_fail_resolution(dst, refusal.code, refusal.operation, refusal.qualified_name,
-                             refusal.file_path, refusal.line, refusal.candidate_count,
-                             refusal.candidate_atom_ids, refusal.candidate_atom_id_count);
+        gbuf_fail_resolution_full(dst, refusal.code, refusal.operation, refusal.qualified_name,
+                                  refusal.file_path, refusal.line, refusal.candidate_count,
+                                  refusal.candidate_atom_ids, refusal.candidate_atom_id_count,
+                                  refusal.message, refusal.detail_keys, refusal.detail_vals,
+                                  (size_t)refusal.detail_count);
         return;
     }
     gbuf_fail_resolution_code(dst, "CBM_SOURCE_WORKER_FAILED", "graph_buffer.merge", NULL, NULL);
@@ -386,6 +425,12 @@ bool cbm_gbuf_get_refusal(const cbm_gbuf_t *gb, cbm_gbuf_refusal_t *out) {
     out->candidate_atom_id_count = gb->refusal_candidate_atom_id_count;
     for (int i = 0; i < gb->refusal_candidate_atom_id_count; i++) {
         out->candidate_atom_ids[i] = gb->refusal_candidate_atom_ids[i];
+    }
+    out->message = gb->refusal_message[0] ? gb->refusal_message : NULL;
+    out->detail_count = gb->refusal_detail_count;
+    for (int i = 0; i < gb->refusal_detail_count; i++) {
+        out->detail_keys[i] = gb->refusal_detail_keys[i];
+        out->detail_vals[i] = gb->refusal_detail_vals[i];
     }
     return true;
 }
@@ -1329,6 +1374,13 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char
 
 void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb, const char *code, const char *operation) {
     gbuf_fail_resolution_code(gb, code, operation, NULL, NULL);
+}
+
+void cbm_gbuf_refuse_resolution_detail(cbm_gbuf_t *gb, const char *code, const char *operation,
+                                       const char *message, const char *const *detail_keys,
+                                       const char *const *detail_vals, size_t detail_count) {
+    gbuf_fail_resolution_full(gb, code, operation, NULL, NULL, 0, 0, NULL, 0, message, detail_keys,
+                              detail_vals, detail_count);
 }
 
 const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, const char *label,

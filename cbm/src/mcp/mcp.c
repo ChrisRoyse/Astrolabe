@@ -7854,6 +7854,25 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
             "operation, qualified name, source path, and line.");
     }
 
+    /* #1024: a Rust `mod` declaration whose source exists at NEITHER
+     * compiler-defined path is a dangling reference, not an ambiguity — nothing
+     * to guess, no wrong edge to invent. The declaration resolves to nothing
+     * instead of refusing the whole corpus, so the count is always emitted,
+     * including 0, and a degraded index can never read as a clean one. */
+    uint_least64_t dangling_rust_module_skips = cbm_pipeline_get_dangling_rust_module_skips(p);
+    yyjson_mut_obj_add_uint(doc, root, "dangling_rust_module_skips",
+                            (uint64_t)dangling_rust_module_skips);
+    if (dangling_rust_module_skips > 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "dangling_rust_module_hint",
+            "Some Rust `mod` declarations named no source at either compiler-defined path "
+            "(<dir>/<mod>.rs and <dir>/<mod>/mod.rs). No IMPORTS edge was fabricated for them "
+            "and the orphaned files still indexed as ordinary files; see the "
+            "pkgmap.rust_module_dangling / CBM_IMPORT_RUST_MODULE_MISSING log entries for the "
+            "exact source file, module name, and both probed candidate paths. Fix the module "
+            "layout, delete the dangling declaration, or bind it with #[path = \"...\"].");
+    }
+
     uint_least64_t parse_recovery_diagnostics =
         cbm_pipeline_get_parse_recovery_diagnostics(p);
     yyjson_mut_obj_add_uint(doc, root, "parse_recovery_diagnostics",

@@ -287,6 +287,16 @@ struct cbm_pipeline {
      * ambiguity so the success response identifies the actual degradation. */
     uint_least64_t unresolved_reference_source_skips;
 
+    /* Rust `mod` declarations that named NO existing source at either
+     * compiler-defined path (#1024). A zero-candidate declaration is a dangling
+     * reference, not an ambiguity: there is nothing to guess and no wrong edge
+     * to invent, so the IMPORTS edge is skipped and counted instead of refusing
+     * the whole corpus. Incremented directly by the resolving pass — which runs
+     * in extraction workers against per-worker graph buffers — so the counter
+     * lives on the pipeline (shared by every worker context) rather than on a
+     * buffer that would need merge-time summing. */
+    _Atomic uint_least64_t dangling_rust_module_skips;
+
     /* Recoverable tree-sitter parse diagnostics persisted as ParseDiagnostic
      * graph rows. A clean run reports zero; a recovered parse reports the
      * exact number of diagnostic rows collected from real source trees. */
@@ -909,6 +919,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->phase_metrics_complete = true;
     p->parallel_dispatches_complete = true;
     p->compile_context_authority = "not_applicable";
+    atomic_init(&p->dangling_rust_module_skips, 0);
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -1340,8 +1351,20 @@ void cbm_pipeline_record_gbuf_refusal(cbm_pipeline_t *p, const cbm_gbuf_t *gb, c
     char atom_key_buf[CBM_GBUF_REFUSAL_CANDIDATE_MAX][CBM_SZ_32];
     size_t n = 0;
 
-    keys[n] = "component";
-    vals[n++] = "graph_buffer";
+    /* A refusal site that names its own component owns that label: a
+     * pkgmap-originated refusal is not a graph_buffer defect and must not
+     * report itself as one (#1024). Only when the site supplied no component
+     * does the recording layer name itself. */
+    bool site_component = false;
+    for (int i = 0; have && i < refusal.detail_count; i++) {
+        if (refusal.detail_keys[i] && strcmp(refusal.detail_keys[i], "component") == 0) {
+            site_component = true;
+        }
+    }
+    if (!site_component) {
+        keys[n] = "component";
+        vals[n++] = "graph_buffer";
+    }
     if (have && refusal.operation) {
         keys[n] = "graph_operation";
         vals[n++] = refusal.operation;
@@ -1372,14 +1395,28 @@ void cbm_pipeline_record_gbuf_refusal(cbm_pipeline_t *p, const cbm_gbuf_t *gb, c
         keys[n] = atom_key_buf[i];
         vals[n++] = refusal.candidate_atom_ids[i];
     }
+    /* The refusing site's own detail pairs — the paths, module names, and
+     * candidate identities it had already computed (#1024). Without these the
+     * public diagnostic carried code + operation and nothing else, and the
+     * evidence stayed in a worker log. */
+    for (int i = 0; have && i < refusal.detail_count && n < (size_t)CBM_PIPELINE_ERROR_DETAIL_MAX;
+         i++) {
+        if (!refusal.detail_keys[i] || !refusal.detail_keys[i][0] || !refusal.detail_vals[i]) {
+            continue;
+        }
+        keys[n] = refusal.detail_keys[i];
+        vals[n++] = refusal.detail_vals[i];
+    }
 
     cbm_pipeline_record_fatal_error_detail(
         p, have ? refusal.code : "CBM_GRAPH_RESOLUTION_FAILED",
         have && refusal.operation ? refusal.operation : "graph_buffer.resolution",
         phase ? phase : "graph", path ? path : "",
         0, /* requested */
-        "the authoritative graph buffer refused a canonical identity or reference resolution; "
-        "no store or row-sink mutation was committed",
+        have && refusal.message
+            ? refusal.message
+            : "the authoritative graph buffer refused a canonical identity or reference "
+              "resolution; no store or row-sink mutation was committed",
         "resolve the reported atoms by exact identity — the detail pairs name the operation, the "
         "contended qualified name, its file and line, and every candidate atom",
         keys, vals, n);
@@ -1525,6 +1562,17 @@ uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipe
     return p ? p->unresolved_reference_source_skips : 0;
 }
 
+uint_least64_t cbm_pipeline_note_dangling_rust_module_skip(cbm_pipeline_t *p) {
+    if (!p) {
+        return 0;
+    }
+    return atomic_fetch_add(&p->dangling_rust_module_skips, 1) + 1;
+}
+
+uint_least64_t cbm_pipeline_get_dangling_rust_module_skips(const cbm_pipeline_t *p) {
+    return p ? atomic_load(&((cbm_pipeline_t *)p)->dangling_rust_module_skips) : 0;
+}
+
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count) {
     if (p) {
         p->parse_recovery_diagnostics += count;
@@ -1550,8 +1598,17 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                           "remediation",
                           "preserve the complete source identity frame through extraction and "
                           "resolution");
-            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_SOURCE_ARGUMENT_INVALID",
-                "pipeline.reference_source");
+            const char *detail_keys[] = {"component", "reference_operation", "project",
+                                         "file_path"};
+            const char *detail_vals[] = {"pipeline.reference_source", operation ? operation : "",
+                                         project_name ? project_name : "",
+                                         rel_path ? rel_path : ""};
+            cbm_gbuf_refuse_resolution_detail(
+                (cbm_gbuf_t *)gbuf, "CBM_REFERENCE_SOURCE_ARGUMENT_INVALID",
+                "pipeline.reference_source",
+                "reference source resolution was called without the complete graph, project, "
+                "path, and diagnostic-operation identity frame it requires",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
         }
         return NULL;
     }
@@ -1567,8 +1624,17 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                       "remediation",
                       "preserve the module qualified name from extraction through reference "
                       "resolution, then re-index the complete corpus");
-        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_MODULE_QN_MISSING",
-            "pipeline.reference_source");
+        {
+            const char *detail_keys[] = {"component", "reference_operation", "project", "file_path",
+                                         "enclosing_qualified_name"};
+            const char *detail_vals[] = {"pipeline.reference_source", operation, project_name,
+                                         rel_path, enclosing_qn};
+            cbm_gbuf_refuse_resolution_detail(
+                (cbm_gbuf_t *)gbuf, "CBM_REFERENCE_MODULE_QN_MISSING", "pipeline.reference_source",
+                "an enclosing scope was extracted without the module qualified name needed to "
+                "distinguish top-level ownership from a nested callable",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         return NULL;
     }
 
@@ -1583,8 +1649,16 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                           "repository path",
                           "remediation",
                           "repair structure-pass File ownership and re-index the complete corpus");
-            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_FILE_SOURCE_NOT_FOUND",
-                "pipeline.reference_source");
+            const char *detail_keys[] = {"component", "reference_operation", "project",
+                                         "file_path"};
+            const char *detail_vals[] = {"pipeline.reference_source", operation, project_name,
+                                         rel_path};
+            cbm_gbuf_refuse_resolution_detail(
+                (cbm_gbuf_t *)gbuf, "CBM_REFERENCE_FILE_SOURCE_NOT_FOUND",
+                "pipeline.reference_source",
+                "a top-level reference has no unique source-backed File atom at its exact "
+                "repository path",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
         }
         return file;
     }
@@ -1613,8 +1687,19 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                       "remediation",
                       "preserve the parser source position through extraction and retry the "
                       "complete corpus");
-        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_SOURCE_LOCATION_MISSING",
-            "pipeline.reference_source");
+        {
+            const char *detail_keys[] = {"component",  "reference_operation",
+                                         "project",    "file_path",
+                                         "enclosing_qualified_name", "source_line"};
+            const char *detail_vals[] = {"pipeline.reference_source", operation, project_name,
+                                         rel_path,                    enclosing_qn, line_buf};
+            cbm_gbuf_refuse_resolution_detail(
+                (cbm_gbuf_t *)gbuf, "CBM_REFERENCE_SOURCE_LOCATION_MISSING",
+                "pipeline.reference_source",
+                "an enclosing-callable reference carries no positive 1-based source line, so its "
+                "owning atom cannot be resolved by exact location",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         return NULL;
     }
     cbm_gbuf_record_unresolved_reference_source(gbuf, operation, enclosing_qn, rel_path,

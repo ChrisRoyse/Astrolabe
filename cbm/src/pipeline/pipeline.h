@@ -207,6 +207,13 @@ uint_least64_t cbm_pipeline_get_ambiguous_reference_skips(const cbm_pipeline_t *
  * silently re-attributed to a File node. */
 uint_least64_t cbm_pipeline_get_unresolved_reference_source_skips(const cbm_pipeline_t *p);
 
+/* Rust `mod` declarations whose declared source existed at NEITHER
+ * compiler-defined path (`<dir>/<mod>.rs`, `<dir>/<mod>/mod.rs`) (#1024). The
+ * declaration resolves to nothing, no IMPORTS edge is fabricated, and the
+ * corpus still publishes — so a successful index MUST report this count on
+ * every run, including zero, or the loss becomes a silent fallback. */
+uint_least64_t cbm_pipeline_get_dangling_rust_module_skips(const cbm_pipeline_t *p);
+
 /* Recoverable tree-sitter parse diagnostics that were persisted as
  * ParseDiagnostic graph rows. Successful index responses emit this count on
  * every run, including zero, so malformed-source recovery is never silent. */

@@ -152,6 +152,20 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
  * pointer to a worker log (#1022), so the cause is not optional. */
 void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb, const char *code, const char *operation);
 
+/* Same, plus the refusing site's own message and structured detail pairs
+ * (#1024). The 2-argument form retained only (code, operation), so the paths,
+ * module names, and candidate identities a call site had already computed
+ * reached nothing but a worker log — exactly the archaeology #1022 set out to
+ * delete. `detail_keys`/`detail_vals` are index-aligned; up to
+ * CBM_GBUF_REFUSAL_DETAIL_MAX pairs with a non-empty key and non-NULL value are
+ * copied into buffer-owned fixed storage (keys truncate at CBM_SZ_64, values at
+ * CBM_SZ_512). `message` describes the failing site itself; pass NULL to keep
+ * the generic graph-buffer wrapper text. First-writer-wins, exactly like the
+ * 2-argument form. */
+void cbm_gbuf_refuse_resolution_detail(cbm_gbuf_t *gb, const char *code, const char *operation,
+                                       const char *message, const char *const *detail_keys,
+                                       const char *const *detail_vals, size_t detail_count);
+
 /* Find a node by qualified name. Returns NULL if not found and poisons
  * persistence when the qualified name maps to multiple stable atoms. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn);
@@ -222,6 +236,14 @@ bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb);
 
 enum { CBM_GBUF_REFUSAL_CANDIDATE_MAX = 4 };
 
+/* Bound on site-supplied refusal detail pairs (#1024). Sized so the widest
+ * converted call site — the ECMAScript extension-substitution family, whose
+ * evidence is its component, source file, module, match count, and all five
+ * probed candidate paths — fits without truncating away a candidate, while the
+ * whole record stays fixed-size buffer-owned storage. Pairs beyond this bound
+ * are dropped, so a site must order its most identifying pairs first. */
+enum { CBM_GBUF_REFUSAL_DETAIL_MAX = 10 };
+
 /* The exact first graph-buffer refusal, retained so the owning pipeline can
  * publish it as the run's terminal diagnostic. Without it a refusal only ever
  * reached a worker log line and the MCP response carried no captured cause
@@ -236,6 +258,13 @@ typedef struct {
     int candidate_count;        /* live candidates that tied, 0 when N/A */
     const char *candidate_atom_ids[CBM_GBUF_REFUSAL_CANDIDATE_MAX];
     int candidate_atom_id_count;
+    /* Site-supplied cause (#1024). `message` is NULL when the refusing site
+     * supplied none, and the reader keeps its generic wrapper text. The detail
+     * arrays are index-aligned and hold `detail_count` borrowed pairs. */
+    const char *message;
+    const char *detail_keys[CBM_GBUF_REFUSAL_DETAIL_MAX];
+    const char *detail_vals[CBM_GBUF_REFUSAL_DETAIL_MAX];
+    int detail_count;
 } cbm_gbuf_refusal_t;
 
 /* Read the retained first refusal. Returns false and zeroes `out` when the

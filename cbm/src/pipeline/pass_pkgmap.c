@@ -1449,8 +1449,15 @@ char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *r
                       "an import must carry exactly one local, resource, or unbound-code identity",
                       "remediation", "repair the language extractor import identity contract");
         if (ctx && ctx->gbuf) {
-            cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_BINDING_INVALID",
-                "pkgmap.import_properties.validate_binding");
+            const char *detail_keys[] = {"component", "source_file", "contract"};
+            const char *detail_vals[] = {"pipeline.import_edges", rel_path ? rel_path : "",
+                                         "exactly_one_of_local_resource_unbound"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_BINDING_INVALID",
+                "pkgmap.import_properties.validate_binding",
+                "an extracted import does not carry exactly one local, resource, or unbound-code "
+                "binding identity, so its edge properties cannot be canonicalized",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
         }
         if (ctx && ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
@@ -1466,8 +1473,15 @@ char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *r
                       "an import edge could not retain its complete identity properties",
                       "remediation", "free memory or reduce the import identifier size, then retry");
         if (ctx && ctx->gbuf) {
-            cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_PROPERTIES_ALLOC_FAILED",
-                "pkgmap.import_properties.serialize_binding");
+            const char *detail_keys[] = {"component", "source_file", "binding", "fault_class"};
+            const char *detail_vals[] = {"pipeline.import_edges", rel_path ? rel_path : "", binding,
+                                         "resolver_infrastructure"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_PROPERTIES_ALLOC_FAILED",
+                "pkgmap.import_properties.serialize_binding",
+                "an import edge could not retain its complete identity properties because the "
+                "escaped binding value could not be allocated",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
         }
         if (ctx && ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
@@ -1490,8 +1504,15 @@ char *cbm_pipeline_import_edge_properties(cbm_pipeline_ctx_t *ctx, const char *r
                       "an import edge could not allocate its identity properties document",
                       "remediation", "free memory and retry indexing");
         if (ctx && ctx->gbuf) {
-            cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_PROPERTIES_ALLOC_FAILED",
-                "pkgmap.import_properties.allocate_document");
+            const char *detail_keys[] = {"component", "source_file", "binding", "fault_class"};
+            const char *detail_vals[] = {"pipeline.import_edges", rel_path ? rel_path : "", binding,
+                                         "resolver_infrastructure"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_PROPERTIES_ALLOC_FAILED",
+                "pkgmap.import_properties.allocate_document",
+                "an import edge could not allocate the document that carries its identity "
+                "properties",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
         }
         if (ctx && ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
@@ -2015,8 +2036,15 @@ static const cbm_gbuf_node_t *resolve_es_extension_substitution(
                       "relative ECMAScript import path cannot identify a repository source",
                       "remediation", "repair the relative import path and retry indexing");
         free(runtime_path);
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_ES_PATH_INVALID",
-            "pkgmap.es_substitution");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel, module_path};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_ES_PATH_INVALID", "pkgmap.es_substitution",
+                "a relative ECMAScript import path cannot name any repository source once "
+                "normalized, so no extension-substitution family exists to probe",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2084,13 +2112,36 @@ static const cbm_gbuf_node_t *resolve_es_extension_substitution(
                                     : "multiple exact sources exist for one runtime import spelling",
         "remediation", match_count == 0 ? "restore the exact imported source or repair the specifier"
                                         : "remove the conflicting source candidates and retry indexing");
+    {
+        /* Recorded BEFORE the candidate paths are freed: the whole point of the
+         * detail pairs is that the probed family reaches the public diagnostic
+         * instead of only the worker log (#1024). */
+        const char *detail_keys[] = {"component",        "source_file",      "module",
+                                     "match_count",      "candidate_1_path", "candidate_2_path",
+                                     "candidate_3_path", "candidate_4_path", "candidate_5_path"};
+        const char *detail_vals[] = {"pipeline.pkgmap",
+                                     source_rel,
+                                     module_path,
+                                     match_count_text,
+                                     cands[0] ? cands[0] : "",
+                                     cands[1] ? cands[1] : "",
+                                     cands[2] ? cands[2] : "",
+                                     cands[3] ? cands[3] : "",
+                                     cands[4] ? cands[4] : ""};
+        cbm_gbuf_refuse_resolution_detail(
+            ctx->gbuf,
+            match_count == 0 ? "CBM_IMPORT_ES_SOURCE_MISSING" : "CBM_IMPORT_ES_SOURCE_AMBIGUOUS",
+            "pkgmap.es_substitution",
+            match_count == 0
+                ? "an ECMAScript runtime import spelling has no exact source in its extension "
+                  "substitution family; every compiler-defined candidate path was probed"
+                : "an ECMAScript runtime import spelling resolves to several exact sources in its "
+                  "extension substitution family; no import edge may be invented",
+            detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+    }
     for (int i = 0; i < candidate_count; i++) {
         free(cands[i]);
     }
-    cbm_gbuf_refuse_resolution(ctx->gbuf,
-                               match_count == 0 ? "CBM_IMPORT_ES_SOURCE_MISSING"
-                                                : "CBM_IMPORT_ES_SOURCE_AMBIGUOUS",
-                               "pkgmap.es_substitution");
     if (ctx->cancelled) {
         atomic_store(ctx->cancelled, SKIP_ONE);
     }
@@ -2101,8 +2152,16 @@ allocation_failed:
                   "source", source_rel ? source_rel : "", "module", module_path ? module_path : "",
                   "message", "extension substitution could not allocate every ordered path",
                   "remediation", "free memory or reduce the import path size, then retry indexing");
-    cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_ES_SUBSTITUTION_ALLOC_FAILED",
-        "pkgmap.es_substitution");
+    {
+        const char *detail_keys[] = {"component", "source_file", "module", "fault_class"};
+        const char *detail_vals[] = {"pipeline.pkgmap", source_rel ? source_rel : "",
+                                     module_path ? module_path : "", "resolver_infrastructure"};
+        cbm_gbuf_refuse_resolution_detail(
+            ctx->gbuf, "CBM_IMPORT_ES_SUBSTITUTION_ALLOC_FAILED", "pkgmap.es_substitution",
+            "ECMAScript extension substitution could not allocate every ordered candidate path; "
+            "the import family was never fully probed, so its absence is unproven",
+            detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+    }
     if (ctx->cancelled) {
         atomic_store(ctx->cancelled, SKIP_ONE);
     }
@@ -2141,6 +2200,7 @@ static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_
     const cbm_gbuf_node_t *found = NULL;
     const char *found_path = NULL;
     int match_count = 0;
+    int invalid_count = 0;
     for (int i = 0; i < 2; i++) {
         source_path_status_t path_status = normalize_source_candidate(cands[i]);
         if (path_status == SOURCE_PATH_ALLOC_FAILED) {
@@ -2149,6 +2209,7 @@ static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_
             goto allocation_failed;
         }
         if (path_status == SOURCE_PATH_INVALID) {
+            invalid_count++;
             continue;
         }
         const cbm_gbuf_node_t *candidate =
@@ -2172,34 +2233,85 @@ static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_
         free(cands[1]);
         return found;
     }
-    cbm_log_error(
-        "pkgmap.rust_module_resolve_failed", "code",
-        match_count == 0 ? "CBM_IMPORT_RUST_MODULE_MISSING" : "CBM_IMPORT_RUST_MODULE_AMBIGUOUS",
-        "source", source_rel, "module", module_path, "candidate_1_path", cands[0],
-        "candidate_2_path", cands[1], "matched_path", found_path ? found_path : "", "message",
-        match_count == 0 ? "no exact Rust module source exists"
-                         : "both compiler-defined Rust module sources exist",
-        "remediation", match_count == 0 ? "restore the declared Rust module source"
-                                         : "remove one conflicting Rust module source");
+    if (match_count == 0) {
+        /* Dangling module declaration: the `mod` names NO source at either
+         * compiler-defined path (#1024). This is not the ambiguity case — there
+         * is nothing to guess and no wrong binding to invent — so refusing the
+         * corpus models nothing and merely deletes the whole graph because one
+         * subtree does not compile. The declaration honestly resolves to
+         * nothing: no IMPORTS edge is fabricated, the orphaned files still index
+         * as ordinary files, downstream references through this path stay
+         * unresolved (which they are), and the skip is counted and labelled so
+         * the loss is disclosed, never silent (standing invariant 3). */
+        uint_least64_t skips = cbm_pipeline_note_dangling_rust_module_skip(ctx->pipeline);
+        char skip_buf[CBM_SZ_32];
+        char invalid_buf[CBM_SZ_32];
+        snprintf(skip_buf, sizeof(skip_buf), "%llu", (unsigned long long)skips);
+        snprintf(invalid_buf, sizeof(invalid_buf), "%d", invalid_count);
+        cbm_log_warn(
+            "pkgmap.rust_module_dangling", "code", "CBM_IMPORT_RUST_MODULE_MISSING", "component",
+            "pipeline.pkgmap", "operation", "pkgmap.rust_module_resolve", "source", source_rel,
+            "module", module_path, "candidate_1_path", cands[0], "candidate_2_path", cands[1],
+            "structurally_invalid_candidates", invalid_buf, "disposition", "import_edge_skipped",
+            "dangling_rust_module_skips", skip_buf, "message",
+            "a Rust module declaration names no source at either compiler-defined path; the "
+            "declaration resolves to nothing, its IMPORTS edge is skipped and counted, and the "
+            "corpus still publishes",
+            "remediation",
+            "create the declared module at one of the probed candidate paths, delete the dangling "
+            "`mod` declaration, or bind it explicitly with #[path = \"...\"]");
+        free(cands[0]);
+        free(cands[1]);
+        return NULL;
+    }
+
+    /* Both compiler-defined sources exist: a real ambiguity with guess-risk, so
+     * it stays fail-closed. Refuse WITH the site detail so the terminal
+     * diagnostic names the file, module, and both candidates instead of
+     * pointing at a worker log (#1022/#1024). */
+    cbm_log_error("pkgmap.rust_module_resolve_failed", "code", "CBM_IMPORT_RUST_MODULE_AMBIGUOUS",
+                  "component", "pipeline.pkgmap", "source", source_rel, "module", module_path,
+                  "candidate_1_path", cands[0], "candidate_2_path", cands[1], "matched_path",
+                  found_path ? found_path : "", "message",
+                  "both compiler-defined Rust module sources exist", "remediation",
+                  "remove one conflicting Rust module source");
+    {
+        const char *detail_keys[] = {"component",       "source_file",      "module",
+                                     "candidate_1_path", "candidate_2_path", "matched_path"};
+        const char *detail_vals[] = {"pipeline.pkgmap", source_rel,          module_path,
+                                     cands[0],          cands[1],            found_path ? found_path : ""};
+        cbm_gbuf_refuse_resolution_detail(
+            ctx->gbuf, "CBM_IMPORT_RUST_MODULE_AMBIGUOUS", "pkgmap.rust_module_resolve",
+            "a Rust `mod` declaration resolves to both compiler-defined module sources; the "
+            "physical module target is ambiguous and no import edge may be invented",
+            detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+    }
     free(cands[0]);
     free(cands[1]);
-    cbm_gbuf_refuse_resolution(ctx->gbuf,
-                               match_count == 0 ? "CBM_IMPORT_RUST_MODULE_MISSING"
-                                                : "CBM_IMPORT_RUST_MODULE_AMBIGUOUS",
-                               "pkgmap.rust_module_resolve");
     if (ctx->cancelled) {
         atomic_store(ctx->cancelled, SKIP_ONE);
     }
     return NULL;
 
 allocation_failed:
+    /* Resolver infrastructure fault, NOT a corpus fact: the candidates could
+     * never be probed, so their absence proves nothing. Stays fatal with its
+     * recorded cause. */
     cbm_log_error("pkgmap.rust_module_resolve_failed", "code",
-                  "CBM_IMPORT_RUST_MODULE_ALLOC_FAILED", "source", source_rel ? source_rel : "",
-                  "module", module_path ? module_path : "", "message",
+                  "CBM_IMPORT_RUST_MODULE_ALLOC_FAILED", "component", "pipeline.pkgmap", "source",
+                  source_rel ? source_rel : "", "module", module_path ? module_path : "", "message",
                   "Rust module resolution could not allocate both exact candidates", "remediation",
                   "free memory or reduce the module path size, then retry indexing");
-    cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_RUST_MODULE_ALLOC_FAILED",
-        "pkgmap.rust_module_resolve");
+    {
+        const char *detail_keys[] = {"component", "source_file", "module", "fault_class"};
+        const char *detail_vals[] = {"pipeline.pkgmap", source_rel ? source_rel : "",
+                                     module_path ? module_path : "", "resolver_infrastructure"};
+        cbm_gbuf_refuse_resolution_detail(
+            ctx->gbuf, "CBM_IMPORT_RUST_MODULE_ALLOC_FAILED", "pkgmap.rust_module_resolve",
+            "Rust module resolution could not allocate both compiler-defined candidate paths; the "
+            "declared module was never probed, so its absence is unproven",
+            detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+    }
     if (ctx->cancelled) {
         atomic_store(ctx->cancelled, SKIP_ONE);
     }
@@ -2323,8 +2435,24 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
                       "one import spelling resolves to multiple exact source containers",
                       "remediation",
                       "make the import path unambiguous or configure one exact source root");
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_SOURCE_AMBIGUOUS",
-            "pkgmap.source_import_resolve");
+        {
+            const char *detail_keys[] = {"component",           "source_file",
+                                         "module",              "candidate_a_path",
+                                         "candidate_a_atom_id", "candidate_b_path",
+                                         "candidate_b_atom_id"};
+            const char *detail_vals[] = {"pipeline.pkgmap",
+                                         source_rel ? source_rel : "",
+                                         module_path,
+                                         found_path ? found_path : "",
+                                         found->atom_id ? found->atom_id : "",
+                                         cands[i],
+                                         n->atom_id ? n->atom_id : ""};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_SOURCE_AMBIGUOUS", "pkgmap.source_import_resolve",
+                "one sibling-import spelling resolves to multiple exact source containers with "
+                "distinct atom identities; binding either one would fabricate provenance",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2362,8 +2490,16 @@ static const cbm_gbuf_node_t *persist_browser_module_request(
                       "message", "a browser module request lacks its complete graph identity",
                       "remediation", "preserve project, source file, and exact module specifier");
         if (ctx && ctx->gbuf) {
-            cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_IDENTITY_INVALID",
-                "pkgmap.browser_module_request");
+            const char *detail_keys[] = {"component", "source_file", "module", "project"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel ? source_rel : "",
+                                         module_path ? module_path : "",
+                                         ctx->project_name ? ctx->project_name : ""};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_IDENTITY_INVALID",
+                "pkgmap.browser_module_request",
+                "a browser runtime module request lacks the complete project/source/specifier "
+                "identity a persisted RuntimeModuleRequest atom requires",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
         }
         if (ctx && ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
@@ -2385,8 +2521,16 @@ static const cbm_gbuf_node_t *persist_browser_module_request(
                       module_path, "message",
                       "the complete browser module request identity could not be allocated",
                       "remediation", "free memory or reduce the module specifier size, then retry");
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_ALLOC_FAILED",
-            "pkgmap.browser_module_request");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module", "fault_class"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel, module_path,
+                                         "resolver_infrastructure"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_ALLOC_FAILED",
+                "pkgmap.browser_module_request",
+                "the complete browser runtime module request identity could not be allocated",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2405,8 +2549,16 @@ static const cbm_gbuf_node_t *persist_browser_module_request(
                       "CBM_IMPORT_BROWSER_REQUEST_SIZE_OVERFLOW", "source", source_rel, "module",
                       module_path, "message", "browser module request properties exceed size_t",
                       "remediation", "reduce the source path or module specifier size, then retry");
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_SIZE_OVERFLOW",
-            "pkgmap.browser_module_request");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module", "fault_class"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel, module_path,
+                                         "resolver_infrastructure"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_SIZE_OVERFLOW",
+                "pkgmap.browser_module_request",
+                "browser runtime module request properties exceed the addressable size limit",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2423,8 +2575,16 @@ static const cbm_gbuf_node_t *persist_browser_module_request(
                       module_path, "message",
                       "browser module request properties could not be allocated", "remediation",
                       "free memory and retry indexing");
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_ALLOC_FAILED",
-            "pkgmap.browser_module_request");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module", "fault_class"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel, module_path,
+                                         "resolver_infrastructure"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_ALLOC_FAILED",
+                "pkgmap.browser_module_request",
+                "the browser runtime module request properties document could not be allocated",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2461,8 +2621,17 @@ static const cbm_gbuf_node_t *persist_browser_module_request(
                       "remediation",
                       "inspect graph-buffer identity/property diagnostics and retry the complete "
                       "corpus");
-        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_PERSISTED_STATE_INVALID",
-            "pkgmap.browser_module_request");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module", "readback"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel, module_path,
+                                         "graph_buffer_identity_mismatch"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_BROWSER_REQUEST_PERSISTED_STATE_INVALID",
+                "pkgmap.browser_module_request",
+                "the persisted RuntimeModuleRequest graph-buffer readback does not exactly match "
+                "the canonical identity and properties that were written",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2561,8 +2730,16 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                               "dependency_kind", imp->dependency_kind ? imp->dependency_kind : "",
                               "message", "an exact unbound source dependency has no target",
                               "remediation", "restore the exact source file or repair the path");
-                cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_IMPORT_UNBOUND_SOURCE_MISSING",
-                    "pkgmap.resolve_import_node");
+                const char *detail_keys[] = {"component", "source_file", "module",
+                                             "dependency_kind", "resolution"};
+                const char *detail_vals[] = {
+                    "pipeline.pkgmap", source_rel ? source_rel : "", imp->module_path,
+                    imp->dependency_kind ? imp->dependency_kind : "", "exact_source"};
+                cbm_gbuf_refuse_resolution_detail(
+                    ctx->gbuf, "CBM_IMPORT_UNBOUND_SOURCE_MISSING", "pkgmap.resolve_import_node",
+                    "a quoted include asserts an exact source identity that no repository file "
+                    "satisfies; its stem must never be reinterpreted as a semantic module",
+                    detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
                 if (ctx->cancelled) {
                     atomic_store(ctx->cancelled, SKIP_ONE);
                 }

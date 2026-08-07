@@ -3967,6 +3967,9 @@ unsafe extern "C" {
     ) -> uint_least64_t;
 }
 unsafe extern "C" {
+    pub fn cbm_pipeline_get_dangling_rust_module_skips(p: *const cbm_pipeline_t) -> uint_least64_t;
+}
+unsafe extern "C" {
     pub fn cbm_pipeline_get_parse_recovery_diagnostics(p: *const cbm_pipeline_t) -> uint_least64_t;
 }
 #[repr(C)]
