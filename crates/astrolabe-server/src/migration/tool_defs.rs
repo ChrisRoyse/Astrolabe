@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 22] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 23] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -26,7 +26,80 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 22] {
         get_kernel_tool_definition(),
         kernel_answer_tool_definition(),
         anchor_erase_tool_definition(),
+        // #1009: L5 latent (indirect) associations.
+        discover_latent_links_tool_definition(),
     ]
+}
+
+pub(crate) fn discover_latent_links_tool_definition() -> Value {
+    json!({
+        "name": "discover_latent_links",
+        "title": "Discover Latent Links",
+        "description": "\"What is this related to that nothing records?\" — L5 latent association discovery over the persisted composite association graph, on Swanson's ABC model. Every other layer reports a pair because direct evidence for that pair exists (an extracted edge, close slot vectors, co-occurring series); this one proposes pairs precisely where the direct edge is ABSENT but many shared intermediaries are present, which is the hidden-coupling / duplicated-concept / missing-abstraction finding that blast radius structurally cannot reach because blast radius only walks edges that exist. Shared intermediaries are weighted by rarity, never counted raw: an intermediary reached by hundreds of symbols (a logger, an error constructor) carries almost no evidence and would emit C(degree,2) spurious pairs on its own, so scoring is Resource-Allocation (sum 1/degree, the primary rank, best on sparse code graphs) plus Adamic-Adar (sum 1/ln degree) plus Swanson's raw linking-term count, and intermediaries above the declared breadth ceiling are gated out AND counted. Modes: \"open\" (seeded — what is this symbol implicitly related to), \"closed\" (given two symbols, the ranked linking intermediaries that explain them), \"sweep\" (the repo's top latent pairs). Every served pair is trust=\"provisional\" without exception: a latent link is a hypothesis about a missing association, never an observed one, and each pair carries the intermediaries that produced it so the caller judges the evidence rather than the score. A sweep that would exceed the declared pair budget refuses with the breadth ceiling that would fit rather than silently truncating the ranking; an absent kernel_graph projection refuses rather than ranking absences over a partial graph. Fails closed with {code,message,remediation} on a missing/unresolved symbol, an unsupported mode/relation, or an out-of-bounds gate override.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["open", "closed", "sweep"],
+                    "description": "open (default): ranked latent partners of one seed. closed: the linking intermediaries explaining a given pair. sweep: the repo's top latent pairs under the pair budget."
+                },
+                "relation": {
+                    "type": "string",
+                    "enum": ["coupling", "co_citation", "undirected"],
+                    "description": "Which arc makes an intermediary shared, and therefore which degree is the rarity denominator. coupling (default): shared successors, A->B<-C — the 'these two do the same work' signal. co_citation: shared predecessors, A<-B->C — 'these two are used by the same work'. undirected: either direction."
+                },
+                "seed": {
+                    "type": "string",
+                    "description": "mode=\"open\": qualified name of the symbol whose implicit relationships you want. Must resolve in this project's indexed graph or the call refuses fail-closed."
+                },
+                "a": {
+                    "type": "string",
+                    "description": "mode=\"closed\": qualified name of the first endpoint."
+                },
+                "c": {
+                    "type": "string",
+                    "description": "mode=\"closed\": qualified name of the second endpoint."
+                },
+                "max_intermediary_degree": {
+                    "type": "integer",
+                    "description": "Breadth ceiling: an intermediary reached by more symbols than this is over-broad, gated out, and counted in disclosure.intermediaries_over_broad. Default 50. Raising it admits hubs and inflates spurious pairs quadratically; lowering it is how you make an over-budget sweep fit."
+                },
+                "min_shared_intermediaries": {
+                    "type": "integer",
+                    "description": "Fewest linking intermediaries a pair needs to be reported. Default 2 — a pair joined through a single intermediary is a coincidence of one call site."
+                },
+                "pair_budget": {
+                    "type": "integer",
+                    "description": "mode=\"sweep\": ceiling on candidate pairs the sweep may materialize. Exceeding it refuses with the remediation rather than truncating the ranking. Default 4000000."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "How many ranked pairs to serve. Default 100. The pre-truncation count is always disclosed as disclosure.pairs_truncated."
+                },
+                "listed_intermediaries": {
+                    "type": "integer",
+                    "description": "How many of each pair's linking intermediaries to list as evidence, rarest first. Default 8. The pair's full shared_count is always served alongside."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn get_kernel_tool_definition() -> Value {

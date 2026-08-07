@@ -197,6 +197,11 @@ use predict_impact::*;
 mod oracle_surface;
 use oracle_surface::*;
 
+/// L5 latent (indirect) association discovery over the persisted composite
+/// association projection (#1009).
+mod latent_links;
+use latent_links::*;
+
 mod coverage_ingest;
 use coverage_ingest::*;
 

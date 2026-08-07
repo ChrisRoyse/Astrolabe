@@ -61,6 +61,20 @@ pub use gaps::{
     grounding_gap_report_artifact_bytes,
 };
 
+/// L5 latent (indirect) associations: Swanson-style ABC discovery over the
+/// composite association graph (#1009). The layer that proposes associations the
+/// graph implies but does not record.
+pub mod latent;
+pub use latent::{
+    ASTRO_LATENT_KNOB_RANGE, ASTRO_LATENT_NODE_UNKNOWN, ASTRO_LATENT_PAIR_BUDGET_EXCEEDED,
+    KNOB_LISTED_INTERMEDIARIES, KNOB_MAX_INTERMEDIARY_DEGREE, KNOB_MIN_SHARED_INTERMEDIARIES,
+    KNOB_PAIR_BUDGET, KNOB_TOP_K, LATENT_DISCOVERY_SCHEMA, LATENT_EXPLANATION_SCHEMA,
+    LATENT_KNOB_REGISTRY_VERSION, LATENT_KNOBS, LatentConfig, LatentDisclosure,
+    LatentDiscoveryReport, LatentExplanation, LatentIntermediary, LatentMode, LatentPair,
+    LatentRelation, latent_closed_discovery, latent_corpus_sweep, latent_discovery_artifact_bytes,
+    latent_explanation_artifact_bytes, latent_open_discovery, latent_sweep_pair_cost,
+};
+
 /// Scope algebra for scoped and hierarchical kernels (#38).
 pub mod scope;
 pub use scope::{NodeScope, Scope, ScopeAttributes, induced_subgraph};
