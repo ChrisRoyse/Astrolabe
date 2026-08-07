@@ -4756,6 +4756,7 @@ try {
         Fail-Astro 'ASTRO_FSV_CHILD_EXIT_OBSERVATION_MISMATCH' "the original and duplicated exact process handles disagree on native child PID $($child.Id) exit code (primary=$childExitCode; duplicate=$($childExitObservation.exact_duplicate_exit_code))" 'preserve the run record and repair exact process-handle observation; never infer success from disagreeing sources'
     }
     if ($childExitCode -ne 0) { exit 1 }
+    exit 0
 }
 catch {
     $failure = $_
