@@ -1100,6 +1100,10 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
     }
 
 cleanup:
+    /* Publish the graph buffer's refusal cause on every failing exit (#1022). */
+    if (result != 0) {
+        cbm_pipeline_record_gbuf_refusal(pipeline, gbuf, "graph", db_path);
+    }
     if (result != 0 && stage_generation_started && !preserve_unevaluable_stage) {
         (void)remove_optional_file(stage, "CBM_INCREMENTAL_FAILED_STAGE_REMOVE_FAILED");
         (void)remove_optional_file(stage_wal, "CBM_INCREMENTAL_FAILED_STAGE_WAL_REMOVE_FAILED");
@@ -1591,6 +1595,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                  itoa_buf(edge_cap.count), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     incr_free_edge_capture(&edge_cap);
     if (relinked < 0) {
+        /* Re-link aborts on a graph-buffer refusal; publish its cause before the
+         * buffer that holds the record is destroyed (#1022). */
+        cbm_pipeline_record_gbuf_refusal(p, existing, "graph", db_path);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_gbuf_free(existing);
         return CBM_NOT_FOUND;

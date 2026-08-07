@@ -1316,6 +1316,75 @@ void cbm_pipeline_record_fatal_error_detail(cbm_pipeline_t *p, const char *code,
                   p->fatal_error_message, "remediation", p->fatal_error_remediation);
 }
 
+/* Publish a graph-buffer refusal as the run's terminal diagnostic (#1022).
+ *
+ * A refusal inside the graph buffer poisons persistence, but the buffer is a
+ * layer below the pipeline and could only log; the run then aborted with no
+ * fatal record at all, so the MCP response carried `diagnostic.captured=false`
+ * and pointed the operator at a worker log they cannot read. This runs at the
+ * single choke point every failing run passes through, so no refusal site can
+ * abort silently. record_fatal_error_detail is first-writer-wins: a more
+ * specific diagnostic recorded earlier still wins. */
+void cbm_pipeline_record_gbuf_refusal(cbm_pipeline_t *p, const cbm_gbuf_t *gb, const char *phase,
+                                      const char *path) {
+    if (!p || !gb || !cbm_gbuf_resolution_failed(gb)) {
+        return;
+    }
+    cbm_gbuf_refusal_t refusal;
+    bool have = cbm_gbuf_get_refusal(gb, &refusal);
+
+    const char *keys[CBM_PIPELINE_ERROR_DETAIL_MAX];
+    const char *vals[CBM_PIPELINE_ERROR_DETAIL_MAX];
+    char line_buf[CBM_SZ_32];
+    char count_buf[CBM_SZ_32];
+    char atom_key_buf[CBM_GBUF_REFUSAL_CANDIDATE_MAX][CBM_SZ_32];
+    size_t n = 0;
+
+    keys[n] = "component";
+    vals[n++] = "graph_buffer";
+    if (have && refusal.operation) {
+        keys[n] = "graph_operation";
+        vals[n++] = refusal.operation;
+    }
+    if (have && refusal.qualified_name) {
+        keys[n] = "qualified_name";
+        vals[n++] = refusal.qualified_name;
+    }
+    if (have && refusal.file_path) {
+        keys[n] = "file_path";
+        vals[n++] = refusal.file_path;
+    }
+    if (have && refusal.line > 0) {
+        (void)snprintf(line_buf, sizeof(line_buf), "%d", refusal.line);
+        keys[n] = "line";
+        vals[n++] = line_buf;
+    }
+    if (have && refusal.candidate_count > 0) {
+        (void)snprintf(count_buf, sizeof(count_buf), "%d", refusal.candidate_count);
+        keys[n] = "candidate_count";
+        vals[n++] = count_buf;
+    }
+    for (int i = 0; have && i < refusal.candidate_atom_id_count &&
+                    n + SKIP_ONE < (size_t)CBM_PIPELINE_ERROR_DETAIL_MAX;
+         i++) {
+        (void)snprintf(atom_key_buf[i], sizeof(atom_key_buf[i]), "candidate_atom_id_%d",
+                       i + SKIP_ONE);
+        keys[n] = atom_key_buf[i];
+        vals[n++] = refusal.candidate_atom_ids[i];
+    }
+
+    cbm_pipeline_record_fatal_error_detail(
+        p, have ? refusal.code : "CBM_GRAPH_RESOLUTION_FAILED",
+        have && refusal.operation ? refusal.operation : "graph_buffer.resolution",
+        phase ? phase : "graph", path ? path : "",
+        0, /* requested */
+        "the authoritative graph buffer refused a canonical identity or reference resolution; "
+        "no store or row-sink mutation was committed",
+        "resolve the reported atoms by exact identity — the detail pairs name the operation, the "
+        "contended qualified name, its file and line, and every candidate atom",
+        keys, vals, n);
+}
+
 static const char *cbm_pipeline_code_from_legacy_reason(const char *reason) {
     if (!reason || reason[0] != '[') {
         return NULL;
@@ -1481,7 +1550,8 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                           "remediation",
                           "preserve the complete source identity frame through extraction and "
                           "resolution");
-            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_SOURCE_ARGUMENT_INVALID",
+                "pipeline.reference_source");
         }
         return NULL;
     }
@@ -1497,7 +1567,8 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                       "remediation",
                       "preserve the module qualified name from extraction through reference "
                       "resolution, then re-index the complete corpus");
-        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_MODULE_QN_MISSING",
+            "pipeline.reference_source");
         return NULL;
     }
 
@@ -1512,7 +1583,8 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                           "repository path",
                           "remediation",
                           "repair structure-pass File ownership and re-index the complete corpus");
-            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+            cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_FILE_SOURCE_NOT_FOUND",
+                "pipeline.reference_source");
         }
         return file;
     }
@@ -1541,7 +1613,8 @@ const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(
                       "remediation",
                       "preserve the parser source position through extraction and retry the "
                       "complete corpus");
-        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf);
+        cbm_gbuf_refuse_resolution((cbm_gbuf_t *)gbuf, "CBM_REFERENCE_SOURCE_LOCATION_MISSING",
+            "pipeline.reference_source");
         return NULL;
     }
     cbm_gbuf_record_unresolved_reference_source(gbuf, operation, enclosing_qn, rel_path,
@@ -4094,6 +4167,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
 
 cleanup:
+    /* Every failing exit of this run funnels here while the graph buffer is
+     * still alive: publish its refusal cause before it is destroyed (#1022). */
+    if (rc != 0) {
+        cbm_pipeline_record_gbuf_refusal(p, p->gbuf, "graph", p->repo_path);
+    }
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     free(source_files);

@@ -122,6 +122,13 @@ void cbm_pipeline_record_fatal_error_detail(cbm_pipeline_t *p, const char *code,
                                             const char *message, const char *remediation,
                                             const char *const *detail_keys,
                                             const char *const *detail_vals, size_t detail_count);
+/* Publish a graph-buffer refusal as the run's terminal diagnostic (#1022). A
+ * no-op when the buffer did not refuse; first-writer-wins, so an earlier, more
+ * specific fatal record is never displaced. Call it on every failing exit of a
+ * run that owns a graph buffer, BEFORE the buffer is freed. */
+void cbm_pipeline_record_gbuf_refusal(cbm_pipeline_t *p, const cbm_gbuf_t *gb, const char *phase,
+                                      const char *path);
+
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
 void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
                                            const char *mode, const char *code, int item_count,

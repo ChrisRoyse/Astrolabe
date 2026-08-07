@@ -1545,9 +1545,11 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     }
     free(file_qn);
     if (def->parent_class && strcmp(def->label, "Method") == 0) {
+        /* KEEP IN SYNC with pass_definitions.c: the method's own parse-time byte
+         * discriminates same-named parents that share one physical line (#1022). */
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn_location(
             ctx->gbuf, def->parent_class, def->file_path ? def->file_path : rel,
-            (int)def->start_line);
+            (int)def->start_line, (uint64_t)def->start_byte, def->end_byte > def->start_byte);
         if (parent && def_node) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD", "{}");
         }

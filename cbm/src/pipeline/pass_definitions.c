@@ -566,7 +566,8 @@ static void process_diagnostic(cbm_pipeline_ctx_t *ctx, const CBMParseDiagnostic
         cbm_log_error("diagnostic.identity_failed", "code", "CBM_DIAGNOSTIC_QN_OVERFLOW", "path",
                       rel, "message", "the parse diagnostic identity exceeded its graph buffer",
                       "remediation", "shorten the source path or diagnostic code and retry");
-        cbm_gbuf_refuse_resolution(ctx->gbuf);
+        cbm_gbuf_refuse_resolution(ctx->gbuf, "CBM_DIAGNOSTIC_QN_OVERFLOW",
+            "pipeline.diagnostic_identity");
         free(file_qn);
         return;
     }
@@ -629,9 +630,13 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
     }
     free(file_qn);
     if (def->parent_class && def->label && strcmp(def->label, "Method") == 0) {
+        /* The method's own parse-time byte discriminates same-named parents
+         * that share one physical line — the whole of a minified bundle (#1022).
+         * A definition with no persisted span passes ref_byte_valid = false and
+         * resolves exactly as before. */
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn_location(
             ctx->gbuf, def->parent_class, def->file_path ? def->file_path : rel,
-            (int)def->start_line);
+            (int)def->start_line, (uint64_t)def->start_byte, def->end_byte > def->start_byte);
         if (parent && node_id > 0) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
         }

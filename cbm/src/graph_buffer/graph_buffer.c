@@ -229,6 +229,21 @@ struct cbm_gbuf {
     CBMHashTable *node_by_atom;
     CBMHashTable *node_by_qn;
     _Atomic bool resolution_failed;
+    /* Retained identity of the FIRST refusal (#1022). resolution_failed alone
+     * only told the pipeline that *something* refused, so the terminal MCP
+     * response carried no cause at all and the operator was pointed at a worker
+     * log. First-writer-wins: the refusal that actually poisoned the corpus is
+     * the one reported; later ones are consequences. */
+    _Atomic bool refusal_claimed;
+    _Atomic bool refusal_present;
+    char refusal_code[CBM_SZ_64];
+    char refusal_operation[CBM_SZ_64];
+    char refusal_qualified_name[CBM_SZ_512];
+    char refusal_file_path[CBM_SZ_1K];
+    int refusal_line;
+    int refusal_candidate_count;
+    char refusal_candidate_atom_ids[CBM_GBUF_REFUSAL_CANDIDATE_MAX][CBM_SZ_128];
+    int refusal_candidate_atom_id_count;
     /* Counted, labelled degradations — NOT failures (#727). A reference whose
      * source syntax resolves to several stable atoms in one semantic domain
      * (e.g. three `#[cfg]`-gated methods sharing a qualified name) cannot be
@@ -293,10 +308,90 @@ struct cbm_gbuf {
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-static void gbuf_index_failure(cbm_gbuf_t *gb, const char *operation, const char *key) {
-    if (gb) {
-        atomic_store(&gb->resolution_failed, true);
+/* Poison persistence AND retain the exact cause (#1022). Every refusal site
+ * that can abort the corpus routes through here so the owning pipeline can
+ * publish a terminal diagnostic instead of a bare "resolution failed" with the
+ * evidence stranded in a worker log. First writer wins; the flag is raised
+ * afterwards so any reader that sees the flag also sees a complete record. */
+static void gbuf_fail_resolution(cbm_gbuf_t *gb, const char *code, const char *operation,
+                                 const char *qualified_name, const char *file_path, int line,
+                                 int candidate_count, const char *const *candidate_atom_ids,
+                                 int candidate_atom_id_count) {
+    if (!gb) {
+        return;
     }
+    if (!atomic_exchange(&gb->refusal_claimed, true)) {
+        (void)snprintf(gb->refusal_code, sizeof(gb->refusal_code), "%s",
+                       code && code[0] ? code : "CBM_GRAPH_RESOLUTION_FAILED");
+        (void)snprintf(gb->refusal_operation, sizeof(gb->refusal_operation), "%s",
+                       operation ? operation : "");
+        (void)snprintf(gb->refusal_qualified_name, sizeof(gb->refusal_qualified_name), "%s",
+                       qualified_name ? qualified_name : "");
+        (void)snprintf(gb->refusal_file_path, sizeof(gb->refusal_file_path), "%s",
+                       file_path ? file_path : "");
+        gb->refusal_line = line;
+        gb->refusal_candidate_count = candidate_count;
+        gb->refusal_candidate_atom_id_count = 0;
+        for (int i = 0; candidate_atom_ids && i < candidate_atom_id_count &&
+                        gb->refusal_candidate_atom_id_count < CBM_GBUF_REFUSAL_CANDIDATE_MAX;
+             i++) {
+            if (!candidate_atom_ids[i] || !candidate_atom_ids[i][0]) {
+                continue;
+            }
+            int slot = gb->refusal_candidate_atom_id_count;
+            (void)snprintf(gb->refusal_candidate_atom_ids[slot],
+                           sizeof(gb->refusal_candidate_atom_ids[slot]), "%s",
+                           candidate_atom_ids[i]);
+            gb->refusal_candidate_atom_id_count = slot + SKIP_ONE;
+        }
+        atomic_store(&gb->refusal_present, true);
+    }
+    atomic_store(&gb->resolution_failed, true);
+}
+
+/* Refusal with no candidate identity beyond its code/operation. */
+static void gbuf_fail_resolution_code(cbm_gbuf_t *gb, const char *code, const char *operation,
+                                      const char *qualified_name, const char *file_path) {
+    gbuf_fail_resolution(gb, code, operation, qualified_name, file_path, 0, 0, NULL, 0);
+}
+
+/* Carry a worker buffer's exact refusal into the buffer it merges into. The
+ * parallel extract path resolves references inside per-worker buffers, so
+ * without this the only copy of the cause dies with the worker and the merged
+ * corpus fails with a generic "a worker graph failed" (#1022). */
+static void gbuf_propagate_refusal(cbm_gbuf_t *dst, const cbm_gbuf_t *src) {
+    cbm_gbuf_refusal_t refusal;
+    if (cbm_gbuf_get_refusal(src, &refusal)) {
+        gbuf_fail_resolution(dst, refusal.code, refusal.operation, refusal.qualified_name,
+                             refusal.file_path, refusal.line, refusal.candidate_count,
+                             refusal.candidate_atom_ids, refusal.candidate_atom_id_count);
+        return;
+    }
+    gbuf_fail_resolution_code(dst, "CBM_SOURCE_WORKER_FAILED", "graph_buffer.merge", NULL, NULL);
+}
+
+bool cbm_gbuf_get_refusal(const cbm_gbuf_t *gb, cbm_gbuf_refusal_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!gb || !out || !atomic_load(&((cbm_gbuf_t *)gb)->refusal_present)) {
+        return false;
+    }
+    out->code = gb->refusal_code;
+    out->operation = gb->refusal_operation[0] ? gb->refusal_operation : NULL;
+    out->qualified_name = gb->refusal_qualified_name[0] ? gb->refusal_qualified_name : NULL;
+    out->file_path = gb->refusal_file_path[0] ? gb->refusal_file_path : NULL;
+    out->line = gb->refusal_line;
+    out->candidate_count = gb->refusal_candidate_count;
+    out->candidate_atom_id_count = gb->refusal_candidate_atom_id_count;
+    for (int i = 0; i < gb->refusal_candidate_atom_id_count; i++) {
+        out->candidate_atom_ids[i] = gb->refusal_candidate_atom_ids[i];
+    }
+    return true;
+}
+
+static void gbuf_index_failure(cbm_gbuf_t *gb, const char *operation, const char *key) {
+    gbuf_fail_resolution_code(gb, "CBM_GRAPH_INDEX_INSERT_FAILED", operation, key, NULL);
     cbm_log_error("gbuf.index_insert_failed", "code", "CBM_GRAPH_INDEX_INSERT_FAILED", "component",
                   "graph_buffer", "operation", operation ? operation : "", "key", key ? key : "",
                   "message", "authoritative graph index insertion or growth failed", "remediation",
@@ -549,7 +644,7 @@ static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
 
     if (!make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type, e->properties_json)) {
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_EDGE_IDENTITY_INVALID", "graph_buffer.unindex_edge", NULL, NULL);
         cbm_log_error("gbuf.edge_identity_failed", "code", "CBM_EDGE_IDENTITY_INVALID", "type",
                       e->type ? e->type : "", "message",
                       "an existing edge no longer yields the exact schema-v5 identity tuple",
@@ -1016,7 +1111,7 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
         char requested_buf[CBM_SZ_32];
         snprintf(current_buf, sizeof(current_buf), "%lld", (long long)gb->next_id);
         snprintf(requested_buf, sizeof(requested_buf), "%lld", (long long)next_id);
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_GRAPH_ID_SEQUENCE_REGRESSION", "graph_buffer.set_next_id", NULL, NULL);
         cbm_log_error(
             "gbuf.id_sequence_refused", "code", "CBM_GRAPH_ID_SEQUENCE_REGRESSION",
             "current_next_id", current_buf, "requested_next_id", requested_buf, "message",
@@ -1062,7 +1157,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
         !valid_utf8_text(label) || !valid_utf8_text(name) || !valid_utf8_text(qualified_name) ||
         !valid_utf8_text(canonical_file_path) || !valid_properties_object(json)) {
         if (gb) {
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_NODE_CANONICAL_INPUT_INVALID", "graph_buffer.upsert_node", qualified_name, canonical_file_path);
         }
         cbm_log_error("gbuf.node_refused", "code", "CBM_NODE_CANONICAL_INPUT_INVALID",
                       "qualified_name", qualified_name ? qualified_name : "", "message",
@@ -1077,7 +1172,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
         make_atom_id(gb->project, label, name, qualified_name, canonical_file_path, start_line,
                      end_line, source_present, source_bytes, source_len, start_byte, end_byte);
     if (!atom_id) {
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_NODE_ATOM_ALLOC_FAILED", "graph_buffer.upsert_node", qualified_name, canonical_file_path);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_ATOM_ALLOC_FAILED", "message",
                       "stable source atom allocation failed", "remediation",
                       "free memory or reduce the indexed repository size, then retry");
@@ -1093,7 +1188,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
                                        source_len, start_byte, end_byte);
         free(atom_id);
         if (!equal) {
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_NODE_ATOM_COLLISION", "graph_buffer.upsert_node", qualified_name, canonical_file_path);
             cbm_log_error("gbuf.atom_collision", "code", "CBM_NODE_ATOM_COLLISION",
                           "qualified_name", qualified_name, "message",
                           "one stable atom resolved to unequal canonical payloads", "remediation",
@@ -1102,7 +1197,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
         }
         char *new_props = heap_strdup(json);
         if (!new_props) {
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_NODE_PROPERTIES_ALLOC_FAILED", "graph_buffer.upsert_node", qualified_name, canonical_file_path);
             cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_PROPERTIES_ALLOC_FAILED",
                           "qualified_name", qualified_name, "message",
                           "same-atom property enrichment allocation failed", "remediation",
@@ -1117,7 +1212,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
     cbm_gbuf_node_t *node = calloc(CBM_ALLOC_ONE, sizeof(cbm_gbuf_node_t));
     if (!node) {
         free(atom_id);
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_NODE_ALLOC_FAILED", "graph_buffer.upsert_node", qualified_name, canonical_file_path);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_ALLOC_FAILED", "message",
                       "graph node allocation failed", "remediation",
                       "free memory or reduce the indexed repository size, then retry");
@@ -1155,7 +1250,7 @@ static int64_t upsert_node_internal(cbm_gbuf_t *gb, const char *label, const cha
         (source_len > 0 && !node->source_bytes)) {
         free_node_strings(node);
         free(node);
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_NODE_FIELDS_ALLOC_FAILED", "graph_buffer.upsert_node", qualified_name, canonical_file_path);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_FIELDS_ALLOC_FAILED",
                       "qualified_name", qualified_name, "message",
                       "one or more graph-node fields could not be retained", "remediation",
@@ -1217,7 +1312,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_source_node(const cbm_gbuf_t *gb, const cha
     char *atom_id = make_atom_id(gb->project, label, name, qualified_name, file_path, start_line,
                                  end_line, true, source_bytes, source_len, start_byte, end_byte);
     if (!atom_id) {
-        atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+        gbuf_fail_resolution_code((cbm_gbuf_t *)gb, "CBM_NODE_ATOM_ALLOC_FAILED", "graph_buffer.find_source_node", qualified_name, file_path);
         return NULL;
     }
     const cbm_gbuf_node_t *node = cbm_ht_get(gb->node_by_atom, atom_id);
@@ -1232,10 +1327,8 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_atom_id(const cbm_gbuf_t *gb, const char
     return cbm_ht_get(gb->node_by_atom, atom_id);
 }
 
-void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb) {
-    if (gb) {
-        atomic_store(&gb->resolution_failed, true);
-    }
+void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb, const char *code, const char *operation) {
+    gbuf_fail_resolution_code(gb, code, operation, NULL, NULL);
 }
 
 const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, const char *label,
@@ -1266,7 +1359,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_source_container(const cbm_gbuf_t *gb, cons
 
     char count_buf[CBM_SZ_32];
     snprintf(count_buf, sizeof(count_buf), "%d", match_count);
-    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    gbuf_fail_resolution((cbm_gbuf_t *)gb, "CBM_SOURCE_CONTAINER_AMBIGUOUS", "graph_buffer.find_source_container", label, file_path, 0, match_count, NULL, 0);
     cbm_log_error("gbuf.source_container_ambiguous", "code", "CBM_SOURCE_CONTAINER_AMBIGUOUS",
                   "label", label, "file_path", file_path, "candidate_count", count_buf, "message",
                   "exact source-container path resolves to multiple stable atoms", "remediation",
@@ -1297,7 +1390,7 @@ int cbm_gbuf_replace_source_container_properties(cbm_gbuf_t *gb, const char *lab
     cbm_gbuf_node_t *node = (cbm_gbuf_node_t *)cbm_gbuf_find_source_container(gb, label, file_path);
     if (!gb || !node || !valid_properties_object(json)) {
         if (gb) {
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_SOURCE_CONTAINER_PROPERTIES_INVALID", "graph_buffer.replace_source_container_properties", label, file_path);
         }
         cbm_log_error("gbuf.source_container_properties_refused", "code",
                       "CBM_SOURCE_CONTAINER_PROPERTIES_INVALID", "label", label ? label : "",
@@ -1309,7 +1402,7 @@ int cbm_gbuf_replace_source_container_properties(cbm_gbuf_t *gb, const char *lab
     }
     char *copy = heap_strdup(json);
     if (!copy) {
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_SOURCE_CONTAINER_PROPERTIES_ALLOC_FAILED", "graph_buffer.replace_source_container_properties", label, file_path);
         cbm_log_error("gbuf.source_container_properties_refused", "code",
                       "CBM_SOURCE_CONTAINER_PROPERTIES_ALLOC_FAILED", "label", label, "file_path",
                       file_path, "message",
@@ -1336,7 +1429,7 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
     if (!gb || !node || !valid_properties_object(node->properties_json) ||
         !valid_properties_object(patch_json)) {
         if (gb) {
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_INPUT_INVALID", "graph_buffer.merge_source_container_properties", label, file_path);
         }
         cbm_log_error("gbuf.source_container_properties_merge_refused", "code",
                       "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_INPUT_INVALID", "label",
@@ -1364,7 +1457,7 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
         merged_json = NULL;
         rc = 0;
     } else {
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_FAILED", "graph_buffer.merge_source_container_properties", label, file_path);
         cbm_log_error("gbuf.source_container_properties_merge_refused", "code",
                       "CBM_SOURCE_CONTAINER_PROPERTIES_MERGE_FAILED", "label", label, "file_path",
                       file_path, "message",
@@ -1463,7 +1556,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn)
     }
     void *node = cbm_ht_get(gb->node_by_qn, qn);
     if (node == AMBIGUOUS_QN) {
-        atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+        gbuf_fail_resolution_code((cbm_gbuf_t *)gb, "CBM_NODE_QN_AMBIGUOUS", "graph_buffer.find_by_qn", qn, NULL);
         log_qn_resolution_ambiguity(gb, qn);
         return NULL;
     }
@@ -1601,8 +1694,27 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain(const cbm_gbuf_t *gb, const ch
     return cbm_gbuf_find_by_qn_domain_status(gb, qn, domain, operation, NULL);
 }
 
+/* True when `node` is a live atom of `qn` in `file_path` whose inclusive line
+ * range contains `line`. This is the historical location filter, unchanged. */
+static bool location_line_candidate(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node,
+                                    const char *qn, const char *file_path, int line) {
+    return node_is_live(gb, node) && node->qualified_name && node->file_path &&
+           strcmp(node->qualified_name, qn) == 0 && strcmp(node->file_path, file_path) == 0 &&
+           node->start_line > 0 && node->end_line >= node->start_line &&
+           line >= node->start_line && line <= node->end_line;
+}
+
+/* True when `node`'s end-exclusive byte span contains `ref_byte`. A node with
+ * no persisted span (end_byte == start_byte) carries no byte identity and can
+ * never be narrowed by one. */
+static bool location_byte_candidate(const cbm_gbuf_node_t *node, uint64_t ref_byte) {
+    return node->end_byte > node->start_byte && ref_byte >= node->start_byte &&
+           ref_byte < node->end_byte;
+}
+
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,
-                                                    const char *file_path, int line) {
+                                                    const char *file_path, int line,
+                                                    uint64_t ref_byte, bool ref_byte_valid) {
     if (!gb || !qn || !file_path || line <= 0) {
         return NULL;
     }
@@ -1616,30 +1728,87 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const 
     int match_count = 0;
     for (int i = 0; i < candidates->count; i++) {
         const cbm_gbuf_node_t *node = candidates->items[i];
-        if (!node_is_live(gb, node) || !node->qualified_name || !node->file_path ||
-            strcmp(node->qualified_name, qn) != 0 || strcmp(node->file_path, file_path) != 0 ||
-            node->start_line <= 0 || node->end_line < node->start_line || line < node->start_line ||
-            line > node->end_line) {
+        if (!location_line_candidate(gb, node, qn, file_path, line)) {
             continue;
         }
         match = node;
         match_count++;
     }
 
-    if (match_count > 1) {
-        char line_buf[CBM_SZ_32];
-        char count_buf[CBM_SZ_32];
-        snprintf(line_buf, sizeof(line_buf), "%d", line);
-        snprintf(count_buf, sizeof(count_buf), "%d", match_count);
-        atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
-        cbm_log_error("gbuf.location_resolution_ambiguous", "code", "CBM_NODE_LOCATION_AMBIGUOUS",
-                      "qualified_name", qn, "file_path", file_path, "line", line_buf,
-                      "candidate_count", count_buf, "message",
-                      "source location resolves to multiple stable atoms", "remediation",
-                      "resolve by atom_id or an exact byte span before persistence");
-        return NULL;
+    if (match_count <= 1) {
+        return match;
     }
-    return match;
+
+    /* (file_path, line) tied. A minified bundle is one physical line, so the
+     * line carries almost no identity there while the byte span carries all of
+     * it (#1022). Narrow with the reference's own byte before refusing. */
+    bool narrowed = false;
+    if (ref_byte_valid) {
+        const cbm_gbuf_node_t *byte_match = NULL;
+        int byte_match_count = 0;
+        for (int i = 0; i < candidates->count; i++) {
+            const cbm_gbuf_node_t *node = candidates->items[i];
+            if (!location_line_candidate(gb, node, qn, file_path, line) ||
+                !location_byte_candidate(node, ref_byte)) {
+                continue;
+            }
+            byte_match = node;
+            byte_match_count++;
+        }
+        if (byte_match_count == 1) {
+            return byte_match;
+        }
+        /* Zero byte-containing candidates leaves the original line tie standing:
+         * report and refuse on that, never on an empty narrowed set. */
+        if (byte_match_count > 0) {
+            narrowed = true;
+            match_count = byte_match_count;
+        }
+    }
+
+    /* Still several atoms share the full available identity. Never pick one. */
+    char line_buf[CBM_SZ_32];
+    char count_buf[CBM_SZ_32];
+    char byte_buf[CBM_SZ_32];
+    snprintf(line_buf, sizeof(line_buf), "%d", line);
+    snprintf(count_buf, sizeof(count_buf), "%d", match_count);
+    snprintf(byte_buf, sizeof(byte_buf), "%llu",
+             ref_byte_valid ? (unsigned long long)ref_byte : 0ULL);
+    const char *candidate_atom_ids[CBM_GBUF_REFUSAL_CANDIDATE_MAX];
+    int candidate_atom_id_count = 0;
+    int ordinal = 0;
+    for (int i = 0; i < candidates->count; i++) {
+        const cbm_gbuf_node_t *node = candidates->items[i];
+        if (!location_line_candidate(gb, node, qn, file_path, line) ||
+            (narrowed && !location_byte_candidate(node, ref_byte))) {
+            continue;
+        }
+        if (candidate_atom_id_count < CBM_GBUF_REFUSAL_CANDIDATE_MAX && node->atom_id) {
+            candidate_atom_ids[candidate_atom_id_count++] = node->atom_id;
+        }
+        char ordinal_buf[CBM_SZ_32];
+        char start_byte_buf[CBM_SZ_32];
+        char end_byte_buf[CBM_SZ_32];
+        snprintf(ordinal_buf, sizeof(ordinal_buf), "%d", ++ordinal);
+        snprintf(start_byte_buf, sizeof(start_byte_buf), "%llu",
+                 (unsigned long long)node->start_byte);
+        snprintf(end_byte_buf, sizeof(end_byte_buf), "%llu", (unsigned long long)node->end_byte);
+        cbm_log_error("gbuf.location_resolution_candidate", "code", "CBM_NODE_LOCATION_CANDIDATE",
+                      "qualified_name", qn, "file_path", file_path, "candidate_ordinal",
+                      ordinal_buf, "atom_id", node->atom_id ? node->atom_id : "", "label",
+                      node->label ? node->label : "", "start_byte", start_byte_buf, "end_byte",
+                      end_byte_buf, "source_sha256",
+                      node->source_sha256 ? node->source_sha256 : "");
+    }
+    gbuf_fail_resolution((cbm_gbuf_t *)gb, "CBM_NODE_LOCATION_AMBIGUOUS",
+                         "graph_buffer.find_by_qn_location", qn, file_path, line, match_count,
+                         candidate_atom_ids, candidate_atom_id_count);
+    cbm_log_error("gbuf.location_resolution_ambiguous", "code", "CBM_NODE_LOCATION_AMBIGUOUS",
+                  "qualified_name", qn, "file_path", file_path, "line", line_buf, "reference_byte",
+                  byte_buf, "candidate_count", count_buf, "message",
+                  "source location resolves to multiple stable atoms", "remediation",
+                  "resolve by atom_id or an exact byte span before persistence");
+    return NULL;
 }
 
 static bool reference_owner_candidate(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node,
@@ -1694,7 +1863,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(const cbm_gbuf_t *gb,
         if (gb) {
             char line_buf[CBM_SZ_32];
             snprintf(line_buf, sizeof(line_buf), "%d", line);
-            atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+            gbuf_fail_resolution((cbm_gbuf_t *)gb, "CBM_REFERENCE_SOURCE_LOCATION_INVALID", operation, claimed_qn, file_path, line, 0, NULL, 0);
             cbm_log_error("gbuf.reference_source_location_invalid", "code",
                           "CBM_REFERENCE_SOURCE_LOCATION_INVALID", "operation",
                           operation ? operation : "", "claimed_qualified_name",
@@ -1727,7 +1896,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(const cbm_gbuf_t *gb,
             continue;
         }
         if (!reference_owner_span_valid(candidate)) {
-            atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+            gbuf_fail_resolution((cbm_gbuf_t *)gb, "CBM_REFERENCE_SOURCE_SPAN_INVALID", operation, claimed_qn, file_path, line, SKIP_ONE, NULL, 0);
             cbm_log_error("gbuf.reference_source_span_invalid", "code",
                           "CBM_REFERENCE_SOURCE_SPAN_INVALID", "operation", operation,
                           "claimed_qualified_name", claimed_qn ? claimed_qn : "", "file_path",
@@ -1802,7 +1971,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_reference_owner_at(const cbm_gbuf_t *gb,
     char count_buf[CBM_SZ_32];
     snprintf(line_buf, sizeof(line_buf), "%d", line);
     snprintf(count_buf, sizeof(count_buf), "%d", containing_count);
-    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    gbuf_fail_resolution((cbm_gbuf_t *)gb, "CBM_REFERENCE_SOURCE_LOCATION_AMBIGUOUS", operation, claimed_qn, file_path, line, containing_count, NULL, 0);
     cbm_log_error("gbuf.reference_source_location_ambiguous", "code",
                   "CBM_REFERENCE_SOURCE_LOCATION_AMBIGUOUS", "operation", operation,
                   "claimed_qualified_name", claimed_qn ? claimed_qn : "", "file_path", file_path,
@@ -2367,7 +2536,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     const char *json = canonical_properties_json(properties_json);
     if (!gb || !type || !type[0] || !valid_utf8_text(type) || !valid_properties_object(json)) {
         if (gb) {
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_EDGE_CANONICAL_INPUT_INVALID", "graph_buffer.insert_edge", NULL, NULL);
         }
         cbm_log_error("gbuf.edge_refused", "code", "CBM_EDGE_CANONICAL_INPUT_INVALID", "type",
                       type ? type : "", "message",
@@ -2379,7 +2548,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     /* Check for dedup */
     char key[EDGE_KEY_BUF];
     if (!make_edge_key(key, sizeof(key), source_id, target_id, type, json)) {
-        atomic_store(&gb->resolution_failed, true);
+        gbuf_fail_resolution_code(gb, "CBM_EDGE_IDENTITY_INVALID", "graph_buffer.insert_edge", NULL, NULL);
         cbm_log_error(
             "gbuf.edge_refused", "code", "CBM_EDGE_IDENTITY_INVALID", "type", type, "message",
             "edge local_name/preprocess_context_id identity fields must be JSON text or null",
@@ -2524,7 +2693,7 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
             char key[EDGE_KEY_BUF];
             if (!make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
                                e->properties_json)) {
-                atomic_store(&gb->resolution_failed, true);
+                gbuf_fail_resolution_code(gb, "CBM_EDGE_IDENTITY_INVALID", "graph_buffer.delete_edges", NULL, NULL);
                 cbm_log_error("gbuf.edge_identity_failed", "code", "CBM_EDGE_IDENTITY_INVALID",
                               "type", e->type ? e->type : "", "message",
                               "an edge selected for deletion has an invalid schema-v5 identity",
@@ -2566,7 +2735,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
     if (!same_atom_payload(existing, sn->label, sn->name, sn->qualified_name, sn->file_path,
                            sn->start_line, sn->end_line, sn->source_present, sn->source_bytes,
                            sn->source_len, sn->start_byte, sn->end_byte)) {
-        atomic_store(&dst->resolution_failed, true);
+        gbuf_fail_resolution_code(dst, "CBM_NODE_ATOM_COLLISION", "graph_buffer.merge_worker", sn->qualified_name, sn->file_path);
         cbm_log_error("gbuf.atom_collision", "code", "CBM_NODE_ATOM_COLLISION", "qualified_name",
                       sn->qualified_name ? sn->qualified_name : "", "message",
                       "worker atom resolved to unequal canonical payloads", "remediation",
@@ -2575,7 +2744,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
     }
     char *new_props = heap_strdup(canonical_properties_json(sn->properties_json));
     if (!new_props) {
-        atomic_store(&dst->resolution_failed, true);
+        gbuf_fail_resolution_code(dst, "CBM_NODE_PROPERTIES_ALLOC_FAILED", "graph_buffer.merge_worker", sn->qualified_name, sn->file_path);
         cbm_log_error("gbuf.node_alloc_failed", "code", "CBM_NODE_PROPERTIES_ALLOC_FAILED",
                       "qualified_name", sn->qualified_name ? sn->qualified_name : "", "message",
                       "worker property merge allocation failed", "remediation",
@@ -2596,7 +2765,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         if (!*remap || !val || !owned_key) {
             free(val);
             free(owned_key);
-            atomic_store(&dst->resolution_failed, true);
+            gbuf_fail_resolution_code(dst, "CBM_NODE_REMAP_ALLOC_FAILED", "graph_buffer.merge_worker", sn->qualified_name, sn->file_path);
             cbm_log_error("gbuf.merge_alloc_failed", "code", "CBM_NODE_REMAP_ALLOC_FAILED",
                           "message", "worker node-id remap allocation failed", "remediation",
                           "free memory or reduce the indexed repository size, then retry");
@@ -2649,7 +2818,7 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
         (node->source_len > 0 && !node->source_bytes)) {
         free_node_strings(node);
         free(node);
-        atomic_store(&dst->resolution_failed, true);
+        gbuf_fail_resolution_code(dst, "CBM_NODE_COPY_ALLOC_FAILED", "graph_buffer.merge_worker", sn->qualified_name, sn->file_path);
         cbm_log_error("gbuf.merge_alloc_failed", "code", "CBM_NODE_COPY_ALLOC_FAILED", "message",
                       "worker node copy allocation failed", "remediation",
                       "free memory or reduce the indexed repository size, then retry");
@@ -2703,7 +2872,7 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
         return CBM_NOT_FOUND;
     }
     if (atomic_load(&src->resolution_failed)) {
-        atomic_store(&dst->resolution_failed, true);
+        gbuf_propagate_refusal(dst, src);
         cbm_log_error(
             "gbuf.merge_refused", "code", "CBM_SOURCE_WORKER_FAILED", "message",
             "a worker graph contains a canonical identity or source retention failure",
@@ -2832,7 +3001,7 @@ const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(const cbm_gbuf_t *gb,
     char signature_buf[CBM_SZ_32];
     snprintf(basic_buf, sizeof(basic_buf), "%d", basic_count);
     snprintf(signature_buf, sizeof(signature_buf), "%d", signature_count);
-    atomic_store(&((cbm_gbuf_t *)gb)->resolution_failed, true);
+    gbuf_fail_resolution((cbm_gbuf_t *)gb, ambiguous ? "CBM_NODE_SUCCESSOR_AMBIGUOUS" : "CBM_NODE_SUCCESSOR_SIGNATURE_CHANGED", "graph_buffer.find_successor_node", qualified_name, file_path, 0, basic_count, NULL, 0);
     cbm_log_error(
         "gbuf.successor_resolution_failed", "code",
         ambiguous ? "CBM_NODE_SUCCESSOR_AMBIGUOUS" : "CBM_NODE_SUCCESSOR_SIGNATURE_CHANGED",
@@ -2929,7 +3098,7 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
                           "reject files above INT_MAX bytes before extraction");
             free(src);
             free(dump_nodes);
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_SOURCE_BLOB_TOO_LARGE", "graph_buffer.build_dump_nodes", NULL, NULL);
             *out_count = 0;
             *src_out = NULL;
             return NULL;
@@ -2979,7 +3148,7 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
             }
             free(src);
             free(dump_nodes);
-            atomic_store(&gb->resolution_failed, true);
+            gbuf_fail_resolution_code(gb, "CBM_DUMP_IDENTITY_COPY_ALLOC_FAILED", "graph_buffer.build_dump_nodes", NULL, NULL);
             *out_count = 0;
             *src_out = NULL;
             return NULL;

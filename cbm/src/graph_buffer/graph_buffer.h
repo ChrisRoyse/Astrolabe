@@ -145,8 +145,12 @@ int cbm_gbuf_merge_source_container_properties(cbm_gbuf_t *gb, const char *label
                                                const char *properties_patch_json);
 
 /* Mark a caller-diagnosed reference ambiguity as terminal for persistence.
- * Callers must emit a structured diagnostic before invoking this function. */
-void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb);
+ * Callers must emit a structured diagnostic before invoking this function AND
+ * pass its exact `code` plus the resolving `operation`: the buffer retains them
+ * so the owning pipeline can publish the cause as the run's terminal
+ * diagnostic. Refusing without a cause left the MCP response with nothing but a
+ * pointer to a worker log (#1022), so the cause is not optional. */
+void cbm_gbuf_refuse_resolution(cbm_gbuf_t *gb, const char *code, const char *operation);
 
 /* Find a node by qualified name. Returns NULL if not found and poisons
  * persistence when the qualified name maps to multiple stable atoms. */
@@ -171,10 +175,21 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_domain_status(const cbm_gbuf_t *gb, c
 
 /* Resolve a qualified name at an exact source location. The path and 1-based
  * line are both required. Exactly one live atom whose inclusive line range
- * contains the location is returned; multiple matches poison persistence and
- * emit a structured error rather than selecting an arbitrary atom. */
+ * contains the location is returned.
+ *
+ * (file_path, line) is not a discriminating identity on a minified bundle: a
+ * whole generated file is one physical line, so every same-named atom in it
+ * shares the line and the resolution refused, poisoning the corpus (#1022).
+ * Tree-sitter already produces exact end-exclusive byte spans, so the caller
+ * passes the reference's own source byte (`ref_byte_valid` false when it has
+ * none) and it narrows a multi-candidate line match to the candidates whose
+ * span actually contains that byte. Byte narrowing is applied ONLY after the
+ * line filter is ambiguous, so single-candidate resolutions — every ordinary
+ * source file — keep their exact previous result. No tolerance is invented: if
+ * several atoms still contain the byte, the resolution still refuses. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn_location(const cbm_gbuf_t *gb, const char *qn,
-                                                    const char *file_path, int line);
+                                                    const char *file_path, int line,
+                                                    uint64_t ref_byte, bool ref_byte_valid);
 
 /* Resolve the persisted source owner of a semantic reference. The exact
  * repository path and 1-based line select live source-backed callable/type
@@ -202,6 +217,31 @@ const cbm_gbuf_node_t *cbm_gbuf_find_successor_node(const cbm_gbuf_t *gb,
 
 /* True after any canonical identity or reference-resolution failure. */
 bool cbm_gbuf_resolution_failed(const cbm_gbuf_t *gb);
+
+/* ── Terminal refusal record ─────────────────────────────────────── */
+
+enum { CBM_GBUF_REFUSAL_CANDIDATE_MAX = 4 };
+
+/* The exact first graph-buffer refusal, retained so the owning pipeline can
+ * publish it as the run's terminal diagnostic. Without it a refusal only ever
+ * reached a worker log line and the MCP response carried no captured cause
+ * (#1022). Every pointer is borrowed from the buffer and valid until
+ * cbm_gbuf_free(). Absent fields are NULL / 0. */
+typedef struct {
+    const char *code;           /* CBM_* refusal code, never NULL when present */
+    const char *operation;      /* resolving operation, may be NULL */
+    const char *qualified_name; /* contended identity, may be NULL */
+    const char *file_path;      /* owning repository path, may be NULL */
+    int line;                   /* 1-based source line, 0 when unknown */
+    int candidate_count;        /* live candidates that tied, 0 when N/A */
+    const char *candidate_atom_ids[CBM_GBUF_REFUSAL_CANDIDATE_MAX];
+    int candidate_atom_id_count;
+} cbm_gbuf_refusal_t;
+
+/* Read the retained first refusal. Returns false and zeroes `out` when the
+ * buffer recorded no structured refusal (resolution may still have failed —
+ * callers must consult cbm_gbuf_resolution_failed separately). */
+bool cbm_gbuf_get_refusal(const cbm_gbuf_t *gb, cbm_gbuf_refusal_t *out);
 
 /* Number of reference edges skipped because their source syntax resolved to
  * several stable atoms in one semantic domain (#727). These are counted,
