@@ -15,6 +15,7 @@
 #ifndef CBM_LOG_H
 #define CBM_LOG_H
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -73,6 +74,11 @@ CBMLogFormat cbm_log_get_format(void);
  *   level=info msg=pass.timing pass=defs elapsed_ms=42
  */
 void cbm_log(CBMLogLevel level, const char *msg, ...);
+
+/* va_list form of cbm_log, so a caller that must do something else with the
+ * same key/value pairs (e.g. retain them as the pipeline's terminal error) can
+ * forward them without duplicating the argument list at every call site. */
+void cbm_logv(CBMLogLevel level, const char *msg, va_list ap);
 
 /* Convenience macros. */
 #define cbm_log_debug(msg, ...) cbm_log(CBM_LOG_DEBUG, msg, ##__VA_ARGS__, NULL)

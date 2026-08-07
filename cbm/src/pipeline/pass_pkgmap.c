@@ -26,6 +26,7 @@
 
 #include <yyjson/yyjson.h>
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <limits.h>
 #include <stdint.h>
@@ -1486,15 +1487,62 @@ int cbm_pipeline_import_edge_binding(const char *properties_json, CBMImportBindi
     return result;
 }
 
+/* Emit the exact structured import-map diagnostic AND retain it as the
+ * pipeline's terminal error, from one argument list so the two can never drift
+ * apart. Before this existed, every failure here was logged and then discarded:
+ * the pipeline's fatal slot stayed empty, so mcp.c fell back to the generic
+ * CBM_PIPELINE_FAILED / "inspect the preceding structured diagnostics" while the
+ * real code sat in a worker log the response never named (#1004). */
+static void import_map_failed_impl(cbm_pipeline_t *pipeline, ...) {
+    va_list ap;
+    va_start(ap, pipeline);
+    cbm_logv(CBM_LOG_ERROR, "pkgmap.import_map_failed", ap);
+    va_end(ap);
+
+    const char *code = NULL;
+    const char *operation = NULL;
+    const char *file = NULL;
+    const char *message = NULL;
+    const char *remediation = NULL;
+    va_start(ap, pipeline);
+    for (;;) {
+        const char *key = va_arg(ap, const char *);
+        if (!key) {
+            break;
+        }
+        const char *value = va_arg(ap, const char *);
+        if (!value) {
+            break;
+        }
+        if (strcmp(key, "code") == 0) {
+            code = value;
+        } else if (strcmp(key, "operation") == 0) {
+            operation = value;
+        } else if (strcmp(key, "file") == 0) {
+            file = value;
+        } else if (strcmp(key, "message") == 0) {
+            message = value;
+        } else if (strcmp(key, "remediation") == 0) {
+            remediation = value;
+        }
+    }
+    va_end(ap);
+
+    cbm_pipeline_record_fatal_error(pipeline, code, operation, "import_map", file, 0, message,
+                                    remediation);
+}
+
+#define import_map_failed(pipeline_, ...) import_map_failed_impl((pipeline_), __VA_ARGS__, NULL)
+
 /* IMPORTS edges are the sole authority after import resolution. Decode them in
  * one place so sequential, parallel, and cross-LSP consumers cannot drift back
  * to source-cache/QN shortcuts or silently reinterpret graph faults as an empty
  * import set. */
-int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,
-                                  const char *rel_path, const char ***out_keys,
-                                  const char ***out_vals, int *out_count) {
+int cbm_pipeline_import_map_build(cbm_pipeline_t *pipeline, const cbm_gbuf_t *gbuf,
+                                  const char *project_name, const char *rel_path,
+                                  const char ***out_keys, const char ***out_vals, int *out_count) {
     if (!out_keys || !out_vals || !out_count) {
-        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_OUTPUT_INVALID",
+        import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_OUTPUT_INVALID",
                       "component", "pipeline.import_map", "operation", "validate_outputs", "file",
                       rel_path ? rel_path : "<unknown>", "message",
                       "import-map output ownership pointers are required", "remediation",
@@ -1506,7 +1554,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
     *out_count = 0;
 
     if (!gbuf || !project_name || !project_name[0] || !rel_path || !rel_path[0]) {
-        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_INPUT_INVALID",
+        import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_INPUT_INVALID",
                       "component", "pipeline.import_map", "operation", "validate_inputs", "project",
                       project_name ? project_name : "", "file", rel_path ? rel_path : "", "message",
                       "import-map graph, project, and exact source path are required",
@@ -1516,8 +1564,8 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
 
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_source_container(gbuf, "File", rel_path);
     if (!file_node) {
-        cbm_log_error(
-            "pkgmap.import_map_failed", "code",
+        import_map_failed(
+            pipeline, "code",
             cbm_gbuf_resolution_failed(gbuf) ? "CBM_IMPORT_MAP_FILE_AMBIGUOUS"
                                              : "CBM_IMPORT_MAP_FILE_MISSING",
             "component", "pipeline.import_map", "operation", "resolve_source_file", "project",
@@ -1532,7 +1580,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
     if (cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count) !=
             0 ||
         edge_count < 0 || (edge_count > 0 && !edges)) {
-        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_QUERY_FAILED",
+        import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_QUERY_FAILED",
                       "component", "pipeline.import_map", "operation", "query_import_edges",
                       "project", project_name, "file", rel_path, "message",
                       "the complete resolved IMPORTS edge set could not be read", "remediation",
@@ -1545,7 +1593,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
 
     size_t capacity = (size_t)edge_count;
     if (capacity > SIZE_MAX / sizeof(const char *) || capacity > SIZE_MAX / sizeof(int64_t)) {
-        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_CAPACITY_OVERFLOW",
+        import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_CAPACITY_OVERFLOW",
                       "component", "pipeline.import_map", "operation", "size_entries", "project",
                       project_name, "file", rel_path, "message",
                       "IMPORTS edge count exceeds the addressable import-map capacity",
@@ -1560,7 +1608,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
         free(keys);
         free(vals);
         free(target_ids);
-        cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_ALLOC_FAILED",
+        import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_ALLOC_FAILED",
                       "component", "pipeline.import_map", "operation", "allocate_entries",
                       "project", project_name, "file", rel_path, "message",
                       "import map could not allocate every resolved IMPORTS entry", "remediation",
@@ -1578,7 +1626,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
             snprintf(edge_ordinal, sizeof(edge_ordinal), "%d", i + SKIP_ONE);
             cbm_pipeline_import_map_free(keys, vals, count);
             free(target_ids);
-            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_EDGE_INVALID",
+            import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_EDGE_INVALID",
                           "component", "pipeline.import_map", "operation", "validate_edge",
                           "project", project_name, "file", rel_path, "edge_ordinal", edge_ordinal,
                           "message",
@@ -1607,7 +1655,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
             yyjson_doc_free(doc);
             cbm_pipeline_import_map_free(keys, vals, count);
             free(target_ids);
-            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
+            import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
                           "component", "pipeline.import_map", "operation", "decode_binding_kind",
                           "project", project_name, "file", rel_path, "edge_id", edge_id, "detail",
                           json_detail, "message",
@@ -1643,7 +1691,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
             yyjson_doc_free(doc);
             cbm_pipeline_import_map_free(keys, vals, count);
             free(target_ids);
-            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
+            import_map_failed(pipeline, "code", "CBM_IMPORT_MAP_PROPERTIES_INVALID",
                           "component", "pipeline.import_map", "operation", "validate_binding",
                           "project", project_name, "file", rel_path, "edge_id", edge_id, "message",
                           "IMPORTS binding properties contradict their declared category",
@@ -1663,8 +1711,8 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
                 yyjson_doc_free(doc);
                 cbm_pipeline_import_map_free(keys, vals, count);
                 free(target_ids);
-                cbm_log_error(
-                    "pkgmap.import_map_failed", "code",
+                import_map_failed(
+                    pipeline, "code",
                     "CBM_IMPORT_RUNTIME_REQUEST_PROPERTIES_INVALID", "component",
                     "pipeline.import_map", "operation", "validate_runtime_request", "project",
                     project_name, "file", rel_path, "edge_id", edge_id, "message",
@@ -1693,7 +1741,7 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
         if (!owned_local) {
             cbm_pipeline_import_map_free(keys, vals, count);
             free(target_ids);
-            cbm_log_error("pkgmap.import_map_failed", "code", "CBM_IMPORT_NAME_ALLOC_FAILED",
+            import_map_failed(pipeline, "code", "CBM_IMPORT_NAME_ALLOC_FAILED",
                           "component", "pipeline.import_map", "operation", "copy_local_name",
                           "project", project_name, "file", rel_path, "message",
                           "import map could not retain an import local name", "remediation",
@@ -1722,8 +1770,8 @@ int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_na
         }
         if (duplicate >= 0) {
             const cbm_gbuf_node_t *previous = cbm_gbuf_find_by_id(gbuf, target_ids[duplicate]);
-            cbm_log_error(
-                "pkgmap.import_map_failed", "code", "CBM_IMPORT_LOCAL_NAME_AMBIGUOUS", "component",
+            import_map_failed(
+                pipeline, "code", "CBM_IMPORT_LOCAL_NAME_AMBIGUOUS", "component",
                 "pipeline.import_map", "operation", "deduplicate_local_name", "project",
                 project_name, "file", rel_path, "local_name", owned_local, "candidate_a_atom_id",
                 previous && previous->atom_id ? previous->atom_id : "", "candidate_b_atom_id",

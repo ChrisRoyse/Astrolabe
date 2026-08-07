@@ -108,6 +108,126 @@ static const char *path_last(CBMArena *a, const char *path) {
     return path;
 }
 
+// Derive the namespace a stylesheet module binds from its URL, per the Sass
+// module spec: "the last component of the module's URL without a file
+// extension". Directory components are dropped, a `sass:` (or any scheme)
+// prefix is dropped, exactly one known stylesheet extension is removed, and a
+// partial's leading underscore is stripped — so "src/_corners.scss" → "corners"
+// and "sass:math" → "math".
+//
+// Only a *known* stylesheet extension is removed. path_last() cannot be used
+// here: it treats '.' as a scope separator, which turns "theme.css" into the
+// extension "css" rather than the module name "theme".
+static bool ascii_suffix_ieq(const char *s, size_t s_len, const char *suffix) {
+    size_t suffix_len = strlen(suffix);
+    if (s_len <= suffix_len) {
+        return false;
+    }
+    const char *tail = s + (s_len - suffix_len);
+    for (size_t i = 0; i < suffix_len; i++) {
+        unsigned char a = (unsigned char)tail[i];
+        unsigned char b = (unsigned char)suffix[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (unsigned char)(a - 'A' + 'a');
+        }
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *stylesheet_module_name(CBMArena *a, const char *path) {
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            base = p + SKIP_ONE;
+        }
+    }
+    if (!base[0]) {
+        return NULL;
+    }
+    size_t len = strlen(base);
+    static const char *const exts[] = {".scss", ".sass", ".css", NULL};
+    for (const char *const *e = exts; *e; e++) {
+        if (ascii_suffix_ieq(base, len, *e)) {
+            len -= strlen(*e);
+            break;
+        }
+    }
+    if (base[0] == '_') { /* Sass partial */
+        base++;
+        len--;
+    }
+    if (len == 0) {
+        return NULL;
+    }
+    char *out = cbm_arena_alloc(a, len + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, base, len);
+    out[len] = '\0';
+    return out;
+}
+
+// True when a reference's final component carries a known file extension, i.e.
+// it names a *file* rather than a namespace. path_last() would return that
+// extension as the local alias ("theme.css" → "css", "lib.sh" → "sh"), putting
+// a filename suffix into the identifier-resolution map (#1004).
+//
+// Only ever call this for extractors whose reference syntax is a filesystem
+// path. Languages that use '.' as a *module* separator (Python "a.b.c", Java,
+// Lua, Ada, Elm, …) must keep path_last: there ".c" is a module component, not
+// a suffix, and this check would misread it.
+static bool module_ref_is_file(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    size_t len = strlen(base);
+    static const char *const exts[] = {
+        ".css",  ".scss",  ".sass",    ".less",      ".js",    ".mjs",   ".cjs",   ".jsx",
+        ".ts",   ".tsx",   ".rb",      ".sh",        ".bash",  ".zsh",   ".r",     ".dart",
+        ".zig",  ".bzl",   ".bazel",   ".star",      ".tcl",   ".conf",  ".m",     ".wl",
+        ".wls",  ".nix",   ".jsonnet", ".libsonnet", ".json",  ".yaml",  ".yml",   ".toml",
+        ".lua",  ".sql",   ".html",    ".htm",       ".svg",   ".wasm",  ".c",     ".h",
+        ".cc",   ".cpp",   ".hpp",     ".go",        ".rs",    ".php",   ".pl",    ".pm",
+        ".vim",  ".el",    ".cmake",   ".thrift",    ".capnp", ".proto", ".pkl",   ".gn",
+        ".gni",  ".build", ".md",      ".txt",       NULL};
+    for (const char *const *e = exts; *e; e++) {
+        if (ascii_suffix_ieq(base, len, *e)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Build an import for a reference that may name either a module or a file.
+// A file reference binds no lexical alias, so it becomes a resource dependency;
+// anything else keeps its namespace via path_last. This is what lets
+// `library(dplyr)` bind "dplyr" while `source("setup.R")` binds nothing.
+static CBMImport file_or_module_import(CBMArena *a, const char *path, const char *resource_kind) {
+    if (module_ref_is_file(path)) {
+        CBMImport imp = {.module_path = path,
+                         .resource_kind = resource_kind,
+                         .binding = CBM_IMPORT_BINDING_RESOURCE};
+        return imp;
+    }
+    CBMImport imp = {.local_name = path_last(a, path),
+                     .module_path = path,
+                     .binding = CBM_IMPORT_BINDING_LOCAL};
+    return imp;
+}
+
 // Get the final physical filename component without interpreting '.' as a
 // semantic-language separator. The returned pointer aliases the arena-owned
 // path and therefore needs no extra allocation.
@@ -562,8 +682,18 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
             local_name = cbm_node_text(a, name_node, ctx->source);
         }
     }
+    /* A bare `require('./styles.css')` result is discarded, so it binds nothing.
+     * path_last() on a module *path* would hand back the file extension as the
+     * alias ("css"), which is not a source identifier — the same defect that
+     * made two same-extension requires collide and abort the index (#1004).
+     * Side-effect requires are unbound dependencies, exactly like the ES
+     * side-effect import above. */
     if (!local_name) {
-        local_name = path_last(a, path);
+        CBMImport unbound = make_es_unbound_import(ctx, path);
+        if (!cbm_imports_push(&ctx->result->imports, a, unbound)) {
+            return false;
+        }
+        return true;
     }
 
     CBMImport imp = make_es_import(ctx, local_name, path);
@@ -1236,7 +1366,7 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
             continue;
         }
 
-        CBMImport imp = {.local_name = path_last(a, arg_text), .module_path = arg_text};
+        CBMImport imp = file_or_module_import(a, arg_text, "ruby_require");
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return;
         }
@@ -1333,7 +1463,7 @@ static void r_push_import(CBMExtractCtx *ctx, const char *raw) {
     if (mod[0] == '\0') {
         return;
     }
-    CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
+    CBMImport imp = file_or_module_import(a, mod, "r_source");
     if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
         return;
     }
@@ -1644,7 +1774,7 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
         if (find_first_descendant_of(node, "string_literal", &uri)) {
             char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
             if (path && path[0]) {
-                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                CBMImport imp = file_or_module_import(a, path, "dart_import");
                 if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                     return;
                 }
@@ -1704,7 +1834,7 @@ static void parse_zig_imports(CBMExtractCtx *ctx) {
                 if (find_first_descendant_of(node, "string", &str)) {
                     char *path = strip_quotes(a, cbm_node_text(a, str, ctx->source));
                     if (path && path[0]) {
-                        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                        CBMImport imp = file_or_module_import(a, path, "zig_import");
                         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                             return;
                         }
@@ -1731,7 +1861,7 @@ static void process_wolfram_get_top(CBMExtractCtx *ctx, TSNode node) {
             char *text = cbm_node_text(a, child, ctx->source);
             if (text && text[0]) {
                 char *path = strip_quotes(a, text);
-                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                CBMImport imp = file_or_module_import(a, path, "wolfram_get");
                 if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                     return;
                 }
@@ -1759,7 +1889,7 @@ static void process_wolfram_needs(CBMExtractCtx *ctx, TSNode node) {
     char *text = cbm_node_text(a, arg, ctx->source);
     if (text && text[0]) {
         char *path = strip_quotes(a, text);
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        CBMImport imp = file_or_module_import(a, path, "wolfram_needs");
         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
             return;
         }
@@ -2804,7 +2934,7 @@ static void parse_starlark_imports(CBMExtractCtx *ctx) {
                             }
                         }
                         if (path && path[0]) {
-                            CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                            CBMImport imp = file_or_module_import(a, path, "starlark_load");
                             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                                 return;
                             }
@@ -2839,7 +2969,7 @@ static void parse_tcl_imports(CBMExtractCtx *ctx) {
                         TSNode c = ts_node_named_child(args, j);
                         char *mod = strip_quotes(a, cbm_node_text(a, c, ctx->source));
                         if (mod && mod[0]) {
-                            CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
+                            CBMImport imp = file_or_module_import(a, mod, "tcl_source");
                             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                                 return;
                             }
@@ -2912,7 +3042,7 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
                 if (!ts_node_is_null(arg)) {
                     char *mod = strip_quotes(a, cbm_node_text(a, arg, ctx->source));
                     if (mod && mod[0]) {
-                        CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
+                        CBMImport imp = file_or_module_import(a, mod, "shell_source");
                         if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                             return;
                         }
@@ -2925,10 +3055,37 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
 }
 
 // --- CSS / SCSS imports ---
+//
+// Read the explicit namespace of `@use "url" as <alias>` / `as *`.
+// tree-sitter-scss models no dedicated `as` node, so the clause is recovered by
+// scanning the statement's children for the bare keyword and taking the token
+// that follows. Returns NULL when the statement has no `as` clause, in which
+// case the caller derives the default namespace from the URL.
+static const char *scss_use_alias(CBMExtractCtx *ctx, TSNode stmt) {
+    CBMArena *a = ctx->arena;
+    uint32_t n = ts_node_child_count(stmt);
+    for (uint32_t i = 0; i + 1 < n; i++) {
+        char *tok = cbm_node_text(a, ts_node_child(stmt, i), ctx->source);
+        if (!tok || strcmp(tok, "as") != 0) {
+            continue;
+        }
+        for (uint32_t j = i + 1; j < n; j++) {
+            char *alias = cbm_node_text(a, ts_node_child(stmt, j), ctx->source);
+            if (!alias || !alias[0] || strcmp(alias, ";") == 0) {
+                continue;
+            }
+            return alias; /* a bare `*` is the caller's glob namespace */
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
 // CSS @import "x.css" and SCSS @use/@forward 'x' are top-level statements that
 // carry a `string_value` (whose `string_content` is the unquoted path). The
 // generic text fallback mangled these (kept the surrounding quotes), so the
-// resolver couldn't match the target file. Extract the clean string content.
+// resolver couldn't match the target file. Extract the clean string content,
+// then bind each at-rule according to what it actually declares (see below).
 static void css_push_import_from_stmt(CBMExtractCtx *ctx, TSNode stmt) {
     CBMArena *a = ctx->arena;
     TSNode sv = stmt;
@@ -2950,7 +3107,44 @@ static void css_push_import_from_stmt(CBMExtractCtx *ctx, TSNode stmt) {
     if (!path || !path[0]) {
         return;
     }
-    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+
+    const char *kind = ts_node_type(stmt);
+    CBMImport imp = {.module_path = path};
+
+    if (strcmp(kind, "use_statement") == 0) {
+        /* Sass `@use` is the only stylesheet at-rule that binds a namespace.
+         * Default namespace = last URL component, extension and partial
+         * underscore stripped; `as alias` overrides it; `as *` loads the module
+         * globally, which the import map already models as the `*` glob. */
+        const char *alias = scss_use_alias(ctx, stmt);
+        const char *ns = alias ? alias : stylesheet_module_name(a, path);
+        if (ns && ns[0]) {
+            imp.local_name = ns;
+            imp.binding = CBM_IMPORT_BINDING_LOCAL;
+        } else {
+            /* No derivable namespace — record the dependency, never invent an
+             * identifier. */
+            imp.resource_kind = "scss_use";
+            imp.binding = CBM_IMPORT_BINDING_RESOURCE;
+        }
+    } else if (strcmp(kind, "forward_statement") == 0) {
+        /* `@forward` re-exports another module's members; it binds nothing in
+         * the forwarding stylesheet itself. */
+        imp.resource_kind = "scss_forward";
+        imp.binding = CBM_IMPORT_BINDING_RESOURCE;
+    } else if (ctx->language == CBM_LANG_SCSS) {
+        /* Legacy Sass `@import` makes the loaded module's members globally
+         * available with no namespace — the same shape as `@use ... as *`. */
+        imp.local_name = "*";
+        imp.binding = CBM_IMPORT_BINDING_LOCAL;
+    } else {
+        /* Plain CSS `@import` is defined by css-cascade as if the imported
+         * stylesheet were written in place of the rule. It declares no members
+         * and binds no name: a dependency, not a lexical alias. */
+        imp.resource_kind = "css_import";
+        imp.binding = CBM_IMPORT_BINDING_RESOURCE;
+    }
+
     if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
         return;
     }
@@ -2965,8 +3159,11 @@ static void parse_css_imports(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *k = ts_node_type(node);
+        /* `@include` is deliberately absent: it invokes a mixin, it does not
+         * load a module. Treating it as an import fabricated a dependency edge
+         * whenever a mixin took a string argument. */
         if (strcmp(k, "import_statement") == 0 || strcmp(k, "use_statement") == 0 ||
-            strcmp(k, "forward_statement") == 0 || strcmp(k, "include_statement") == 0) {
+            strcmp(k, "forward_statement") == 0) {
             css_push_import_from_stmt(ctx, node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
@@ -3043,9 +3240,25 @@ static void parse_html_imports(CBMExtractCtx *ctx) {
     }
 }
 
-// Shared: push an import whose path is the (quote-stripped) text of `node`.
-// Strips a leading "./" so relative-import resolution matches the sibling file.
-static void push_path_import(CBMExtractCtx *ctx, TSNode node) {
+// Shared: push a file-inclusion import whose path is the (quote-stripped) text
+// of `node`. Strips a leading "./" so relative-import resolution matches the
+// sibling file.
+//
+// These directives (CMake include(), Nix import ./x.nix, Jsonnet import,
+// Crystal require, Thrift include, …) name a *physical file*; none of them binds
+// a lexical alias in the importing file. They are therefore emitted as
+// CBM_IMPORT_BINDING_RESOURCE: the IMPORTS edge — the dependency — is preserved,
+// while no identifier enters the import-resolution map.
+//
+// Deriving a local name here with path_last() was a defect: path_last treats '.'
+// as a scope separator (right for "std::collections::HashMap", wrong for a file
+// path), so "theme.css" yielded the *extension* "css" as the alias. Two
+// same-extension path imports in one file then collided in
+// cbm_pipeline_import_map_build with CBM_IMPORT_LOCAL_NAME_AMBIGUOUS, which is
+// terminal — one such file aborted the entire repository index (#1004). It also
+// contradicted the CBMImportBinding contract in cbm.h, which exists precisely to
+// keep filenames and extensions out of identifier-resolution maps.
+static void push_path_import(CBMExtractCtx *ctx, TSNode node, const char *resource_kind) {
     CBMArena *a = ctx->arena;
     char *path = strip_quotes(a, cbm_node_text(a, node, ctx->source));
     if (!path || !path[0]) {
@@ -3062,7 +3275,9 @@ static void push_path_import(CBMExtractCtx *ctx, TSNode node) {
     if (!path[0]) {
         return;
     }
-    CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+    CBMImport imp = {.module_path = path,
+                     .resource_kind = resource_kind,
+                     .binding = CBM_IMPORT_BINDING_RESOURCE};
     if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
         return;
     }
@@ -3072,7 +3287,8 @@ static void push_path_import(CBMExtractCtx *ctx, TSNode node) {
 // child (string_content / str_literal / …); else an inner quoted `string`
 // (whose quotes push_path_import strips); else the node's own text. Never falls
 // back to text that still contains a directive keyword.
-static void push_string_descendant_import(CBMExtractCtx *ctx, TSNode node) {
+static void push_string_descendant_import(CBMExtractCtx *ctx, TSNode node,
+                                          const char *resource_kind) {
     TSNode hit = node;
     static const char *content_kinds[] = {
         "string_content",  "str_literal",     "slStringLiteralPart",
@@ -3080,7 +3296,7 @@ static void push_string_descendant_import(CBMExtractCtx *ctx, TSNode node) {
         "string_fragment", "literal_content", NULL};
     for (const char **k = content_kinds; *k; k++) {
         if (find_first_descendant_of(node, *k, &hit)) {
-            push_path_import(ctx, hit);
+            push_path_import(ctx, hit, resource_kind);
             return;
         }
     }
@@ -3089,11 +3305,11 @@ static void push_string_descendant_import(CBMExtractCtx *ctx, TSNode node) {
                                          "static_string", "stringConstant", NULL};
     for (const char **k = string_kinds; *k; k++) {
         if (find_first_descendant_of(node, *k, &hit)) {
-            push_path_import(ctx, hit);
+            push_path_import(ctx, hit, resource_kind);
             return;
         }
     }
-    push_path_import(ctx, node);
+    push_path_import(ctx, node, resource_kind);
 }
 
 // --- CMake imports: include(path) / add_subdirectory(dir) ---
@@ -3113,7 +3329,7 @@ static void parse_cmake_imports(CBMExtractCtx *ctx) {
                     uint32_t nc = ts_node_named_child_count(args);
                     for (uint32_t j = 0; j < nc; j++) {
                         TSNode arg = ts_node_named_child(args, j);
-                        push_string_descendant_import(ctx, arg);
+                        push_string_descendant_import(ctx, arg, "cmake_include");
                         break; /* first argument is the module/dir */
                     }
                 }
@@ -3133,7 +3349,7 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx) {
         const char *k = ts_node_type(node);
         if (strcmp(k, "require_directive") == 0 || strcmp(k, "include_directive") == 0 ||
             strcmp(k, "inherit_directive") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "bitbake_include");
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
@@ -3164,7 +3380,7 @@ static void parse_meson_imports(CBMExtractCtx *ctx) {
                     if (find_first_descendant_of(node, "string", &str)) {
                         char *path = strip_quotes(a, cbm_node_text(a, str, ctx->source));
                         if (path && path[0]) {
-                            CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                            CBMImport imp = file_or_module_import(a, path, "meson_subdir");
                             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                                 return;
                             }
@@ -3185,7 +3401,7 @@ static void parse_kconfig_imports(CBMExtractCtx *ctx) {
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "source") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "kconfig_source");
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
@@ -3199,7 +3415,7 @@ static void parse_gn_imports(CBMExtractCtx *ctx) {
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_statement") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "gn_import");
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
@@ -3215,7 +3431,7 @@ static void parse_just_imports(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), "import") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "just_import");
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -3239,9 +3455,9 @@ static void parse_nix_imports(CBMExtractCtx *ctx) {
                 TSNode frag = arg;
                 if (find_first_descendant_of(arg, "path_fragment", &frag) ||
                     find_first_descendant_of(arg, "string_content", &frag)) {
-                    push_path_import(ctx, frag);
+                    push_path_import(ctx, frag, "nix_import");
                 } else {
-                    push_path_import(ctx, arg);
+                    push_path_import(ctx, arg, "nix_import");
                 }
             }
         }
@@ -3259,7 +3475,7 @@ static void parse_jsonnet_imports(CBMExtractCtx *ctx) {
         const char *k = ts_node_type(node);
         if (ts_node_is_named(node) && (strcmp(k, "import") == 0 || strcmp(k, "importstr") == 0 ||
                                        strcmp(k, "importbin") == 0)) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "jsonnet_import");
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
@@ -3275,7 +3491,7 @@ static void parse_pkl_imports(CBMExtractCtx *ctx) {
         const char *k = ts_node_type(node);
         if (strcmp(k, "extendsOrAmendsClause") == 0 || strcmp(k, "importClause") == 0 ||
             strcmp(k, "importExpr") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "pkl_import");
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
@@ -3301,7 +3517,7 @@ static void parse_nickel_imports(CBMExtractCtx *ctx) {
                 for (uint32_t m = j + 1; m < nc; m++) {
                     TSNode s = ts_node_child(node, m);
                     if (strcmp(ts_node_type(s), "static_string") == 0) {
-                        push_string_descendant_import(ctx, s);
+                        push_string_descendant_import(ctx, s, "nickel_import");
                         break;
                     }
                 }
@@ -3322,7 +3538,7 @@ static void parse_thrift_imports(CBMExtractCtx *ctx) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *k = ts_node_type(node);
         if (strcmp(k, "include_statement") == 0 || strcmp(k, "cpp_include_statement") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "thrift_include");
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -3338,7 +3554,7 @@ static void parse_capnp_imports(CBMExtractCtx *ctx) {
         const char *k = ts_node_type(node);
         if (ts_node_is_named(node) &&
             (strcmp(k, "import_using") == 0 || strcmp(k, "import_path") == 0)) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "capnp_import");
             continue; /* don't double-emit from nested import_path */
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
@@ -3380,7 +3596,7 @@ static void parse_tablegen_imports(CBMExtractCtx *ctx) {
         const char *k = ts_node_type(node);
         if (ts_node_is_named(node) &&
             (strcmp(k, "include_directive") == 0 || strcmp(k, "include") == 0)) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "tablegen_include");
             continue;
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
@@ -3395,7 +3611,7 @@ static void parse_crystal_imports(CBMExtractCtx *ctx) {
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "require") == 0) {
-            push_string_descendant_import(ctx, node);
+            push_string_descendant_import(ctx, node, "crystal_require");
             continue;
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
@@ -3729,7 +3945,7 @@ static void parse_hyprlang_imports(CBMExtractCtx *ctx) {
                 path = strip_quotes(a, cbm_node_text(a, node, ctx->source));
             }
             if (path && path[0]) {
-                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                CBMImport imp = file_or_module_import(a, path, "hyprlang_source");
                 if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
                     return;
                 }

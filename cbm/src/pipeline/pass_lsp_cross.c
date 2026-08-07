@@ -1369,7 +1369,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        if (cbm_pipeline_import_map_build(ctx->gbuf, ctx->project_name, files[i].rel_path,
+        if (cbm_pipeline_import_map_build(ctx->pipeline, ctx->gbuf, ctx->project_name, files[i].rel_path,
                                           &imp_keys, &imp_vals, &imp_count) != 0) {
             free(source);
             status = -1;

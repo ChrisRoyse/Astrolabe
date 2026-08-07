@@ -274,9 +274,9 @@ int cbm_pipeline_import_edge_binding(const char *properties_json, CBMImportBindi
  * contribute to reachability without becoming direct aliases. Malformed edges, missing targets, and
  * allocation failures remain hard errors. Values borrow graph-buffer storage;
  * keys and both arrays are released with cbm_pipeline_import_map_free(). */
-int cbm_pipeline_import_map_build(const cbm_gbuf_t *gbuf, const char *project_name,
-                                  const char *rel_path, const char ***out_keys,
-                                  const char ***out_vals, int *out_count);
+int cbm_pipeline_import_map_build(cbm_pipeline_t *pipeline, const cbm_gbuf_t *gbuf,
+                                  const char *project_name, const char *rel_path,
+                                  const char ***out_keys, const char ***out_vals, int *out_count);
 void cbm_pipeline_import_map_free(const char **keys, const char **vals, int count);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.

@@ -232,8 +232,14 @@ struct cbm_pipeline {
     int file_errors_cap;
 
     /* Exact first fatal diagnostic. Fixed storage guarantees the reporting
-     * path remains available even when allocation itself is the failure. */
-    bool fatal_error_present;
+     * path remains available even when allocation itself is the failure.
+     *
+     * Parallel resolve workers can fail concurrently, so `claimed` elects
+     * exactly one writer and `present` publishes the record only once every
+     * field is filled. A reader that sees `present` therefore sees a complete,
+     * untorn diagnostic (#1004). */
+    atomic_bool fatal_error_claimed;
+    atomic_bool fatal_error_present;
     char fatal_error_code[PL_ERROR_CODE];
     char fatal_error_operation[PL_ERROR_OPERATION];
     char fatal_error_phase[PL_ERROR_PHASE];
@@ -1214,7 +1220,7 @@ bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t 
     if (out) {
         memset(out, 0, sizeof(*out));
     }
-    if (!p || !out || !p->fatal_error_present) {
+    if (!p || !out || !atomic_load_explicit(&p->fatal_error_present, memory_order_acquire)) {
         return false;
     }
     out->code = p->fatal_error_code;
@@ -1230,10 +1236,10 @@ bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t 
 void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation) {
-    if (!p || p->fatal_error_present) {
+    if (!p || atomic_exchange_explicit(&p->fatal_error_claimed, true, memory_order_acq_rel)) {
+        /* Another thread already owns the terminal diagnostic; first one wins. */
         return;
     }
-    p->fatal_error_present = true;
     (void)snprintf(p->fatal_error_code, sizeof(p->fatal_error_code), "%s",
                    code ? code : "CBM_PIPELINE_FAILED");
     (void)snprintf(p->fatal_error_operation, sizeof(p->fatal_error_operation), "%s",
@@ -1247,6 +1253,8 @@ void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const 
                    remediation ? remediation
                                : "inspect the exact code and operation, fix the cause, then retry");
     p->fatal_error_requested = requested;
+    /* Publish last: every field above is now filled. */
+    atomic_store_explicit(&p->fatal_error_present, true, memory_order_release);
 
     char requested_text[32];
     (void)snprintf(requested_text, sizeof(requested_text), "%zu", requested);

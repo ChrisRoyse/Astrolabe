@@ -1758,6 +1758,9 @@ typedef struct {
     CBMFileResult **result_cache;
     const cbm_gbuf_t *main_gbuf;    /* READ-ONLY during Phase 4 */
     const cbm_registry_t *registry; /* READ-ONLY during Phase 4 */
+    /* Back-pointer used only to retain a terminal diagnostic (#1004). Recording
+     * elects exactly one writer atomically, so workers may call it concurrently. */
+    cbm_pipeline_t *pipeline;
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
@@ -3187,8 +3190,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        int import_map_status = cbm_pipeline_import_map_build(rc->main_gbuf, rc->project_name, rel,
-                                                              &imp_keys, &imp_vals, &imp_count);
+        int import_map_status = cbm_pipeline_import_map_build(
+            rc->pipeline, rc->main_gbuf, rc->project_name, rel, &imp_keys, &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
         if (import_map_status != 0) {
@@ -3427,6 +3430,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .result_cache = result_cache,
         .main_gbuf = ctx->gbuf,
         .registry = ctx->registry,
+        .pipeline = ctx->pipeline,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
         .all_defs = all_defs,

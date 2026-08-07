@@ -333,7 +333,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        if (cbm_pipeline_import_map_build(ctx->gbuf, ctx->project_name, rel, &imp_keys, &imp_vals,
+        if (cbm_pipeline_import_map_build(ctx->pipeline, ctx->gbuf, ctx->project_name, rel, &imp_keys, &imp_vals,
                                           &imp_count) != 0) {
             if (result_owned) {
                 cbm_free_result(result);

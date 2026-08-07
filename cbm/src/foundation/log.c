@@ -553,7 +553,7 @@ static size_t format_log_line(char *line_buf, size_t line_size, CBMLogLevel leve
     return pos;
 }
 
-void cbm_log(CBMLogLevel level, const char *msg, ...) {
+void cbm_logv(CBMLogLevel level, const char *msg, va_list ap) {
     log_lock();
     if (level < g_log_level) {
         log_unlock();
@@ -562,7 +562,7 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     char stack_line[CBM_SZ_4K];
     va_list args;
-    va_start(args, msg);
+    va_copy(args, ap);
     va_list stack_args;
     va_copy(stack_args, args);
     size_t line_len = format_log_line(stack_line, sizeof(stack_line), level, msg, stack_args);
@@ -606,6 +606,13 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     emit_line_locked(line_buf);
     free(line_buf);
     log_unlock();
+}
+
+void cbm_log(CBMLogLevel level, const char *msg, ...) {
+    va_list args;
+    va_start(args, msg);
+    cbm_logv(level, msg, args);
+    va_end(args);
 }
 
 void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t value) {
