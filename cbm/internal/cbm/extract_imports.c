@@ -3057,28 +3057,111 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
 // --- CSS / SCSS imports ---
 //
 // Read the explicit namespace of `@use "url" as <alias>` / `as *`.
-// tree-sitter-scss models no dedicated `as` node, so the clause is recovered by
-// scanning the statement's children for the bare keyword and taking the token
-// that follows. Returns NULL when the statement has no `as` clause, in which
-// case the caller derives the default namespace from the URL.
-static const char *scss_use_alias(CBMExtractCtx *ctx, TSNode stmt) {
-    CBMArena *a = ctx->arena;
-    uint32_t n = ts_node_child_count(stmt);
-    for (uint32_t i = 0; i + 1 < n; i++) {
-        char *tok = cbm_node_text(a, ts_node_child(stmt, i), ctx->source);
-        if (!tok || strcmp(tok, "as") != 0) {
+//
+// The vendored tree-sitter-scss grammar has NO `as` token — `anon_sym_as` does
+// not exist in its symbol table — so the clause is never a node and the old
+// child-scan for a node whose text is "as" could not match: it returned NULL for
+// every statement, silently discarding every explicit namespace (#940). Two
+// `@use` of same-basename modules with distinct aliases then collided on the
+// derived default namespace and killed the whole index with
+// CBM_IMPORT_LOCAL_NAME_AMBIGUOUS.
+//
+// The clause is therefore recovered from the raw source bytes that follow the
+// URL node. Per the Sass module spec the grammar is
+//   @use <url> [as <namespace>] [with (<configuration>)] ;
+// so `as` — when present — is the first token after the URL. Starting the scan
+// at the URL node's end byte means an " as " *inside* the URL string can never
+// be misread, and requiring the keyword immediately after the URL means a
+// `with (...)` configuration is never mistaken for an alias.
+static bool scss_ns_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '-' || c >= 0x80;
+}
+
+/* Advance past SCSS whitespace, block comments, and line comments. */
+static void scss_skip_trivia(const char *src, uint32_t *pos, uint32_t end) {
+    while (*pos < end) {
+        unsigned char c = (unsigned char)src[*pos];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') {
+            (*pos)++;
             continue;
         }
-        for (uint32_t j = i + 1; j < n; j++) {
-            char *alias = cbm_node_text(a, ts_node_child(stmt, j), ctx->source);
-            if (!alias || !alias[0] || strcmp(alias, ";") == 0) {
-                continue;
+        if (c == '/' && *pos + SKIP_ONE < end && src[*pos + SKIP_ONE] == '*') {
+            uint32_t p = *pos + PAIR_LEN;
+            while (p + SKIP_ONE < end && !(src[p] == '*' && src[p + SKIP_ONE] == '/')) {
+                p++;
             }
-            return alias; /* a bare `*` is the caller's glob namespace */
+            *pos = (p + SKIP_ONE < end) ? p + PAIR_LEN : end;
+            continue;
         }
+        if (c == '/' && *pos + SKIP_ONE < end && src[*pos + SKIP_ONE] == '/') {
+            uint32_t p = *pos + PAIR_LEN;
+            while (p < end && src[p] != '\n') {
+                p++;
+            }
+            *pos = p;
+            continue;
+        }
+        break;
+    }
+}
+
+// `url_end` is the end byte of the URL node the caller already resolved. The
+// scan stops at the first byte that is not the `as` keyword, so the statement's
+// terminating `;` (or any other following syntax) ends it naturally. Returns
+// NULL when the statement has no `as` clause, in which case the caller derives
+// the default namespace from the URL.
+enum { SCSS_AS_LEN = 2 }; /* strlen("as") */
+
+static const char *scss_use_alias(CBMExtractCtx *ctx, uint32_t url_end) {
+    const char *src = ctx->source;
+    if (!src || ctx->source_len <= 0) {
         return NULL;
     }
-    return NULL;
+    uint32_t limit = (uint32_t)ctx->source_len;
+    if (url_end >= limit) {
+        return NULL;
+    }
+    uint32_t pos = url_end;
+    /* The resolved URL node may be the inner `string_content`, which stops
+     * before the closing quote; step over exactly that one delimiter. */
+    if (src[pos] == '"' || src[pos] == '\'') {
+        pos++;
+    }
+    scss_skip_trivia(src, &pos, limit);
+    /* `as` is a lowercase keyword in Sass; it must be delimited, so `as-foo`
+     * and `assets` are not the clause. */
+    if (pos + SCSS_AS_LEN > limit || src[pos] != 'a' || src[pos + SKIP_ONE] != 's') {
+        return NULL;
+    }
+    if (pos + SCSS_AS_LEN < limit && scss_ns_byte((unsigned char)src[pos + SCSS_AS_LEN])) {
+        return NULL;
+    }
+    pos += SCSS_AS_LEN;
+    scss_skip_trivia(src, &pos, limit);
+    if (pos >= limit) {
+        return NULL;
+    }
+    if (src[pos] == '*') {
+        /* `as *` loads the module globally — the same shape the import map
+         * already models (and exempts from local-name collision) as `*`. */
+        return "*";
+    }
+    uint32_t start = pos;
+    while (pos < limit && scss_ns_byte((unsigned char)src[pos])) {
+        pos++;
+    }
+    if (pos == start) {
+        return NULL;
+    }
+    size_t len = (size_t)(pos - start);
+    char *alias = cbm_arena_alloc(ctx->arena, len + SKIP_ONE);
+    if (!alias) {
+        return NULL;
+    }
+    memcpy(alias, src + start, len);
+    alias[len] = '\0';
+    return alias;
 }
 
 // CSS @import "x.css" and SCSS @use/@forward 'x' are top-level statements that
@@ -3116,7 +3199,7 @@ static void css_push_import_from_stmt(CBMExtractCtx *ctx, TSNode stmt) {
          * Default namespace = last URL component, extension and partial
          * underscore stripped; `as alias` overrides it; `as *` loads the module
          * globally, which the import map already models as the `*` glob. */
-        const char *alias = scss_use_alias(ctx, stmt);
+        const char *alias = scss_use_alias(ctx, ts_node_end_byte(sv));
         const char *ns = alias ? alias : stylesheet_module_name(a, path);
         if (ns && ns[0]) {
             imp.local_name = ns;
