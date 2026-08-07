@@ -56,6 +56,7 @@ public static class AstroLauncherLockNative
     private const int FILE_DISPOSITION_INFO_CLASS = 4;
     private const int FILE_DISPOSITION_INFO_EX_CLASS = 21;
     private const uint FILE_DISPOSITION_DELETE = 0x00000001;
+    private const uint FILE_DISPOSITION_POSIX_SEMANTICS = 0x00000002;
     private const uint FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE = 0x00000010;
     private const int JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS = 3;
     private const int ERROR_FILE_NOT_FOUND = 2;
@@ -1501,21 +1502,26 @@ public static class AstroLauncherLockNative
     public static void DeleteExactFileHandle(SafeFileHandle file)
     {
         RequireExactOrdinarySingleLinkFile(file, "exact disposition-delete source");
-        IntPtr information = Marshal.AllocHGlobal(1);
+        IntPtr information = Marshal.AllocHGlobal(4);
         try
         {
-            // FILE_DISPOSITION_INFO.DeleteFile is the one-byte Win32 BOOLEAN TRUE.
-            Marshal.WriteByte(information, 0, 1);
+            uint flags =
+                FILE_DISPOSITION_DELETE |
+                FILE_DISPOSITION_POSIX_SEMANTICS;
+            Marshal.WriteInt32(information, unchecked((int)flags));
             if (!SetFileInformationByHandle(
                     file,
-                    FILE_DISPOSITION_INFO_CLASS,
+                    FILE_DISPOSITION_INFO_EX_CLASS,
                     information,
-                    1
+                    4
                 ))
             {
+                int error = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "exact retained-handle FILE_DISPOSITION_INFO delete failed"
+                    error,
+                    "exact retained-handle POSIX FILE_DISPOSITION_INFO_EX delete " +
+                    "failed; native_error=" +
+                    error.ToString(CultureInfo.InvariantCulture)
                 );
             }
         }
@@ -1538,6 +1544,7 @@ public static class AstroLauncherLockNative
         {
             uint flags =
                 FILE_DISPOSITION_DELETE |
+                FILE_DISPOSITION_POSIX_SEMANTICS |
                 FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
             Marshal.WriteInt32(information, unchecked((int)flags));
             if (!SetFileInformationByHandle(
@@ -1573,21 +1580,24 @@ public static class AstroLauncherLockNative
                 "exact disposition-delete source must remain an ordinary directory"
             );
         }
-        IntPtr disposition = Marshal.AllocHGlobal(1);
+        IntPtr disposition = Marshal.AllocHGlobal(4);
         try
         {
-            Marshal.WriteByte(disposition, 0, 1);
+            uint flags =
+                FILE_DISPOSITION_DELETE |
+                FILE_DISPOSITION_POSIX_SEMANTICS;
+            Marshal.WriteInt32(disposition, unchecked((int)flags));
             if (!SetFileInformationByHandle(
                     directory,
-                    FILE_DISPOSITION_INFO_CLASS,
+                    FILE_DISPOSITION_INFO_EX_CLASS,
                     disposition,
-                    1
+                    4
                 ))
             {
                 int error = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
                     error,
-                    "exact directory FILE_DISPOSITION_INFO delete failed; native_error=" +
+                    "exact directory POSIX FILE_DISPOSITION_INFO_EX delete failed; native_error=" +
                     error.ToString(CultureInfo.InvariantCulture)
                 );
             }
