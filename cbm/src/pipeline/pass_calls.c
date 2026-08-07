@@ -274,15 +274,23 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
     char
         props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
-             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
-             broker ? ",\"broker\":\"" : "", broker ? broker : "");
-    if (broker) {
-        size_t plen = strlen(props);
-        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
-        }
-    }
+    /* #946: the broker arm must carry its own closing-quote slot. It previously
+     * emitted only an opener and a value while the method arm emitted opener,
+     * value, and closer, so an ASYNC_CALLS edge serialized as
+     * {"callee":"...","url_path":"...","broker":"kafka}  -- unparseable JSON
+     * that the graph buffer refused with CBM_EDGE_CANONICAL_INPUT_INVALID,
+     * failing the whole corpus dump. Both arms are now symmetric (opener,
+     * value, closer) so the object always closes balanced. The former trailing
+     * `if (broker)` fixup could never fire -- the format string always
+     * terminated the buffer with '}' -- and is deleted rather than left as
+     * unreachable code. `method` and `broker` are borrowed from the fixed
+     * service-pattern tables (constant ASCII identifiers such as "GET" and
+     * "cloud_tasks"), never source bytes, so unlike callee/url they need no
+     * cbm_json_escape. */
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s%s}",
+             esc_callee, esc_url, method ? ",\"method\":\"" : "", method ? method : "",
+             method ? "\"" : "", broker ? ",\"broker\":\"" : "", broker ? broker : "",
+             broker ? "\"" : "");
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
 }
 
