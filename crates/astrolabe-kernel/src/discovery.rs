@@ -572,7 +572,7 @@ pub fn finalize_association_discovery(
         });
     }
     let evaluator = aggregate_hypothesis_evaluations(&inputs, &prepared.artifact.config.evaluator)
-        .map_err(map_lodestar)?;
+        .map_err(map_evaluator_lodestar)?;
     let by_id = prepared
         .artifact
         .candidates
@@ -620,7 +620,7 @@ pub fn finalize_association_discovery(
         ));
     }
     let ranked = rank_traceable_hypotheses(&rank_inputs, &prepared.artifact.config.ranking)
-        .map_err(map_lodestar)?;
+        .map_err(map_evaluator_lodestar)?;
     let reasoning_kernel = compact_reasoning_kernel(prepared, &evaluator, &ranked, &validated)?;
     let trust = reasoning_kernel.trust.clone();
     let artifact = FinalAssociationDiscovery {
@@ -1569,9 +1569,14 @@ fn compact_reasoning_kernel(
         .hypotheses
         .iter()
         .all(|row| validated.contains(&pair_id(row.a, row.c)));
+    let all_fully_grounded = ranked.hypotheses.iter().all(|row| {
+        candidates
+            .get(row.hypothesis_id.as_str())
+            .is_some_and(|candidate| candidate.grounded_confidence >= 1.0)
+    });
     Ok(CompactReasoningKernel {
         schema: "astrolabe.discovery_reasoning_kernel.v1".to_string(),
-        trust: if all_validated {
+        trust: if all_validated && all_fully_grounded {
             "grounded_evaluator_and_held_out".to_string()
         } else {
             "provisional_evaluator_grounded_held_out_incomplete".to_string()
@@ -1749,6 +1754,14 @@ fn map_lodestar(error: calyx_lodestar::LodestarError) -> DomainError {
         error.code(),
         error.to_string(),
         "inspect the exact discovery stage input and repair the named Calyx mathematical invariant before retrying",
+    )
+}
+
+fn map_evaluator_lodestar(error: calyx_lodestar::LodestarError) -> DomainError {
+    DomainError::new(
+        ASTRO_DISCOVERY_EVALUATOR_INVALID,
+        error.to_string(),
+        "repair the independent evaluator receipts against the exact prepared generation and retry publication",
     )
 }
 
