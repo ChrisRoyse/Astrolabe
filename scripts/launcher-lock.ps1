@@ -1917,7 +1917,7 @@ function Test-AstroPathLongPath {
 function Wait-AstroPathAbsent {
     param(
         [Parameter(Mandatory)][string]$LiteralPath,
-        [ValidateRange(1, 60000)][int]$TimeoutMs = 5000,
+        [ValidateRange(1, 60000)][int]$TimeoutMs = 15000,
         [ValidateRange(1, 1000)][int]$InitialDelayMs = 10,
         [ValidateRange(1, 1000)][int]$MaximumDelayMs = 250
     )
