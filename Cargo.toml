@@ -39,6 +39,7 @@ calyx-aster = { path = "calyx/crates/calyx-aster" }
 calyx-assay = { path = "calyx/crates/calyx-assay" }
 calyx-core = { path = "calyx/crates/calyx-core" }
 calyx-ledger = { path = "calyx/crates/calyx-ledger" }
+calyx-lodestar = { path = "calyx/crates/calyx-lodestar" }
 calyx-loom = { path = "calyx/crates/calyx-loom" }
 calyx-paths = { path = "calyx/crates/calyx-paths" }
 calyx-sextant = { path = "calyx/crates/calyx-sextant" }

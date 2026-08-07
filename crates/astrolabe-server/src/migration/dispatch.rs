@@ -21,6 +21,7 @@ pub fn handle_tool_raw(
         "predict_impact" => handle_predict_impact(args_json),
         "abduce_cause" => handle_abduce_cause(args_json),
         "discover_latent_links" => handle_discover_latent_links(args_json),
+        "discover_associations" => handle_discover_associations(args_json),
         "forecast" => handle_forecast(args_json),
         "coverage_ingest" => handle_coverage_ingest(args_json),
         "guard_calibrate" => handle_guard_calibrate(args_json),

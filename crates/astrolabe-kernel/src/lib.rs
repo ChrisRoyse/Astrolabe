@@ -75,6 +75,13 @@ pub use latent::{
     latent_explanation_artifact_bytes, latent_open_discovery, latent_sweep_pair_cost,
 };
 
+/// Complete, typed association discovery over one exact persisted graph
+/// generation (#1012): normalization, latent/ABC mining, spectral bridges,
+/// gated walks, evaluator receipts, held-out validation, and a compact
+/// reasoning kernel.
+pub mod discovery;
+pub use discovery::*;
+
 /// Scope algebra for scoped and hierarchical kernels (#38).
 pub mod scope;
 pub use scope::{NodeScope, Scope, ScopeAttributes, induced_subgraph};

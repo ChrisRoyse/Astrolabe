@@ -46,10 +46,10 @@ pub use agent_task::{
     ASTRO_ANCHOR_PROMOTION_INPUT_INVALID, AgentTaskPackManifestV1, AgentTaskPackReport,
     AnchorContradictionV1, AnchorPromotionReport, AnchorPromotionV1, ContradictionPair,
     PromotedPair, SCHEMA_AGENT_TASK_PACK, SCHEMA_ANCHOR_CONTRADICTION, SCHEMA_ANCHOR_PROMOTION,
-    effective_anchor_trust, effective_anchor_trust_map, ingest_agent_task_outcome,
-    is_anchor_promoted, promote_on_resolution, read_agent_task_pack, read_agent_task_packs,
-    read_anchor_contradictions, read_anchor_promotions, record_agent_task_pack,
-    rollup_effective_anchor_trust,
+    effective_anchor_trust, effective_anchor_trust_map, effective_anchor_trust_map_at,
+    ingest_agent_task_outcome, is_anchor_promoted, promote_on_resolution, read_agent_task_pack,
+    read_agent_task_packs, read_anchor_contradictions, read_anchor_promotions,
+    read_anchor_promotions_at, record_agent_task_pack, rollup_effective_anchor_trust,
 };
 
 pub use parsers::{
@@ -904,11 +904,21 @@ pub fn read_anchor_rows<C>(vault: &AsterVault<C>) -> calyx_core::Result<Vec<Pers
 where
     C: Clock,
 {
-    let tombstoned_sources = read_anchor_tombstones(vault)?
+    read_anchor_rows_at(vault, vault.snapshot())
+}
+
+pub fn read_anchor_rows_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> calyx_core::Result<Vec<PersistedAnchorRow>>
+where
+    C: Clock,
+{
+    let tombstoned_sources = read_anchor_tombstones_at(vault, snapshot)?
         .into_iter()
         .map(|tombstone| tombstone.source)
         .collect::<BTreeSet<_>>();
-    let mut rows = read_all_anchor_rows(vault)?;
+    let mut rows = read_all_anchor_rows_at(vault, snapshot)?;
     for persisted in &mut rows {
         persisted
             .row
@@ -926,6 +936,16 @@ where
     C: Clock,
 {
     let snapshot = vault.snapshot();
+    read_all_anchor_rows_at(vault, snapshot)
+}
+
+pub fn read_all_anchor_rows_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> calyx_core::Result<Vec<PersistedAnchorRow>>
+where
+    C: Clock,
+{
     let mut rows = Vec::new();
     for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Anchors)? {
         let row: AnchorRowV1 = serde_json::from_slice(&bytes).map_err(|error| {
@@ -977,6 +997,16 @@ where
     C: Clock,
 {
     let snapshot = vault.snapshot();
+    read_anchor_tombstones_at(vault, snapshot)
+}
+
+pub fn read_anchor_tombstones_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> calyx_core::Result<Vec<AnchorTombstoneV1>>
+where
+    C: Clock,
+{
     let mut tombstones = Vec::new();
     for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Kv)? {
         if !key.starts_with(ANCHOR_TOMBSTONE_PREFIX) {

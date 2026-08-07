@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 23] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 24] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -28,7 +28,47 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 23] {
         anchor_erase_tool_definition(),
         // #1009: L5 latent (indirect) associations.
         discover_latent_links_tool_definition(),
+        // #1012: composed grounded association discovery generation.
+        discover_associations_tool_definition(),
     ]
+}
+
+pub(crate) fn discover_associations_tool_definition() -> Value {
+    json!({
+        "name": "discover_associations",
+        "title": "Discover Grounded Associations",
+        "description": "Runs Astrolabe's complete retained-generation discovery pipeline: deterministic concept normalization without identity merging; the full typed structural/semantic/temporal relationship multigraph; Swanson corpus mining with Resource Allocation, Adamic-Adar, direct-link exclusion and disclosed hub gates; sparse spectral community and cross-community bridge measurement; bounded cycle-safe typed multi-hop walks; citation-bound independent AI evaluation; leakage-free grouped held-out validation with precision/recall/MRR/calibration/null evidence; and a separately fingerprinted compact reasoning kernel. prepare persists exact provisional candidate/evidence stages. publish requires independent evaluator receipts tied to that physical hash and atomically publishes every Assay/Kernel stage plus a ledger record. read independently decodes and hashes the physical generation. No stage silently falls back or reconstructs per query.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Exact indexed project name."},
+                "mode": {"type": "string", "enum": ["prepare", "publish", "read"], "description": "prepare mines/persists provisional evidence; publish validates evaluator receipts and publishes a compact kernel; read physically reads a published generation."},
+                "prepared_artifact_sha256": {"type": "string", "description": "prepare hash required by publish; for read, omit to follow the current final pointer or pass a final artifact hash."},
+                "section": {"type": "string", "enum": ["all", "manifest", "evaluator", "ranked", "kernel"], "description": "Focused physical read section."},
+                "workers": {"type": "integer", "minimum": 1, "maximum": 256},
+                "cross_validation_folds": {"type": "integer", "minimum": 2, "maximum": 32},
+                "top_k": {"type": "integer", "minimum": 1},
+                "max_intermediary_degree": {"type": "integer", "minimum": 2},
+                "min_shared_intermediaries": {"type": "integer", "minimum": 1},
+                "evaluator_runs": {
+                    "type": "object",
+                    "description": "publish only: map hypothesis_id to independent evaluator run arrays. Every run scores plausibility, novelty, testability, falsifiability, supplies a falsification test, and cites prepared evidence ids."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn discover_latent_links_tool_definition() -> Value {

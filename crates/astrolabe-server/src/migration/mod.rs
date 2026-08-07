@@ -202,6 +202,10 @@ use oracle_surface::*;
 mod latent_links;
 use latent_links::*;
 
+/// Complete grounded association discovery generation (#1012).
+mod association_discovery;
+use association_discovery::*;
+
 mod coverage_ingest;
 use coverage_ingest::*;
 

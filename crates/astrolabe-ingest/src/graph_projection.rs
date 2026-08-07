@@ -553,14 +553,28 @@ pub fn read_graph_projection_csr<C>(
 where
     C: Clock,
 {
-    match load_persisted_projection(vault, kind, false)? {
+    read_graph_projection_csr_at(vault, kind, vault.latest_seq())
+}
+
+/// Reads and verifies a projection and its complete typed+similarity source at
+/// one caller-retained MVCC sequence.  This is the discovery-safe variant: no
+/// helper is permitted to acquire a newer snapshot mid-read.
+pub fn read_graph_projection_csr_at<C>(
+    vault: &AsterVault<C>,
+    kind: GraphProjectionKind,
+    snapshot: Seq,
+) -> IngestResult<Option<GraphProjectionCsr>>
+where
+    C: Clock,
+{
+    match load_persisted_projection_at(vault, kind, false, snapshot)? {
         PersistedProjectionState::Missing => Ok(None),
         PersistedProjectionState::Incomplete => Err(projection_corrupt(format!(
             "{} CSR segment set is incomplete; call ensure_graph_projection_csr to rebuild",
             kind.name()
         ))),
         PersistedProjectionState::Complete(csr) => {
-            let source = read_source_edges(vault)?;
+            let source = read_source_edges_at(vault, snapshot)?;
             if csr.source_fingerprint_blake3 != source.fingerprint {
                 return Err(projection_corrupt(format!(
                     "{} CSR source fingerprint {} is stale against current Graph CF fingerprint {}; call ensure_graph_projection_csr to rebuild",
@@ -1095,6 +1109,13 @@ where
     C: Clock,
 {
     let snapshot = vault.latest_seq();
+    read_source_edges_at(vault, snapshot)
+}
+
+fn read_source_edges_at<C>(vault: &AsterVault<C>, snapshot: Seq) -> IngestResult<SourceEdges>
+where
+    C: Clock,
+{
     let mut hasher = blake3::Hasher::new();
 
     // Family 1 — typed CBM structural edge rows (`astrolabe:edge:v1:`).
@@ -1173,7 +1194,7 @@ where
     }
 
     // Resolve endpoints and attest the family only when SIM rows are present.
-    let resolved = crate::sqlite_import::read_global_atom_cx_ids(vault)?;
+    let resolved = crate::sqlite_import::read_global_atom_cx_ids_at(vault, snapshot)?;
     let (ledger_seq, ledger_hash) = newest_sim_edge_ledger_attestation(vault, snapshot)?;
 
     let mut count = 0usize;
@@ -1564,6 +1585,18 @@ where
     C: Clock,
 {
     let snapshot = vault.latest_seq();
+    load_persisted_projection_at(vault, kind, incomplete_ok, snapshot)
+}
+
+fn load_persisted_projection_at<C>(
+    vault: &AsterVault<C>,
+    kind: GraphProjectionKind,
+    incomplete_ok: bool,
+    snapshot: Seq,
+) -> IngestResult<PersistedProjectionState>
+where
+    C: Clock,
+{
     let Some(manifest_bytes) =
         vault.read_cf_at(snapshot, ColumnFamily::Kernel, &manifest_key(kind))?
     else {

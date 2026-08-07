@@ -787,8 +787,18 @@ pub fn effective_anchor_trust_map<C>(
 where
     C: Clock,
 {
-    let rows = read_anchor_rows(vault)?;
-    let promotions = read_anchor_promotions(vault)?;
+    effective_anchor_trust_map_at(vault, vault.snapshot())
+}
+
+pub fn effective_anchor_trust_map_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: calyx_core::Seq,
+) -> calyx_core::Result<BTreeMap<CxId, TrustTag>>
+where
+    C: Clock,
+{
+    let rows = crate::read_anchor_rows_at(vault, snapshot)?;
+    let promotions = read_anchor_promotions_at(vault, snapshot)?;
     let mut by_symbol: BTreeMap<CxId, Vec<&crate::PersistedAnchorRow>> = BTreeMap::new();
     for persisted in &rows {
         if persisted.row.anchors.is_empty() {
@@ -830,6 +840,16 @@ where
     C: Clock,
 {
     let snapshot = vault.snapshot();
+    read_anchor_promotions_at(vault, snapshot)
+}
+
+pub fn read_anchor_promotions_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: calyx_core::Seq,
+) -> calyx_core::Result<Vec<AnchorPromotionV1>>
+where
+    C: Clock,
+{
     let mut records = Vec::new();
     for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Kv)? {
         if !key.starts_with(ANCHOR_PROMOTION_PREFIX) {

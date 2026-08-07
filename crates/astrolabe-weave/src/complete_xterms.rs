@@ -342,6 +342,20 @@ where
     C: Clock,
 {
     let snapshot = vault.snapshot();
+    read_complete_association_state_at(vault, snapshot)
+}
+
+/// Independently reconstructs and verifies the complete Base/Slot/XTerm state
+/// at one caller-retained MVCC sequence.  Discovery callers use this instead of
+/// taking a second snapshot after loading the graph, so every association stage
+/// is provably bound to the same physical source generation.
+pub fn read_complete_association_state_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+) -> calyx_core::Result<CompleteAssociationState>
+where
+    C: Clock,
+{
     let state = read_persisted_state_at(vault, snapshot)?;
     let legacy = read_legacy_v1_state_at(vault, snapshot)?;
     if !legacy.witnesses.is_empty() || !legacy.rows.is_empty() {

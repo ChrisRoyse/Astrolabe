@@ -9359,6 +9359,16 @@ where
     C: Clock,
 {
     let snapshot = vault.latest_seq();
+    read_global_atom_cx_ids_at(vault, snapshot)
+}
+
+pub(crate) fn read_global_atom_cx_ids_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> IngestResult<BTreeMap<String, CxId>>
+where
+    C: Clock,
+{
     let mut resolved = BTreeMap::new();
     for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
         if !supported_node_map_schema(&row.schema) {

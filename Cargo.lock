@@ -161,8 +161,12 @@ version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
  "astrolabe-panel",
+ "calyx-lodestar",
+ "calyx-paths",
+ "rayon",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -471,6 +475,36 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "calyx-lodestar"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-ledger",
+ "calyx-loom",
+ "calyx-mincut",
+ "calyx-paths",
+ "calyx-sextant",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "calyx-mincut"
+version = "0.1.0"
+dependencies = [
+ "calyx-core",
+ "calyx-paths",
+ "rayon",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
