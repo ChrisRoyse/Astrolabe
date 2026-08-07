@@ -1673,7 +1673,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         rels[i] = files[i].rel_path;
     }
     CBMHashTable *namespace_map = NULL;
-    int namespace_rc = cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels,
+    int namespace_rc = cbm_pipeline_namespace_map_build(ctx, ctx->project_name, result_cache, rels,
                                                         file_count, &namespace_map);
     free(rels);
     if (namespace_rc != 0) {

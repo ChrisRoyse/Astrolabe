@@ -301,8 +301,9 @@ void cbm_pipeline_import_map_free(const char **keys, const char **vals, int coun
  * Each result that declared a namespace/package contributes one entry keyed by
  * the namespace string (e.g. "App.Utils", "com.example").  Returns NULL when no
  * results declared a namespace.  Caller frees via cbm_pipeline_namespace_map_free. */
-int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *const *results,
-                                     const char *const *rels, int count, CBMHashTable **out_map);
+int cbm_pipeline_namespace_map_build(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                     CBMFileResult *const *results, const char *const *rels,
+                                     int count, CBMHashTable **out_map);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */

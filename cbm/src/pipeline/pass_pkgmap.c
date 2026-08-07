@@ -1141,6 +1141,34 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
     return NULL;
 }
 
+/* Emit a pkgmap resolver-fault diagnostic AND retain it as the graph buffer's
+ * refusal before the corpus is cancelled. Every site routed here is a resolver
+ * INFRASTRUCTURE fault (allocation or addressable-size limit), never a corpus
+ * fact: the candidate was never probed, so its absence is unproven. Without the
+ * retained record these cancels reached the caller as a bare
+ * CBM_PIPELINE_FAILED with diagnostic.captured=false and the real cause
+ * stranded in a worker log -- the #1022 hole in exactly the sites that neither
+ * wrote resolution_failed nor called refuse_resolution (#1027). The recorder
+ * writes fixed buffer-owned storage and never allocates, so it is safe to call
+ * from an out-of-memory path; first writer wins, so the earliest real cause
+ * still owns the response. */
+static void pkgmap_resolver_fault(const cbm_pipeline_ctx_t *ctx, const char *event,
+                                  const char *code, const char *operation, const char *source_rel,
+                                  const char *module_path, const char *message,
+                                  const char *remediation) {
+    cbm_log_error(event, "code", code, "component", "pipeline.pkgmap", "operation", operation,
+                  "source", source_rel ? source_rel : "", "module",
+                  module_path ? module_path : "", "message", message, "remediation", remediation);
+    const char *detail_keys[] = {"component", "source_file", "module", "fault_class"};
+    const char *detail_vals[] = {"pipeline.pkgmap", source_rel ? source_rel : "",
+                                 module_path ? module_path : "", "resolver_infrastructure"};
+    cbm_gbuf_refuse_resolution_detail(ctx->gbuf, code, operation, message, detail_keys, detail_vals,
+                                      sizeof(detail_keys) / sizeof(detail_keys[0]));
+    if (ctx->cancelled) {
+        atomic_store(ctx->cancelled, SKIP_ONE);
+    }
+}
+
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
@@ -1152,14 +1180,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     int relative_status =
         cbm_pipeline_resolve_relative_import_checked(source_rel, module_path, &resolved);
     if (relative_status == CBM_RELATIVE_IMPORT_ERROR) {
-        cbm_log_error("pkgmap.relative_resolve_failed", "code",
-                      "CBM_RELATIVE_IMPORT_RESOLVE_FAILED", "module", module_path, "source",
-                      source_rel ? source_rel : "", "message",
-                      "relative-import resolution could not represent the complete path",
-                      "remediation", "free memory and retry indexing");
-        if (ctx->cancelled) {
-            atomic_store(ctx->cancelled, SKIP_ONE);
-        }
+        pkgmap_resolver_fault(ctx, "pkgmap.relative_resolve_failed",
+                              "CBM_RELATIVE_IMPORT_RESOLVE_FAILED",
+                              "pkgmap.relative_import_resolve", source_rel, module_path,
+                              "relative-import resolution could not represent the complete path",
+                              "free memory and retry indexing");
         return NULL;
     }
     if (relative_status == CBM_RELATIVE_IMPORT_INVALID) {
@@ -1173,14 +1198,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
         free(resolved);
         if (!qn) {
-            cbm_log_error(
-                "pkgmap.relative_resolve_failed", "code", "CBM_RELATIVE_IMPORT_RESOLVE_FAILED",
-                "module", module_path, "source", source_rel ? source_rel : "", "message",
+            pkgmap_resolver_fault(
+                ctx, "pkgmap.relative_resolve_failed", "CBM_RELATIVE_IMPORT_RESOLVE_FAILED",
+                "pkgmap.relative_import_identity", source_rel, module_path,
                 "relative-import resolution could not allocate the complete graph identity",
-                "remediation", "free memory and retry indexing");
-            if (ctx->cancelled) {
-                atomic_store(ctx->cancelled, SKIP_ONE);
-            }
+                "free memory and retry indexing");
         }
         return qn;
     }
@@ -1194,22 +1216,23 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
             char **aliased = NULL;
             int alias_count = 0;
             if (cbm_path_alias_resolve_all(amap, module_path, &aliased, &alias_count) != 0) {
-                cbm_log_error("path_alias.failed", "code", "CBM_PATH_ALIAS_RESOLVE_FAILED",
-                              "module", module_path, "source", source_rel, "message",
-                              "the configured path-alias targets could not be resolved completely",
-                              "remediation", "free memory and retry indexing");
-                if (ctx->cancelled) {
-                    atomic_store(ctx->cancelled, SKIP_ONE);
-                }
+                pkgmap_resolver_fault(
+                    ctx, "path_alias.failed", "CBM_PATH_ALIAS_RESOLVE_FAILED",
+                    "pkgmap.path_alias_resolve", source_rel, module_path,
+                    "the configured path-alias targets could not be resolved completely",
+                    "free memory and retry indexing");
                 return NULL;
             }
             char *first_qn = NULL;
             for (int i = 0; i < alias_count; i++) {
                 char *qn = cbm_pipeline_fqn_module(ctx->project_name, aliased[i]);
                 if (!qn) {
-                    if (ctx->cancelled) {
-                        atomic_store(ctx->cancelled, SKIP_ONE);
-                    }
+                    pkgmap_resolver_fault(
+                        ctx, "path_alias.failed", "CBM_PATH_ALIAS_RESOLVE_FAILED",
+                        "pkgmap.path_alias_identity", source_rel, module_path,
+                        "a configured path-alias target could not allocate its complete graph "
+                        "identity, so the alias family was never fully probed",
+                        "free memory and retry indexing");
                     for (int j = i; j < alias_count; j++) {
                         free(aliased[j]);
                     }
@@ -1249,8 +1272,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     const char *mapped_qn = (const char *)cbm_ht_get(pkgmap, module_path);
     if (mapped_qn) {
         char *exact = strdup(mapped_qn);
-        if (!exact && ctx->cancelled) {
-            atomic_store(ctx->cancelled, SKIP_ONE);
+        if (!exact) {
+            pkgmap_resolver_fault(ctx, "pkgmap.resolve_failed", "CBM_PKGMAP_RESOLVE_FAILED",
+                                  "pkgmap.exact_lookup", source_rel, module_path,
+                                  "the exact package-map module identity could not be retained",
+                                  "free memory and retry indexing");
         }
         return exact;
     }
@@ -1265,13 +1291,10 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         result = resolve_backslash_prefix(pkgmap, module_path, ctx->project_name, &failed);
     }
     if (failed) {
-        cbm_log_error("pkgmap.resolve_failed", "code", "CBM_PKGMAP_RESOLVE_FAILED", "module",
-                      module_path, "source", source_rel ? source_rel : "", "message",
-                      "package-map resolution could not allocate the complete module path",
-                      "remediation", "free memory and retry indexing");
-        if (ctx->cancelled) {
-            atomic_store(ctx->cancelled, SKIP_ONE);
-        }
+        pkgmap_resolver_fault(ctx, "pkgmap.resolve_failed", "CBM_PKGMAP_RESOLVE_FAILED",
+                              "pkgmap.prefix_resolve", source_rel, module_path,
+                              "package-map resolution could not allocate the complete module path",
+                              "free memory and retry indexing");
         return NULL;
     }
     if (result) {
@@ -1280,8 +1303,12 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
 
     /* 5. Fallthrough to default resolution */
     result = cbm_pipeline_fqn_module(ctx->project_name, module_path);
-    if (!result && ctx->cancelled) {
-        atomic_store(ctx->cancelled, SKIP_ONE);
+    if (!result) {
+        pkgmap_resolver_fault(ctx, "pkgmap.resolve_failed", "CBM_PKGMAP_RESOLVE_FAILED",
+                              "pkgmap.default_identity", source_rel, module_path,
+                              "default module resolution could not allocate the complete graph "
+                              "identity",
+                              "free memory and retry indexing");
     }
     return result;
 }
@@ -2341,6 +2368,36 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     /* Directory of the importing file (empty for repo-root files). */
     char *dir = path_dirname(source_rel ? source_rel : "");
     if (!dir) {
+        /* Resolver infrastructure fault, NOT a corpus fact. Returning a bare
+         * NULL here made the caller read an out-of-memory failure as "this
+         * import has no sibling source" and publish a graph with the edge
+         * silently missing (standing invariant 3). No candidate was ever built,
+         * so the sibling's absence is unproven: record and refuse (#1027).
+         * Recorded inline rather than through the allocation_failed label
+         * because `cands`/`ncand` are not yet initialized at this point. */
+        cbm_log_error("pkgmap.sibling_resolve_failed", "code",
+                      "CBM_IMPORT_SIBLING_RESOLVE_FAILED", "component", "pipeline.pkgmap",
+                      "operation", "pkgmap.source_import_resolve", "module", module_path, "source",
+                      source_rel ? source_rel : "", "message",
+                      "sibling-import resolution could not allocate the importing file's source "
+                      "directory",
+                      "remediation", "free memory and retry indexing");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module", "fault_class",
+                                         "stage"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel ? source_rel : "",
+                                         module_path, "resolver_infrastructure",
+                                         "source_directory"};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_SIBLING_RESOLVE_FAILED", "pkgmap.source_import_resolve",
+                "sibling-import resolution could not allocate the importing file's source "
+                "directory, so no candidate path was ever built and the sibling's absence is "
+                "unproven",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
+        if (ctx->cancelled) {
+            atomic_store(ctx->cancelled, SKIP_ONE);
+        }
         return NULL;
     }
 
@@ -2465,19 +2522,51 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     free(dir);
     return found;
 
-allocation_failed:
+allocation_failed: {
+    /* Resolver infrastructure fault, NOT a corpus fact: the candidate family
+     * was never fully built, so the sibling's absence is unproven. This site
+     * cancelled the whole corpus while recording nothing, so the MCP response
+     * fell back to CBM_PIPELINE_FAILED with diagnostic.captured=false and the
+     * cause reached only a worker log (#1027 -- the hole #1022's sweep missed,
+     * because this site wrote neither resolution_failed nor a refusal).
+     * Recorded BEFORE cands[] is freed so the probed paths reach the public
+     * diagnostic; the recorder uses fixed buffer-owned storage and never
+     * allocates, which is what makes it safe on this path. */
+    char candidates_built[CBM_SZ_32];
+    snprintf(candidates_built, sizeof(candidates_built), "%d", ncand);
+    cbm_log_error("pkgmap.sibling_resolve_failed", "code", "CBM_IMPORT_SIBLING_RESOLVE_FAILED",
+                  "component", "pipeline.pkgmap", "operation", "pkgmap.source_import_resolve",
+                  "module", module_path, "source", source_rel ? source_rel : "",
+                  "candidates_built", candidates_built, "candidate_1_path",
+                  cands[0] ? cands[0] : "", "candidate_2_path", cands[1] ? cands[1] : "", "message",
+                  "sibling-import resolution could not allocate every candidate path",
+                  "remediation", "free memory and retry indexing");
+    {
+        const char *detail_keys[] = {"component",        "source_file",      "module",
+                                     "fault_class",      "candidates_built", "candidate_1_path",
+                                     "candidate_2_path"};
+        const char *detail_vals[] = {"pipeline.pkgmap",
+                                     source_rel ? source_rel : "",
+                                     module_path,
+                                     "resolver_infrastructure",
+                                     candidates_built,
+                                     cands[0] ? cands[0] : "",
+                                     cands[1] ? cands[1] : ""};
+        cbm_gbuf_refuse_resolution_detail(
+            ctx->gbuf, "CBM_IMPORT_SIBLING_RESOLVE_FAILED", "pkgmap.source_import_resolve",
+            "sibling-import resolution could not allocate every ordered candidate path; the "
+            "import family was never fully probed, so its absence is unproven",
+            detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+    }
     for (int i = 0; i < ncand; i++) {
         free(cands[i]);
     }
     free(dir);
-    cbm_log_error("pkgmap.sibling_resolve_failed", "code", "CBM_IMPORT_SIBLING_RESOLVE_FAILED",
-                  "module", module_path, "source", source_rel ? source_rel : "", "message",
-                  "sibling-import resolution could not allocate every candidate path",
-                  "remediation", "free memory and retry indexing");
     if (ctx->cancelled) {
         atomic_store(ctx->cancelled, SKIP_ONE);
     }
     return NULL;
+}
 }
 
 static const cbm_gbuf_node_t *persist_browser_module_request(
@@ -2773,14 +2862,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
          * and `App\Utils\{A, B}` reduce to a clean dotted path. */
         char *norm = strdup(imp->module_path);
         if (!norm) {
-            cbm_log_error("pkgmap.namespace_resolve_failed", "code",
-                          "CBM_IMPORT_NAMESPACE_RESOLVE_FAILED", "module", imp->module_path,
-                          "source", source_rel ? source_rel : "", "message",
-                          "namespace resolution could not allocate the complete module path",
-                          "remediation", "free memory and retry indexing");
-            if (ctx->cancelled) {
-                atomic_store(ctx->cancelled, SKIP_ONE);
-            }
+            pkgmap_resolver_fault(
+                ctx, "pkgmap.namespace_resolve_failed", "CBM_IMPORT_NAMESPACE_RESOLVE_FAILED",
+                "pkgmap.namespace_resolve", source_rel, imp->module_path,
+                "namespace resolution could not allocate the complete module path",
+                "free memory and retry indexing");
             return NULL;
         }
         char *brace = strchr(norm, '{');
@@ -2824,15 +2910,12 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     char *qbuf = cbm_strndup(seg, len);
                     if (!qbuf) {
                         free(norm);
-                        cbm_log_error(
-                            "pkgmap.namespace_resolve_failed", "code",
-                            "CBM_IMPORT_NAMESPACE_RESOLVE_FAILED", "module", imp->module_path,
-                            "source", source_rel ? source_rel : "", "message",
+                        pkgmap_resolver_fault(
+                            ctx, "pkgmap.namespace_resolve_failed",
+                            "CBM_IMPORT_NAMESPACE_RESOLVE_FAILED", "pkgmap.namespace_identity",
+                            source_rel, imp->module_path,
                             "namespace resolution could not allocate a complete graph identity",
-                            "remediation", "free memory and retry indexing");
-                        if (ctx->cancelled) {
-                            atomic_store(ctx->cancelled, SKIP_ONE);
-                        }
+                            "free memory and retry indexing");
                         return NULL;
                     }
                     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
@@ -2870,13 +2953,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     bool symbol_failed = false;
     char *owned_seg = import_candidate_symbol(imp->module_path, &symbol_failed);
     if (symbol_failed) {
-        cbm_log_error("pkgmap.symbol_resolve_failed", "code", "CBM_IMPORT_SYMBOL_RESOLVE_FAILED",
-                      "module", imp->module_path, "source", source_rel ? source_rel : "", "message",
-                      "symbol resolution could not allocate the complete import name",
-                      "remediation", "free memory and retry indexing");
-        if (ctx->cancelled) {
-            atomic_store(ctx->cancelled, SKIP_ONE);
-        }
+        pkgmap_resolver_fault(ctx, "pkgmap.symbol_resolve_failed",
+                              "CBM_IMPORT_SYMBOL_RESOLVE_FAILED", "pkgmap.symbol_candidate",
+                              source_rel, imp->module_path,
+                              "symbol resolution could not allocate the complete import name",
+                              "free memory and retry indexing");
         return NULL;
     }
     const char *seg = owned_seg;
@@ -2890,6 +2971,29 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     size_t module_len = strlen(imp->module_path);
     if (module_len > (SIZE_MAX / sizeof(char *)) - PAIR_LEN) {
         free(owned_seg);
+        /* Addressable-capacity refusal rather than memory exhaustion, so it
+         * carries its own code and the measured module length; the symbol
+         * family was never probed, so its absence is unproven (#1027). */
+        char module_bytes[CBM_SZ_32];
+        snprintf(module_bytes, sizeof(module_bytes), "%zu", module_len);
+        cbm_log_error("pkgmap.symbol_resolve_failed", "code",
+                      "CBM_IMPORT_SYMBOL_CAPACITY_OVERFLOW", "component", "pipeline.pkgmap",
+                      "operation", "pkgmap.symbol_capacity", "module", imp->module_path, "source",
+                      source_rel ? source_rel : "", "module_bytes", module_bytes, "message",
+                      "the import specifier exceeds the addressable symbol-candidate capacity",
+                      "remediation", "reduce the import specifier length and retry indexing");
+        {
+            const char *detail_keys[] = {"component", "source_file", "module", "fault_class",
+                                         "module_bytes"};
+            const char *detail_vals[] = {"pipeline.pkgmap", source_rel ? source_rel : "",
+                                         imp->module_path, "resolver_infrastructure",
+                                         module_bytes};
+            cbm_gbuf_refuse_resolution_detail(
+                ctx->gbuf, "CBM_IMPORT_SYMBOL_CAPACITY_OVERFLOW", "pkgmap.symbol_capacity",
+                "the import specifier exceeds the addressable symbol-candidate capacity, so no "
+                "candidate symbol was ever probed and the target's absence is unproven",
+                detail_keys, detail_vals, sizeof(detail_keys) / sizeof(detail_keys[0]));
+        }
         if (ctx->cancelled) {
             atomic_store(ctx->cancelled, SKIP_ONE);
         }
@@ -2907,13 +3011,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         free(cands);
         free(candidate_path);
         free(owned_seg);
-        cbm_log_error("pkgmap.symbol_resolve_failed", "code", "CBM_IMPORT_SYMBOL_RESOLVE_FAILED",
-                      "module", imp->module_path, "source", source_rel ? source_rel : "", "message",
-                      "symbol resolution could not allocate every import candidate", "remediation",
-                      "free memory and retry indexing");
-        if (ctx->cancelled) {
-            atomic_store(ctx->cancelled, SKIP_ONE);
-        }
+        pkgmap_resolver_fault(ctx, "pkgmap.symbol_resolve_failed",
+                              "CBM_IMPORT_SYMBOL_RESOLVE_FAILED", "pkgmap.symbol_candidates",
+                              source_rel, imp->module_path,
+                              "symbol resolution could not allocate every import candidate",
+                              "free memory and retry indexing");
         return NULL;
     }
     size_t ncands = 0;
@@ -3012,9 +3114,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     {
         char *mp = strdup(imp->module_path);
         if (!mp) {
-            if (ctx->cancelled) {
-                atomic_store(ctx->cancelled, SKIP_ONE);
-            }
+            pkgmap_resolver_fault(
+                ctx, "pkgmap.crate_path_resolve_failed", "CBM_IMPORT_CRATE_PATH_RESOLVE_FAILED",
+                "pkgmap.crate_path_copy", source_rel, imp->module_path,
+                "crate-relative module resolution could not retain the complete module path",
+                "free memory and retry indexing");
             return NULL;
         }
         char *brace = strchr(mp, '{');
@@ -3030,9 +3134,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         char *clean = malloc(mp_len + SKIP_ONE);
         if (!clean) {
             free(mp);
-            if (ctx->cancelled) {
-                atomic_store(ctx->cancelled, SKIP_ONE);
-            }
+            pkgmap_resolver_fault(
+                ctx, "pkgmap.crate_path_resolve_failed", "CBM_IMPORT_CRATE_PATH_RESOLVE_FAILED",
+                "pkgmap.crate_path_normalize", source_rel, imp->module_path,
+                "crate-relative module resolution could not allocate the normalized module path",
+                "free memory and retry indexing");
             return NULL;
         }
         size_t ci = 0;
@@ -3068,9 +3174,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             char *work = strdup(body);
             if (!work) {
                 free(clean);
-                if (ctx->cancelled) {
-                    atomic_store(ctx->cancelled, SKIP_ONE);
-                }
+                pkgmap_resolver_fault(
+                    ctx, "pkgmap.crate_path_resolve_failed",
+                    "CBM_IMPORT_CRATE_PATH_RESOLVE_FAILED", "pkgmap.crate_path_probe", source_rel,
+                    imp->module_path,
+                    "crate-relative module resolution could not allocate the prefix-truncation "
+                    "buffer, so the module prefix family was never probed",
+                    "free memory and retry indexing");
                 return NULL;
             }
             for (;;) {
@@ -3102,8 +3212,30 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 static void ns_map_free_entry(const char *key, void *value, void *ud);
 
-int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *const *results,
-                                     const char *const *rels, int count, CBMHashTable **out_map) {
+/* Retain a namespace-map fault as the graph buffer's refusal. Every failure in
+ * cbm_pipeline_namespace_map_build aborts the whole corpus, but the function
+ * carried no pipeline/ctx handle, so its CBM_NOT_FOUND reached the caller with
+ * an empty diagnostic slot and the response fell back to CBM_PIPELINE_FAILED
+ * with diagnostic.captured=false -- the same #1027 hole as the pkgmap resolver
+ * faults. Fixed buffer-owned storage, no allocation, first writer wins. */
+static void namespace_map_refuse(const cbm_pipeline_ctx_t *ctx, const char *code,
+                                 const char *operation, const char *key, const char *message) {
+    if (!ctx) {
+        return;
+    }
+    const char *detail_keys[] = {"component", "namespace", "fault_class"};
+    const char *detail_vals[] = {"pipeline.namespace_map", key ? key : "",
+                                 "resolver_infrastructure"};
+    cbm_gbuf_refuse_resolution_detail(ctx->gbuf, code, operation, message, detail_keys, detail_vals,
+                                      sizeof(detail_keys) / sizeof(detail_keys[0]));
+    if (ctx->cancelled) {
+        atomic_store(ctx->cancelled, SKIP_ONE);
+    }
+}
+
+int cbm_pipeline_namespace_map_build(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                     CBMFileResult *const *results, const char *const *rels,
+                                     int count, CBMHashTable **out_map) {
     if (!out_map) {
         return CBM_NOT_FOUND;
     }
@@ -3122,6 +3254,10 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                               "operation", "create", "key", "", "message",
                               "namespace map could not be allocated", "remediation",
                               "free memory or reduce repository size, then retry");
+                namespace_map_refuse(ctx, "CBM_NAMESPACE_MAP_ALLOC_FAILED", "namespace_map.create",
+                                     "",
+                                     "the namespace map could not be allocated, so no namespace "
+                                     "declaration was ever indexed");
                 return CBM_NOT_FOUND;
             }
         }
@@ -3131,6 +3267,10 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                           "component", "namespace_map", "operation", "qualified_name", "key",
                           rels[i], "message", "namespace file identity could not be allocated",
                           "remediation", "free memory or reduce repository size, then retry");
+            namespace_map_refuse(ctx, "CBM_NAMESPACE_QN_ALLOC_FAILED",
+                                 "namespace_map.qualified_name", rels[i],
+                                 "a namespace declarer's file identity could not be allocated, so "
+                                 "its declaration is unrepresented");
             goto fail;
         }
         /* Normalize the namespace key to dot-separated form so it matches the
@@ -3143,6 +3283,10 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                           "component", "namespace_map", "operation", "key_copy", "key",
                           r->namespace_name, "message", "namespace key could not be retained",
                           "remediation", "free memory or reduce repository size, then retry");
+            namespace_map_refuse(ctx, "CBM_NAMESPACE_KEY_ALLOC_FAILED", "namespace_map.key_copy",
+                                 r->namespace_name,
+                                 "a namespace key could not be retained, so its declaration is "
+                                 "unrepresented");
             goto fail;
         }
         for (char *p = key; *p; p++) {
@@ -3161,6 +3305,8 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                               "operation", "insert", "key", key, "message",
                               "namespace map could not retain an entry", "remediation",
                               "free memory or reduce repository size, then retry");
+                namespace_map_refuse(ctx, "CBM_NAMESPACE_MAP_INSERT_FAILED", "namespace_map.insert",
+                                     key, "the namespace map could not retain a declaration entry");
                 free(key);
                 free(file_qn);
                 goto fail;
@@ -3182,6 +3328,10 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                                   "operation", "append", "key", key, "message",
                                   "namespace value length overflowed", "remediation",
                                   "reduce the number or size of namespace declarations");
+                    namespace_map_refuse(ctx, "CBM_NAMESPACE_VALUE_TOO_LARGE",
+                                         "namespace_map.append", key,
+                                         "the accumulated namespace declarer list exceeds the "
+                                         "addressable value size");
                     free(key);
                     free(file_qn);
                     goto fail;
@@ -3194,6 +3344,10 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                                   "operation", "append", "key", key, "message",
                                   "combined namespace value could not be allocated", "remediation",
                                   "free memory or reduce repository size, then retry");
+                    namespace_map_refuse(ctx, "CBM_NAMESPACE_VALUE_ALLOC_FAILED",
+                                         "namespace_map.append", key,
+                                         "the combined namespace declarer list could not be "
+                                         "allocated");
                     free(key);
                     free(file_qn);
                     goto fail;
@@ -3206,6 +3360,9 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                                   "operation", "update", "key", stored_key, "message",
                                   "namespace map could not update an entry", "remediation",
                                   "free memory or reduce repository size, then retry");
+                    namespace_map_refuse(ctx, "CBM_NAMESPACE_MAP_UPDATE_FAILED",
+                                         "namespace_map.update", stored_key,
+                                         "the namespace map could not update a declaration entry");
                     free(combined);
                     free(key);
                     free(file_qn);
@@ -3218,6 +3375,10 @@ int cbm_pipeline_namespace_map_build(const char *project_name, CBMFileResult *co
                     "component", "namespace_map", "operation", "lookup", "key", key, "message",
                     "namespace map key/value state is internally inconsistent", "remediation",
                     "preserve the inputs and report this invariant failure");
+                namespace_map_refuse(ctx, "CBM_NAMESPACE_MAP_STATE_INVALID", "namespace_map.lookup",
+                                     key,
+                                     "the namespace map key/value state is internally "
+                                     "inconsistent, so its declarer list cannot be trusted");
                 free(key);
                 free(file_qn);
                 goto fail;
