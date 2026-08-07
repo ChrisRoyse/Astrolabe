@@ -198,7 +198,8 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
 
-/* Get IDF weight for a token. Returns 0.0 for unknown tokens. */
+/* Get the frozen smoothed positive-baseline IDF weight for a token:
+ * 1 + ln((N + 1) / (df + 1)). Returns 0.0 for unknown/invalid tokens. */
 float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token);
 
 /* Get the enriched Random Indexing vector for a token (after co-occurrence). */

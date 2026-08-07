@@ -1899,6 +1899,21 @@ static int parse_token_index(const char *idx_str) {
     return (end != idx_str) ? (int)parsed : CBM_NOT_FOUND;
 }
 
+/* Frozen corpus weighting contract used by both sparse TF-IDF and dense
+ * Random Indexing aggregation.  The positive baseline is intentional: plain
+ * log(N / df) erases every observed term when N == df, manufacturing an
+ * all-zero semantic vector for a one-document corpus.  Smoothing preserves
+ * rarity ordering while giving every valid observed term finite evidence. */
+static float corpus_idf_weight(int document_count, int document_frequency) {
+    if (document_count <= 0 || document_frequency <= 0 ||
+        document_frequency > document_count) {
+        return 0.0F;
+    }
+    return CBM_SEM_UNIT_POS +
+           logf((CBM_SEM_UNIT_POS + (float)document_count) /
+                (CBM_SEM_UNIT_POS + (float)document_frequency));
+}
+
 float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token) {
     if (!corpus || !token || corpus->doc_count == 0) {
         return 0.0F;
@@ -1911,7 +1926,7 @@ float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token) {
     if (df <= 0) {
         return 0.0F;
     }
-    return logf((float)corpus->doc_count / (float)df);
+    return corpus_idf_weight(corpus->doc_count, df);
 }
 
 const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const char *token) {
@@ -1943,7 +1958,7 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
     }
     if (out_idf && corpus->doc_count > 0) {
         int df = corpus->entries[index].doc_freq;
-        *out_idf = df > 0 ? logf((float)corpus->doc_count / (float)df) : 0.0F;
+        *out_idf = corpus_idf_weight(corpus->doc_count, df);
     }
     return corpus->entries[index].token;
 }

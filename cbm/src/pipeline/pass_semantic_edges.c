@@ -723,9 +723,10 @@ static bool build_tfidf_vector(vec_build_ctx_t *vc, int f) {
         return false;
     }
 
-    /* Keep only terms the corpus gives a positive IDF: a term present in every
-     * document carries no discriminative signal (idf = ln(N/N) = 0) and would
-     * only add a constant to every pair. */
+    /* Keep only terms the corpus gives a valid positive IDF. The frozen corpus
+     * contract uses a smoothed +1 baseline, so every observed token remains
+     * semantic evidence even when it is corpus-universal; unknown or invalid
+     * token identities remain zero and are rejected above. */
     int *ids = malloc((size_t)tc * sizeof(int));
     if (!ids) {
         tfidf_build_error("CBM_SEM_TFIDF_ALLOC_FAILED", "allocate_term_scratch", f,
@@ -750,7 +751,7 @@ static bool build_tfidf_vector(vec_build_ctx_t *vc, int f) {
         }
     }
     if (kept == 0) {
-        /* Honest empty vector: every term of this function is corpus-universal.
+        /* Honest empty vector: the function had no valid observed corpus term.
          * sparse_tfidf_cosine scores an empty side as 0, never as a match. */
         free(ids);
         return true;
