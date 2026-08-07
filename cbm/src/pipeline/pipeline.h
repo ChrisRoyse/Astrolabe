@@ -29,6 +29,13 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 typedef struct cbm_pipeline cbm_pipeline_t;
 
+/* Upper bound on the structured key/value detail pairs a fatal diagnostic can
+ * carry alongside its first-class fields (#1004/#943). The emitting site's own
+ * diagnostic keys (component, file, local_name, candidate_a_atom_id, ...) travel
+ * with the record so the public failure response names the exact cause instead
+ * of telling the caller to go read a worker log. */
+#define CBM_PIPELINE_ERROR_DETAIL_MAX 16
+
 typedef struct {
     const char *code;
     const char *operation;
@@ -37,6 +44,11 @@ typedef struct {
     const char *message;
     const char *remediation;
     size_t requested;
+    /* Borrowed, NUL-terminated, index-aligned. `detail_count` is 0 when the
+     * emitting site recorded no extra structured keys. */
+    const char *const *detail_keys;
+    const char *const *detail_vals;
+    size_t detail_count;
 } cbm_pipeline_error_t;
 
 /* Optional success hook invoked after a pipeline has completed every

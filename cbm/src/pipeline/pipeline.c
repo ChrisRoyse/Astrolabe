@@ -26,6 +26,12 @@ enum {
     PL_ERROR_PATH = 131072,
     PL_ERROR_MESSAGE = 512,
     PL_ERROR_REMEDIATION = 512,
+    /* Structured detail pairs carried with the fatal record (#1004/#943). A key is
+     * a diagnostic field name; a value holds an atom id (64 hex), a relative
+     * path, or a local identifier. Fixed storage keeps the reporting path
+     * available even when allocation itself is the failure. */
+    PL_ERROR_DETAIL_KEY = 64,
+    PL_ERROR_DETAIL_VALUE = 512,
     PL_PARALLEL_DISPATCH_CAPACITY = 64
 };
 #include "pipeline/pipeline.h"
@@ -247,6 +253,15 @@ struct cbm_pipeline {
     char fatal_error_message[PL_ERROR_MESSAGE];
     char fatal_error_remediation[PL_ERROR_REMEDIATION];
     size_t fatal_error_requested;
+    /* The emitting site's own structured keys, copied verbatim so the public
+     * failure response can name the exact cause (#1004/#943). `detail_key_ptrs` /
+     * `detail_val_ptrs` alias the fixed storage and are what the reader
+     * borrows; they are filled before `present` is published. */
+    char fatal_error_detail_keys[CBM_PIPELINE_ERROR_DETAIL_MAX][PL_ERROR_DETAIL_KEY];
+    char fatal_error_detail_vals[CBM_PIPELINE_ERROR_DETAIL_MAX][PL_ERROR_DETAIL_VALUE];
+    const char *fatal_error_detail_key_ptrs[CBM_PIPELINE_ERROR_DETAIL_MAX];
+    const char *fatal_error_detail_val_ptrs[CBM_PIPELINE_ERROR_DETAIL_MAX];
+    size_t fatal_error_detail_count;
 
     /* Exact live-store identity frozen during routing. A full rebuild may only
      * publish over the same bytes; another process replacing or mutating the
@@ -1230,12 +1245,30 @@ bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t 
     out->message = p->fatal_error_message;
     out->remediation = p->fatal_error_remediation;
     out->requested = p->fatal_error_requested;
+    out->detail_keys = p->fatal_error_detail_count ? p->fatal_error_detail_key_ptrs : NULL;
+    out->detail_vals = p->fatal_error_detail_count ? p->fatal_error_detail_val_ptrs : NULL;
+    out->detail_count = p->fatal_error_detail_count;
     return true;
 }
 
 void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation) {
+    cbm_pipeline_record_fatal_error_detail(p, code, operation, phase, path, requested, message,
+                                           remediation, NULL, NULL, 0);
+}
+
+/* Record the terminal diagnostic together with the emitting site's own
+ * structured keys (#1004/#943). Callers whose diagnostic identity lives in extra
+ * fields -- the exact file, the contended local name, the colliding atom ids --
+ * pass them here so the public failure response carries the cause instead of
+ * directing the caller to a worker log it cannot read. */
+void cbm_pipeline_record_fatal_error_detail(cbm_pipeline_t *p, const char *code,
+                                            const char *operation, const char *phase,
+                                            const char *path, size_t requested,
+                                            const char *message, const char *remediation,
+                                            const char *const *detail_keys,
+                                            const char *const *detail_vals, size_t detail_count) {
     if (!p || atomic_exchange_explicit(&p->fatal_error_claimed, true, memory_order_acq_rel)) {
         /* Another thread already owns the terminal diagnostic; first one wins. */
         return;
@@ -1253,6 +1286,25 @@ void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const 
                    remediation ? remediation
                                : "inspect the exact code and operation, fix the cause, then retry");
     p->fatal_error_requested = requested;
+
+    p->fatal_error_detail_count = 0;
+    if (detail_keys && detail_vals) {
+        for (size_t i = 0; i < detail_count && p->fatal_error_detail_count <
+                                                    (size_t)CBM_PIPELINE_ERROR_DETAIL_MAX;
+             i++) {
+            if (!detail_keys[i] || !detail_keys[i][0] || !detail_vals[i]) {
+                continue;
+            }
+            size_t slot = p->fatal_error_detail_count;
+            (void)snprintf(p->fatal_error_detail_keys[slot], PL_ERROR_DETAIL_KEY, "%s",
+                           detail_keys[i]);
+            (void)snprintf(p->fatal_error_detail_vals[slot], PL_ERROR_DETAIL_VALUE, "%s",
+                           detail_vals[i]);
+            p->fatal_error_detail_key_ptrs[slot] = p->fatal_error_detail_keys[slot];
+            p->fatal_error_detail_val_ptrs[slot] = p->fatal_error_detail_vals[slot];
+            p->fatal_error_detail_count = slot + 1;
+        }
+    }
     /* Publish last: every field above is now filled. */
     atomic_store_explicit(&p->fatal_error_present, true, memory_order_release);
 

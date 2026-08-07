@@ -8744,6 +8744,29 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                 ? fatal.remediation
                 : "inspect the preceding structured diagnostics, fix the exact failure, then retry "
                   "the complete corpus");
+        /* #943/#1004: the causative structured diagnostic travels in the
+         * response. Telling a caller to "inspect preceding structured
+         * diagnostics" while withholding them forced worker-log archaeology for
+         * every failure. The detail pairs are pipeline-owned storage borrowed
+         * only while `p` is alive -- the document is serialized before
+         * cbm_pipeline_free below -- and are read only when has_fatal. */
+        yyjson_mut_val *diagnostic = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, root, "diagnostic", diagnostic);
+        yyjson_mut_obj_add_strcpy(doc, diagnostic, "code",
+                                  has_fatal ? fatal.code : "CBM_PIPELINE_FAILED");
+        yyjson_mut_obj_add_strcpy(doc, diagnostic, "operation",
+                                  has_fatal ? fatal.operation : "cbm_pipeline_run");
+        yyjson_mut_obj_add_strcpy(doc, diagnostic, "phase", has_fatal ? fatal.phase : "pipeline");
+        yyjson_mut_obj_add_strcpy(doc, diagnostic, "path", has_fatal ? fatal.path : repo_path);
+        yyjson_mut_obj_add_bool(doc, diagnostic, "captured", has_fatal);
+        for (size_t detail = 0; has_fatal && detail < fatal.detail_count; detail++) {
+            if (!fatal.detail_keys[detail] || !fatal.detail_keys[detail][0] ||
+                !fatal.detail_vals[detail]) {
+                continue;
+            }
+            yyjson_mut_obj_add_strcpy(doc, diagnostic, fatal.detail_keys[detail],
+                                      fatal.detail_vals[detail]);
+        }
         yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
     }
 

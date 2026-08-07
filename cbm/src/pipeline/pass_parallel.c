@@ -1212,8 +1212,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
 static int build_captured_pkgmap(cbm_pipeline_ctx_t *ctx) {
     CBMHashTable *captured_pkgmap = NULL;
-    if (cbm_pkgmap_build_from_files_checked(ctx->all_files, ctx->all_file_count, ctx->project_name,
-                                            &captured_pkgmap) != 0) {
+    if (cbm_pkgmap_build_from_files_checked(ctx->pipeline, ctx->all_files, ctx->all_file_count,
+                                            ctx->project_name, &captured_pkgmap) != 0) {
         return CBM_NOT_FOUND;
     }
     cbm_pipeline_set_pkgmap(captured_pkgmap);

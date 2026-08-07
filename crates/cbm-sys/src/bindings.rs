@@ -12,6 +12,7 @@ pub const CBM_ADR_MAX_LENGTH: u32 = 8000;
 pub const CBM_VECTOR_SEARCH_MAX_KEYWORDS: u32 = 32;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
 pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
+pub const CBM_PIPELINE_ERROR_DETAIL_MAX: u32 = 16;
 pub type va_list = *mut ::std::os::raw::c_char;
 pub type uint_least64_t = ::std::os::raw::c_ulonglong;
 #[repr(C)]
@@ -3809,6 +3810,9 @@ pub struct cbm_pipeline_error_t {
     pub message: *const ::std::os::raw::c_char,
     pub remediation: *const ::std::os::raw::c_char,
     pub requested: usize,
+    pub detail_keys: *const *const ::std::os::raw::c_char,
+    pub detail_vals: *const *const ::std::os::raw::c_char,
+    pub detail_count: usize,
 }
 impl Default for cbm_pipeline_error_t {
     fn default() -> Self {

@@ -818,35 +818,66 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
     return ends_with(basename, ".gemspec");
 }
 
-static int pkgmap_read_captured(const cbm_file_info_t *file, char **out_source, int *out_len) {
+/* Emit a terminal pkgmap manifest diagnostic AND retain it as the pipeline's
+ * fatal record. Every one of these returns aborts the whole index, so the code,
+ * component, and exact manifest path have to reach the public response; logging
+ * alone left the caller with the generic CBM_PIPELINE_FAILED (#1004/#943). */
+static void pkgmap_manifest_failed(cbm_pipeline_t *pipeline, const char *code,
+                                   const char *operation, const char *rel_path,
+                                   const char *detail_key, const char *detail_value,
+                                   const char *message, const char *remediation) {
+    bool has_detail = detail_key && detail_key[0] && detail_value;
+    if (has_detail) {
+        cbm_log_error("pkgmap.failed", "code", code, "component", "pipeline.pkgmap", "operation",
+                      operation, "rel_path", rel_path ? rel_path : "", detail_key, detail_value,
+                      "message", message, "remediation", remediation);
+    } else {
+        cbm_log_error("pkgmap.failed", "code", code, "component", "pipeline.pkgmap", "operation",
+                      operation, "rel_path", rel_path ? rel_path : "", "message", message,
+                      "remediation", remediation);
+    }
+    const char *detail_keys[3] = {"component", "rel_path", detail_key};
+    const char *detail_vals[3] = {"pipeline.pkgmap", rel_path ? rel_path : "", detail_value};
+    cbm_pipeline_record_fatal_error_detail(pipeline, code, operation, "pkgmap",
+                                           rel_path ? rel_path : "", 0, message, remediation,
+                                           detail_keys, detail_vals, has_detail ? 3 : 2);
+}
+
+static int pkgmap_read_captured(cbm_pipeline_t *pipeline, const cbm_file_info_t *file,
+                                char **out_source, int *out_len) {
     *out_source = NULL;
     *out_len = 0;
     if (file->size < 0) {
-        cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_SIZE_INVALID", "rel_path",
-                      file->rel_path, "bytes", pkgmap_i64toa(file->size), "message",
-                      "a captured manifest has a negative inventory size", "remediation",
-                      "refresh the captured repository inventory and retry");
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MANIFEST_SIZE_INVALID", "read_manifest_size",
+                               file->rel_path, "bytes", pkgmap_i64toa(file->size),
+                               "a captured manifest has a negative inventory size",
+                               "refresh the captured repository inventory and retry");
         return CBM_NOT_FOUND;
     }
     if (file->size > INT_MAX) {
-        cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_SIZE_LIMIT_EXCEEDED",
-                      "rel_path", file->rel_path, "bytes", pkgmap_i64toa(file->size), "limit",
-                      pkgmap_itoa(INT_MAX), "message",
-                      "a captured manifest exceeds the parser address limit", "remediation",
-                      "reduce the manifest to the reported limit or less and retry");
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MANIFEST_SIZE_LIMIT_EXCEEDED",
+                               "read_manifest_size", file->rel_path, "bytes",
+                               pkgmap_i64toa(file->size),
+                               "a captured manifest exceeds the parser address limit",
+                               "reduce the manifest to the reported limit or less and retry");
         return CBM_NOT_FOUND;
     }
     FILE *stream = cbm_fopen(file->path, "rb");
     if (!stream) {
-        cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_OPEN_FAILED", "rel_path",
-                      file->rel_path, "message", "a captured manifest could not be opened",
-                      "remediation", "inspect snapshot access and retry");
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MANIFEST_OPEN_FAILED", "open_manifest",
+                               file->rel_path, NULL, NULL,
+                               "a captured manifest could not be opened",
+                               "inspect snapshot access and retry");
         return CBM_NOT_FOUND;
     }
     size_t size = (size_t)file->size;
     char *source = malloc(size + 1u);
     if (!source) {
         fclose(stream);
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MANIFEST_ALLOC_FAILED", "allocate_manifest",
+                               file->rel_path, "bytes", pkgmap_i64toa(file->size),
+                               "a captured manifest could not be held in memory",
+                               "free memory and retry the unchanged corpus");
         return CBM_NOT_FOUND;
     }
     size_t got = fread(source, 1, size, stream);
@@ -856,9 +887,10 @@ static int pkgmap_read_captured(const cbm_file_info_t *file, char **out_source, 
     }
     if (!ok) {
         free(source);
-        cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_READ_FAILED", "rel_path",
-                      file->rel_path, "message", "the complete captured manifest could not be read",
-                      "remediation", "inspect snapshot access and retry");
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MANIFEST_READ_FAILED", "read_manifest",
+                               file->rel_path, "bytes", pkgmap_i64toa(file->size),
+                               "the complete captured manifest could not be read",
+                               "inspect snapshot access and retry");
         return CBM_NOT_FOUND;
     }
     source[size] = '\0';
@@ -868,9 +900,15 @@ static int pkgmap_read_captured(const cbm_file_info_t *file, char **out_source, 
 }
 
 /* Build the map only from the immutable captured inventory. */
-int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_count,
-                                        const char *project_name, CBMHashTable **out) {
+int cbm_pkgmap_build_from_files_checked(cbm_pipeline_t *pipeline, const cbm_file_info_t *files,
+                                        int file_count, const char *project_name,
+                                        CBMHashTable **out) {
     if (!out || !project_name || file_count < 0 || (file_count > 0 && !files)) {
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_INPUT_INVALID", "validate_inputs", "", NULL,
+                               NULL,
+                               "package-map construction requires the complete captured "
+                               "inventory and a project identity",
+                               "repair the internal package-map caller contract");
         return CBM_NOT_FOUND;
     }
     *out = NULL;
@@ -885,7 +923,7 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
 
         int source_len = 0;
         char *source = NULL;
-        if (pkgmap_read_captured(&files[i], &source, &source_len) != 0) {
+        if (pkgmap_read_captured(pipeline, &files[i], &source, &source_len) != 0) {
             cbm_pkg_entries_free(&entries);
             return CBM_NOT_FOUND;
         }
@@ -897,10 +935,10 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
                 }
                 free(source);
                 cbm_pkg_entries_free(&entries);
-                cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_JSON_MANIFEST_INVALID",
-                              "rel_path", files[i].rel_path, "message",
-                              "a captured JSON manifest is malformed", "remediation",
-                              "correct the manifest JSON and retry indexing");
+                pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_JSON_MANIFEST_INVALID",
+                                       "validate_json_manifest", files[i].rel_path, "basename",
+                                       basename, "a captured JSON manifest is malformed",
+                                       "correct the manifest JSON and retry indexing");
                 return CBM_NOT_FOUND;
             }
             yyjson_doc_free(validation);
@@ -909,10 +947,10 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
         if (!cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries)) {
             free(source);
             cbm_pkg_entries_free(&entries);
-            cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_MANIFEST_CLASSIFIER_DRIFT",
-                          "rel_path", files[i].rel_path, "message",
-                          "a captured manifest was selected but no parser accepted it",
-                          "remediation", "synchronize manifest discovery and parser registration");
+            pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MANIFEST_CLASSIFIER_DRIFT",
+                                   "parse_manifest", files[i].rel_path, "basename", basename,
+                                   "a captured manifest was selected but no parser accepted it",
+                                   "synchronize manifest discovery and parser registration");
             return CBM_NOT_FOUND;
         }
         if (entries.count == entries_before) {
@@ -922,10 +960,10 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
         free(source);
         if (entries.failed) {
             cbm_pkg_entries_free(&entries);
-            cbm_log_error("pkgmap.failed", "code", "CBM_PKGMAP_ENTRY_ALLOC_FAILED", "rel_path",
-                          files[i].rel_path, "message",
-                          "the complete manifest mapping could not be represented", "remediation",
-                          "free memory and retry indexing");
+            pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_ENTRY_ALLOC_FAILED", "retain_entries",
+                                   files[i].rel_path, NULL, NULL,
+                                   "the complete manifest mapping could not be represented",
+                                   "free memory and retry indexing");
             return CBM_NOT_FOUND;
         }
     }
@@ -934,6 +972,9 @@ int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_c
     bool failed = entries.failed;
     cbm_pkg_entries_free(&entries);
     if (failed) {
+        pkgmap_manifest_failed(pipeline, "CBM_PKGMAP_MERGE_FAILED", "merge_entries", "", NULL, NULL,
+                               "the merged package map could not be represented",
+                               "free memory and retry indexing");
         return CBM_NOT_FOUND;
     }
     *out = map;
@@ -1504,6 +1545,13 @@ static void import_map_failed_impl(cbm_pipeline_t *pipeline, ...) {
     const char *file = NULL;
     const char *message = NULL;
     const char *remediation = NULL;
+    /* Every remaining key/value pair is the diagnostic's identity -- component,
+     * project, the contended local name, both candidate atom ids, the edge
+     * ordinal. They travel with the fatal record so the MCP failure payload
+     * carries the cause instead of naming a worker log (#1004/#943). */
+    const char *detail_keys[CBM_PIPELINE_ERROR_DETAIL_MAX];
+    const char *detail_vals[CBM_PIPELINE_ERROR_DETAIL_MAX];
+    size_t detail_count = 0;
     va_start(ap, pipeline);
     for (;;) {
         const char *key = va_arg(ap, const char *);
@@ -1518,18 +1566,26 @@ static void import_map_failed_impl(cbm_pipeline_t *pipeline, ...) {
             code = value;
         } else if (strcmp(key, "operation") == 0) {
             operation = value;
-        } else if (strcmp(key, "file") == 0) {
-            file = value;
         } else if (strcmp(key, "message") == 0) {
             message = value;
         } else if (strcmp(key, "remediation") == 0) {
             remediation = value;
+        } else {
+            if (strcmp(key, "file") == 0) {
+                file = value;
+            }
+            if (detail_count < (size_t)CBM_PIPELINE_ERROR_DETAIL_MAX) {
+                detail_keys[detail_count] = key;
+                detail_vals[detail_count] = value;
+                detail_count++;
+            }
         }
     }
     va_end(ap);
 
-    cbm_pipeline_record_fatal_error(pipeline, code, operation, "import_map", file, 0, message,
-                                    remediation);
+    cbm_pipeline_record_fatal_error_detail(pipeline, code, operation, "import_map", file, 0,
+                                           message, remediation, detail_keys, detail_vals,
+                                           detail_count);
 }
 
 #define import_map_failed(pipeline_, ...) import_map_failed_impl((pipeline_), __VA_ARGS__, NULL)
@@ -1769,13 +1825,28 @@ int cbm_pipeline_import_map_build(cbm_pipeline_t *pipeline, const cbm_gbuf_t *gb
             }
         }
         if (duplicate >= 0) {
+            /* Two distinct exact targets claim one identifier inside one file.
+             * This is genuinely ambiguous source: picking a winner would invent
+             * a resolution the source does not state, and dropping the binding
+             * would silently degrade every reference through that name. The run
+             * therefore fails closed (#1004). The false ambiguity that used to
+             * dominate here -- stylesheet and other file-path "imports" whose
+             * local name was really a file extension -- was removed at the
+             * classification site: those bindings are CBM_IMPORT_BINDING_RESOURCE
+             * and never enter this map. Every pair reaching this point is real.
+             *
+             * Each key/value below travels with the fatal record as a structured
+             * detail pair, so the MCP failure response names the exact file, the
+             * contended identifier, and both candidate atoms instead of the
+             * generic CBM_PIPELINE_FAILED (#943). */
             const cbm_gbuf_node_t *previous = cbm_gbuf_find_by_id(gbuf, target_ids[duplicate]);
             import_map_failed(
                 pipeline, "code", "CBM_IMPORT_LOCAL_NAME_AMBIGUOUS", "component",
                 "pipeline.import_map", "operation", "deduplicate_local_name", "project",
-                project_name, "file", rel_path, "local_name", owned_local, "candidate_a_atom_id",
+                project_name ? project_name : "", "file", rel_path ? rel_path : "", "local_name",
+                owned_local, "candidate_a_atom_id",
                 previous && previous->atom_id ? previous->atom_id : "", "candidate_b_atom_id",
-                target->atom_id, "message",
+                target->atom_id ? target->atom_id : "", "message",
                 "one local import name resolves to multiple exact graph targets", "remediation",
                 "make the explicit source import alias unambiguous and retry indexing");
             free(owned_local);

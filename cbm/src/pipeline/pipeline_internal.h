@@ -111,6 +111,17 @@ typedef struct {
 void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const char *operation,
                                      const char *phase, const char *path, size_t requested,
                                      const char *message, const char *remediation);
+
+/* Same, plus the emitting site's own structured keys (#1004/#943). `detail_keys` and
+ * `detail_vals` are index-aligned and copied into pipeline-owned fixed storage;
+ * up to CBM_PIPELINE_ERROR_DETAIL_MAX pairs with a non-empty key are retained so
+ * the public failure response names the exact cause. */
+void cbm_pipeline_record_fatal_error_detail(cbm_pipeline_t *p, const char *code,
+                                            const char *operation, const char *phase,
+                                            const char *path, size_t requested,
+                                            const char *message, const char *remediation,
+                                            const char *const *detail_keys,
+                                            const char *const *detail_vals, size_t detail_count);
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
 void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
                                            const char *mode, const char *code, int item_count,
@@ -295,9 +306,14 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name);
 
-/* Build pkgmap by reading manifest files from the files array (sequential path). */
-int cbm_pkgmap_build_from_files_checked(const cbm_file_info_t *files, int file_count,
-                                        const char *project_name, CBMHashTable **out);
+/* Build pkgmap by reading manifest files from the files array (sequential path).
+ * `pipeline` receives the terminal diagnostic when a captured manifest cannot be
+ * read or parsed: these failures abort the run, so the exact code, manifest
+ * path, and remediation must reach the public response rather than only the
+ * worker log (#1004/#943). */
+int cbm_pkgmap_build_from_files_checked(cbm_pipeline_t *pipeline, const cbm_file_info_t *files,
+                                        int file_count, const char *project_name,
+                                        CBMHashTable **out);
 
 /* Free pkgmap and all owned strings. */
 void cbm_pkgmap_free(CBMHashTable *pkgmap);
