@@ -148,6 +148,11 @@ where
         let mut accepted = Vec::<Constellation>::new();
         let mut ids = Vec::with_capacity(input.len());
         for constellation in input {
+            // Each constellation resolved is demonstrated forward progress, so the
+            // retained read lease is kept alive rather than timing the batch out
+            // against its own size (#980).
+            let pinned = snapshot.snapshot();
+            self.rows.record_reader_progress(pinned, &self.clock);
             if constellation.vault_id != self.vault_id {
                 return Err(CalyxError::vault_access_denied(
                     "constellation belongs to another vault",
@@ -159,7 +164,7 @@ where
             let base = encode::encode_constellation_base(&constellation)?;
             if let Some(existing) =
                 self.rows
-                    .read_at(snapshot.snapshot(), ColumnFamily::Base, &key, &self.clock)?
+                    .read_at(pinned, ColumnFamily::Base, &key, &self.clock)?
             {
                 if existing == base {
                     ids.push(id);
@@ -168,8 +173,7 @@ where
                 let merged = if let Some(merged) = existing_merges.get_mut(&key) {
                     merged
                 } else {
-                    existing_merges
-                        .insert(key.clone(), self.get_at_snapshot(id, snapshot.snapshot())?);
+                    existing_merges.insert(key.clone(), self.get_at_snapshot(id, pinned)?);
                     existing_merges
                         .get_mut(&key)
                         .expect("inserted existing merge")

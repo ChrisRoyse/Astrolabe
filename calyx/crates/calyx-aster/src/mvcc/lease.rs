@@ -91,6 +91,18 @@ impl Freshness {
 }
 
 /// A bounded reader lease that pins one MVCC sequence.
+///
+/// The lease is a *liveness* bound on version GC, not a correctness lock: while
+/// it is registered, snapshot GC may not reclaim versions at or below
+/// `pinned_seq`. `max_age_ms` therefore bounds how long a reader may hold that
+/// pin **without demonstrating forward progress** — it is deliberately NOT a
+/// budget for how long a legitimate operation may run, because no fixed
+/// duration can be a correct budget for a corpus-sized readback.
+///
+/// This value is an immutable `Copy` handed to every read call, so it carries
+/// the lease's *issue-time identity*, not its authoritative deadline. The live
+/// deadline is owned by the lease registry, which a progressing holder refreshes
+/// in place (#980); see `VersionedCfStore::record_reader_progress`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReaderLease {
     id: u64,
@@ -121,8 +133,16 @@ impl ReaderLease {
         self.issued_at
     }
 
+    /// Stall window: the maximum time this lease may go without its holder
+    /// demonstrating forward progress before version GC may reclaim its pin.
     pub const fn max_age_ms(self) -> u64 {
         self.max_age_ms
+    }
+
+    /// Milliseconds since this lease was issued, measured from the immutable
+    /// copy. The registry tracks the authoritative time since last progress.
+    pub const fn age_at(self, now: Ts) -> u64 {
+        now.saturating_sub(self.issued_at)
     }
 
     pub fn expires_at(self) -> Ts {
@@ -137,13 +157,25 @@ impl ReaderLease {
         self.is_expired_at(clock.now())
     }
 
+    /// Fail-closed liveness check against this immutable copy's own window.
+    ///
+    /// Callers that hold a registered lease should go through
+    /// `VersionedCfStore::ensure_snapshot_live`, which consults the registry's
+    /// authoritative progress deadline first (#980). This copy-local check is
+    /// the fallback for a lease that is no longer registered at all.
     pub fn ensure_live_at(self, now: Ts) -> Result<()> {
         if self.is_expired_at(now) {
             return Err(CalyxError::reader_lease_expired(format!(
-                "reader lease {} for seq {} expired at {}",
+                "reader lease {} for seq {} expired at {}: unregistered holder made no \
+                 observable progress for {} ms (issued at {}, stall window max_age_ms={}, \
+                 observed at {})",
                 self.id,
                 self.pinned_seq,
-                self.expires_at()
+                self.expires_at(),
+                self.age_at(now),
+                self.issued_at,
+                self.max_age_ms,
+                now
             )));
         }
         Ok(())

@@ -178,6 +178,11 @@ where
             plan_index_bytes: index_bytes,
             ..OrderedReadbackMetrics::default()
         };
+        // Sorting the plan and sizing the publication buffers is itself minutes of
+        // forward progress on a corpus-sized readback, and it happens before the
+        // first CF group's liveness check. Record it so plan setup can never be
+        // mistaken for a stalled reader (#980).
+        self.rows.record_reader_progress(snapshot, &self.clock);
         let mut start = 0;
         while start < ordered.len() {
             let cf = ordered[start].cf;
@@ -242,6 +247,8 @@ where
                 })?;
             metrics.checked_merge(group_metrics).map_err(E::from)?;
             start = end;
+            // A fully resolved CF group is demonstrated forward progress (#980).
+            self.rows.record_reader_progress(snapshot, &self.clock);
         }
         if let Some(missing) = buffered_seen.iter().position(|seen| !seen) {
             return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
@@ -263,6 +270,10 @@ where
         })?;
         metrics.max_readback_batch_bytes = metrics.max_readback_batch_bytes.max(buffered_bytes);
         for (ordinal, read) in reads.iter().enumerate() {
+            // Publishing one row is demonstrated forward progress. At corpus
+            // scale this loop alone runs for minutes while the caller digests
+            // every row, so it must keep the reader's registry lease alive (#980).
+            self.rows.record_reader_progress(snapshot, &self.clock);
             on_row(
                 ordinal,
                 read.cf,

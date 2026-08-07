@@ -172,6 +172,48 @@ impl SnapshotPinWatchdog {
         self.lock().remove(&reader_id).is_some()
     }
 
+    /// Progress state of one registered lease at `now`.
+    ///
+    /// `None` means the lease is not registered (released, aborted, or never
+    /// registered). `Some((live, age_ms))` reports whether it is still within
+    /// its stall window and how long it has been since its holder last
+    /// demonstrated forward progress.
+    pub fn progress_state_at(&self, reader_id: ReaderId, now: Ts) -> Option<(bool, u64)> {
+        self.lock().get(&reader_id).map(|lease| {
+            (
+                !lease.is_expired_at(now),
+                now.saturating_sub(lease.created_at),
+            )
+        })
+    }
+
+    /// Records that a registered lease's holder demonstrated forward progress at
+    /// `now`, restarting its stall window in place (#980).
+    ///
+    /// Only `created_at` moves: `seq` — and therefore the version-GC floor this
+    /// lease contributes — is unchanged, so this can never let GC reclaim a
+    /// version the holder can still observe. An unregistered or already-expired
+    /// lease is never resurrected; the call is a no-op and returns `false`.
+    ///
+    /// The refresh is skipped while less than half the stall window has elapsed,
+    /// so a hot read loop performs at most two refreshes per window. That
+    /// half-window trigger is derived from the lease's own `lease_duration_ms`,
+    /// not an independent constant.
+    pub fn record_progress_at(&self, reader_id: ReaderId, now: Ts) -> bool {
+        let mut leases = self.lock();
+        let Some(lease) = leases.get_mut(&reader_id) else {
+            return false;
+        };
+        if lease.is_expired_at(now) {
+            return false;
+        }
+        if now.saturating_sub(lease.created_at) < lease.lease_duration_ms / 2 {
+            return false;
+        }
+        lease.created_at = now;
+        true
+    }
+
     pub fn abort_reader(&self, reader_id: ReaderId) -> Option<ReadLease> {
         self.lock().remove(&reader_id)
     }

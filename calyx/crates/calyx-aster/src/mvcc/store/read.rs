@@ -230,6 +230,8 @@ impl VersionedCfStore {
                             metrics.max_readback_batch_bytes = metrics
                                 .max_readback_batch_bytes
                                 .max(version.value.len() as u64);
+                            // One resolved row is demonstrated forward progress (#980).
+                            self.record_reader_progress(snapshot, clock);
                             on_value(*ordinal, Some(&version.value))?;
                             metrics.rows_read_back =
                                 metrics.rows_read_back.checked_add(1).ok_or_else(|| {
@@ -291,7 +293,15 @@ impl VersionedCfStore {
                     "latest-only ordered readback generation did not retain its router",
                 ))
             })?;
-            return self.visit_router_key_plan(cf, &unresolved, metrics, router, on_value);
+            return self.visit_router_key_plan(
+                snapshot,
+                cf,
+                &unresolved,
+                metrics,
+                router,
+                clock,
+                on_value,
+            );
         }
         let router_guard = self.router.read().expect("mvcc router poisoned");
         let Some(router) = router_guard.as_ref() else {
@@ -306,15 +316,17 @@ impl VersionedCfStore {
             }
             return Ok(metrics);
         };
-        self.visit_router_key_plan(cf, &unresolved, metrics, router, on_value)
+        self.visit_router_key_plan(snapshot, cf, &unresolved, metrics, router, clock, on_value)
     }
 
     fn visit_router_key_plan<E, F>(
         &self,
+        snapshot: Snapshot,
         cf: ColumnFamily,
         unresolved: &[(usize, &[u8])],
         mut metrics: OrderedReadbackMetrics,
         router: &CfRouter,
+        clock: &dyn Clock,
         on_value: &mut F,
     ) -> std::result::Result<OrderedReadbackMetrics, E>
     where
@@ -325,6 +337,10 @@ impl VersionedCfStore {
         let mut router_bytes = 0_u64;
         let mut max_value_bytes = 0_u64;
         let router_metrics = router.visit_key_plan(cf, &unresolved, &mut |ordinal, value| {
+            // Every row resolved from an immutable generation is demonstrated
+            // forward progress. This is the loop that runs for minutes on a
+            // corpus-sized plan, so it owns keeping the lease alive (#980).
+            self.record_reader_progress(snapshot, clock);
             router_rows = router_rows.checked_add(1).ok_or_else(|| {
                 E::from(calyx_core::CalyxError::aster_corrupt_shard(
                     "ordered readback row counter overflow",
@@ -686,13 +702,53 @@ impl VersionedCfStore {
         )))
     }
 
+    /// Fail-closed read guard for one pinned snapshot.
+    ///
+    /// `snapshot` is an immutable `Copy` stamped at pin time, so its own window
+    /// only ever describes the moment the lease was issued. The **registry** owns
+    /// the authoritative deadline: a holder that keeps demonstrating forward
+    /// progress refreshes its entry in place through
+    /// [`Self::record_reader_progress`] (#980). While that entry is live, every
+    /// version at or below `pinned_seq` is still pinned against version GC, so
+    /// reading at this snapshot stays correct no matter how long the operation
+    /// has legitimately been running.
+    ///
+    /// Expiry is therefore reserved for a reader that genuinely stopped making
+    /// progress for a whole stall window — its pin is reclaimable and the read
+    /// must not continue. An unregistered lease (released or aborted) falls back
+    /// to its copy-local window, exactly as before.
     pub(super) fn ensure_snapshot_live(&self, snapshot: Snapshot, clock: &dyn Clock) -> Result<()> {
         let now = clock.now();
         let lease = snapshot.lease();
-        if lease.is_expired_at(now) {
-            self.leases.abort_if_expired(lease, now);
+        match self.leases.progress_state(lease.id(), now) {
+            Some((true, _)) => Ok(()),
+            Some((false, stalled_for_ms)) => {
+                self.leases.abort_registered_if_expired(lease.id(), now);
+                Err(calyx_core::CalyxError::reader_lease_expired(format!(
+                    "reader lease {} for seq {} expired: holder made no observable progress for \
+                     {stalled_for_ms} ms (stall window max_age_ms={}, pinned at {}, observed at \
+                     {now}). The pin was released so version GC can reclaim seq <= {}",
+                    lease.id(),
+                    lease.pinned_seq(),
+                    lease.max_age_ms(),
+                    lease.issued_at(),
+                    lease.pinned_seq()
+                )))
+            }
+            None => lease.ensure_live_at(now),
         }
-        lease.ensure_live_at(now)
+    }
+
+    /// Records that `snapshot`'s reader demonstrated forward progress (#980).
+    ///
+    /// Called from read loops that legitimately run far longer than one stall
+    /// window. Only the registry's stall window moves; the pinned sequence, the
+    /// lease id, and the version-GC floor are untouched, so this can never widen
+    /// visibility or unpin a version the holder can still read. A reader stuck
+    /// *inside* one step never reaches these calls, so it still expires.
+    pub(crate) fn record_reader_progress(&self, snapshot: Snapshot, clock: &dyn Clock) {
+        self.leases
+            .record_progress(snapshot.lease().id(), clock.now());
     }
 }
 

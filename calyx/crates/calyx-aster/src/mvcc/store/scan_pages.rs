@@ -58,6 +58,8 @@ impl VersionedCfStore {
                 self.ensure_unbarriered(cf, key).map_err(E::from)?;
                 page.push((key.clone(), value));
                 if page.len() == limit {
+                    // One emitted page is demonstrated forward progress (#980).
+                    self.record_reader_progress(snapshot, clock);
                     on_page(std::mem::take(&mut page))?;
                 }
             }

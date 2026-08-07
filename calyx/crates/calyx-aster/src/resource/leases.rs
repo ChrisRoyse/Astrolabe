@@ -43,6 +43,23 @@ impl LeaseRegistry {
         self.watchdog.release(lease_id)
     }
 
+    /// Progress state of one registered lease at `now`: `None` when it is not
+    /// registered, else `(still within its stall window, ms since last progress)`.
+    pub fn progress_state(&self, lease_id: u64, now: Ts) -> Option<(bool, u64)> {
+        self.watchdog.progress_state_at(lease_id, now)
+    }
+
+    /// Records demonstrated forward progress for one registered lease (#980),
+    /// restarting its stall window without moving its pinned sequence.
+    pub fn record_progress(&self, lease_id: u64, now: Ts) -> bool {
+        self.watchdog.record_progress_at(lease_id, now)
+    }
+
+    /// Aborts one registered lease if the *registry's* entry is expired at `now`.
+    pub fn abort_registered_if_expired(&self, lease_id: u64, now: Ts) -> bool {
+        self.watchdog.abort_if_expired_at(lease_id, now)
+    }
+
     /// Aborts one lease if the caller observed it expired at `now`.
     pub fn abort_if_expired(&self, lease: ReaderLease, now: Ts) -> bool {
         let probe = ReadLease::from_millis(
