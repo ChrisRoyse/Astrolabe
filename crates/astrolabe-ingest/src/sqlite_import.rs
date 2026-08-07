@@ -132,7 +132,10 @@ const FILE_DIGEST_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 // contract, so an exact body/span change can never reuse a v2 identity. v4
 // folds the complete local-name + preprocessing-context edge identity. v5
 // additionally binds the independently measured generated URL-path column. v6
-// binds the complete measured node semantic input into the node CxId.
+// is a pure domain bump retiring every v5-era digest-reuse row: panel v4
+// changed node CxId derivation (`node_symbol_identity`), so a v5 digest match
+// could otherwise carry forward rows keyed by retired v3-panel identities. The
+// digest bytes themselves are computed exactly as in v5.
 const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v6";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 /// Ledger payload schema for admitting historical symbol versions without
