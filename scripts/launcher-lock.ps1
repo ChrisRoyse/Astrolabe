@@ -1914,6 +1914,35 @@ function Test-AstroPathLongPath {
     }
 }
 
+function Wait-AstroPathAbsent {
+    param(
+        [Parameter(Mandatory)][string]$LiteralPath,
+        [ValidateRange(1, 60000)][int]$TimeoutMs = 5000,
+        [ValidateRange(1, 1000)][int]$InitialDelayMs = 10,
+        [ValidateRange(1, 1000)][int]$MaximumDelayMs = 250
+    )
+
+    $full = [IO.Path]::GetFullPath($LiteralPath)
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $delayMs = $InitialDelayMs
+    $observations = [Collections.Generic.List[string]]::new()
+    while ($true) {
+        $state = Get-AstroPathEntryState $full
+        if ($state.State -ceq 'absent') { return }
+        if ($observations.Count -lt 64) {
+            $observations.Add(
+                "elapsed_ms=$($stopwatch.ElapsedMilliseconds),state=$($state.State),error=$($state.Error)"
+            )
+        }
+        if ($stopwatch.ElapsedMilliseconds -ge $TimeoutMs) {
+            throw "exact path deletion did not converge to absence within ${TimeoutMs}ms " +
+                "(observations=$($observations -join ';')): $full"
+        }
+        Start-Sleep -Milliseconds $delayMs
+        $delayMs = [Math]::Min($MaximumDelayMs, $delayMs * 2)
+    }
+}
+
 function Get-AstroFileInfoLongPath {
     param([Parameter(Mandatory)][string]$LiteralPath)
 
@@ -2019,10 +2048,7 @@ function Remove-AstroFileLongPath {
     finally {
         $handle.Dispose()
     }
-    $terminal = Get-AstroPathEntryState $full
-    if ($terminal.State -cne 'absent') {
-        throw "exact file delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
-    }
+    Wait-AstroPathAbsent -LiteralPath $full
 }
 
 function Remove-AstroEmptyDirectoryLongPath {
@@ -2049,10 +2075,7 @@ function Remove-AstroEmptyDirectoryLongPath {
     finally {
         $handle.Dispose()
     }
-    $terminal = Get-AstroPathEntryState $full
-    if ($terminal.State -cne 'absent') {
-        throw "exact empty-directory delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
-    }
+    Wait-AstroPathAbsent -LiteralPath $full
 }
 
 function Remove-AstroOrdinaryFlatDirectoryLongPath {
@@ -2102,10 +2125,7 @@ function Remove-AstroOrdinaryFlatDirectoryLongPath {
     finally {
         $handle.Dispose()
     }
-    $terminal = Get-AstroPathEntryState $full
-    if ($terminal.State -cne 'absent') {
-        throw "exact flat-directory delete did not reach absence (state=$($terminal.State), error=$($terminal.Error)): $full"
-    }
+    Wait-AstroPathAbsent -LiteralPath $full
 }
 
 function Throw-AstroOrdinaryTreeInventoryFailure {
