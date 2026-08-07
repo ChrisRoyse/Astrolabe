@@ -14,6 +14,7 @@
 //! `(inputs, seed, config)`.
 
 use astrolabe_domain::TrustTag;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffConfig;
@@ -181,17 +182,27 @@ pub fn measure_drift(
     // Permutation null: re-partition the pooled indices into sizes m and l.
     let mut rng = DeterministicRng::from_u64_labeled(seed, "mmd-perm");
     let mut idx: Vec<usize> = (0..n).collect();
-    let mut ge = 0usize;
+    // Generate the seeded permutations in their exact historical serial order:
+    // the Fisher-Yates stream mutates one shared index vector, so parallel RNG
+    // generation would change the statistic. The expensive MMD evaluation is a
+    // pure read of the frozen Gram matrix for each completed partition, and an
+    // indexed parallel collect therefore preserves the identical partition set
+    // while using the process-wide Rayon pool already warmed by signal-card
+    // bootstraps. No per-call thread pool is constructed.
+    let mut partitions = Vec::with_capacity(cfg.mmd_permutations);
     for _ in 0..cfg.mmd_permutations {
         for i in (1..n).rev() {
             let j = (rng.next_u64() % (i as u64 + 1)) as usize;
             idx.swap(i, j);
         }
-        let stat = mmd_squared_from_gram(&k, n, &idx[..m], &idx[m..]);
-        if stat >= observed {
-            ge += 1;
-        }
+        partitions.push(idx.clone());
     }
+    let ge = partitions
+        .into_par_iter()
+        .filter(|partition| {
+            mmd_squared_from_gram(&k, n, &partition[..m], &partition[m..]) >= observed
+        })
+        .count();
     let num = (1 + ge) as u128 * 1000;
     let den = (1 + cfg.mmd_permutations) as u128;
     let p_value_permille = num.div_ceil(den) as u64;

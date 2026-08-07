@@ -35,8 +35,9 @@ use astrolabe_assay::{
 };
 use astrolabe_ingest::{CbmGraphSnapshot, read_cbm_graph_snapshot};
 use calyx_aster::cf::{ColumnFamily, slot_key};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::mvcc::{OrderedReadbackMetrics, is_tombstone_value};
 use calyx_aster::vault::encode::decode_slot_vector;
+use calyx_aster::vault::{AsterVault, OrderedCfRead, SstReadSession};
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId, SlotVector};
 
 /// Axis name for the discrete symbol-kind (node-label) axis.
@@ -69,6 +70,8 @@ pub struct SignalCardProduction {
     pub axes_skipped_degenerate: usize,
     /// Slots skipped because they had no dense vector across the sample — labeled.
     pub slots_skipped_no_dense: usize,
+    /// Exact physical accounting for every Slot-CF key requested by this pass.
+    pub readback: OrderedReadbackMetrics,
 }
 
 /// Derives each non-structural symbol's structural axis values from a persisted
@@ -136,46 +139,64 @@ struct SlotAlignment {
 /// and the bits estimator both need equal-dimension points); alignment across the
 /// row, kind, and degree vectors is preserved.
 fn align_slot<C>(
-    vault: &AsterVault<C>,
-    at_seq: u64,
+    session: &SstReadSession<'_, C>,
     slot: SlotId,
     symbols: &[SymbolAxes],
-) -> Result<Option<SlotAlignment>>
+) -> Result<(Option<SlotAlignment>, OrderedReadbackMetrics)>
 where
     C: Clock,
 {
+    let keys = symbols
+        .iter()
+        .map(|symbol| slot_key(symbol.cx_id))
+        .collect::<Vec<_>>();
+    let reads = keys
+        .iter()
+        .enumerate()
+        .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::slot(slot), key))
+        .collect::<Vec<_>>();
+    let mut dense_by_symbol: Vec<Option<Vec<f64>>> = vec![None; symbols.len()];
+    let metrics =
+        session.visit_ordered_cf_plan::<CalyxError, _>(&reads, |ordinal, _, _, persisted| {
+            let Some(bytes) = persisted.filter(|bytes| !is_tombstone_value(bytes)) else {
+                return Ok(());
+            };
+            if let SlotVector::Dense { data, .. } = decode_slot_vector(bytes)? {
+                dense_by_symbol[ordinal] = Some(data.into_iter().map(f64::from).collect());
+            }
+            Ok(())
+        })?;
     let mut rows: Vec<Vec<f64>> = Vec::new();
     let mut kind: Vec<i64> = Vec::new();
     let mut degree: Vec<f64> = Vec::new();
     let mut dim: Option<usize> = None;
-    for symbol in symbols {
-        let Some(bytes) =
-            vault.read_cf_at(at_seq, ColumnFamily::slot(slot), &slot_key(symbol.cx_id))?
-        else {
+    for (symbol, dense) in symbols.iter().zip(dense_by_symbol) {
+        let Some(data) = dense else {
             continue;
         };
-        if let SlotVector::Dense { data, .. } = decode_slot_vector(&bytes)? {
-            let width = data.len();
-            match dim {
-                None => dim = Some(width),
-                // A slot's dense vectors are fixed-width; a stray mismatch is not
-                // sampled rather than corrupting the equal-dimension contract.
-                Some(expected) if expected != width => continue,
-                Some(_) => {}
-            }
-            rows.push(data.into_iter().map(f64::from).collect());
-            kind.push(symbol.kind_class);
-            degree.push(symbol.degree);
+        let width = data.len();
+        match dim {
+            None => dim = Some(width),
+            // A slot's dense vectors are fixed-width; a stray mismatch is not
+            // sampled rather than corrupting the equal-dimension contract.
+            Some(expected) if expected != width => continue,
+            Some(_) => {}
         }
+        rows.push(data);
+        kind.push(symbol.kind_class);
+        degree.push(symbol.degree);
     }
     match dim {
-        Some(dim) if !rows.is_empty() => Ok(Some(SlotAlignment {
-            dim,
-            rows,
-            kind,
-            degree,
-        })),
-        _ => Ok(None),
+        Some(dim) if !rows.is_empty() => Ok((
+            Some(SlotAlignment {
+                dim,
+                rows,
+                kind,
+                degree,
+            }),
+            metrics,
+        )),
+        _ => Ok((None, metrics)),
     }
 }
 
@@ -228,16 +249,23 @@ where
         CalyxError::aster_corrupt_shard(format!("bits config unavailable: {error}"))
     })?;
     let at_seq = vault.latest_seq();
+    let session = vault.sst_read_session_at(at_seq)?;
 
     let mut kind_signals: Vec<SignalBits> = Vec::new();
     let mut degree_signals: Vec<SignalBits> = Vec::new();
     let mut report = SignalCardProduction {
         symbols_measured: symbols.len(),
+        readback: OrderedReadbackMetrics {
+            session_snapshot_seq: at_seq,
+            ..OrderedReadbackMetrics::default()
+        },
         ..SignalCardProduction::default()
     };
 
     for slot in slots {
-        let Some(alignment) = align_slot(vault, at_seq, *slot, symbols)? else {
+        let (alignment, readback) = align_slot(&session, *slot, symbols)?;
+        report.readback.checked_merge(readback)?;
+        let Some(alignment) = alignment else {
             report.slots_skipped_no_dense += 1;
             continue;
         };

@@ -27,8 +27,9 @@ use astrolabe_domain::knobs::U64KnobDeclaration;
 use astrolabe_ingest::read_cbm_graph_snapshot;
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag};
 use calyx_aster::cf::{ColumnFamily, slot_key};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::mvcc::{OrderedReadbackMetrics, is_tombstone_value};
 use calyx_aster::vault::encode::decode_slot_vector;
+use calyx_aster::vault::{AsterVault, OrderedCfRead};
 use calyx_core::{CalyxError, Clock, Result, SlotId, SlotVector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -550,6 +551,8 @@ pub struct DriftProductionReport {
     /// persisted with the drift-card payload so a consumer can distinguish the
     /// full corpus population from the bounded exact-MMD window.
     pub current_sampling_per_slot: Vec<SlotSamplingProvenance>,
+    /// Exact physical accounting for current Slot-CF hydration.
+    pub slot_readback: OrderedReadbackMetrics,
 }
 
 /// Reads the current import's per-slot samples from the persisted Slot column
@@ -565,37 +568,74 @@ pub fn read_slot_samples_from_vault<C>(
 where
     C: Clock,
 {
+    Ok(read_slot_samples_from_vault_counted(vault, project, slots)?.0)
+}
+
+fn read_slot_samples_from_vault_counted<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    slots: &[SlotId],
+) -> Result<(Vec<DriftSlotSamples>, OrderedReadbackMetrics)>
+where
+    C: Clock,
+{
     let snapshot = read_cbm_graph_snapshot(vault, project).map_err(|error| {
         CalyxError::aster_corrupt_shard(format!("read graph snapshot: {error}"))
     })?;
     let at_seq = vault.latest_seq();
+    let session = vault.sst_read_session_at(at_seq)?;
+    let symbols = snapshot
+        .nodes
+        .into_iter()
+        .filter(|node| !node.structural)
+        .filter_map(|node| node.cx_id)
+        .collect::<Vec<_>>();
     let mut per_slot: BTreeMap<SlotId, Vec<Vec<f64>>> =
         slots.iter().map(|slot| (*slot, Vec::new())).collect();
-    for node in snapshot.nodes.into_iter().filter(|node| !node.structural) {
-        let Some(cx_id) = node.cx_id else {
-            continue;
-        };
-        for slot in slots {
-            let Some(bytes) =
-                vault.read_cf_at(at_seq, ColumnFamily::slot(*slot), &slot_key(cx_id))?
-            else {
-                continue;
-            };
-            if let SlotVector::Dense { data, .. } = decode_slot_vector(&bytes)? {
-                per_slot
-                    .get_mut(slot)
-                    .expect("slot present in initialized map")
-                    .push(data.into_iter().map(f64::from).collect());
-            }
-        }
+    let mut readback = OrderedReadbackMetrics {
+        session_snapshot_seq: at_seq,
+        ..OrderedReadbackMetrics::default()
+    };
+    for slot in slots {
+        let keys = symbols
+            .iter()
+            .map(|cx_id| slot_key(*cx_id))
+            .collect::<Vec<_>>();
+        let reads = keys
+            .iter()
+            .enumerate()
+            .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::slot(*slot), key))
+            .collect::<Vec<_>>();
+        let mut dense_by_symbol = vec![None; symbols.len()];
+        let slot_metrics = session.visit_ordered_cf_plan::<CalyxError, _>(
+            &reads,
+            |ordinal, _, _, persisted| {
+                let Some(bytes) = persisted.filter(|bytes| !is_tombstone_value(bytes)) else {
+                    return Ok(());
+                };
+                if let SlotVector::Dense { data, .. } = decode_slot_vector(bytes)? {
+                    dense_by_symbol[ordinal] =
+                        Some(data.into_iter().map(f64::from).collect::<Vec<_>>());
+                }
+                Ok(())
+            },
+        )?;
+        readback.checked_merge(slot_metrics)?;
+        let samples = per_slot
+            .get_mut(slot)
+            .expect("slot present in initialized map");
+        samples.extend(dense_by_symbol.into_iter().flatten());
     }
-    Ok(per_slot
-        .into_iter()
-        .map(|(slot, samples)| DriftSlotSamples {
-            slot: format!("S{}", slot.get()),
-            samples,
-        })
-        .collect())
+    Ok((
+        per_slot
+            .into_iter()
+            .map(|(slot, samples)| DriftSlotSamples {
+                slot: format!("S{}", slot.get()),
+                samples,
+            })
+            .collect(),
+        readback,
+    ))
 }
 
 /// Loads the persisted reference window (the prior import's slot samples), or an
@@ -957,7 +997,8 @@ where
     C: Clock,
 {
     let provenance = provenance.into();
-    let current_population = read_slot_samples_from_vault(vault, project, slots)?;
+    let (current_population, slot_readback) =
+        read_slot_samples_from_vault_counted(vault, project, slots)?;
     let current_sample_cap = drift_current_sample_cap()?;
     let (current, current_sampling) =
         bound_slot_sample_window(&current_population, current_sample_cap, seed);
@@ -1000,6 +1041,7 @@ where
         seed,
     )?;
     report.reference_persisted = true;
+    report.slot_readback = slot_readback;
     report.assay_cotenant_rows_skipped +=
         reference_load_skips + sampling.assay_cotenant_rows_skipped;
     Ok(report)

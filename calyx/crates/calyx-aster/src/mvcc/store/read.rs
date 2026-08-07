@@ -58,17 +58,45 @@ impl VersionedCfStore {
         reads: &[CfRead],
         clock: &dyn Clock,
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        for read in reads {
-            self.ensure_cf_selected(read.cf)?;
-        }
         self.ensure_snapshot_live(snapshot, clock)?;
-        for read in reads {
-            self.ensure_unbarriered(read.cf, &read.key)?;
+        if reads.is_empty() {
+            return Ok(Vec::new());
         }
-        reads
-            .iter()
-            .map(|read| self.read_at(snapshot, read.cf, &read.key, clock))
-            .collect()
+        let mut order = (0..reads.len()).collect::<Vec<_>>();
+        order.sort_unstable_by(|left, right| {
+            reads[*left]
+                .cf
+                .cmp(&reads[*right].cf)
+                .then_with(|| reads[*left].key.cmp(&reads[*right].key))
+                .then_with(|| left.cmp(right))
+        });
+        let mut values = vec![None; reads.len()];
+        let mut start = 0;
+        while start < order.len() {
+            let cf = reads[order[start]].cf;
+            let mut end = start + 1;
+            while end < order.len() && reads[order[end]].cf == cf {
+                end += 1;
+            }
+            let keys = order[start..end]
+                .iter()
+                .map(|ordinal| (*ordinal, reads[*ordinal].key.as_slice()))
+                .collect::<Vec<_>>();
+            self.visit_cf_key_plan::<CalyxError, _>(
+                snapshot,
+                cf,
+                &keys,
+                clock,
+                &mut |ordinal, value| {
+                    values[ordinal] = value
+                        .filter(|bytes| !is_tombstone_value(bytes))
+                        .map(ToOwned::to_owned);
+                    Ok(())
+                },
+            )?;
+            start = end;
+        }
+        Ok(values)
     }
 
     /// Visits a sorted exact-key plan for one column family under one pinned
@@ -81,6 +109,46 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         keys: &[(usize, &[u8])],
         clock: &dyn Clock,
+        on_value: &mut F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        self.visit_cf_key_plan_inner(snapshot, cf, keys, clock, None, on_value)
+    }
+
+    /// Ordered-plan counterpart used by an operation-scoped physical read
+    /// generation. Latest-only handles reuse the retained router inventory;
+    /// full-MVCC handles keep resolving the pinned sequence from version rows.
+    pub(crate) fn visit_cf_key_plan_in_generation<E, F>(
+        &self,
+        generation: &SstReadGeneration<'_>,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        keys: &[(usize, &[u8])],
+        clock: &dyn Clock,
+        on_value: &mut F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        if !generation.belongs_to(self) {
+            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                "ordered readback generation belongs to a different MVCC store",
+            )));
+        }
+        self.visit_cf_key_plan_inner(snapshot, cf, keys, clock, Some(generation), on_value)
+    }
+
+    fn visit_cf_key_plan_inner<E, F>(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        keys: &[(usize, &[u8])],
+        clock: &dyn Clock,
+        generation: Option<&SstReadGeneration<'_>>,
         on_value: &mut F,
     ) -> std::result::Result<OrderedReadbackMetrics, E>
     where
@@ -108,6 +176,12 @@ impl VersionedCfStore {
         }
 
         let mut metrics = OrderedReadbackMetrics {
+            session_snapshot_seq: snapshot.seq(),
+            requested_keys: u64::try_from(keys.len()).map_err(|_| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback key count exceeds u64",
+                ))
+            })?,
             read_batches: 1,
             ..OrderedReadbackMetrics::default()
         };
@@ -125,7 +199,8 @@ impl VersionedCfStore {
                     "ordered readback resolution-index byte count overflow",
                 ))
             })?;
-        {
+        let latest_only = self.router_latest_readback.load(Ordering::Acquire);
+        if !latest_only {
             let table = self.rows.read().expect("mvcc row table poisoned");
             if !table.is_empty() {
                 metrics.source_read_operations = 1;
@@ -195,7 +270,7 @@ impl VersionedCfStore {
         if unresolved.is_empty() {
             return Ok(metrics);
         }
-        if !self.router_latest_readback.load(Ordering::Acquire) {
+        if !latest_only {
             for (ordinal, _) in unresolved {
                 on_value(ordinal, None)?;
                 metrics.rows_read_back =
@@ -210,8 +285,16 @@ impl VersionedCfStore {
 
         self.ensure_router_latest_snapshot(snapshot)
             .map_err(E::from)?;
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
+        if let Some(generation) = generation {
+            let router = generation.router().ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "latest-only ordered readback generation did not retain its router",
+                ))
+            })?;
+            return self.visit_router_key_plan(cf, &unresolved, metrics, router, on_value);
+        }
+        let router_guard = self.router.read().expect("mvcc router poisoned");
+        let Some(router) = router_guard.as_ref() else {
             for (ordinal, _) in unresolved {
                 on_value(ordinal, None)?;
                 metrics.rows_read_back =
@@ -223,6 +306,21 @@ impl VersionedCfStore {
             }
             return Ok(metrics);
         };
+        self.visit_router_key_plan(cf, &unresolved, metrics, router, on_value)
+    }
+
+    fn visit_router_key_plan<E, F>(
+        &self,
+        cf: ColumnFamily,
+        unresolved: &[(usize, &[u8])],
+        mut metrics: OrderedReadbackMetrics,
+        router: &CfRouter,
+        on_value: &mut F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
+    {
         let mut router_rows = 0_u64;
         let mut router_bytes = 0_u64;
         let mut max_value_bytes = 0_u64;
@@ -270,6 +368,9 @@ impl VersionedCfStore {
                 ))
             })?;
         metrics.sst_files_opened = router_metrics.sst_files_opened;
+        metrics.unique_sst_generations = router_metrics.sst_files_opened;
+        metrics.sst_key_probes = router_metrics.sst_key_probes;
+        metrics.sst_map_reuses = router_metrics.sst_map_reuses;
         metrics.plan_index_bytes = metrics
             .plan_index_bytes
             .checked_add(router_metrics.plan_index_bytes)

@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
 
@@ -120,6 +120,10 @@ pub struct CfRead {
 /// Physical accounting for one storage-local ordered readback plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OrderedReadbackMetrics {
+    /// Exact MVCC sequence retained for the logical read session.
+    pub session_snapshot_seq: Seq,
+    /// Caller-requested keys, including duplicates and explicit misses.
+    pub requested_keys: u64,
     /// Planned rows delivered to the caller, including physical tombstones and
     /// explicit absences.
     pub rows_read_back: u64,
@@ -132,16 +136,45 @@ pub struct OrderedReadbackMetrics {
     /// Immutable SST generations opened. Each generation is opened at most once
     /// per column-family batch, regardless of the number of planned keys in it.
     pub sst_files_opened: u64,
+    /// Distinct immutable SST generations opened by this operation. This must
+    /// equal `sst_files_opened`; divergence is a physical-accounting fault.
+    pub unique_sst_generations: u64,
+    /// SST key probes performed while a generation mapping was retained.
+    pub sst_key_probes: u64,
+    /// Avoided reopen/remap operations: probes after the first on each retained
+    /// immutable generation.
+    pub sst_map_reuses: u64,
     /// Peak transient ordinal/CF/key-reference index bytes retained at once
     /// while ordering and resolving the plan.
     pub plan_index_bytes: u64,
-    /// Largest persisted value borrowed at once. The ordered path never retains
-    /// the complete value corpus.
+    /// Peak persisted value bytes retained until whole-operation validation
+    /// completes and ordered callback publication can begin.
     pub max_readback_batch_bytes: u64,
 }
 
 impl OrderedReadbackMetrics {
-    pub(crate) fn checked_merge(&mut self, other: Self) -> Result<()> {
+    /// Merges telemetry from another plan in the same retained snapshot.
+    pub fn checked_merge(&mut self, other: Self) -> Result<()> {
+        if other.sst_files_opened != other.unique_sst_generations {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "ordered readback reported {} SST opens for {} unique generations",
+                other.sst_files_opened, other.unique_sst_generations
+            )));
+        }
+        if self.read_batches != 0
+            && other.read_batches != 0
+            && self.session_snapshot_seq != other.session_snapshot_seq
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "ordered readback mixed snapshot seq {} with {}",
+                self.session_snapshot_seq, other.session_snapshot_seq
+            )));
+        }
+        if self.read_batches == 0 {
+            self.session_snapshot_seq = other.session_snapshot_seq;
+        }
+        self.requested_keys =
+            checked_metric_add(self.requested_keys, other.requested_keys, "requested_keys")?;
         self.rows_read_back =
             checked_metric_add(self.rows_read_back, other.rows_read_back, "rows_read_back")?;
         self.bytes_read_back = checked_metric_add(
@@ -161,6 +194,15 @@ impl OrderedReadbackMetrics {
             other.sst_files_opened,
             "sst_files_opened",
         )?;
+        self.unique_sst_generations = checked_metric_add(
+            self.unique_sst_generations,
+            other.unique_sst_generations,
+            "unique_sst_generations",
+        )?;
+        self.sst_key_probes =
+            checked_metric_add(self.sst_key_probes, other.sst_key_probes, "sst_key_probes")?;
+        self.sst_map_reuses =
+            checked_metric_add(self.sst_map_reuses, other.sst_map_reuses, "sst_map_reuses")?;
         self.plan_index_bytes = self.plan_index_bytes.max(other.plan_index_bytes);
         self.max_readback_batch_bytes = self
             .max_readback_batch_bytes
@@ -214,6 +256,27 @@ pub struct VersionedCfStore {
     resource_counters: Arc<ResourceCounters>,
     snapshot_gc: SnapshotGcReclaimer,
     snapshot_gc_counters: SnapshotGcCounters,
+}
+
+/// Router generation retained by one operation-scoped read session.
+///
+/// Full-MVCC handles resolve the pinned sequence entirely from `rows`, so they
+/// do not retain the router and therefore do not block writers. Latest-only
+/// handles have no historical row table; they retain the router's read guard so
+/// every plan in the operation observes one immutable SST/memtable inventory.
+pub(crate) struct SstReadGeneration<'a> {
+    store: &'a VersionedCfStore,
+    router: Option<RwLockReadGuard<'a, Option<CfRouter>>>,
+}
+
+impl SstReadGeneration<'_> {
+    pub(super) fn belongs_to(&self, store: &VersionedCfStore) -> bool {
+        std::ptr::eq(self.store, store)
+    }
+
+    pub(super) fn router(&self) -> Option<&CfRouter> {
+        self.router.as_ref().and_then(|router| router.as_ref())
+    }
 }
 
 impl VersionedCfStore {
@@ -331,6 +394,37 @@ impl VersionedCfStore {
     /// Releases one pinned reader lease; returns whether it was still live.
     pub fn release_lease(&self, lease_id: u64) -> bool {
         self.leases.release(lease_id)
+    }
+
+    /// Retains the exact physical read generation for `snapshot`.
+    ///
+    /// The latest-only router is acquired while the row read lock is held,
+    /// matching commit's row-write -> router-write order. The row guard is then
+    /// released because latest-only reads never consult the empty MVCC table;
+    /// retaining it would block unrelated readers and would create a recursive
+    /// read-lock hazard once a writer queued. The router guard alone prevents
+    /// commits, flushes, and manifest handoffs from replacing this generation.
+    pub(crate) fn retain_sst_read_generation(
+        &self,
+        snapshot: Snapshot,
+        clock: &dyn Clock,
+    ) -> Result<SstReadGeneration<'_>> {
+        self.ensure_snapshot_live(snapshot, clock)?;
+        if !self.router_latest_readback.load(Ordering::Acquire) {
+            return Ok(SstReadGeneration {
+                store: self,
+                router: None,
+            });
+        }
+
+        let rows = self.rows.read().expect("mvcc row table poisoned");
+        self.ensure_router_latest_snapshot(snapshot)?;
+        let router = self.router.read().expect("mvcc router poisoned");
+        drop(rows);
+        Ok(SstReadGeneration {
+            store: self,
+            router: Some(router),
+        })
     }
 
     /// Live reader-lease view at `now` for resource accounting.

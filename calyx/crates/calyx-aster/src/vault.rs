@@ -81,6 +81,7 @@ pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
     read_materialized_slot_column,
 };
+pub use snapshot_lease::SstReadSession;
 
 /// Digest-only receipt for one ledger-bound data row.
 ///

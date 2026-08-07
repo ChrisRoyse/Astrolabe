@@ -1,5 +1,5 @@
 use super::page;
-use super::{SstEntry, SstKeyState, SstLookupMetadata, SstReader};
+use super::{SstEntry, SstKeyState, SstLookupMetadata, SstReader, ValidatedSstValueRange};
 use calyx_core::Result;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +60,8 @@ impl LevelFile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SstPlanReadMetrics {
     pub files_opened: u64,
+    pub key_probes: u64,
+    pub map_reuses: u64,
     pub max_value_bytes: u64,
     pub plan_index_bytes: u64,
 }
@@ -160,6 +162,18 @@ impl SstLevel {
             )));
         }
         let mut metrics = SstPlanReadMetrics::default();
+        let mut readers = Vec::new();
+        let mut sources: Vec<Option<(usize, ValidatedSstValueRange)>> = vec![None; keys.len()];
+        let source_bytes = sources
+            .capacity()
+            .checked_mul(std::mem::size_of::<Option<(usize, ValidatedSstValueRange)>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "SST ordered-readback source-index byte count overflow",
+                ))
+            })?;
+        metrics.plan_index_bytes = source_bytes;
         for file in &self.files {
             let candidates = keys
                 .iter()
@@ -188,16 +202,39 @@ impl SstLevel {
                 continue;
             }
             let reader = file.open_reader().map_err(E::from)?;
+            let reader_index = readers.len();
             metrics.files_opened = metrics.files_opened.checked_add(1).ok_or_else(|| {
                 E::from(calyx_core::CalyxError::aster_corrupt_shard(
                     "SST ordered-readback file-open counter overflow",
                 ))
             })?;
+            let candidate_count = u64::try_from(candidates.len()).map_err(|_| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "SST ordered-readback candidate count exceeds u64",
+                ))
+            })?;
+            metrics.key_probes =
+                metrics
+                    .key_probes
+                    .checked_add(candidate_count)
+                    .ok_or_else(|| {
+                        E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                            "SST ordered-readback key-probe counter overflow",
+                        ))
+                    })?;
+            metrics.map_reuses = metrics
+                .map_reuses
+                .checked_add(candidate_count.saturating_sub(1))
+                .ok_or_else(|| {
+                    E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                        "SST ordered-readback map-reuse counter overflow",
+                    ))
+                })?;
             for position in candidates {
-                let (ordinal, key) = keys[position];
-                if let Some(value) = reader.get_ref(key).map_err(E::from)? {
-                    metrics.max_value_bytes = metrics.max_value_bytes.max(value.len() as u64);
-                    on_value(ordinal, Some(value))?;
+                let (_, key) = keys[position];
+                if let Some(range) = reader.validated_value_range(key).map_err(E::from)? {
+                    metrics.max_value_bytes = metrics.max_value_bytes.max(range.len() as u64);
+                    sources[position] = Some((reader_index, range));
                     resolved[position] = true;
                 } else if file.contains_indexed_key(key) == Some(true) {
                     return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
@@ -208,9 +245,18 @@ impl SstLevel {
                     )));
                 }
             }
+            readers.push(reader);
         }
+        // No callback is invoked until every required generation has opened and
+        // every selected record has passed its CRC/bounds validation. A corrupt,
+        // replaced, or missing generation therefore aborts with zero partial
+        // consumer output. The retained mappings make publication a pure slice
+        // replay and are all dropped when this method returns.
         for (position, (ordinal, _)) in keys.iter().enumerate() {
-            if !resolved[position] {
+            if let Some((reader_index, range)) = sources[position] {
+                let value = readers[reader_index].value_at_validated_range(range);
+                on_value(*ordinal, Some(value))?;
+            } else if !resolved[position] {
                 on_value(*ordinal, None)?;
                 resolved[position] = true;
             }

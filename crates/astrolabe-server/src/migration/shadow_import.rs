@@ -779,6 +779,7 @@ where
             "current_total_population": report.current_total_population,
             "current_total_retained": report.current_total_retained,
             "current_sampling_per_slot": report.current_sampling_per_slot,
+            "slot_readback": ordered_readback_summary(&report.slot_readback),
             "trust": "measured",
             "provenance": "index_time_drift",
         }),
@@ -804,6 +805,24 @@ fn signal_cards_unavailable(reason: String) -> Value {
         "reason": reason,
         "trust": "provisional",
         "provenance": "unavailable",
+    })
+}
+
+fn ordered_readback_summary(metrics: &calyx_aster::mvcc::OrderedReadbackMetrics) -> Value {
+    json!({
+        "session_snapshot_seq": metrics.session_snapshot_seq,
+        "requested_keys": metrics.requested_keys,
+        "rows_read_back": metrics.rows_read_back,
+        "bytes_read_back": metrics.bytes_read_back,
+        "read_batches": metrics.read_batches,
+        "source_read_operations": metrics.source_read_operations,
+        "sst_files_opened": metrics.sst_files_opened,
+        "unique_sst_generations": metrics.unique_sst_generations,
+        "sst_key_probes": metrics.sst_key_probes,
+        "sst_map_reuses": metrics.sst_map_reuses,
+        "plan_index_bytes": metrics.plan_index_bytes,
+        "max_readback_batch_bytes": metrics.max_readback_batch_bytes,
+        "generation_open_invariant": metrics.sst_files_opened == metrics.unique_sst_generations,
     })
 }
 
@@ -858,6 +877,7 @@ where
             "symbols_measured": production.symbols_measured,
             "axes_skipped_degenerate": production.axes_skipped_degenerate,
             "slots_skipped_no_dense": production.slots_skipped_no_dense,
+            "slot_readback": ordered_readback_summary(&production.readback),
             "trust": "provisional",
             "provenance": "index_time_signal_cards",
         });
@@ -983,6 +1003,7 @@ where
         "symbols_measured": production.symbols_measured,
         "axes_skipped_degenerate": production.axes_skipped_degenerate,
         "slots_skipped_no_dense": production.slots_skipped_no_dense,
+        "slot_readback": ordered_readback_summary(&production.readback),
         "axes": axes,
         "trust": "measured",
         "provenance": "index_time_signal_cards",

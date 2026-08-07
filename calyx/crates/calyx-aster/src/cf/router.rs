@@ -42,6 +42,8 @@ pub struct CfRouter {
 pub(crate) struct RouterPlanReadMetrics {
     pub source_read_operations: u64,
     pub sst_files_opened: u64,
+    pub sst_key_probes: u64,
+    pub sst_map_reuses: u64,
     pub max_value_bytes: u64,
     pub plan_index_bytes: u64,
 }
@@ -368,6 +370,7 @@ impl CfRouter {
     {
         let mut metrics = RouterPlanReadMetrics::default();
         let mut resolved = vec![false; keys.len()];
+        let mut memtable_values: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
         metrics.plan_index_bytes = resolved
             .capacity()
             .checked_add(7)
@@ -387,10 +390,10 @@ impl CfRouter {
                         "router ordered-readback source counter overflow",
                     ))
                 })?;
-            for (position, (ordinal, key)) in keys.iter().enumerate() {
+            for (position, (_, key)) in keys.iter().enumerate() {
                 if let Some(value) = table.get(key) {
                     metrics.max_value_bytes = metrics.max_value_bytes.max(value.len() as u64);
-                    on_value(*ordinal, Some(&value))?;
+                    memtable_values[position] = Some(value);
                     resolved[position] = true;
                 }
             }
@@ -402,6 +405,11 @@ impl CfRouter {
             .unwrap_or_default()
             .visit_key_plan(keys, &mut resolved, on_value)?;
         merge_sst_plan_metrics(&mut metrics, level_metrics)?;
+        for (position, (ordinal, _)) in keys.iter().enumerate() {
+            if let Some(value) = memtable_values[position].as_deref() {
+                on_value(*ordinal, Some(value))?;
+            }
+        }
         Ok(metrics)
     }
 
@@ -627,6 +635,22 @@ where
         .ok_or_else(|| {
             E::from(CalyxError::aster_corrupt_shard(
                 "router ordered-readback source counter overflow",
+            ))
+        })?;
+    metrics.sst_key_probes = metrics
+        .sst_key_probes
+        .checked_add(sst.key_probes)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback SST key-probe counter overflow",
+            ))
+        })?;
+    metrics.sst_map_reuses = metrics
+        .sst_map_reuses
+        .checked_add(sst.map_reuses)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback SST map-reuse counter overflow",
             ))
         })?;
     metrics.max_value_bytes = metrics.max_value_bytes.max(sst.max_value_bytes);

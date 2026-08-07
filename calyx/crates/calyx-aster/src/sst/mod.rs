@@ -80,6 +80,20 @@ pub struct SstReader {
     lookup: Arc<SstLookupMetadata>,
 }
 
+/// Byte range proven by a complete record decode and CRC check against one
+/// retained immutable [`SstReader`] mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedSstValueRange {
+    start: usize,
+    end: usize,
+}
+
+impl ValidatedSstValueRange {
+    pub(crate) const fn len(self) -> usize {
+        self.end - self.start
+    }
+}
+
 /// Writes a sorted immutable SSTable. The input iterator must already be ordered.
 pub fn write_sst<'a>(
     path: impl AsRef<Path>,
@@ -268,6 +282,18 @@ impl SstReader {
     /// Ordered full-state verification uses this seam to hash and decode a row
     /// while the SST is open, without allocating a second value buffer per key.
     pub(crate) fn get_ref(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+        Ok(self
+            .validated_value_range(key)?
+            .map(|range| self.value_at_validated_range(range)))
+    }
+
+    /// Validates one indexed record completely and returns an immutable byte
+    /// range that can be replayed after the whole multi-get read set has been
+    /// validated. The range is meaningful only for this retained reader.
+    pub(crate) fn validated_value_range(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<ValidatedSstValueRange>> {
         if !self.lookup.bloom.may_contain(key) {
             return Ok(None);
         }
@@ -278,9 +304,30 @@ impl SstReader {
         else {
             return Ok(None);
         };
-        Ok(Some(
-            read_record_ref(self.column.as_bytes(), self.lookup.index[position].offset)?.value,
-        ))
+        let record = read_record_ref(self.column.as_bytes(), self.lookup.index[position].offset)?;
+        let base = self.column.as_bytes().as_ptr() as usize;
+        let start = (record.value.as_ptr() as usize)
+            .checked_sub(base)
+            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST value precedes mapped bytes"))?;
+        let end = start
+            .checked_add(record.value.len())
+            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST validated value range overflow"))?;
+        if end > self.column.as_bytes().len() {
+            return Err(CalyxError::aster_corrupt_shard(
+                "SST validated value range exceeds mapped bytes",
+            ));
+        }
+        Ok(Some(ValidatedSstValueRange { start, end }))
+    }
+
+    /// Replays bytes from a range produced by [`Self::validated_value_range`].
+    /// The reader's mmap is immutable for its lifetime, so a previously valid
+    /// range cannot become invalid between preflight and callback publication.
+    pub(crate) fn value_at_validated_range(&self, range: ValidatedSstValueRange) -> &[u8] {
+        self.column
+            .as_bytes()
+            .get(range.start..range.end)
+            .expect("validated SST value range remains valid for retained immutable mmap")
     }
 
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstEntry>> {

@@ -2,9 +2,9 @@
 //! vault-internal snapshot handle (or accept an already-pinned lease) and defer
 //! to the MVCC store's visibility-filtered readers.
 
-use super::{AsterVault, OrderedCfRead, encode};
+use super::{AsterVault, OrderedCfRead, SstReadSession, encode};
 use crate::cf::{ColumnFamily, KeyRange};
-use crate::mvcc::{OrderedReadbackMetrics, Snapshot};
+use crate::mvcc::{OrderedReadbackMetrics, Snapshot, SstReadGeneration};
 use calyx_core::{Clock, Result, Seq};
 
 impl<C> AsterVault<C>
@@ -87,8 +87,9 @@ where
     }
 
     /// Re-reads an exact CF/key plan under one pinned snapshot while grouping
-    /// the physical work by CF and key. Values are borrowed only for the
-    /// callback duration; the complete value corpus is never materialized.
+    /// the physical work by CF and key. Values are retained only until every
+    /// requested CF/generation has passed validation, then published in caller
+    /// order. A storage failure therefore invokes no consumer callback.
     ///
     /// The callback receives each input row's stable `ordinal` exactly once,
     /// even though physical reads occur in `(CF,key)` order. Tombstone bytes are
@@ -98,13 +99,33 @@ where
         &self,
         snapshot: Seq,
         reads: &[OrderedCfRead<'_>],
+        on_row: F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        self.sst_read_session_at(snapshot)
+            .map_err(E::from)?
+            .visit_ordered_cf_plan(reads, on_row)
+    }
+
+    /// Opens one retained-snapshot session for a complete logical multi-get.
+    pub fn sst_read_session(&self) -> calyx_core::Result<SstReadSession<'_, C>> {
+        self.sst_read_session_at(self.latest_seq())
+    }
+
+    fn visit_ordered_cf_plan_snapshot<E, F>(
+        &self,
+        generation: &SstReadGeneration<'_>,
+        snapshot: Snapshot,
+        reads: &[OrderedCfRead<'_>],
         mut on_row: F,
     ) -> std::result::Result<OrderedReadbackMetrics, E>
     where
         E: From<calyx_core::CalyxError>,
         F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
     {
-        let snapshot = self.snapshot_handle(snapshot);
         if let Some((position, read)) = reads
             .iter()
             .enumerate()
@@ -124,7 +145,7 @@ where
                 .then_with(|| left.key.cmp(right.key))
                 .then_with(|| left.ordinal.cmp(&right.ordinal))
         });
-        let index_bytes = ordered
+        let mut index_bytes = ordered
             .capacity()
             .checked_mul(std::mem::size_of::<OrderedCfRead<'_>>())
             .and_then(|bytes| u64::try_from(bytes).ok())
@@ -133,7 +154,27 @@ where
                     "ordered readback plan-index byte count overflow",
                 ))
             })?;
+        let mut buffered_values: Vec<Option<Vec<u8>>> = vec![None; reads.len()];
+        let mut buffered_seen = vec![false; reads.len()];
+        let publication_index_bytes = buffered_values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Option<Vec<u8>>>())
+            .and_then(|bytes| bytes.checked_add(buffered_seen.capacity()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback publication-buffer byte count overflow",
+                ))
+            })?;
+        index_bytes = index_bytes
+            .checked_add(publication_index_bytes)
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback retained-index byte count overflow",
+                ))
+            })?;
         let mut metrics = OrderedReadbackMetrics {
+            session_snapshot_seq: snapshot.seq(),
             plan_index_bytes: index_bytes,
             ..OrderedReadbackMetrics::default()
         };
@@ -157,8 +198,9 @@ where
                         "ordered readback CF-key index byte count overflow",
                     ))
                 })?;
-            let mut group_metrics = self.rows.visit_cf_key_plan(
-                snapshot.snapshot(),
+            let mut group_metrics = self.rows.visit_cf_key_plan_in_generation(
+                generation,
+                snapshot,
                 cf,
                 &keys,
                 &self.clock,
@@ -178,7 +220,16 @@ where
                             ),
                         )));
                     }
-                    on_row(ordinal, cf, read.key, value)
+                    if buffered_seen[ordinal] {
+                        return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                            format!(
+                                "ordered readback ordinal {ordinal} was resolved more than once"
+                            ),
+                        )));
+                    }
+                    buffered_values[ordinal] = value.map(ToOwned::to_owned);
+                    buffered_seen[ordinal] = true;
+                    Ok(())
                 },
             )?;
             group_metrics.plan_index_bytes = index_bytes
@@ -191,6 +242,33 @@ where
                 })?;
             metrics.checked_merge(group_metrics).map_err(E::from)?;
             start = end;
+        }
+        if let Some(missing) = buffered_seen.iter().position(|seen| !seen) {
+            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                format!("ordered readback ordinal {missing} was never resolved"),
+            )));
+        }
+        let buffered_bytes = buffered_values.iter().try_fold(0_u64, |total, value| {
+            let len = value.as_ref().map_or(0, Vec::len);
+            let len = u64::try_from(len).map_err(|_| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback buffered value exceeds u64",
+                ))
+            })?;
+            total.checked_add(len).ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback buffered-byte count overflow",
+                ))
+            })
+        })?;
+        metrics.max_readback_batch_bytes = metrics.max_readback_batch_bytes.max(buffered_bytes);
+        for (ordinal, read) in reads.iter().enumerate() {
+            on_row(
+                ordinal,
+                read.cf,
+                read.key,
+                buffered_values[ordinal].as_deref(),
+            )?;
         }
         Ok(metrics)
     }
@@ -261,6 +339,31 @@ where
             after_key,
             limit,
             &self.clock,
+        )
+    }
+}
+
+impl<C> SstReadSession<'_, C>
+where
+    C: Clock,
+{
+    /// Executes an ordered physical plan under this session's retained snapshot.
+    /// Each required SST is mapped at most once for the plan and all mappings
+    /// are dropped before this method returns.
+    pub fn visit_ordered_cf_plan<E, F>(
+        &self,
+        reads: &[OrderedCfRead<'_>],
+        on_row: F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
+    {
+        self.vault.visit_ordered_cf_plan_snapshot(
+            &self.generation,
+            self.snapshot.snapshot(),
+            reads,
+            on_row,
         )
     }
 }
