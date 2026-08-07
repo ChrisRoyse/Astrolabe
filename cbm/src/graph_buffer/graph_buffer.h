@@ -74,6 +74,10 @@ void cbm_gbuf_free(cbm_gbuf_t *gb);
  * Edges are remapped for any QN-colliding nodes, then inserted with dedup.
  * After merge, src can be safely freed. Owned data is copied; immutable
  * source-slab references remain borrowed from the enclosing pipeline slab.
+ * src's retained refusal record AND its counted skip counters
+ * (cbm_gbuf_ambiguous_reference_skips, cbm_gbuf_unresolved_reference_source_skips)
+ * both cross into dst, including when src refused or is empty (#1022, #1028):
+ * freeing src therefore never deletes a labelled degradation.
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src);
 
@@ -275,7 +279,9 @@ bool cbm_gbuf_get_refusal(const cbm_gbuf_t *gb, cbm_gbuf_refusal_t *out);
 /* Number of reference edges skipped because their source syntax resolved to
  * several stable atoms in one semantic domain (#727). These are counted,
  * labelled degradations rather than failures: the corpus still publishes, so
- * callers MUST surface this count or the loss becomes silent. */
+ * callers MUST surface this count or the loss becomes silent. The count is
+ * cumulative over every buffer merged into this one (#1028), so reading it from
+ * the pipeline's own graph buffer is complete regardless of worker count. */
 uint_least64_t cbm_gbuf_ambiguous_reference_skips(const cbm_gbuf_t *gb);
 
 /* Record and diagnose a reference edge whose extracted syntax names an

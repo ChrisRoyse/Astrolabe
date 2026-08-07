@@ -409,6 +409,33 @@ static void gbuf_propagate_refusal(cbm_gbuf_t *dst, const cbm_gbuf_t *src) {
     gbuf_fail_resolution_code(dst, "CBM_SOURCE_WORKER_FAILED", "graph_buffer.merge", NULL, NULL);
 }
 
+/* Carry a worker buffer's counted, labelled degradations into the buffer it
+ * merges into (#1028). The refusal record above already crosses the merge; the
+ * skip counters did not, so a worker that skipped a reference edge published a
+ * clean-looking total once its buffer was freed — a silent loss under standing
+ * invariant 3 ("every skip counted"). At 13a7e5c8 the parallel passes resolve
+ * against the MAIN buffer, so no worker buffer carries a nonzero count and this
+ * is exactly a no-op; it exists so the class cannot reopen the moment a
+ * resolution moves into a worker buffer (the resolve worker already creates
+ * nodes in its own buffer). Both merges are sequential, but the fields are
+ * _Atomic, so read and accumulate atomically. No saturation: the increment
+ * sites do not clamp either, and an unlabeled clamp would itself be a silent
+ * degradation. */
+static void gbuf_accumulate_skip_counters(cbm_gbuf_t *dst, const cbm_gbuf_t *src) {
+    if (!dst || !src) {
+        return;
+    }
+    uint_least64_t ambiguous = atomic_load(&((cbm_gbuf_t *)src)->ambiguous_reference_skips);
+    uint_least64_t unresolved_source =
+        atomic_load(&((cbm_gbuf_t *)src)->unresolved_reference_source_skips);
+    if (ambiguous > 0) {
+        (void)atomic_fetch_add(&dst->ambiguous_reference_skips, ambiguous);
+    }
+    if (unresolved_source > 0) {
+        (void)atomic_fetch_add(&dst->unresolved_reference_source_skips, unresolved_source);
+    }
+}
+
 bool cbm_gbuf_get_refusal(const cbm_gbuf_t *gb, cbm_gbuf_refusal_t *out) {
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -2923,6 +2950,11 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     if (!dst || !src) {
         return CBM_NOT_FOUND;
     }
+    /* Before every early return (#1028): a refused worker and an empty worker
+     * are precisely the cases a bottom-of-function accumulation would drop, and
+     * a skip that a worker really observed stays true even when its graph is
+     * discarded. */
+    gbuf_accumulate_skip_counters(dst, src);
     if (atomic_load(&src->resolution_failed)) {
         gbuf_propagate_refusal(dst, src);
         cbm_log_error(
