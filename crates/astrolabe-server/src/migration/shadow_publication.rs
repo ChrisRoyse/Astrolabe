@@ -8,7 +8,7 @@ use std::os::windows::fs::MetadataExt;
 
 const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
-const PUBLICATION_SCHEMA: &str = "astrolabe.shadow-publication.v3";
+pub(crate) const PUBLICATION_SCHEMA: &str = "astrolabe.shadow-publication.v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +127,10 @@ pub(crate) struct ShadowPublication {
     recovery_manifest: Option<PublicationRecoveryManifest>,
     metadata_acknowledgement: Option<MetadataAcknowledgementRecoveryManifest>,
     seed_lower_repair: Option<SeedLowerRepair>,
+    /// Set only once the CBM pass has produced a durable staged store (#1037).
+    /// While `None`, abort cleanup destroys the transaction exactly as before —
+    /// there is no multi-hour product to keep.
+    stage_preservation: Option<PreservedStageArming>,
 }
 
 impl ShadowPublication {
@@ -174,6 +178,7 @@ impl ShadowPublication {
             recovery_manifest: None,
             metadata_acknowledgement: None,
             seed_lower_repair: None,
+            stage_preservation: None,
         };
         let initialized = (|| -> Result<(), DynError> {
             fs::create_dir(&publication.stage_cache)?;
@@ -203,6 +208,27 @@ impl ShadowPublication {
 
     pub(crate) fn checkpoint_stage_source(&self) -> Result<(), DynError> {
         checkpoint_sqlite(&sqlite_path(&self.stage_cache, &self.project), "CBM source")
+    }
+
+    /// Arms stage preservation for every later abort (#1037). Called once the CBM
+    /// pass has produced a durable staged store, binding it to the exact identity
+    /// under which it was produced and to that pass's verbatim tool result.
+    pub(crate) fn arm_stage_preservation(
+        &mut self,
+        fingerprint: &PreservedStageFingerprint,
+        index_tool_result: &str,
+    ) -> Result<(), DynError> {
+        self.stage_preservation = Some(PreservedStageArming::new(fingerprint, index_tool_result)?);
+        Ok(())
+    }
+
+    /// Adopts this project's preserved stage into the fresh stage, or refuses with
+    /// the exact mismatching dimension. Never falls back to a rebuild.
+    pub(crate) fn adopt_preserved_stage(
+        &self,
+        expected: &PreservedStageFingerprint,
+    ) -> Result<AdoptedPreservedStage, DynError> {
+        adopt_preserved_stage(&self.live_cache, &self.project, &self.stage_cache, expected)
     }
 
     pub(crate) fn abort(self, phase: &str, error: impl std::fmt::Display) -> DynError {
@@ -1211,10 +1237,81 @@ impl ShadowPublication {
         Ok(())
     }
 
+    /// Preserves the staged CBM store when this publication was armed, returning
+    /// the label the abort error carries (#1037). Preservation happens BEFORE the
+    /// transaction tree is unlinked and moves the database by rename inside the
+    /// same store root, so it needs no second multi-GB copy. A preservation
+    /// failure is labeled and surfaced, never silently swallowed; it does not
+    /// block cleanup, because leaving a half-published transaction behind is the
+    /// worse outcome.
+    fn preserve_stage_label(&self, phase: &str, error: &str) -> String {
+        let Some(arming) = self.stage_preservation.as_ref() else {
+            return String::new();
+        };
+        if !preserve_aborted_stage_enabled() {
+            let label = format!(
+                "; {ASTRO_SHADOW_STAGE_PRESERVED}: skipped=operator_opt_out (ASTRO_SHADOW_PRESERVE_ABORTED_STAGE=0); the staged CBM store for project {:?} was destroyed with the transaction",
+                self.project
+            );
+            eprintln!(
+                "astro.shadow.stage_preserved project={} status=skipped reason=operator_opt_out",
+                self.project
+            );
+            return label;
+        }
+        match preserve_stage(
+            &self.live_cache,
+            &self.project,
+            &self.generation,
+            self.owner.pid,
+            self.owner.process_start_utc_ticks,
+            &self.stage_cache,
+            phase,
+            error,
+            arming,
+        ) {
+            Ok(evidence) => {
+                eprintln!(
+                    "astro.shadow.stage_preserved project={} status=preserved evidence={evidence}",
+                    self.project
+                );
+                format!(
+                    "; {ASTRO_SHADOW_STAGE_PRESERVED}: the staged CBM store was preserved at {} (resume_token={}, source_sha256={}, bytes={}); remediation: after fixing the named phase error, retry with ASTRO_SHADOW_RESUME_PRESERVED_STAGE=1 to adopt it instead of re-running the CBM pass — adoption refuses unless every input fingerprint still matches",
+                    evidence["preserved_stage_dir"],
+                    evidence["resume_token"],
+                    evidence["source_sha256"],
+                    evidence["source_bytes"],
+                )
+            }
+            Err(preserve_error) => {
+                eprintln!(
+                    "astro.shadow.stage_preserved project={} status=failed error={preserve_error}",
+                    self.project
+                );
+                format!("; {ASTRO_SHADOW_STAGE_PRESERVE_FAILED}: {preserve_error}")
+            }
+        }
+    }
+
     fn abort_cleanup(&self, phase: &str, error: impl std::fmt::Display) -> Result<(), DynError> {
+        let error = error.to_string();
+        let preservation = self.preserve_stage_label(phase, &error);
+        self.abort_cleanup_after_preservation(phase, &error, &preservation)
+    }
+
+    fn abort_cleanup_after_preservation(
+        &self,
+        phase: &str,
+        error: &str,
+        preservation: &str,
+    ) -> Result<(), DynError> {
         let journal_error = self.write_journal(
             "aborted",
-            json!({"failed_phase": phase, "error": error.to_string()}),
+            json!({
+                "failed_phase": phase,
+                "error": error,
+                "stage_preservation": preservation,
+            }),
         );
         let cleanup_error = remove_transaction_tree(&self.transaction_dir, &self.project_root);
         let root_cleanup_error = remove_empty_dir(&self.project_root);
@@ -1245,11 +1342,14 @@ impl ShadowPublication {
 
     fn abort_error(&self, phase: &str, error: impl std::fmt::Display) -> DynError {
         let error = error.to_string();
-        if let Err(cleanup_error) = self.abort_cleanup(phase, &error) {
+        let preservation = self.preserve_stage_label(phase, &error);
+        if let Err(cleanup_error) =
+            self.abort_cleanup_after_preservation(phase, &error, &preservation)
+        {
             return cleanup_error;
         }
         format!(
-            "ASTRO_SHADOW_PUBLICATION_ABORTED: shadow publication for project {:?} failed during {phase}: {error}. The prior live generation was not committed. Remediation: fix the named phase error and rerun index_repository with calyx=\"shadow\"",
+            "ASTRO_SHADOW_PUBLICATION_ABORTED: shadow publication for project {:?} failed during {phase}: {error}. The prior live generation was not committed. Remediation: fix the named phase error and rerun index_repository with calyx=\"shadow\"{preservation}",
             self.project
         )
         .into()
@@ -2195,7 +2295,7 @@ fn exact_quiescent_sqlite_snapshot(
     Ok(())
 }
 
-fn checkpoint_sqlite(path: &Path, kind: &str) -> Result<(), DynError> {
+pub(crate) fn checkpoint_sqlite(path: &Path, kind: &str) -> Result<(), DynError> {
     if !path.exists() {
         return Err(format!(
             "ASTRO_SHADOW_SQLITE_MISSING: {kind} database is missing at {}; remediation: inspect the preceding index/lower phase",

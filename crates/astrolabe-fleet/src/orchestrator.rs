@@ -1675,13 +1675,16 @@ fn dir_size_bytes(dir: &Path) -> Result<u64, String> {
 /// its own output for `project`, or `None` when every entry is recognized
 /// (#454: only a recognized store may be wiped for a clean re-run).
 fn foreign_store_entry(store_dir: &Path, store_key: &str, clone_path: &str) -> Option<String> {
-    const FIXED: [&str; 6] = [
+    const FIXED: [&str; 7] = [
         "_config.db",
         "index-args.json",
         "pipeline-stdout.json",
         "pipeline-stderr.txt",
         "logs",
         ".astrolabe-shadow-publication",
+        // #1037: a preserved staged CBM store from an aborted publication is this
+        // pipeline's own output, not a foreign entry.
+        ".astrolabe-shadow-preserved-stage",
     ];
     let index_project = recognized_pipeline_index_project(store_dir, clone_path);
     let entries = match fs::read_dir(store_dir) {

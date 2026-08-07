@@ -594,12 +594,29 @@ pub(crate) fn handle_index_repository(
         |transition_grant| {
             let shadow_started = std::time::Instant::now();
             let stage_started = std::time::Instant::now();
-            let publication = ShadowPublication::begin(&cache_dir, &project)?;
+            let mut publication = ShadowPublication::begin(&cache_dir, &project)?;
             eprintln!(
                 "astro.shadow.index_phase phase=stage_seed elapsed_ms={} total_ms={}",
                 stage_started.elapsed().as_millis(),
                 shadow_started.elapsed().as_millis()
             );
+            // #1037: the complete keying identity of the CBM pass. A corpus with no
+            // git work tree cannot be keyed, so preservation/resume are labeled
+            // unavailable rather than keyed on a partial identity.
+            let stage_fingerprint = match PreservedStageFingerprint::capture(
+                &project,
+                repo_path.as_deref(),
+                &index_admission_identity,
+                PUBLICATION_SCHEMA,
+            ) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
+                    eprintln!(
+                        "astro.shadow.preserved_stage project={project} status=unavailable reason={error}"
+                    );
+                    None
+                }
+            };
             let staged_args = match supervised_index_worker_args(
                 &sanitized_args,
                 publication.stage_cache(),
@@ -608,20 +625,60 @@ pub(crate) fn handle_index_repository(
                 Ok(args) => args,
                 Err(error) => return Err(publication.abort("worker argument binding", error)),
             };
-            let pass = match run_shadow_index_pass(
-                runner,
-                &staged_args,
-                Some(&project),
-                &skills,
-                publication.stage_cache(),
-            ) {
-                Ok(pass) => pass,
-                Err(error) => {
+            let mut adoption_evidence = Value::Null;
+            let pass = if resume_preserved_stage_requested() {
+                let Some(fingerprint) = stage_fingerprint.as_ref() else {
                     return tool_error_result(
                         publication
-                            .abort("staged index execution", error)
+                            .abort(
+                                "preserved stage adoption",
+                                "ASTRO_SHADOW_PRESERVED_STAGE_CORPUS_UNIDENTIFIABLE: a seeded resume was requested but this corpus has no exact identity to match a preserved stage against; remediation: unset ASTRO_SHADOW_RESUME_PRESERVED_STAGE and run a full index",
+                            )
                             .to_string(),
                     );
+                };
+                let adopted = match publication.adopt_preserved_stage(fingerprint) {
+                    Ok(adopted) => adopted,
+                    Err(error) => {
+                        return tool_error_result(
+                            publication
+                                .abort("preserved stage adoption", error)
+                                .to_string(),
+                        );
+                    }
+                };
+                adoption_evidence = adopted.evidence_json();
+                match resume_shadow_index_pass_from_adopted_stage(
+                    &adopted,
+                    &project,
+                    &skills,
+                    publication.stage_cache(),
+                ) {
+                    Ok(pass) => pass,
+                    Err(error) => {
+                        return tool_error_result(
+                            publication
+                                .abort("preserved stage resume", error)
+                                .to_string(),
+                        );
+                    }
+                }
+            } else {
+                match run_shadow_index_pass(
+                    runner,
+                    &staged_args,
+                    Some(&project),
+                    &skills,
+                    publication.stage_cache(),
+                ) {
+                    Ok(pass) => pass,
+                    Err(error) => {
+                        return tool_error_result(
+                            publication
+                                .abort("staged index execution", error)
+                                .to_string(),
+                        );
+                    }
                 }
             };
             let (result, resolved_project, row_sink) = match pass {
@@ -649,6 +706,17 @@ pub(crate) fn handle_index_repository(
                     return Ok(error_result);
                 }
             };
+            // #1037: from here on the stage holds a durable CBM store, so every
+            // abort preserves it instead of destroying it.
+            if let Some(fingerprint) = stage_fingerprint.as_ref()
+                && let Err(error) = publication.arm_stage_preservation(fingerprint, &result)
+            {
+                return tool_error_result(
+                    publication
+                        .abort("stage preservation arming", error)
+                        .to_string(),
+                );
+            }
             let staged = (|| -> Result<(String, ShadowImportOutcome), DynError> {
                 if resolved_project != project {
                     return Err(format!(
@@ -694,6 +762,9 @@ pub(crate) fn handle_index_repository(
                     "calyx": "shadow",
                     "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
                     "grounding_summary": grounding_summary(&outcome)?,
+                    // Never an unlabeled claim: a generation published from an
+                    // adopted preserved stage says so, with its resume token (#1037).
+                    "preserved_stage_resume": adoption_evidence,
                 }),
             )
         },

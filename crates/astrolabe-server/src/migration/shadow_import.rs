@@ -1376,6 +1376,13 @@ impl ShadowIndexAdmissionIdentity {
         &self.identity_sha256
     }
 
+    /// The exact producer binary that would run the CBM pass. Named separately
+    /// from [`Self::identity_sha256`] so a preserved-stage refusal can point at the
+    /// changed toolchain dimension directly instead of at an opaque digest (#1037).
+    pub(crate) fn producer_executable_sha256(&self) -> &str {
+        &self.producer_executable_sha256
+    }
+
     fn producer_contract_identity(&self) -> Result<Value, DynError> {
         let inputs = self
             .record
@@ -2874,6 +2881,45 @@ pub(crate) fn run_shadow_index_pass(
     Ok(ShadowIndexPassOutcome::Completed {
         raw_result,
         project,
+        candidate,
+    })
+}
+
+/// Rebuilds a [`ShadowIndexPassOutcome::Completed`] from a preserved CBM store that
+/// was adopted into `cache_dir`, without re-running the multi-hour CBM pass (#1037).
+///
+/// [`run_shadow_index_pass`] is three steps: the out-of-process CBM index, a pure
+/// read of its `<project>.db`, and a pure in-memory candidate build. Steps two and
+/// three are a total function of that persisted database plus the skill knobs, so a
+/// resume reproduces the identical outcome by running only those two. The
+/// `raw_result` is the verbatim tool response of the exact pass that produced the
+/// adopted database, bound to it by the preserved manifest's hashes.
+pub(crate) fn resume_shadow_index_pass_from_adopted_stage(
+    adopted: &AdoptedPreservedStage,
+    project: &str,
+    skills: &SkillDiscoveryConfig,
+    cache_dir: &Path,
+) -> Result<ShadowIndexPassOutcome, DynError> {
+    let pass_started = std::time::Instant::now();
+    let sqlite_path = sqlite_path(cache_dir, project);
+    if sqlite_path != adopted.staged_source() {
+        return Err(format!(
+            "ASTRO_SHADOW_PRESERVED_STAGE_ADOPT_FAILED: adopted stage {} is not the staged CBM source {} this pass would read; remediation: preserve both paths and inspect the stage layout binding",
+            adopted.staged_source().display(),
+            sqlite_path.display()
+        )
+        .into());
+    }
+    let rows = read_shadow_pipeline_rows(&sqlite_path, project)?;
+    let candidate = row_sink_import_candidate_from_rows_with_skills(rows, skills);
+    eprintln!(
+        "astro.shadow.index_phase phase=preserved_stage_resume elapsed_ms={} evidence={}",
+        pass_started.elapsed().as_millis(),
+        adopted.evidence_json()
+    );
+    Ok(ShadowIndexPassOutcome::Completed {
+        raw_result: adopted.index_tool_result().to_string(),
+        project: project.to_string(),
         candidate,
     })
 }

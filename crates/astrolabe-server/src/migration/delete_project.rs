@@ -129,6 +129,9 @@ fn project_sidecars(
         Sidecar::dir(vault),
         // Search-index manifest.
         Sidecar::file(manifest_cache_path(cache_dir, project)),
+        // Preserved staged CBM store from an aborted publication (#1037) — a
+        // multi-GB artifact that must not outlive its project.
+        Sidecar::dir(preserved_stage_dir(cache_dir, project)),
     ];
     // Lock family. Each lock file may have a sibling `.lock.guard` (the
     // exclusive-lock holder written beside the observable marker via

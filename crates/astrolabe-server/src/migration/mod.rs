@@ -147,6 +147,9 @@ pub(crate) use shadow_import::{
     shadow_available_slots,
 };
 
+mod preserved_stage;
+use preserved_stage::*;
+
 mod shadow_publication;
 use shadow_publication::*;
 
