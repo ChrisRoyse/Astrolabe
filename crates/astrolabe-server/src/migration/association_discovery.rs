@@ -1,7 +1,7 @@
 //! Production `discover_associations` surface for the complete association
 //! discovery generation (#1012).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use astrolabe_domain::{EdgeKind, TrustTag};
@@ -18,8 +18,31 @@ use super::*;
 
 const DISCOVERY_TOOL_SCHEMA: &str = "astrolabe.discover_associations.v1";
 const DISCOVERY_PERSISTED_SCHEMA: &str = "astrolabe.association_discovery.persisted.v1";
+const DISCOVERY_COMPACT_HEADER_SCHEMA: &str = "astrolabe.association_discovery.compact_header.v1";
+const DISCOVERY_CHUNK_DESCRIPTOR_SCHEMA: &str =
+    "astrolabe.association_discovery.chunk_descriptor.v1";
 const DISCOVERY_PREFIX: &[u8] = b"astrolabe:association-discovery:v1:";
 const DISCOVERY_ACTOR: &str = "astrolabe-association-discovery";
+// Calyx's default memtable admits rows up to 8 MiB. Keep every physical
+// discovery value below half that ceiling so keys and future framing overhead
+// cannot turn a valid logical artifact into an unwriteable physical row.
+const MAX_DISCOVERY_PHYSICAL_VALUE_BYTES: usize = 4 * 1024 * 1024;
+
+const PREPARED_STAGE_FIELDS: [(&str, &str, ColumnFamily); 7] = [
+    ("normalized_concepts", "concept_map", ColumnFamily::Kernel),
+    ("typed_edges", "typed_edges", ColumnFamily::Kernel),
+    ("latent", "latent", ColumnFamily::Kernel),
+    ("spectral", "spectral", ColumnFamily::Kernel),
+    ("walks", "walks", ColumnFamily::Kernel),
+    ("candidates", "candidates", ColumnFamily::Assay),
+    ("validation", "validation", ColumnFamily::Assay),
+];
+
+const FINAL_STAGE_FIELDS: [(&str, &str, ColumnFamily); 3] = [
+    ("evaluator", "evaluator", ColumnFamily::Assay),
+    ("ranked", "ranked", ColumnFamily::Kernel),
+    ("reasoning_kernel", "reasoning_kernel", ColumnFamily::Kernel),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedStage {
@@ -41,12 +64,45 @@ struct PersistedDiscoveryManifest {
     stages: Vec<PersistedStage>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedArtifactHeader {
+    schema: String,
+    artifact_sha256: String,
+    artifact_fields: serde_json::Map<String, Value>,
+    staged_artifact_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LogicalStageChunk {
+    ordinal: usize,
+    key_hex: String,
+    sha256: String,
+    bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LogicalStageDescriptor {
+    schema: String,
+    logical_name: String,
+    logical_sha256: String,
+    logical_bytes: usize,
+    chunks: Vec<LogicalStageChunk>,
+}
+
 #[derive(Clone, Debug)]
 struct StageRow {
     cf: ColumnFamily,
-    name: &'static str,
+    name: String,
     key: Vec<u8>,
     bytes: Vec<u8>,
+}
+
+struct PreparedReadback {
+    envelope: PreparedAssociationDiscoveryEnvelope,
+    snapshot: Seq,
+    manifest: PersistedDiscoveryManifest,
+    manifest_stage: PersistedStage,
+    ledger: LedgerRef,
 }
 
 pub(crate) fn discover_associations_json_at(
@@ -82,18 +138,25 @@ pub(crate) fn discover_associations_json_at(
                 &request_key,
             )?;
             let prepared_cache_hit = cached.is_some();
-            let prepared = match cached {
-                Some(prepared) => prepared,
-                None => prepare_association_discovery(&input, &config).map_err(domain_fault)?,
+            let (prepared, persistence) = match cached {
+                Some(cached) => {
+                    let persistence = cached_prepared_persistence(&cached)?;
+                    (cached.envelope, persistence)
+                }
+                None => {
+                    let prepared =
+                        prepare_association_discovery(&input, &config).map_err(domain_fault)?;
+                    let persistence = persist_prepared(
+                        &vault_dir,
+                        &vault_id,
+                        &vault_salt,
+                        source_read_snapshot,
+                        &request_key,
+                        &prepared,
+                    )?;
+                    (prepared, persistence)
+                }
             };
-            let persistence = persist_prepared(
-                &vault_dir,
-                &vault_id,
-                &vault_salt,
-                source_read_snapshot,
-                &request_key,
-                &prepared,
-            )?;
             Ok(json!({
                 "schema": DISCOVERY_TOOL_SCHEMA,
                 "status": "prepared",
@@ -132,8 +195,10 @@ pub(crate) fn discover_associations_json_at(
                     "pass the hash returned by mode=\"prepare\" and evaluator receipts bound to its evidence ids",
                 )
             })?;
-            let (prepared, read_snapshot) =
+            let prepared_readback =
                 read_prepared(&vault_dir, &vault_id, &vault_salt, project, prepared_hash)?;
+            let prepared = prepared_readback.envelope;
+            let read_snapshot = prepared_readback.snapshot;
             let evaluator_runs = evaluator_runs.ok_or_else(|| {
                 ToolFault::new(
                     "ASTRO_DISCOVERY_EVALUATOR_REQUIRED",
@@ -436,54 +501,14 @@ fn persist_prepared(
 ) -> Result<Value, DynError> {
     let hash = &prepared.artifact_sha256;
     let base = artifact_base("prepared", hash);
-    let mut rows = vec![
-        stage_json(ColumnFamily::Kernel, &base, "artifact", prepared)?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "concept_map",
-            &prepared.artifact.normalized_concepts,
-        )?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "typed_edges",
-            &prepared.artifact.typed_edges,
-        )?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "latent",
-            &prepared.artifact.latent,
-        )?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "spectral",
-            &prepared.artifact.spectral,
-        )?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "walks",
-            &prepared.artifact.walks,
-        )?,
-        stage_json(
-            ColumnFamily::Assay,
-            &base,
-            "candidates",
-            &prepared.artifact.candidates,
-        )?,
-        stage_json(
-            ColumnFamily::Assay,
-            &base,
-            "validation",
-            &prepared.artifact.validation,
-        )?,
-    ];
+    let (header, staged_values) = compact_artifact_header(prepared, hash, &PREPARED_STAGE_FIELDS)?;
+    let mut rows = stage_json_rows(ColumnFamily::Kernel, &base, "artifact", &header)?;
+    for ((_, stage_name, cf), value) in PREPARED_STAGE_FIELDS.iter().zip(staged_values) {
+        rows.extend(stage_json_rows(*cf, &base, stage_name, &value)?);
+    }
     rows.push(StageRow {
         cf: ColumnFamily::Kernel,
-        name: "prepared_request_pointer",
+        name: "prepared_request_pointer".to_string(),
         key: request_key.to_vec(),
         bytes: prepared.artifact_sha256.as_bytes().to_vec(),
     });
@@ -510,7 +535,7 @@ fn read_cached_prepared(
     source_generation_sha256: &str,
     config: &AssociationDiscoveryConfig,
     request_key: &[u8],
-) -> Result<Option<PreparedAssociationDiscoveryEnvelope>, DynError> {
+) -> Result<Option<PreparedReadback>, DynError> {
     let pointer = {
         let vault = open_shadow_vault_read_only(
             vault_dir,
@@ -530,9 +555,9 @@ fn read_cached_prepared(
             "preserve the vault and inspect the content-addressed prepared pointer",
         )
     })?;
-    let (prepared, _) = read_prepared(vault_dir, vault_id, vault_salt, project, &hash)?;
-    if prepared.artifact.source_generation_sha256 != source_generation_sha256
-        || &prepared.artifact.config != config
+    let prepared = read_prepared(vault_dir, vault_id, vault_salt, project, &hash)?;
+    if prepared.envelope.artifact.source_generation_sha256 != source_generation_sha256
+        || &prepared.envelope.artifact.config != config
     {
         return Err(ToolFault::new(
             "ASTRO_DISCOVERY_PREPARED_POINTER_MISMATCH",
@@ -554,33 +579,18 @@ fn persist_final(
 ) -> Result<Value, DynError> {
     let hash = &final_artifact.artifact_sha256;
     let base = artifact_base("final", hash);
-    let rows = vec![
-        stage_json(ColumnFamily::Kernel, &base, "artifact", final_artifact)?,
-        stage_json(
-            ColumnFamily::Assay,
-            &base,
-            "evaluator",
-            &final_artifact.artifact.evaluator,
-        )?,
-        stage_json(
-            ColumnFamily::Assay,
-            &base,
-            "validation",
-            &prepared.artifact.validation,
-        )?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "ranked",
-            &final_artifact.artifact.ranked,
-        )?,
-        stage_json(
-            ColumnFamily::Kernel,
-            &base,
-            "reasoning_kernel",
-            &final_artifact.artifact.reasoning_kernel,
-        )?,
-    ];
+    let (header, staged_values) =
+        compact_artifact_header(final_artifact, hash, &FINAL_STAGE_FIELDS)?;
+    let mut rows = stage_json_rows(ColumnFamily::Kernel, &base, "artifact", &header)?;
+    for ((_, stage_name, cf), value) in FINAL_STAGE_FIELDS.iter().zip(staged_values) {
+        rows.extend(stage_json_rows(*cf, &base, stage_name, &value)?);
+    }
+    rows.extend(stage_json_rows(
+        ColumnFamily::Assay,
+        &base,
+        "validation",
+        &prepared.artifact.validation,
+    )?);
     persist_generation(
         vault_dir,
         vault_id,
@@ -620,13 +630,13 @@ fn persist_generation(
         artifact_sha256: artifact_hash.to_string(),
         stages: stages.iter().map(stage_manifest).collect(),
     };
-    let manifest_row = stage_json(ColumnFamily::Kernel, &base, "manifest", &manifest)?;
+    let manifest_row = physical_stage_json(ColumnFamily::Kernel, &base, "manifest", &manifest)?;
     let manifest_bytes = manifest_row.bytes.clone();
     stages.push(manifest_row);
     if let Some(key) = current_pointer_key {
         stages.push(StageRow {
             cf: ColumnFamily::Kernel,
-            name: "current_pointer",
+            name: "current_pointer".to_string(),
             key,
             bytes: artifact_hash.as_bytes().to_vec(),
         });
@@ -708,37 +718,57 @@ fn read_prepared(
     vault_salt: &str,
     project: &str,
     hash: &str,
-) -> Result<(PreparedAssociationDiscoveryEnvelope, Seq), DynError> {
+) -> Result<PreparedReadback, DynError> {
     validate_hash(hash)?;
     let vault = open_shadow_vault_read_only(
         vault_dir,
         vault_id,
         vault_salt,
-        vec![ColumnFamily::Kernel, ColumnFamily::Ledger],
+        vec![
+            ColumnFamily::Kernel,
+            ColumnFamily::Assay,
+            ColumnFamily::Ledger,
+        ],
     )?;
     let snapshot = vault.latest_seq();
-    let key = stage_key(&artifact_base("prepared", hash), "artifact");
-    let bytes = vault
-        .read_cf_at(snapshot, ColumnFamily::Kernel, &key)?
+    let base = artifact_base("prepared", hash);
+    let manifest_key = stage_key(&base, "manifest");
+    let manifest_bytes = vault
+        .read_cf_at(snapshot, ColumnFamily::Kernel, &manifest_key)?
         .ok_or_else(|| {
             ToolFault::new(
                 "ASTRO_DISCOVERY_PREPARED_NOT_FOUND",
-                format!("prepared generation {hash} was not found"),
+                format!("prepared generation {hash} has no manifest"),
                 "run mode=\"prepare\" and pass its physical artifact hash",
             )
         })?;
-    if sha256_hex_local(&canonical_artifact_bytes_from_envelope(&bytes)?) != hash {
+    let manifest: PersistedDiscoveryManifest = serde_json::from_slice(&manifest_bytes)?;
+    if manifest.schema != DISCOVERY_PERSISTED_SCHEMA
+        || manifest.kind != "prepared"
+        || manifest.project != project
+        || manifest.prepared_artifact_sha256 != hash
+        || manifest.artifact_sha256 != hash
+    {
         return Err(ToolFault::new(
-            "ASTRO_DISCOVERY_PREPARED_HASH_MISMATCH",
-            format!(
-                "prepared row at {} does not rederive hash {hash}",
-                hex_lower(&key)
-            ),
-            "preserve the vault and inspect the prepared artifact bytes",
+            "ASTRO_DISCOVERY_PREPARED_MANIFEST_MISMATCH",
+            "prepared manifest disagrees with its schema, kind, project, or artifact identity",
+            "preserve the vault and inspect the content-addressed prepared manifest",
         )
         .into());
     }
-    let prepared: PreparedAssociationDiscoveryEnvelope = serde_json::from_slice(&bytes)?;
+    verify_manifest_rows(&vault, snapshot, &manifest)?;
+    let envelope_value =
+        read_compact_artifact_value(&vault, snapshot, &base, hash, &PREPARED_STAGE_FIELDS)?;
+    let prepared: PreparedAssociationDiscoveryEnvelope = serde_json::from_value(envelope_value)?;
+    let physical_hash = sha256_hex_local(&canonical_artifact_bytes(&prepared.artifact)?);
+    if physical_hash != hash {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_PREPARED_HASH_MISMATCH",
+            format!("reconstructed prepared bytes rederive {physical_hash}, expected {hash}"),
+            "preserve the vault and inspect the prepared header, descriptors, and chunks",
+        )
+        .into());
+    }
     if prepared.artifact_sha256 != hash || prepared.artifact.project != project {
         return Err(ToolFault::new(
             "ASTRO_DISCOVERY_PREPARED_IDENTITY_MISMATCH",
@@ -747,7 +777,20 @@ fn read_prepared(
         )
         .into());
     }
-    Ok((prepared, snapshot))
+    let ledger = find_discovery_ledger(&vault, snapshot, hash.as_bytes(), &manifest_bytes)?;
+    Ok(PreparedReadback {
+        envelope: prepared,
+        snapshot,
+        manifest,
+        manifest_stage: PersistedStage {
+            cf: format!("{:?}", ColumnFamily::Kernel),
+            name: "manifest".to_string(),
+            key_hex: hex_lower(&manifest_key),
+            sha256: sha256_hex_local(&manifest_bytes),
+            bytes: manifest_bytes.len(),
+        },
+        ledger,
+    })
 }
 
 fn read_discovery(
@@ -794,17 +837,7 @@ fn read_discovery(
         }
     };
     let base = artifact_base("final", &hash);
-    let artifact_key = stage_key(&base, "artifact");
     let manifest_key = stage_key(&base, "manifest");
-    let artifact_bytes = vault
-        .read_cf_at(snapshot, ColumnFamily::Kernel, &artifact_key)?
-        .ok_or_else(|| {
-            ToolFault::new(
-                "ASTRO_DISCOVERY_FINAL_NOT_FOUND",
-                format!("final discovery generation {hash} was not found"),
-                "pass a published final hash, or omit it to read the current pointer",
-            )
-        })?;
     let manifest_bytes = vault
         .read_cf_at(snapshot, ColumnFamily::Kernel, &manifest_key)?
         .ok_or_else(|| {
@@ -814,12 +847,10 @@ fn read_discovery(
                 "preserve the vault and inspect the interrupted generation transaction",
             )
         })?;
-    let final_artifact: FinalAssociationDiscoveryEnvelope =
-        serde_json::from_slice(&artifact_bytes)?;
     let manifest: PersistedDiscoveryManifest = serde_json::from_slice(&manifest_bytes)?;
-    if final_artifact.artifact_sha256 != hash
+    if manifest.schema != DISCOVERY_PERSISTED_SCHEMA
+        || manifest.kind != "final"
         || manifest.artifact_sha256 != hash
-        || final_artifact.artifact.prepared_artifact_sha256 != manifest.prepared_artifact_sha256
         || manifest.project != project
     {
         return Err(ToolFault::new(
@@ -829,7 +860,21 @@ fn read_discovery(
         )
         .into());
     }
-    let physical_hash = sha256_hex_local(&canonical_artifact_bytes_from_envelope(&artifact_bytes)?);
+    verify_manifest_rows(&vault, snapshot, &manifest)?;
+    let envelope_value =
+        read_compact_artifact_value(&vault, snapshot, &base, &hash, &FINAL_STAGE_FIELDS)?;
+    let final_artifact: FinalAssociationDiscoveryEnvelope = serde_json::from_value(envelope_value)?;
+    if final_artifact.artifact_sha256 != hash
+        || final_artifact.artifact.prepared_artifact_sha256 != manifest.prepared_artifact_sha256
+    {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_FINAL_IDENTITY_MISMATCH",
+            "reconstructed final artifact disagrees with its manifest identity",
+            "preserve the vault and inspect the final header, descriptors, and chunks",
+        )
+        .into());
+    }
+    let physical_hash = sha256_hex_local(&canonical_artifact_bytes(&final_artifact.artifact)?);
     if physical_hash != hash {
         return Err(ToolFault::new(
             "ASTRO_DISCOVERY_FINAL_HASH_MISMATCH",
@@ -867,20 +912,173 @@ fn read_discovery(
     }))
 }
 
-fn stage_json<T: Serialize>(
+fn compact_artifact_header<T: Serialize>(
+    envelope: &T,
+    expected_hash: &str,
+    staged_fields: &[(&str, &str, ColumnFamily)],
+) -> Result<(PersistedArtifactHeader, Vec<Value>), DynError> {
+    let value = serde_json::to_value(envelope)?;
+    let envelope_object = value.as_object().ok_or_else(|| {
+        ToolFault::new(
+            "ASTRO_DISCOVERY_ENVELOPE_INVALID",
+            "discovery envelope did not serialize as a JSON object",
+            "preserve the generation and inspect its typed serialization contract",
+        )
+    })?;
+    let artifact_sha256 = envelope_object
+        .get("artifact_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_ENVELOPE_HASH_MISSING",
+                "discovery envelope has no string artifact_sha256",
+                "preserve the generation and inspect its typed serialization contract",
+            )
+        })?;
+    if artifact_sha256 != expected_hash {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_ENVELOPE_HASH_MISMATCH",
+            "discovery envelope hash disagrees with its persistence identity",
+            "preserve the generation and inspect the producer hash contract",
+        )
+        .into());
+    }
+    let mut artifact_fields = envelope_object
+        .get("artifact")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_ARTIFACT_FIELD_MISSING",
+                "discovery envelope has no object artifact field",
+                "preserve the generation and inspect its typed serialization contract",
+            )
+        })?;
+    let mut values = Vec::with_capacity(staged_fields.len());
+    for (field, _, _) in staged_fields {
+        values.push(artifact_fields.remove(*field).ok_or_else(|| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_ARTIFACT_STAGE_MISSING",
+                format!("discovery artifact has no required staged field {field:?}"),
+                "preserve the generation and repair the compact persistence field map",
+            )
+        })?);
+    }
+    Ok((
+        PersistedArtifactHeader {
+            schema: DISCOVERY_COMPACT_HEADER_SCHEMA.to_string(),
+            artifact_sha256: expected_hash.to_string(),
+            artifact_fields,
+            staged_artifact_fields: staged_fields
+                .iter()
+                .map(|(field, _, _)| (*field).to_string())
+                .collect(),
+        },
+        values,
+    ))
+}
+
+fn stage_json_rows<T: Serialize>(
     cf: ColumnFamily,
     base: &[u8],
-    name: &'static str,
+    name: &str,
+    value: &T,
+) -> Result<Vec<StageRow>, DynError> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    stage_logical_bytes(cf, base, name, bytes)
+}
+
+fn physical_stage_json<T: Serialize>(
+    cf: ColumnFamily,
+    base: &[u8],
+    name: &str,
     value: &T,
 ) -> Result<StageRow, DynError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
+    if bytes.len() > MAX_DISCOVERY_PHYSICAL_VALUE_BYTES {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_MANIFEST_TOO_LARGE",
+            format!(
+                "physical stage {name:?} is {} bytes, above the {}-byte discovery row ceiling",
+                bytes.len(),
+                MAX_DISCOVERY_PHYSICAL_VALUE_BYTES
+            ),
+            "reduce physical row count per generation or introduce a separately rooted manifest tree",
+        )
+        .into());
+    }
     Ok(StageRow {
         cf,
-        name,
+        name: name.to_string(),
         key: stage_key(base, name),
         bytes,
     })
+}
+
+fn stage_logical_bytes(
+    cf: ColumnFamily,
+    base: &[u8],
+    name: &str,
+    bytes: Vec<u8>,
+) -> Result<Vec<StageRow>, DynError> {
+    if bytes.len() <= MAX_DISCOVERY_PHYSICAL_VALUE_BYTES {
+        return Ok(vec![StageRow {
+            cf,
+            name: name.to_string(),
+            key: stage_key(base, name),
+            bytes,
+        }]);
+    }
+    let logical_bytes = bytes.len();
+    let logical_sha256 = sha256_hex_local(&bytes);
+    let mut chunks = Vec::with_capacity(logical_bytes.div_ceil(MAX_DISCOVERY_PHYSICAL_VALUE_BYTES));
+    let mut chunk_rows = Vec::with_capacity(chunks.capacity());
+    let mut bytes = bytes.into_iter();
+    for ordinal in 0..chunks.capacity() {
+        let chunk = bytes
+            .by_ref()
+            .take(MAX_DISCOVERY_PHYSICAL_VALUE_BYTES)
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        let chunk_name = format!("{name}:chunk:{ordinal:08}");
+        let key = stage_key(base, &chunk_name);
+        chunks.push(LogicalStageChunk {
+            ordinal,
+            key_hex: hex_lower(&key),
+            sha256: sha256_hex_local(&chunk),
+            bytes: chunk.len(),
+        });
+        chunk_rows.push(StageRow {
+            cf,
+            name: chunk_name,
+            key,
+            bytes: chunk,
+        });
+    }
+    if bytes.next().is_some() {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_CHUNK_INTERNAL_OVERFLOW",
+            format!("logical stage {name:?} was not exhausted by its computed chunk count"),
+            "preserve the generation and inspect the discovery chunk planner",
+        )
+        .into());
+    }
+    let descriptor = LogicalStageDescriptor {
+        schema: DISCOVERY_CHUNK_DESCRIPTOR_SCHEMA.to_string(),
+        logical_name: name.to_string(),
+        logical_sha256,
+        logical_bytes,
+        chunks,
+    };
+    let descriptor_row = physical_stage_json(cf, base, name, &descriptor)?;
+    let mut rows = Vec::with_capacity(chunk_rows.len() + 1);
+    rows.push(descriptor_row);
+    rows.extend(chunk_rows);
+    Ok(rows)
 }
 
 fn stage_manifest(row: &StageRow) -> PersistedStage {
@@ -890,6 +1088,267 @@ fn stage_manifest(row: &StageRow) -> PersistedStage {
         key_hex: hex_lower(&row.key),
         sha256: sha256_hex_local(&row.bytes),
         bytes: row.bytes.len(),
+    }
+}
+
+fn read_compact_artifact_value<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    base: &[u8],
+    expected_hash: &str,
+    staged_fields: &[(&str, &str, ColumnFamily)],
+) -> Result<Value, DynError> {
+    let header_bytes = read_logical_stage(vault, snapshot, ColumnFamily::Kernel, base, "artifact")?;
+    let mut header: PersistedArtifactHeader =
+        serde_json::from_slice(&header_bytes).map_err(|error| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_COMPACT_HEADER_CORRUPT",
+                format!("discovery compact header is invalid: {error}"),
+                "preserve the vault and inspect the content-addressed artifact header",
+            )
+        })?;
+    let expected_fields = staged_fields
+        .iter()
+        .map(|(field, _, _)| (*field).to_string())
+        .collect::<Vec<_>>();
+    if header.schema != DISCOVERY_COMPACT_HEADER_SCHEMA
+        || header.artifact_sha256 != expected_hash
+        || header.staged_artifact_fields != expected_fields
+    {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_COMPACT_HEADER_MISMATCH",
+            "discovery compact header disagrees with its schema, hash, or exact staged-field contract",
+            "preserve the vault and inspect the artifact header plus manifest",
+        )
+        .into());
+    }
+    for (field, stage_name, cf) in staged_fields {
+        if header.artifact_fields.contains_key(*field) {
+            return Err(ToolFault::new(
+                "ASTRO_DISCOVERY_COMPACT_HEADER_DUPLICATE_FIELD",
+                format!("compact header duplicates separately staged field {field:?}"),
+                "preserve the vault and repair the compact persistence field map",
+            )
+            .into());
+        }
+        let bytes = read_logical_stage(vault, snapshot, *cf, base, stage_name)?;
+        let value = serde_json::from_slice(&bytes).map_err(|error| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_STAGE_JSON_CORRUPT",
+                format!("logical stage {stage_name:?} is invalid JSON: {error}"),
+                "preserve the vault and inspect the logical descriptor plus its physical chunks",
+            )
+        })?;
+        header.artifact_fields.insert((*field).to_string(), value);
+    }
+    Ok(json!({
+        "artifact_sha256": header.artifact_sha256,
+        "artifact": Value::Object(header.artifact_fields),
+    }))
+}
+
+fn read_logical_stage<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    cf: ColumnFamily,
+    base: &[u8],
+    name: &str,
+) -> Result<Vec<u8>, DynError> {
+    let logical_key = stage_key(base, name);
+    let physical = vault
+        .read_cf_at(snapshot, cf, &logical_key)?
+        .ok_or_else(|| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_STAGE_MISSING",
+                format!(
+                    "logical stage {name:?} is absent at {}",
+                    hex_lower(&logical_key)
+                ),
+                "preserve the vault and inspect the generation manifest",
+            )
+        })?;
+    if physical.len() > MAX_DISCOVERY_PHYSICAL_VALUE_BYTES {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_PHYSICAL_STAGE_OVERSIZED",
+            format!(
+                "logical stage {name:?} has an unchunked {}-byte physical value",
+                physical.len()
+            ),
+            "preserve the vault and republish through bounded logical-stage chunking",
+        )
+        .into());
+    }
+    let parsed: Value = serde_json::from_slice(&physical).map_err(|error| {
+        ToolFault::new(
+            "ASTRO_DISCOVERY_STAGE_JSON_CORRUPT",
+            format!("logical stage {name:?} is invalid JSON: {error}"),
+            "preserve the vault and inspect the generation manifest plus physical row",
+        )
+    })?;
+    if parsed.get("schema").and_then(Value::as_str) != Some(DISCOVERY_CHUNK_DESCRIPTOR_SCHEMA) {
+        return Ok(physical);
+    }
+    let descriptor: LogicalStageDescriptor = serde_json::from_value(parsed).map_err(|error| {
+        ToolFault::new(
+            "ASTRO_DISCOVERY_CHUNK_DESCRIPTOR_CORRUPT",
+            format!("logical stage {name:?} descriptor is invalid: {error}"),
+            "preserve the vault and inspect the descriptor bytes",
+        )
+    })?;
+    let expected_chunk_count = descriptor
+        .logical_bytes
+        .div_ceil(MAX_DISCOVERY_PHYSICAL_VALUE_BYTES);
+    if descriptor.logical_name != name
+        || descriptor.logical_bytes <= MAX_DISCOVERY_PHYSICAL_VALUE_BYTES
+        || descriptor.chunks.len() != expected_chunk_count
+        || descriptor.chunks.is_empty()
+    {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_CHUNK_DESCRIPTOR_MISMATCH",
+            format!(
+                "logical stage {name:?} descriptor has inconsistent name, size, or chunk count"
+            ),
+            "preserve the vault and inspect the descriptor/chunk generation",
+        )
+        .into());
+    }
+    let mut reconstructed = Vec::with_capacity(descriptor.logical_bytes);
+    for (ordinal, chunk) in descriptor.chunks.iter().enumerate() {
+        let expected_name = format!("{name}:chunk:{ordinal:08}");
+        let expected_key = stage_key(base, &expected_name);
+        if chunk.ordinal != ordinal || chunk.key_hex != hex_lower(&expected_key) {
+            return Err(ToolFault::new(
+                "ASTRO_DISCOVERY_CHUNK_IDENTITY_MISMATCH",
+                format!("logical stage {name:?} chunk {ordinal} has a mismatched ordinal or key"),
+                "preserve the vault and inspect the descriptor/chunk identities",
+            )
+            .into());
+        }
+        let bytes = vault
+            .read_cf_at(snapshot, cf, &expected_key)?
+            .ok_or_else(|| {
+                ToolFault::new(
+                    "ASTRO_DISCOVERY_CHUNK_MISSING",
+                    format!("logical stage {name:?} chunk {ordinal} is absent"),
+                    "preserve the vault and inspect the interrupted generation transaction",
+                )
+            })?;
+        let expected_size = if ordinal + 1 == descriptor.chunks.len() {
+            descriptor.logical_bytes - ordinal * MAX_DISCOVERY_PHYSICAL_VALUE_BYTES
+        } else {
+            MAX_DISCOVERY_PHYSICAL_VALUE_BYTES
+        };
+        if bytes.len() != chunk.bytes
+            || bytes.len() != expected_size
+            || bytes.len() > MAX_DISCOVERY_PHYSICAL_VALUE_BYTES
+            || sha256_hex_local(&bytes) != chunk.sha256
+        {
+            return Err(ToolFault::new(
+                "ASTRO_DISCOVERY_CHUNK_HASH_MISMATCH",
+                format!(
+                    "logical stage {name:?} chunk {ordinal} failed size or SHA-256 verification"
+                ),
+                "preserve the vault and inspect the exact physical chunk row",
+            )
+            .into());
+        }
+        reconstructed.extend_from_slice(&bytes);
+    }
+    if reconstructed.len() != descriptor.logical_bytes
+        || sha256_hex_local(&reconstructed) != descriptor.logical_sha256
+    {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_LOGICAL_STAGE_HASH_MISMATCH",
+            format!("logical stage {name:?} failed reconstructed size or SHA-256 verification"),
+            "preserve the vault and inspect the ordered physical chunk stream",
+        )
+        .into());
+    }
+    Ok(reconstructed)
+}
+
+fn verify_manifest_rows<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    manifest: &PersistedDiscoveryManifest,
+) -> Result<(), DynError> {
+    let mut identities = BTreeSet::new();
+    for stage in &manifest.stages {
+        let cf = manifest_column_family(&stage.cf)?;
+        let key = decode_hex_local(&stage.key_hex)?;
+        if !identities.insert((cf, key.clone())) {
+            return Err(ToolFault::new(
+                "ASTRO_DISCOVERY_MANIFEST_DUPLICATE_ROW",
+                format!("manifest repeats {} row {}", stage.cf, stage.key_hex),
+                "preserve the vault and inspect the persisted manifest",
+            )
+            .into());
+        }
+        let bytes = vault.read_cf_at(snapshot, cf, &key)?.ok_or_else(|| {
+            ToolFault::new(
+                "ASTRO_DISCOVERY_MANIFEST_ROW_MISSING",
+                format!("manifested {} row {} is absent", stage.cf, stage.key_hex),
+                "preserve the vault and inspect the interrupted group commit",
+            )
+        })?;
+        if bytes.len() != stage.bytes || sha256_hex_local(&bytes) != stage.sha256 {
+            return Err(ToolFault::new(
+                "ASTRO_DISCOVERY_MANIFEST_ROW_MISMATCH",
+                format!(
+                    "manifested {} row {} failed byte/SHA-256 verification",
+                    stage.cf, stage.key_hex
+                ),
+                "preserve the vault and inspect the exact physical row plus manifest",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn manifest_column_family(name: &str) -> Result<ColumnFamily, DynError> {
+    match name {
+        "Kernel" => Ok(ColumnFamily::Kernel),
+        "Assay" => Ok(ColumnFamily::Assay),
+        other => Err(ToolFault::new(
+            "ASTRO_DISCOVERY_MANIFEST_CF_UNSUPPORTED",
+            format!("discovery manifest names unsupported column family {other:?}"),
+            "preserve the vault and inspect the generation manifest",
+        )
+        .into()),
+    }
+}
+
+fn decode_hex_local(value: &str) -> Result<Vec<u8>, DynError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(ToolFault::new(
+            "ASTRO_DISCOVERY_MANIFEST_KEY_INVALID",
+            "manifest key hex has odd length",
+            "preserve the vault and inspect the generation manifest",
+        )
+        .into());
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble_local(pair[0])?;
+            let low = hex_nibble_local(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble_local(value: u8) -> Result<u8, DynError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(ToolFault::new(
+            "ASTRO_DISCOVERY_MANIFEST_KEY_INVALID",
+            "manifest key contains non-lowercase-hexadecimal bytes",
+            "preserve the vault and inspect the generation manifest",
+        )
+        .into()),
     }
 }
 
@@ -995,6 +1454,24 @@ fn persistence_response(
     }))
 }
 
+fn cached_prepared_persistence(readback: &PreparedReadback) -> Result<Value, DynError> {
+    let mut stages = readback.manifest.stages.clone();
+    stages.push(readback.manifest_stage.clone());
+    Ok(json!({
+        "schema": DISCOVERY_PERSISTED_SCHEMA,
+        "state": "unchanged",
+        "snapshot_seq": readback.snapshot,
+        "rows_read_back_verified": stages.len(),
+        "stages": stages,
+        "ledger_paired": true,
+        "ledger_ref": {
+            "seq": readback.ledger.seq,
+            "hash": hex_lower(&readback.ledger.hash),
+        },
+        "fsv": Value::Null,
+    }))
+}
+
 fn signature_or_shape(node: &astrolabe_ingest::CbmGraphNode) -> Result<String, DynError> {
     let properties: Value = serde_json::from_str(&node.properties_json)?;
     let object = properties.as_object().ok_or_else(|| {
@@ -1041,15 +1518,7 @@ fn edge_family(kind: EdgeKind) -> &'static str {
     }
 }
 
-fn canonical_artifact_bytes_from_envelope(bytes: &[u8]) -> Result<Vec<u8>, DynError> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    let artifact = value.get("artifact").ok_or_else(|| {
-        ToolFault::new(
-            "ASTRO_DISCOVERY_ARTIFACT_FIELD_MISSING",
-            "persisted discovery envelope has no artifact field",
-            "preserve the vault and inspect the persisted envelope bytes",
-        )
-    })?;
+fn canonical_artifact_bytes<T: Serialize>(artifact: &T) -> Result<Vec<u8>, DynError> {
     let mut canonical = serde_json::to_vec_pretty(artifact)?;
     canonical.push(b'\n');
     Ok(canonical)
