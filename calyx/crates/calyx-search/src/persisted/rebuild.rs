@@ -117,7 +117,10 @@ pub(super) fn previous_manifest(vault_dir: &Path) -> CliResult<Option<SearchInde
 }
 
 pub fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
-    let snapshot = vault.pin_reader(calyx_aster::mvcc::Freshness::FreshDerived, 300_000);
+    let snapshot = vault.pin_reader(
+        calyx_aster::mvcc::Freshness::FreshDerived,
+        calyx_aster::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default,
+    );
     let _guard = PinnedReadGuard::new(vault, snapshot);
     load_docs_at(vault, _guard.snapshot())
 }

@@ -165,10 +165,10 @@ fn pin_search_readback<'a>(
             phase,
             cx_id,
             Some(format!(
-                "lease_id={} max_age_ms={} expires_at={}",
+                "lease_id={} stall_window_ms={} issued_at={}",
                 read.lease_id(),
                 read.lease_max_age_ms(),
-                read.lease_expires_at()
+                read.lease_issued_at()
             )),
         )),
     );
@@ -217,12 +217,12 @@ fn contextualize_hit_hydration_error(
     }
     calyx_core::CalyxError::reader_lease_expired(format!(
         "reader lease expired while hydrating search hit: hit_index={hit_index}, cx_id={}, \
-         snapshot_seq={}, lease_id={}, max_age_ms={}, expires_at={}",
+         snapshot_seq={}, lease_id={}, stall_window_ms={}, issued_at={}",
         hit.cx_id,
         read.seq(),
         read.lease_id(),
         read.lease_max_age_ms(),
-        read.lease_expires_at()
+        read.lease_issued_at()
     ))
     .into()
 }

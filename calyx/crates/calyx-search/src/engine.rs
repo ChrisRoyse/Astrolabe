@@ -38,8 +38,11 @@ pub use types::{FusionChoice, GuardChoice, SearchFreshness, SearchOutcome};
 /// explicit flat tau (issue #1088) and for the flat-path unit tests.
 pub const DEFAULT_IN_REGION_GUARD_TAU: f32 = 0.999;
 
-/// Bounded MVCC reader lease for a whole search readback pass.
-const SEARCH_READER_LEASE_MS: u64 = 300_000;
+/// Stall window for a held search read session, read from the declared
+/// snapshot-pin knob registry (#1038). It bounds time without demonstrated
+/// vault progress, not the duration of the readback pass.
+const SEARCH_READER_LEASE_MS: u64 =
+    calyx_aster::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default;
 
 /// Run the real search over `vault` (already opened) using its persisted
 /// indexes at `vault_dir`. `state` is the loaded panel state (the query is

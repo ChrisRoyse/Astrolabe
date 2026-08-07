@@ -7,6 +7,83 @@ use crate::cf::{ColumnFamily, KeyRange};
 use crate::mvcc::{OrderedReadbackMetrics, Snapshot, SstReadGeneration};
 use calyx_core::{Clock, Result, Seq};
 
+/// Pin-independent part of one ordered readback plan (#980 g25).
+///
+/// Validating ordinals, cloning the plan, sorting it into `(CF, key, ordinal)`
+/// order, and sizing the publication buffers are pure functions of `reads`: they
+/// touch no vault state and cannot resolve a row. At corpus scale that setup
+/// runs longer than the whole base stall window, so performing it under a pinned
+/// reader lease both blocked version GC for no reason and made the holder's own
+/// preparation look like a stall. Preparing before the pin removes the window
+/// entirely for [`AsterVault::visit_ordered_cf_plan_at`].
+struct PreparedOrderedPlan<'a> {
+    ordered: Vec<OrderedCfRead<'a>>,
+    buffered_values: Vec<Option<Vec<u8>>>,
+    buffered_seen: Vec<bool>,
+    index_bytes: u64,
+}
+
+impl<'a> PreparedOrderedPlan<'a> {
+    fn prepare<E>(reads: &[OrderedCfRead<'a>]) -> std::result::Result<Self, E>
+    where
+        E: From<calyx_core::CalyxError>,
+    {
+        if let Some((position, read)) = reads
+            .iter()
+            .enumerate()
+            .find(|(position, read)| read.ordinal != *position)
+        {
+            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                format!(
+                    "ordered readback input position {position} carries ordinal {} instead of its stable input position",
+                    read.ordinal
+                ),
+            )));
+        }
+        let mut ordered = reads.to_vec();
+        ordered.sort_unstable_by(|left, right| {
+            left.cf
+                .cmp(&right.cf)
+                .then_with(|| left.key.cmp(right.key))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+        });
+        let mut index_bytes = ordered
+            .capacity()
+            .checked_mul(std::mem::size_of::<OrderedCfRead<'_>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback plan-index byte count overflow",
+                ))
+            })?;
+        let buffered_values: Vec<Option<Vec<u8>>> = vec![None; reads.len()];
+        let buffered_seen = vec![false; reads.len()];
+        let publication_index_bytes = buffered_values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Option<Vec<u8>>>())
+            .and_then(|bytes| bytes.checked_add(buffered_seen.capacity()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback publication-buffer byte count overflow",
+                ))
+            })?;
+        index_bytes = index_bytes
+            .checked_add(publication_index_bytes)
+            .ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(
+                    "ordered readback retained-index byte count overflow",
+                ))
+            })?;
+        Ok(Self {
+            ordered,
+            buffered_values,
+            buffered_seen,
+            index_bytes,
+        })
+    }
+}
+
 impl<C> AsterVault<C>
 where
     C: Clock,
@@ -105,9 +182,12 @@ where
         E: From<calyx_core::CalyxError>,
         F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
     {
+        // Prepare before pinning: see `PreparedOrderedPlan`. No corpus-
+        // proportional work may run between the pin and the first read (#980 g25).
+        let plan = PreparedOrderedPlan::prepare(reads)?;
         self.sst_read_session_at(snapshot)
             .map_err(E::from)?
-            .visit_ordered_cf_plan(reads, on_row)
+            .visit_prepared_ordered_plan(plan, reads, on_row)
     }
 
     /// Opens one retained-snapshot session for a complete logical multi-get.
@@ -119,6 +199,7 @@ where
         &self,
         generation: &SstReadGeneration<'_>,
         snapshot: Snapshot,
+        plan: PreparedOrderedPlan<'_>,
         reads: &[OrderedCfRead<'_>],
         mut on_row: F,
     ) -> std::result::Result<OrderedReadbackMetrics, E>
@@ -126,63 +207,17 @@ where
         E: From<calyx_core::CalyxError>,
         F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
     {
-        if let Some((position, read)) = reads
-            .iter()
-            .enumerate()
-            .find(|(position, read)| read.ordinal != *position)
-        {
-            return Err(E::from(calyx_core::CalyxError::aster_corrupt_shard(
-                format!(
-                    "ordered readback input position {position} carries ordinal {} instead of its stable input position",
-                    read.ordinal
-                ),
-            )));
-        }
-        let mut ordered = reads.to_vec();
-        ordered.sort_unstable_by(|left, right| {
-            left.cf
-                .cmp(&right.cf)
-                .then_with(|| left.key.cmp(right.key))
-                .then_with(|| left.ordinal.cmp(&right.ordinal))
-        });
-        let mut index_bytes = ordered
-            .capacity()
-            .checked_mul(std::mem::size_of::<OrderedCfRead<'_>>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                E::from(calyx_core::CalyxError::aster_corrupt_shard(
-                    "ordered readback plan-index byte count overflow",
-                ))
-            })?;
-        let mut buffered_values: Vec<Option<Vec<u8>>> = vec![None; reads.len()];
-        let mut buffered_seen = vec![false; reads.len()];
-        let publication_index_bytes = buffered_values
-            .capacity()
-            .checked_mul(std::mem::size_of::<Option<Vec<u8>>>())
-            .and_then(|bytes| bytes.checked_add(buffered_seen.capacity()))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                E::from(calyx_core::CalyxError::aster_corrupt_shard(
-                    "ordered readback publication-buffer byte count overflow",
-                ))
-            })?;
-        index_bytes = index_bytes
-            .checked_add(publication_index_bytes)
-            .ok_or_else(|| {
-                E::from(calyx_core::CalyxError::aster_corrupt_shard(
-                    "ordered readback retained-index byte count overflow",
-                ))
-            })?;
+        let PreparedOrderedPlan {
+            ordered,
+            mut buffered_values,
+            mut buffered_seen,
+            index_bytes,
+        } = plan;
         let mut metrics = OrderedReadbackMetrics {
             session_snapshot_seq: snapshot.seq(),
             plan_index_bytes: index_bytes,
             ..OrderedReadbackMetrics::default()
         };
-        // Sorting the plan and sizing the publication buffers is itself minutes of
-        // forward progress on a corpus-sized readback, and it happens before the
-        // first CF group's liveness check. Record it so plan setup can never be
-        // mistaken for a stalled reader (#980).
-        self.rows.record_reader_progress(snapshot, &self.clock);
         let mut start = 0;
         while start < ordered.len() {
             let cf = ordered[start].cf;
@@ -370,9 +405,28 @@ where
         E: From<calyx_core::CalyxError>,
         F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
     {
+        // Reached with the session already pinned, so the caller's plan
+        // preparation necessarily runs under the lease — which is exactly why a
+        // session is a session-class holder (#1038, and the session stall window
+        // in `sst_read_session_at`).
+        let plan = PreparedOrderedPlan::prepare(reads)?;
+        self.visit_prepared_ordered_plan(plan, reads, on_row)
+    }
+
+    fn visit_prepared_ordered_plan<E, F>(
+        &self,
+        plan: PreparedOrderedPlan<'_>,
+        reads: &[OrderedCfRead<'_>],
+        on_row: F,
+    ) -> std::result::Result<OrderedReadbackMetrics, E>
+    where
+        E: From<calyx_core::CalyxError>,
+        F: FnMut(usize, ColumnFamily, &[u8], Option<&[u8]>) -> std::result::Result<(), E>,
+    {
         self.vault.visit_ordered_cf_plan_snapshot(
             &self.generation,
             self.snapshot.snapshot(),
+            plan,
             reads,
             on_row,
         )

@@ -90,6 +90,12 @@ pub struct PinnedSeqStatus {
     pub oldest_pinned_seq_gap: u64,
     pub active_leases: usize,
     pub reader_lease_expired_total: u64,
+    /// Declared snapshot-pin stall window in effect for scoped vault operations,
+    /// read from `crate::knobs::SNAPSHOT_PIN_STALL_WINDOW_MS` (#1038). Emitted so
+    /// the governing knob can be read back out of a running store rather than
+    /// inferred from source. The knob's stable name is carried by the
+    /// `calyx_snapshot_pin_stall_window_ms{knob="..."}` metric label.
+    pub declared_stall_window_ms: u64,
 }
 
 /// WAL footprint section, measured from `wal/*.wal` segment files.
@@ -191,6 +197,14 @@ impl ResourceStatus {
             "calyx_reader_lease_expired_total",
             base.clone(),
             self.pinned.reader_lease_expired_total,
+        );
+        metric(
+            "calyx_snapshot_pin_stall_window_ms",
+            format!(
+                "{base},knob=\"{}\"",
+                crate::knobs::SNAPSHOT_PIN_STALL_WINDOW_MS.name
+            ),
+            self.pinned.declared_stall_window_ms,
         );
         metric(
             "calyx_backpressure_events_total",

@@ -18,7 +18,10 @@ pub(crate) const PROBE_ANCHOR_CF_DRIFT_CODE: &str = "CALYX_PROBE_ANCHOR_CF_DRIFT
 pub(crate) const GROUNDING_FLAG_DRIFT_CODE: &str = "CALYX_GROUNDING_FLAG_DRIFT";
 pub(crate) const GROUNDING_REMEDIATION: &str = "ingest or replay real anchored content, rebuild derived indexes, then rerun the grounding audit before FSV";
 
-const GROUNDING_READER_LEASE_MS: u64 = 300_000;
+/// Stall window for the grounding audit's held read session, read from the
+/// declared snapshot-pin knob registry (#1038).
+const GROUNDING_READER_LEASE_MS: u64 =
+    calyx_aster::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GroundingAudit {

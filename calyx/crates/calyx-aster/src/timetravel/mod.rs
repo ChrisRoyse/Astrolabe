@@ -22,9 +22,9 @@ pub use retention::{
 pub(crate) use time_index::entry_row;
 pub use time_index::{TimeIndexEntry, read_all};
 
-/// Lease age for a time-travel pin. Long enough for a historical read session;
-/// the pin is released on drop regardless.
-const TIMETRAVEL_LEASE_MS: u64 = 60_000;
+/// Stall window for a time-travel pin, read from the declared snapshot-pin knob
+/// registry (#1038). The pin is released on drop regardless.
+const TIMETRAVEL_LEASE_MS: u64 = crate::knobs::SNAPSHOT_PIN_TIMETRAVEL_STALL_WINDOW_MS.default;
 
 /// A read handle pinned to a historical MVCC sequence resolved from a timestamp.
 ///

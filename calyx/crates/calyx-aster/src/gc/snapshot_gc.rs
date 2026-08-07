@@ -19,9 +19,6 @@ pub use reclaimer::{
 /// Reader id used by the watchdog and MVCC lease registry.
 pub type ReaderId = u64;
 
-/// Default reader lease age, matching the PH58 FoundationDB-style discipline.
-pub const DEFAULT_READER_LEASE_MS: u64 = 5_000;
-
 /// Default maximum allowed `newest_seq - oldest_pinned_seq` gap.
 pub const DEFAULT_MAX_PINNED_SEQ_GAP: u64 = 1_000_000;
 

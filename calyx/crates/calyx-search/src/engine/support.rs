@@ -68,8 +68,11 @@ impl<'a> SearchReadSnapshot<'a> {
         self.snapshot.lease().max_age_ms()
     }
 
-    pub(super) fn lease_expires_at(&self) -> u64 {
-        self.snapshot.lease().expires_at()
+    /// Instant the lease was issued. The authoritative deadline lives in the
+    /// vault's lease registry and moves with demonstrated progress, so an
+    /// `expires_at` derived from this copy would be a false claim (#1038).
+    pub(super) fn lease_issued_at(&self) -> u64 {
+        self.snapshot.lease().issued_at()
     }
 }
 

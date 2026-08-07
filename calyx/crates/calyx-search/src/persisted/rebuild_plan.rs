@@ -8,7 +8,8 @@ use crate::error::{CliError, CliResult};
 use crate::persisted::SearchIndexManifest;
 
 const DEFAULT_REBUILD_SLOT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
-const DEFAULT_REBUILD_READER_LEASE_MS: u64 = 60 * 60 * 1000;
+const DEFAULT_REBUILD_READER_LEASE_MS: u64 =
+    calyx_aster::knobs::SNAPSHOT_PIN_REBUILD_STALL_WINDOW_MS.default;
 const DEFAULT_REBUILD_SCAN_PAGE_ROWS: usize = 4096;
 const DEFAULT_SLOT_ROW_MEMORY_ESTIMATE_BYTES: usize = 32 * 1024;
 const MIN_SLOT_MEMORY_ESTIMATE_BYTES: usize = 1024 * 1024;

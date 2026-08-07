@@ -60,17 +60,6 @@ impl LeaseRegistry {
         self.watchdog.abort_if_expired_at(lease_id, now)
     }
 
-    /// Aborts one lease if the caller observed it expired at `now`.
-    pub fn abort_if_expired(&self, lease: ReaderLease, now: Ts) -> bool {
-        let probe = ReadLease::from_millis(
-            lease.id(),
-            lease.pinned_seq(),
-            lease.issued_at(),
-            lease.max_age_ms(),
-        );
-        probe.is_expired_at(now) && self.watchdog.abort_if_expired_at(lease.id(), now)
-    }
-
     /// Background tick hook: abort all expired leases at `now`.
     pub fn check_and_abort_expired(&self, now: Ts) -> Vec<ReaderId> {
         self.watchdog.check_and_abort_expired_at(now)

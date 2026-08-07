@@ -1,4 +1,4 @@
-use super::{AsterVault, DEFAULT_LEASE_MS};
+use super::AsterVault;
 use crate::mvcc::{Freshness, Snapshot, SstReadGeneration, VersionedCfStore};
 use calyx_core::{Clock, Result, Seq};
 
@@ -50,9 +50,27 @@ where
     C: Clock,
 {
     pub(super) fn snapshot_handle(&self, seq: Seq) -> ScopedSnapshot<'_> {
+        self.snapshot_handle_with_stall_window(
+            seq,
+            crate::knobs::SNAPSHOT_PIN_STALL_WINDOW_MS.default,
+        )
+    }
+
+    /// Pins a scoped snapshot under an explicitly chosen stall window.
+    ///
+    /// The window classifies the *holder*, not the read. A scoped vault
+    /// operation resolves rows continuously and reaches a progress point within
+    /// microseconds of pinning, so it uses the base window. A retained session
+    /// hands control back to a caller that may run for minutes between reads, so
+    /// it uses the session window (#1038).
+    fn snapshot_handle_with_stall_window(
+        &self,
+        seq: Seq,
+        stall_window_ms: u64,
+    ) -> ScopedSnapshot<'_> {
         let snapshot =
             self.rows
-                .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, DEFAULT_LEASE_MS);
+                .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, stall_window_ms);
         ScopedSnapshot {
             rows: &self.rows,
             snapshot,
@@ -60,8 +78,20 @@ where
     }
 
     /// Pins one snapshot lease for a complete logical multi-get operation.
+    ///
+    /// A session is a **session-class** holder: the `SstReadSession` is returned
+    /// to the caller, which routinely builds a corpus-proportional key plan,
+    /// ranks, or audits between reads, so it reaches a progress point far less
+    /// often than a scoped operation. Pinning it under the base window made a
+    /// legitimate holder's own preparation indistinguishable from a stall and
+    /// reaped the pin before its first read (#980 g25: 5,165 ms of plan setup
+    /// against a 5,000 ms window, zero progress recorded). The pin is still
+    /// released on `Drop`, so the wider window bounds only an abandoned handle.
     pub fn sst_read_session_at(&self, seq: Seq) -> Result<SstReadSession<'_, C>> {
-        let snapshot = self.snapshot_handle(seq);
+        let snapshot = self.snapshot_handle_with_stall_window(
+            seq,
+            crate::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default,
+        );
         let generation = self
             .rows
             .retain_sst_read_generation(snapshot.snapshot(), &self.clock)?;

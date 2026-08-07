@@ -36,6 +36,20 @@ pub(crate) fn run_resource_drill(vault: &Path, args: ResourceDrillArgs) -> crate
     };
     let store = open_resource_vault(vault, options)?;
 
+    let knob = calyx_aster::knobs::SNAPSHOT_PIN_STALL_WINDOW_MS;
+    println!(
+        "RESOURCE_DRILL KNOB registry_version={} name={} default={} min={} max={} unit={} \
+         requested={} accepted={}",
+        knob.registry_version,
+        knob.name,
+        knob.default,
+        knob.min,
+        knob.max,
+        knob.unit,
+        args.pin_max_age_ms,
+        knob.accepts(args.pin_max_age_ms)
+    );
+
     print_status(&store, vault, "BEFORE")?;
 
     let pinned = store.pin_reader(Freshness::FreshDerived, args.pin_max_age_ms);

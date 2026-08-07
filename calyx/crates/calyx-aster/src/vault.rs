@@ -230,8 +230,6 @@ impl VaultRouterHandoffReport {
     }
 }
 
-const DEFAULT_LEASE_MS: u64 = 5_000;
-
 /// Single-vault Aster store with content-addressed ingest semantics.
 #[derive(Debug)]
 pub struct AsterVault<C = SystemClock> {

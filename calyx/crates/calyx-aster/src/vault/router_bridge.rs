@@ -1,4 +1,4 @@
-use super::{AsterVault, DEFAULT_LEASE_MS, VaultOpenDiagnostics, VaultRecoveryReport};
+use super::{AsterVault, VaultOpenDiagnostics, VaultRecoveryReport};
 use crate::cf::CfRouter;
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{Freshness, Snapshot, VersionedCfStore};
@@ -43,7 +43,7 @@ where
         self.rows.pin_snapshot(
             Freshness::StaleOk { max_lag },
             &self.clock,
-            DEFAULT_LEASE_MS,
+            crate::knobs::SNAPSHOT_PIN_STALL_WINDOW_MS.default,
         )
     }
 

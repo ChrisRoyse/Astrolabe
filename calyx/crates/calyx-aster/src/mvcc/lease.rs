@@ -1,6 +1,6 @@
 //! Sequence allocation, freshness, and reader lease handles.
 
-use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
+use calyx_core::{CalyxError, Result, Seq, Ts};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Vault-wide monotonic sequence allocator.
@@ -100,9 +100,12 @@ impl Freshness {
 /// duration can be a correct budget for a corpus-sized readback.
 ///
 /// This value is an immutable `Copy` handed to every read call, so it carries
-/// the lease's *issue-time identity*, not its authoritative deadline. The live
-/// deadline is owned by the lease registry, which a progressing holder refreshes
-/// in place (#980); see `VersionedCfStore::record_reader_progress`.
+/// the lease's *issue-time identity* only. It deliberately exposes no expiry
+/// predicate: the live deadline is owned solely by the lease registry, which a
+/// progressing holder refreshes in place (#980, #1038). Every liveness decision
+/// goes through `VersionedCfStore::ensure_snapshot_live`; deriving one from
+/// `issued_at + max_age_ms` here would reintroduce the operation-budget
+/// semantics #980 removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReaderLease {
     id: u64,
@@ -137,52 +140,6 @@ impl ReaderLease {
     /// demonstrating forward progress before version GC may reclaim its pin.
     pub const fn max_age_ms(self) -> u64 {
         self.max_age_ms
-    }
-
-    /// Milliseconds since this lease was issued, measured from the immutable
-    /// copy. The registry tracks the authoritative time since last progress.
-    pub const fn age_at(self, now: Ts) -> u64 {
-        now.saturating_sub(self.issued_at)
-    }
-
-    pub fn expires_at(self) -> Ts {
-        self.issued_at.saturating_add(self.max_age_ms)
-    }
-
-    pub fn is_expired_at(self, now: Ts) -> bool {
-        now >= self.expires_at()
-    }
-
-    pub fn is_expired(self, clock: &dyn Clock) -> bool {
-        self.is_expired_at(clock.now())
-    }
-
-    /// Fail-closed liveness check against this immutable copy's own window.
-    ///
-    /// Callers that hold a registered lease should go through
-    /// `VersionedCfStore::ensure_snapshot_live`, which consults the registry's
-    /// authoritative progress deadline first (#980). This copy-local check is
-    /// the fallback for a lease that is no longer registered at all.
-    pub fn ensure_live_at(self, now: Ts) -> Result<()> {
-        if self.is_expired_at(now) {
-            return Err(CalyxError::reader_lease_expired(format!(
-                "reader lease {} for seq {} expired at {}: unregistered holder made no \
-                 observable progress for {} ms (issued at {}, stall window max_age_ms={}, \
-                 observed at {})",
-                self.id,
-                self.pinned_seq,
-                self.expires_at(),
-                self.age_at(now),
-                self.issued_at,
-                self.max_age_ms,
-                now
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn ensure_live(self, clock: &dyn Clock) -> Result<()> {
-        self.ensure_live_at(clock.now())
     }
 }
 
@@ -235,9 +192,5 @@ impl Snapshot {
 
     pub const fn lease(self) -> ReaderLease {
         self.lease
-    }
-
-    pub fn ensure_live(self, clock: &dyn Clock) -> Result<()> {
-        self.lease.ensure_live(clock)
     }
 }

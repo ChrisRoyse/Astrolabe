@@ -715,8 +715,15 @@ impl VersionedCfStore {
     ///
     /// Expiry is therefore reserved for a reader that genuinely stopped making
     /// progress for a whole stall window — its pin is reclaimable and the read
-    /// must not continue. An unregistered lease (released or aborted) falls back
-    /// to its copy-local window, exactly as before.
+    /// must not continue.
+    ///
+    /// A lease with no registry entry is refused outright (#1038). Every
+    /// `Snapshot` is born registered — `pin_snapshot` and `pin_snapshot_at` are
+    /// the only constructors and both register — so a missing entry means the
+    /// lease was released, aborted, or reclaimed, and versions at or below
+    /// `pinned_seq` are already reclaimable. Consulting the immutable copy's own
+    /// window here would let a read outlive its pin for up to `max_age_ms`,
+    /// which is the operation-budget semantics #980 removed.
     pub(super) fn ensure_snapshot_live(&self, snapshot: Snapshot, clock: &dyn Clock) -> Result<()> {
         let now = clock.now();
         let lease = snapshot.lease();
@@ -735,7 +742,17 @@ impl VersionedCfStore {
                     lease.pinned_seq()
                 )))
             }
-            None => lease.ensure_live_at(now),
+            None => Err(calyx_core::CalyxError::reader_lease_expired(format!(
+                "reader lease {} for seq {} is not registered: its snapshot pin was released, \
+                 aborted, or reclaimed before this read (pinned at {}, stall window \
+                 max_age_ms={}, observed at {now}). Version GC may already have reclaimed seq \
+                 <= {}, so this read is refused; pin a fresh snapshot and retry",
+                lease.id(),
+                lease.pinned_seq(),
+                lease.issued_at(),
+                lease.max_age_ms(),
+                lease.pinned_seq()
+            ))),
         }
     }
 

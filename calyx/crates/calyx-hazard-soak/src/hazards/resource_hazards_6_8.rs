@@ -50,6 +50,9 @@ fn probe_h6_long_reader(root: &Path) -> ProbeResult {
     let key = b"ph59-h6-long-reader-key".to_vec();
 
     write_versions(&store, &key, 1, 10_000, 512)?;
+    // Deliberate hazard-injection window: 200 ms, twice the declared knob floor
+    // `MIN_SNAPSHOT_PIN_STALL_WINDOW_MS`, chosen so the FixedClock jump to
+    // START_TS+850 lands past expiry with no progress recorded (#1038).
     let pinned = store.pin_snapshot_at(5_000, Freshness::FreshDerived, &clock, 200);
     let pinned_read_len = store
         .read_at(pinned, ColumnFamily::Base, &key, &clock)

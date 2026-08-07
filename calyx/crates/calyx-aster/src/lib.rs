@@ -12,6 +12,7 @@ mod file_lock;
 mod fsync;
 pub mod gc;
 pub mod index;
+pub mod knobs;
 pub mod layers;
 pub mod ledger_head;
 pub mod ledger_view;
