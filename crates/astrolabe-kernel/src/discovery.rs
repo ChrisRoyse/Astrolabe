@@ -455,6 +455,40 @@ pub fn prepare_association_discovery(
     }
 
     let candidates = build_candidates(input, &evidence_index, &latent, &spectral_report);
+    if candidates.is_empty() {
+        let intermediaries_considered = latent
+            .iter()
+            .map(|report| report.intermediaries_considered)
+            .sum::<u64>();
+        let intermediaries_over_broad = latent
+            .iter()
+            .map(|report| report.intermediaries_over_broad)
+            .sum::<u64>();
+        let pairs_accumulated = latent
+            .iter()
+            .map(|report| report.pairs_accumulated)
+            .sum::<u64>();
+        let pairs_below_min_shared = latent
+            .iter()
+            .map(|report| report.pairs_below_min_shared)
+            .sum::<u64>();
+        let pairs_direct_edge = latent
+            .iter()
+            .map(|report| report.pairs_direct_edge)
+            .sum::<u64>();
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_GRAPH_INVALID,
+            format!(
+                "no latent candidate exists after the declared association gates: \
+                 intermediaries_considered={intermediaries_considered}, \
+                 intermediaries_over_broad={intermediaries_over_broad}, \
+                 pairs_accumulated={pairs_accumulated}, \
+                 pairs_below_min_shared={pairs_below_min_shared}, \
+                 pairs_direct_edge={pairs_direct_edge}"
+            ),
+            "inspect the disclosed gate counts; change a breadth/shared-intermediary limit only with measured evidence, or repair missing graph associations",
+        ));
+    }
     let (walks, gate_counts) = run_typed_walks(
         input,
         &evidence_index,
@@ -1023,8 +1057,8 @@ fn run_typed_walks(
     if seeds.is_empty() {
         return Err(DomainError::new(
             ASTRO_DISCOVERY_GRAPH_INVALID,
-            "no latent candidate exists from which to seed a gated walk",
-            "lower the declared shared-intermediary floor only with measured evidence, or repair missing graph associations",
+            "non-empty candidate set yielded no distinct gated-walk seed",
+            "preserve the generation and inspect candidate endpoint identities; every candidate must carry a valid A endpoint",
         ));
     }
     let anchors = input
