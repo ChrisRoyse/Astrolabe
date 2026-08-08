@@ -1144,6 +1144,16 @@ CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
                                  include_paths, NULL);
 }
 
+CBMFileResult *cbm_extract_file_at_path_with_rust_edition_context(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, int64_t timeout_micros,
+    const CBMPreprocessContextSet *preprocess_contexts) {
+    return cbm_extract_file_impl(source, source_len, language, project, rel_path, source_path,
+                                 rust_edition, rust_is_crate_root, NULL, NULL, timeout_micros, NULL,
+                                 NULL, preprocess_contexts);
+}
+
 CBMFileResult *cbm_extract_file_at_path_with_metadata(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, const char *source_path, const char *rust_edition,

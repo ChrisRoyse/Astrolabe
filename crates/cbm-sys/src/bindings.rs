@@ -1337,6 +1337,20 @@ unsafe extern "C" {
     ) -> *mut CBMFileResult;
 }
 unsafe extern "C" {
+    pub fn cbm_extract_file_at_path_with_rust_edition_context(
+        source: *const ::std::os::raw::c_char,
+        source_len: ::std::os::raw::c_int,
+        language: CBMLanguage,
+        project: *const ::std::os::raw::c_char,
+        rel_path: *const ::std::os::raw::c_char,
+        source_path: *const ::std::os::raw::c_char,
+        rust_edition: *const ::std::os::raw::c_char,
+        rust_is_crate_root: bool,
+        timeout_micros: i64,
+        preprocess_contexts: *const CBMPreprocessContextSet,
+    ) -> *mut CBMFileResult;
+}
+unsafe extern "C" {
     pub fn cbm_extract_file_at_path_with_metadata(
         source: *const ::std::os::raw::c_char,
         source_len: ::std::os::raw::c_int,

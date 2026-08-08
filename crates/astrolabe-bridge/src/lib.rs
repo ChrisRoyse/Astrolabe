@@ -3639,6 +3639,15 @@ pub struct ExtractedFile {
 }
 
 impl ExtractedFile {
+    /// Extract one file without declaring any C-family compilation-context
+    /// state.
+    ///
+    /// The `None` handoff below is the literal "no state declared" case: a
+    /// C/C++/CUDA input refuses with `CBM_PREPROCESS_CONTEXT_REQUIRED` instead
+    /// of being extracted against guessed host flags. That refusal is the
+    /// #969 guarantee and is preserved here deliberately; migrating this
+    /// entrypoint's callers (`migration::guard`) to a declared state is #1062,
+    /// out of scope for #1061.
     pub fn extract(
         source: &str,
         language: Language,
@@ -3646,9 +3655,30 @@ impl ExtractedFile {
         rel_path: &str,
         timeout_micros: i64,
     ) -> Result<Self, BridgeError> {
-        Self::extract_with_rust_context(source, language, project, rel_path, false, timeout_micros)
+        Self::extract_with_declared_contexts(
+            source,
+            language,
+            project,
+            rel_path,
+            false,
+            timeout_micros,
+            None,
+        )
     }
 
+    /// Extract one historical/standalone blob that has no build database.
+    ///
+    /// The explicit empty set (`items: NULL, count: 0`) declares the
+    /// **configuration-absent** state to libcbm (#1061): the caller has looked
+    /// and no real build configuration consumes this source, so there is
+    /// nothing to bind. libcbm retains definitions and imports and labels the
+    /// file `CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT` while dropping raw call
+    /// views — a counted, labeled degradation, never an invented host context.
+    /// Passing `NULL` here instead would be the "caller forgot to thread
+    /// context" state and would refuse every C-family input; guessing flags
+    /// would violate the no-silent-fallback invariant. Callers that read only
+    /// `imports()`/`definitions()` (the archaeology dependency planner) lose
+    /// nothing measurable.
     pub fn extract_with_rust_context(
         source: &str,
         language: Language,
@@ -3656,6 +3686,35 @@ impl ExtractedFile {
         rel_path: &str,
         rust_is_crate_root: bool,
         timeout_micros: i64,
+    ) -> Result<Self, BridgeError> {
+        let configuration_absent = cbm_sys::CBMPreprocessContextSet {
+            items: ptr::null(),
+            count: 0,
+        };
+        Self::extract_with_declared_contexts(
+            source,
+            language,
+            project,
+            rel_path,
+            rust_is_crate_root,
+            timeout_micros,
+            Some(&configuration_absent),
+        )
+    }
+
+    /// Shared extraction body. `preprocess_contexts` is the caller's declared
+    /// C-family compilation-context state and is forwarded verbatim: `None`
+    /// becomes the C `NULL` (no state declared), `Some(set)` becomes a pointer
+    /// to that exact set. Nothing is defaulted on either side of the FFI
+    /// boundary.
+    fn extract_with_declared_contexts(
+        source: &str,
+        language: Language,
+        project: &str,
+        rel_path: &str,
+        rust_is_crate_root: bool,
+        timeout_micros: i64,
+        preprocess_contexts: Option<&cbm_sys::CBMPreprocessContextSet>,
     ) -> Result<Self, BridgeError> {
         initialize_cbm_allocator()?;
         let source_len = c_int::try_from(source.len()).map_err(|_| {
@@ -3669,11 +3728,16 @@ impl ExtractedFile {
         let project = CString::new(project)?;
         let rel_path = CString::new(rel_path)?;
 
+        let preprocess_contexts = preprocess_contexts.map_or(ptr::null(), |set| {
+            set as *const cbm_sys::CBMPreprocessContextSet
+        });
+
         // SAFETY: cbm_init is idempotent in libcbm. The C strings outlive the call,
-        // and source is passed with an explicit byte length.
+        // source is passed with an explicit byte length, and preprocess_contexts
+        // borrows the caller's live set for the duration of this synchronous call.
         unsafe {
             map_cbm_status(cbm_sys::cbm_init())?;
-            let ptr = cbm_sys::cbm_extract_file_at_path_with_rust_edition(
+            let ptr = cbm_sys::cbm_extract_file_at_path_with_rust_edition_context(
                 source.as_ptr().cast::<c_char>(),
                 source_len,
                 language.as_raw(),
@@ -3683,8 +3747,7 @@ impl ExtractedFile {
                 ptr::null(),
                 rust_is_crate_root,
                 timeout_micros,
-                ptr::null_mut(),
-                ptr::null_mut(),
+                preprocess_contexts,
             );
             let extracted = Self {
                 ptr: NonNull::new(ptr).ok_or_else(|| {

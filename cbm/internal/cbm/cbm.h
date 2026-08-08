@@ -773,6 +773,33 @@ CBMFileResult *cbm_extract_file_at_path_with_rust_edition(
     bool rust_is_crate_root, int64_t timeout_micros, const char **extra_defines,
     const char **include_paths);
 
+/* Rust-aware production extraction that also carries the caller's explicit
+ * C-family compilation-context state (#1061). The caller always declares one of
+ * exactly three states; the entrypoint forwards it verbatim and never
+ * substitutes a default:
+ *   - NULL                       — no state declared. C/C++/CUDA extraction
+ *                                  refuses with CBM_PREPROCESS_CONTEXT_REQUIRED
+ *                                  rather than guessing host flags. This is the
+ *                                  behavior of the context-free entrypoint above
+ *                                  and stays a refusal here too.
+ *   - {items: NULL, count: 0}    — configuration absent. The caller has looked
+ *                                  and no real build configuration consumes this
+ *                                  source. Definitions and imports are retained;
+ *                                  raw call views are dropped and the file is
+ *                                  labeled CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT.
+ *   - {items: ..., count: N > 0} — bound. Extraction uses the exact translation
+ *                                  units; count > 0 with items == NULL refuses
+ *                                  with CBM_PREPROCESS_CONTEXT_INVALID.
+ * The set and everything it borrows are read only for this synchronous call.
+ * Unlike the context-free entrypoint this variant takes no extra_defines /
+ * include_paths: since #969 those are ignored for C-family sources (the compile
+ * context is authoritative) and unused elsewhere. */
+CBMFileResult *cbm_extract_file_at_path_with_rust_edition_context(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, const char *source_path, const char *rust_edition,
+    bool rust_is_crate_root, int64_t timeout_micros,
+    const CBMPreprocessContextSet *preprocess_contexts);
+
 /* Production extraction with immutable repository metadata. Structured
  * classification overrides are accepted only for structured-data languages;
  * NULL selects measured structural classification. All metadata is borrowed
