@@ -312,8 +312,25 @@ pub(crate) struct GitArchaeologyImportReport {
     /// seed set so each file-scoped CBM view is dependency-complete.
     pub(crate) historical_dependency_files_materialized: usize,
     /// Alternative immutable-tree candidates probed and proven absent while a
-    /// typed Rust/ES dependency still resolved to exactly one live source.
+    /// typed Rust/ES dependency still resolved to exactly one live source. Since
+    /// #1063 this also counts the unused entries of a C-family include search
+    /// path: probing every `-I`-style ancestor base is how the nearest one is
+    /// found, so most bases are expected to be absent.
     pub(crate) historical_dependency_candidate_paths_absent: usize,
+    /// #1063 labeled degradation: required source dependencies (`ExactlyOne` and
+    /// C-family include search paths) that matched no file in the immutable tree.
+    /// The dependency edge is dropped and the historical view is a labeled partial
+    /// view — never a silent one, and never an aborted pass (invariant 3).
+    pub(crate) historical_dependency_source_missing: usize,
+    /// #1063 labeled degradation: dependency requests that matched two or more
+    /// immutable-tree sources with no labeled rule to choose between them (a true
+    /// same-depth include-search-path tie, or a multi-candidate typed request whose
+    /// alternatives all exist). The edge is dropped rather than picked unlabeled.
+    pub(crate) historical_dependency_source_ambiguous: usize,
+    /// #1063 labeled degradation: optional dependency requests (relative-looking
+    /// browser URLs) that resolved to no repository-local source. Previously an
+    /// uncounted silent drop.
+    pub(crate) historical_dependency_optional_unresolved: usize,
     /// Exact source-dependency edges traversed while closing historical views.
     pub(crate) historical_dependency_edges: usize,
     /// Repeated dependency targets suppressed by the visited set (including
@@ -729,6 +746,9 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         report.historical_dependency_files_materialized += indexed.dependency_files_materialized;
         report.historical_dependency_candidate_paths_absent +=
             indexed.dependency_candidate_paths_absent;
+        report.historical_dependency_source_missing += indexed.dependency_source_missing;
+        report.historical_dependency_source_ambiguous += indexed.dependency_source_ambiguous;
+        report.historical_dependency_optional_unresolved += indexed.dependency_optional_unresolved;
         report.historical_dependency_edges += indexed.dependency_edges;
         report.historical_dependency_revisits += indexed.dependency_revisits;
         report.historical_dependency_max_depth = report
@@ -2870,6 +2890,12 @@ struct HistoricalCommitIndex {
     object_probe_processes_avoided: usize,
     dependency_files_materialized: usize,
     dependency_candidate_paths_absent: usize,
+    /// #1063 labeled degradations for this commit's dependency closure: required
+    /// dependencies with no immutable-tree source, requests with an unchooseable
+    /// multi-source match, and optional requests that stayed repository-external.
+    dependency_source_missing: usize,
+    dependency_source_ambiguous: usize,
+    dependency_optional_unresolved: usize,
     dependency_edges: usize,
     dependency_revisits: usize,
     dependency_depth: usize,
@@ -2893,6 +2919,10 @@ struct HistoricalMaterialization {
     object_probe_processes_avoided: usize,
     dependency_files_materialized: usize,
     dependency_candidate_paths_absent: usize,
+    /// #1063 labeled degradations, mirrored from the file-scoped closure report.
+    dependency_source_missing: usize,
+    dependency_source_ambiguous: usize,
+    dependency_optional_unresolved: usize,
     dependency_edges: usize,
     dependency_revisits: usize,
     dependency_depth: usize,
@@ -3062,6 +3092,9 @@ fn index_historical_commit(
                 object_probe_processes_avoided: materialized.object_probe_processes_avoided,
                 dependency_files_materialized: materialized.dependency_files_materialized,
                 dependency_candidate_paths_absent: materialized.dependency_candidate_paths_absent,
+                dependency_source_missing: materialized.dependency_source_missing,
+                dependency_source_ambiguous: materialized.dependency_source_ambiguous,
+                dependency_optional_unresolved: materialized.dependency_optional_unresolved,
                 dependency_edges: materialized.dependency_edges,
                 dependency_revisits: materialized.dependency_revisits,
                 dependency_depth: materialized.dependency_depth,
@@ -3106,6 +3139,9 @@ fn index_historical_commit(
                 object_probe_processes_avoided: materialized.object_probe_processes_avoided,
                 dependency_files_materialized: materialized.dependency_files_materialized,
                 dependency_candidate_paths_absent: materialized.dependency_candidate_paths_absent,
+                dependency_source_missing: materialized.dependency_source_missing,
+                dependency_source_ambiguous: materialized.dependency_source_ambiguous,
+                dependency_optional_unresolved: materialized.dependency_optional_unresolved,
                 dependency_edges: materialized.dependency_edges,
                 dependency_revisits: materialized.dependency_revisits,
                 dependency_depth: materialized.dependency_depth,
@@ -3878,6 +3914,9 @@ fn materialize_historical_tree(
             object_probe_processes_avoided,
             dependency_files_materialized: materialized.dependency_files_materialized,
             dependency_candidate_paths_absent: materialized.dependency_candidate_paths_absent,
+            dependency_source_missing: materialized.dependency_source_missing,
+            dependency_source_ambiguous: materialized.dependency_source_ambiguous,
+            dependency_optional_unresolved: materialized.dependency_optional_unresolved,
             dependency_edges: materialized.dependency_edges,
             dependency_revisits: materialized.dependency_revisits,
             dependency_depth: materialized.dependency_depth,
@@ -4001,6 +4040,9 @@ fn materialize_historical_tree(
         object_probe_processes_avoided,
         dependency_files_materialized: 0,
         dependency_candidate_paths_absent: 0,
+        dependency_source_missing: 0,
+        dependency_source_ambiguous: 0,
+        dependency_optional_unresolved: 0,
         dependency_edges: 0,
         dependency_revisits: 0,
         dependency_depth: 0,
@@ -4015,6 +4057,11 @@ struct FileScopedHistoricalBlobMaterialization {
     absent_paths: Vec<String>,
     dependency_files_materialized: usize,
     dependency_candidate_paths_absent: usize,
+    /// #1063 labeled degradations for this commit's closure. See
+    /// [`DependencyUnresolved`] for the exact classification each one counts.
+    dependency_source_missing: usize,
+    dependency_source_ambiguous: usize,
+    dependency_optional_unresolved: usize,
     dependency_edges: usize,
     dependency_revisits: usize,
     dependency_depth: usize,
@@ -4043,6 +4090,9 @@ fn materialize_file_scoped_historical_blobs(
         absent_paths: Vec::new(),
         dependency_files_materialized: 0,
         dependency_candidate_paths_absent: 0,
+        dependency_source_missing: 0,
+        dependency_source_ambiguous: 0,
+        dependency_optional_unresolved: 0,
         dependency_edges: 0,
         dependency_revisits: 0,
         dependency_depth: 0,
@@ -4108,10 +4158,63 @@ fn materialize_file_scoped_historical_blobs(
     Ok(report)
 }
 
+/// How many immutable-tree sources one planned dependency request may resolve to,
+/// and what an off-cardinality outcome means. Since #1063 an off-cardinality
+/// outcome is never fatal: it is a counted, logged, closure-hashed degradation
+/// (invariant 3), because a deliberately file-scoped historical checkout is a
+/// partial view by construction and the planner's contract is materialization
+/// sufficiency, not repository completeness.
 #[derive(Clone, Copy)]
 enum DependencyCardinality {
+    /// The language's own resolution rules name exactly one source (typed Rust
+    /// modules, ES specifier families, includer-relative `./`/`../` quote
+    /// includes). Zero matches count as [`DependencyUnresolved::SourceMissing`],
+    /// two or more as [`DependencyUnresolved::SourceAmbiguous`].
     ExactlyOne,
+    /// The import may legitimately resolve outside the repository (a browser URL
+    /// that merely looks relative). Zero matches count as
+    /// [`DependencyUnresolved::OptionalUnresolved`] — before #1063 this was the
+    /// module's one silent, uncounted drop.
     AtMostOne,
+    /// An ordered include search path (#1063). Candidates are produced by
+    /// [`c_include_search_path_candidates`]: depth 0 is the includer's own
+    /// directory and each further candidate is one directory closer to the corpus
+    /// root, mirroring how the real build resolves a bare `#include "a/b.h"`
+    /// through `-I` roots. Two or more matches select the nearest ancestor under
+    /// the `dependency_resolution=nearest_ancestor_search_path` label; a true
+    /// same-depth tie counts as [`DependencyUnresolved::SourceAmbiguous`] rather
+    /// than becoming an unlabeled preference; zero matches count as
+    /// [`DependencyUnresolved::SourceMissing`].
+    AtMostOneCounted,
+}
+
+/// A dependency request that produced no edge, recorded as a labeled degradation
+/// (#1063): counted on the per-commit report, logged as
+/// `astro.archaeology.dependency_unresolved`, and folded into the closure sha256
+/// so two commits differing only in what they failed to resolve can never claim
+/// the same closure identity.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DependencyUnresolved {
+    /// A required source dependency matched no file in the immutable tree.
+    SourceMissing,
+    /// Two or more immutable-tree sources matched with no labeled rule to choose.
+    SourceAmbiguous,
+    /// An optional (possibly repository-external) request matched no local file.
+    OptionalUnresolved,
+}
+
+impl DependencyUnresolved {
+    /// Stable token used in the `astro.archaeology.dependency_unresolved` log line
+    /// AND inside the `astrolabe.historical-dependency-closure.v1` hash domain.
+    /// Changing a token changes every affected commit's closure identity, so these
+    /// spellings are frozen with the domain version.
+    fn token(self) -> &'static str {
+        match self {
+            Self::SourceMissing => "source_missing",
+            Self::SourceAmbiguous => "source_ambiguous",
+            Self::OptionalUnresolved => "optional_unresolved",
+        }
+    }
 }
 
 struct HistoricalDependencyRequest {
@@ -4120,14 +4223,51 @@ struct HistoricalDependencyRequest {
     kind: String,
     candidates: Vec<String>,
     cardinality: DependencyCardinality,
+    /// [`DependencyCardinality::AtMostOneCounted`] only: candidate → include
+    /// search-path depth (0 = the includer's directory, +1 per ancestor step
+    /// toward the corpus root). Empty for every other cardinality. The map is the
+    /// authority for nearest-ancestor selection; `candidates` itself is sorted for
+    /// deterministic probing and carries no ordering meaning.
+    search_path_depth: BTreeMap<String, usize>,
 }
 
+/// Plan the immutable-tree candidates for one extracted import.
+///
+/// `language` is the INCLUDER's libcbm language: C-family includers (#1063) get
+/// the ordered include search path for bare quote includes, because libcbm marks
+/// every non-angle include `ExactSource` while the real build resolves it through
+/// `-I` roots, not only the includer's directory.
 fn plan_historical_dependency(
     source_path: &str,
     source_rel: &str,
+    language: Language,
     import: &Import,
 ) -> Result<Option<HistoricalDependencyRequest>, DynError> {
+    let mut search_path_depth = BTreeMap::<String, usize>::new();
     let (candidates, cardinality, default_kind) = match import.resolution {
+        // #1063: a bare C-family quote include (`#include "foundation/constants.h"`)
+        // is resolved by the real build through the compiler's include search path.
+        // `./`- and `../`-prefixed spellings are includer-relative by definition and
+        // keep the exact pre-#1063 single-candidate plan.
+        ImportResolution::ExactSource
+            if is_c_family_language(language)
+                && !is_relative_source_request(&import.module_path) =>
+        {
+            let search_path = c_include_search_path_candidates(source_rel, &import.module_path)?;
+            let mut candidates = Vec::with_capacity(search_path.len());
+            for (candidate, depth) in search_path {
+                search_path_depth
+                    .entry(candidate.clone())
+                    .and_modify(|nearest| *nearest = (*nearest).min(depth))
+                    .or_insert(depth);
+                candidates.push(candidate);
+            }
+            (
+                candidates,
+                DependencyCardinality::AtMostOneCounted,
+                "exact_source",
+            )
+        }
         ImportResolution::ExactSource => (
             vec![normalize_exact_source_dependency(
                 source_rel,
@@ -4181,11 +4321,147 @@ fn plan_historical_dependency(
             .unwrap_or_else(|| default_kind.to_string()),
         candidates: candidates.into_iter().collect(),
         cardinality,
+        search_path_depth,
     }))
 }
 
 fn is_relative_source_request(module_path: &str) -> bool {
     module_path.starts_with("./") || module_path.starts_with("../")
+}
+
+/// The libcbm grammars whose imports flow through `parse_c_imports`
+/// (`cbm/internal/cbm/extract_imports.c` language dispatch) and therefore emit
+/// every non-angle `#include` as [`ImportResolution::ExactSource`]. Exactly these
+/// three includer languages get the #1063 include search path.
+fn is_c_family_language(language: Language) -> bool {
+    language == Language::C || language == Language::CPP || language == Language::OBJC
+}
+
+/// Ordered include search path for one bare C-family quote include (#1063).
+///
+/// Returns `(candidate, depth)` pairs in the ONLY order the selection rule
+/// recognizes: depth 0 is `module_path` joined onto the includer's own directory
+/// (byte-identical to the pre-#1063 single candidate, including its fail-closed
+/// `PATH_INVALID`/`SCOPE_ESCAPE` contract), then one candidate per ancestor
+/// directory outward, ending at the corpus root. That mirrors how libcbm's own
+/// build resolves `foundation/constants.h` from `src/pipeline/` through `-Isrc`.
+///
+/// This order is load-bearing: nearest-ancestor selection picks the smallest
+/// depth, so it decides which file enters the closure and therefore the closure
+/// sha256. The walk never steps above the corpus root, so `SCOPE_ESCAPE` remains
+/// the fail-closed contract for spellings that try to leave the indexed corpus.
+fn c_include_search_path_candidates(
+    source_rel: &str,
+    module_path: &str,
+) -> Result<Vec<(String, usize)>, DynError> {
+    let mut candidates = vec![(
+        normalize_exact_source_dependency(source_rel, module_path)?,
+        0usize,
+    )];
+    let mut base = dependency_base_directory(source_rel);
+    let mut depth = 0usize;
+    while !base.is_empty() {
+        base = dependency_base_directory(base);
+        depth = depth.checked_add(1).ok_or_else(|| -> DynError {
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_SEARCH_PATH_DEPTH_OVERFLOW: include search-path depth overflowed usize; remediation=preserve the checkout and inspect the impossible path depth"
+                .into()
+        })?;
+        match normalize_dependency_under_base(source_rel, base, module_path) {
+            Ok(candidate) => candidates.push((candidate, depth)),
+            // Not a swallowed degradation: a search-path base with fewer components
+            // than the spelling's embedded `..` needs cannot NAME any path inside
+            // the corpus, so it contributes no candidate at all. Depth 0 already
+            // enforced the spelling's own fail-closed contract, and shallower bases
+            // are monotonically worse, so the walk stops here deterministically.
+            Err(_) => break,
+        }
+    }
+    Ok(candidates)
+}
+
+/// The directory component of a corpus-relative path (empty = the corpus root).
+fn dependency_base_directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// A labeled include-search-path selection (#1063).
+struct NearestAncestorSelection {
+    /// Materialized (corpus-prefixed) path of the winning candidate.
+    materialized: String,
+    /// `true` when the answer was NOT the trivially unique includer-relative one:
+    /// it came from an ancestor base, or it beat other live candidates. Exactly
+    /// these selections are logged as `dependency_resolution=…` and counted.
+    labeled: bool,
+}
+
+/// Nearest-ancestor selection for a [`DependencyCardinality::AtMostOneCounted`]
+/// request: among the live candidates, the one with the smallest include
+/// search-path depth wins (depth 0 = the includer's own directory). The choice is
+/// disclosed as an `astro.archaeology.dependency_resolution` line carrying the
+/// winning path and its ancestor depth whenever it is not the trivial answer.
+///
+/// Returns `Ok(None)` for a true same-depth tie: the caller counts that as
+/// [`DependencyUnresolved::SourceAmbiguous`] and drops the edge rather than
+/// making an unlabeled preference. Fails closed only on planner defects (a live
+/// candidate with no planned depth, or an empty match set).
+fn select_nearest_ancestor_dependency(
+    commit: &str,
+    request: &HistoricalDependencyRequest,
+    matches: &[(String, String)],
+) -> Result<Option<NearestAncestorSelection>, DynError> {
+    let mut winner: Option<(usize, &String, &String)> = None;
+    let mut tied_at_nearest = false;
+    for (candidate, materialized) in matches {
+        let depth = request
+            .search_path_depth
+            .get(candidate)
+            .copied()
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_SEARCH_PATH_DEPTH_MISSING: commit {commit} source {:?} dependency {:?} matched candidate {candidate:?} that carries no planned include search-path depth; remediation=repair the C-family include search-path planner before retrying",
+                    request.source_path, request.module_path
+                )
+                .into()
+            })?;
+        let nearer = match winner {
+            None => true,
+            Some((nearest, _, _)) => {
+                if depth == nearest {
+                    tied_at_nearest = true;
+                }
+                depth < nearest
+            }
+        };
+        if nearer {
+            winner = Some((depth, candidate, materialized));
+            tied_at_nearest = false;
+        }
+    }
+    let Some((depth, candidate, materialized)) = winner else {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_DEPENDENCY_SEARCH_PATH_EMPTY: commit {commit} source {:?} dependency {:?} entered nearest-ancestor selection with no live candidate; remediation=repair the dependency selection call site before retrying",
+            request.source_path, request.module_path
+        )
+        .into());
+    };
+    if tied_at_nearest {
+        return Ok(None);
+    }
+    let labeled = depth > 0 || matches.len() > 1;
+    if labeled {
+        eprintln!(
+            "astro.archaeology.dependency_resolution commit={commit} dependency_resolution=nearest_ancestor_search_path source={:?} module={:?} kind={} selected={candidate:?} ancestor_depth={depth} candidates={} matches={}",
+            request.source_path,
+            request.module_path,
+            request.kind,
+            request.candidates.len(),
+            matches.len()
+        );
+    }
+    Ok(Some(NearestAncestorSelection {
+        materialized: materialized.clone(),
+        labeled,
+    }))
 }
 
 fn es_source_dependency_candidates(
@@ -4575,6 +4851,17 @@ fn historical_rust_is_crate_root(
 /// source dependency using libcbm's own extraction semantics. The ordinary CBM
 /// pipeline remains fail-closed; this planner makes its filesystem view truthful
 /// instead of asking it to resolve a deliberately incomplete checkout.
+///
+/// #1063: a dependency the immutable tree cannot supply is a LABELED partial
+/// view, not a failure. Requests that resolve to no source, to an unchooseable
+/// set of sources, or (optionally) to nothing local are counted on the report
+/// (`dependency_source_missing` / `dependency_source_ambiguous` /
+/// `dependency_optional_unresolved`), logged as
+/// `astro.archaeology.dependency_unresolved`, and hashed into
+/// `dependency_closure_sha256`. Fatal is reserved for planner defects
+/// (`DEPENDENCY_PLAN_EMPTY`, `DEPENDENCY_PATH_INVALID`,
+/// `DEPENDENCY_SCOPE_ESCAPE`, `DEPENDENCY_CLOSURE_LIMIT`,
+/// `DEPENDENCY_WINDOWS_PATH_INVALID`) and for git/IO faults.
 fn materialize_file_scoped_historical_closure(
     repo: &Path,
     checkout_root: &Path,
@@ -4592,6 +4879,13 @@ fn materialize_file_scoped_historical_closure(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut dependency_edges = BTreeSet::<(String, String, String)>::new();
+    // #1063: every request that produced no edge, as
+    // `(state, source_path, module_path, kind)`. Counted, logged, and hashed into
+    // the closure identity so a partial view is never mistaken for a complete one.
+    let mut unresolved_requests = BTreeSet::<(DependencyUnresolved, String, String, String)>::new();
+    // #1063: include-search-path resolutions that were NOT the trivially unique
+    // includer-relative answer — i.e. a labeled nearest-ancestor choice.
+    let mut nearest_ancestor_selections = 0usize;
     let mut depth = 0usize;
 
     while !frontier.is_empty() {
@@ -4687,7 +4981,8 @@ fn materialize_file_scoped_historical_closure(
                 )
                 .into()
             })? {
-                let Some(request) = plan_historical_dependency(source_path, source_rel, &import)?
+                let Some(request) =
+                    plan_historical_dependency(source_path, source_rel, language, &import)?
                 else {
                     continue;
                 };
@@ -4755,31 +5050,87 @@ fn materialize_file_scoped_historical_closure(
 
         let mut next = BTreeSet::new();
         for request in requests {
+            // `(corpus-relative candidate, materialized path)` for every candidate
+            // that actually exists in this commit's checkout. The corpus-relative
+            // half is what `search_path_depth` is keyed by.
             let matches = request
                 .candidates
                 .iter()
-                .map(|candidate| corpus_materialized_path(corpus_rel, candidate))
-                .filter(|candidate| checkout_root.join(candidate).is_file())
+                .map(|candidate| {
+                    (
+                        candidate.clone(),
+                        corpus_materialized_path(corpus_rel, candidate),
+                    )
+                })
+                .filter(|(_, materialized)| checkout_root.join(materialized).is_file())
                 .collect::<Vec<_>>();
-            let selected = match (request.cardinality, matches.as_slice()) {
-                (DependencyCardinality::ExactlyOne, [selected])
-                | (DependencyCardinality::AtMostOne, [selected]) => Some(selected.clone()),
-                (DependencyCardinality::AtMostOne, []) => None,
-                (DependencyCardinality::ExactlyOne, []) => {
-                    return Err(format!(
-                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_SOURCE_MISSING: commit {commit} source {:?} {} dependency {:?} has no source among {:?}; remediation=restore the exact source file or repair the importing path before retrying; no partial historical view was indexed",
-                        request.source_path, request.kind, request.module_path, request.candidates
-                    )
-                    .into());
+            // #1063: an off-cardinality outcome is a labeled degradation, never an
+            // abort. Fatal remains reserved for planner defects (empty plan,
+            // invalid/escaping paths, closure limit) and git/IO faults.
+            let (selected, unresolved) = match (request.cardinality, matches.as_slice()) {
+                (DependencyCardinality::ExactlyOne, [(_, single)])
+                | (DependencyCardinality::AtMostOne, [(_, single)]) => (Some(single.clone()), None),
+                (DependencyCardinality::AtMostOneCounted, [_, ..]) => {
+                    match select_nearest_ancestor_dependency(commit, &request, &matches)? {
+                        Some(selection) => {
+                            if selection.labeled {
+                                nearest_ancestor_selections = nearest_ancestor_selections
+                                    .checked_add(1)
+                                    .ok_or_else(|| -> DynError {
+                                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_SELECTION_OVERFLOW: labeled nearest-ancestor selection count overflowed usize"
+                                            .into()
+                                    })?;
+                            }
+                            (Some(selection.materialized), None)
+                        }
+                        None => (None, Some(DependencyUnresolved::SourceAmbiguous)),
+                    }
                 }
-                (_, _) => {
-                    return Err(format!(
-                        "ASTRO_ARCHAEOLOGY_DEPENDENCY_SOURCE_AMBIGUOUS: commit {commit} source {:?} {} dependency {:?} matches multiple immutable-tree sources {:?}; remediation=remove the conflicting source candidates before retrying; no partial historical view was indexed",
-                        request.source_path, request.kind, request.module_path, matches
-                    )
-                    .into());
+                (DependencyCardinality::ExactlyOne, [])
+                | (DependencyCardinality::AtMostOneCounted, []) => {
+                    (None, Some(DependencyUnresolved::SourceMissing))
+                }
+                (DependencyCardinality::AtMostOne, []) => {
+                    (None, Some(DependencyUnresolved::OptionalUnresolved))
+                }
+                (DependencyCardinality::ExactlyOne, [_, ..])
+                | (DependencyCardinality::AtMostOne, [_, ..]) => {
+                    (None, Some(DependencyUnresolved::SourceAmbiguous))
                 }
             };
+            if let Some(state) = unresolved {
+                let counter = match state {
+                    DependencyUnresolved::SourceMissing => &mut report.dependency_source_missing,
+                    DependencyUnresolved::SourceAmbiguous => {
+                        &mut report.dependency_source_ambiguous
+                    }
+                    DependencyUnresolved::OptionalUnresolved => {
+                        &mut report.dependency_optional_unresolved
+                    }
+                };
+                *counter = counter.checked_add(1).ok_or_else(|| -> DynError {
+                    "ASTRO_ARCHAEOLOGY_DEPENDENCY_UNRESOLVED_OVERFLOW: unresolved dependency count overflowed usize"
+                        .into()
+                })?;
+                eprintln!(
+                    "astro.archaeology.dependency_unresolved commit={commit} state={} source={:?} module={:?} kind={} candidates={:?} matches={:?}",
+                    state.token(),
+                    request.source_path,
+                    request.module_path,
+                    request.kind,
+                    request.candidates,
+                    matches
+                        .iter()
+                        .map(|(_, materialized)| materialized.as_str())
+                        .collect::<Vec<_>>()
+                );
+                unresolved_requests.insert((
+                    state,
+                    request.source_path.clone(),
+                    request.module_path.clone(),
+                    request.kind.clone(),
+                ));
+            }
             let Some(selected) = selected else {
                 continue;
             };
@@ -4831,16 +5182,33 @@ fn materialize_file_scoped_historical_closure(
         hash_dependency_closure_part(&mut hasher, target.as_bytes())?;
         hash_dependency_closure_part(&mut hasher, kind.as_bytes())?;
     }
+    // #1063: what the closure could NOT resolve is part of its identity. Without
+    // this, two commits whose materialized files and edges agree but whose misses
+    // differ would claim the same closure sha256 — an equivalence the view does not
+    // have. Every part is length-prefixed by `hash_dependency_closure_part`, so the
+    // record stays injective inside the unchanged
+    // `astrolabe.historical-dependency-closure.v1` domain; a closure with no
+    // unresolved request hashes byte-identically to its pre-#1063 self.
+    for (state, source, module_path, kind) in &unresolved_requests {
+        hash_dependency_closure_part(&mut hasher, state.token().as_bytes())?;
+        hash_dependency_closure_part(&mut hasher, source.as_bytes())?;
+        hash_dependency_closure_part(&mut hasher, module_path.as_bytes())?;
+        hash_dependency_closure_part(&mut hasher, kind.as_bytes())?;
+    }
     report.dependency_closure_sha256 = hex_lower(&hasher.finalize());
     eprintln!(
-        "astro.archaeology.dependency_closure commit={commit} seeds={} dependencies={} candidate_paths_absent={} edges={} revisits={} depth={} closure_sha256={}",
+        "astro.archaeology.dependency_closure commit={commit} seeds={} dependencies={} candidate_paths_absent={} edges={} revisits={} depth={} closure_sha256={} source_missing={} ambiguous={} optional_unresolved={} nearest_ancestor_selections={}",
         requested.len(),
         report.dependency_files_materialized,
         report.dependency_candidate_paths_absent,
         report.dependency_edges,
         report.dependency_revisits,
         report.dependency_depth,
-        report.dependency_closure_sha256
+        report.dependency_closure_sha256,
+        report.dependency_source_missing,
+        report.dependency_source_ambiguous,
+        report.dependency_optional_unresolved,
+        nearest_ancestor_selections
     );
     Ok(report)
 }
@@ -4875,6 +5243,22 @@ fn normalize_exact_source_dependency(
     source_rel: &str,
     module_path: &str,
 ) -> Result<String, DynError> {
+    normalize_dependency_under_base(
+        source_rel,
+        dependency_base_directory(source_rel),
+        module_path,
+    )
+}
+
+/// [`normalize_exact_source_dependency`]'s shared body, resolved against an
+/// explicit corpus-relative base directory (empty = the corpus root) so the
+/// #1063 include search path reuses one normalizer instead of reimplementing the
+/// join. `source_rel` carries only the includer identity into the error text.
+fn normalize_dependency_under_base(
+    source_rel: &str,
+    base: &str,
+    module_path: &str,
+) -> Result<String, DynError> {
     let module_path = module_path.replace('\\', "/");
     if module_path.is_empty()
         || module_path.starts_with('/')
@@ -4885,11 +5269,10 @@ fn normalize_exact_source_dependency(
         )
         .into());
     }
-    let parent = source_rel.rsplit_once('/').map_or("", |(parent, _)| parent);
-    let joined = if parent.is_empty() {
+    let joined = if base.is_empty() {
         module_path.clone()
     } else {
-        format!("{parent}/{module_path}")
+        format!("{base}/{module_path}")
     };
     let mut components = Vec::new();
     for component in joined.split('/') {
@@ -5288,6 +5671,9 @@ fn parse_file_scoped_historical_blob_stream<R: BufRead>(
         absent_paths: Vec::new(),
         dependency_files_materialized: 0,
         dependency_candidate_paths_absent: 0,
+        dependency_source_missing: 0,
+        dependency_source_ambiguous: 0,
+        dependency_optional_unresolved: 0,
         dependency_edges: 0,
         dependency_revisits: 0,
         dependency_depth: 0,
@@ -5756,6 +6142,29 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
     insert_number!(
         "historical_dependency_candidate_paths_absent",
         report.historical_dependency_candidate_paths_absent
+    );
+    // #1063 labeled degradations: dependency requests the closure could not turn
+    // into an edge. Persisted with the archaeology summary and served on the MCP
+    // response so a consumer sees exactly how partial the historical view is.
+    insert_number!(
+        "historical_dependency_source_missing",
+        report.historical_dependency_source_missing
+    );
+    insert_number!(
+        "historical_dependency_source_ambiguous",
+        report.historical_dependency_source_ambiguous
+    );
+    insert_number!(
+        "historical_dependency_optional_unresolved",
+        report.historical_dependency_optional_unresolved
+    );
+    object.insert(
+        "dependency_closure_incomplete".to_string(),
+        Value::from(
+            report.historical_dependency_source_missing > 0
+                || report.historical_dependency_source_ambiguous > 0
+                || report.historical_dependency_optional_unresolved > 0,
+        ),
     );
     insert_number!(
         "historical_dependency_edges",

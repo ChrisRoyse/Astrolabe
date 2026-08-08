@@ -1199,6 +1199,12 @@ pub struct Language(cbm_sys::CBMLanguage);
 
 impl Language {
     pub const C: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_C);
+    /// C++ grammar. Shares libcbm's `parse_c_imports` preprocessor-include path
+    /// with [`Self::C`] and [`Self::OBJC`], so callers that reason about quote
+    /// includes must treat all three as one family.
+    pub const CPP: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_CPP);
+    /// Objective-C grammar. See [`Self::CPP`] for the shared include family.
+    pub const OBJC: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_OBJC);
     pub const RUST: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_RUST);
 
     pub fn from_raw(raw: cbm_sys::CBMLanguage) -> Self {
