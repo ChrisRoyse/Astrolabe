@@ -725,6 +725,11 @@ pub(crate) fn handle_index_repository(
             .into());
                 }
                 publication.checkpoint_stage_source()?;
+                // #1040: the staged store is durable and quiescent from here, and
+                // nothing writes it again. Journal that fact with its exact digest
+                // before the long vault import, so an external kill leaves the next
+                // reconcile something it can verify and rescue instead of destroy.
+                publication.journal_stage_completion()?;
                 let outcome = import_shadow_vault_with_archaeology_at(
                     publication.stage_cache(),
                     &project,

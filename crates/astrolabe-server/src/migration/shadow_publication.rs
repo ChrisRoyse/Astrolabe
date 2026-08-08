@@ -72,6 +72,11 @@ struct PublicationJournal {
     owner: PublicationOwner,
     recovery_manifest: Option<PublicationRecoveryManifest>,
     metadata_acknowledgement: Option<MetadataAcknowledgementRecoveryManifest>,
+    /// Present from the `cbm_complete` phase onwards (#1040). Defaulted so a
+    /// journal written before this field existed still decodes — it simply has no
+    /// rescuable staged store, which reconcile labels rather than assumes.
+    #[serde(default)]
+    stage_preservation: Option<PersistedStageArming>,
     evidence: Value,
 }
 
@@ -131,6 +136,10 @@ pub(crate) struct ShadowPublication {
     /// While `None`, abort cleanup destroys the transaction exactly as before —
     /// there is no multi-hour product to keep.
     stage_preservation: Option<PreservedStageArming>,
+    /// The journal-resident form of the arming (#1040), bound to the exact
+    /// post-checkpoint staged bytes. Process memory dies with an externally killed
+    /// owner; this is what a later reconcile reads to rescue the orphan.
+    persisted_stage_preservation: Option<PersistedStageArming>,
 }
 
 impl ShadowPublication {
@@ -179,6 +188,7 @@ impl ShadowPublication {
             metadata_acknowledgement: None,
             seed_lower_repair: None,
             stage_preservation: None,
+            persisted_stage_preservation: None,
         };
         let initialized = (|| -> Result<(), DynError> {
             fs::create_dir(&publication.stage_cache)?;
@@ -220,6 +230,48 @@ impl ShadowPublication {
     ) -> Result<(), DynError> {
         self.stage_preservation = Some(PreservedStageArming::new(fingerprint, index_tool_result)?);
         Ok(())
+    }
+
+    /// Records that the CBM pass produced a durable staged store, moving the
+    /// transaction to the `cbm_complete` phase and persisting the arming into
+    /// `transaction.json` (#1040).
+    ///
+    /// Must be called immediately after [`Self::checkpoint_stage_source`] and
+    /// before any further staged work: the recorded digest is the post-checkpoint
+    /// watermark that publication re-verifies, so a rescue performed by a later
+    /// process publishes exactly the bytes this run finished with. An unarmed
+    /// publication still advances the phase — the stage is genuinely complete —
+    /// and records the absent arming so reconcile labels the loss rather than
+    /// inferring it.
+    pub(crate) fn journal_stage_completion(&mut self) -> Result<(), DynError> {
+        let staged_source = sqlite_path(&self.stage_cache, &self.project);
+        let relative = staged_source
+            .strip_prefix(&self.transaction_dir)
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_SHADOW_STAGE_COMPLETION_PATH: staged CBM source {} is not inside transaction {}: {error}; remediation: inspect the stage layout construction",
+                    staged_source.display(),
+                    self.transaction_dir.display()
+                )
+                .into()
+            })?
+            .to_string_lossy()
+            .into_owned();
+        self.persisted_stage_preservation = match self.stage_preservation.as_ref() {
+            Some(arming) => Some(arming.persist(&staged_source, &relative)?),
+            None => None,
+        };
+        self.write_journal(
+            "cbm_complete",
+            json!({
+                "stage_cache": self.stage_cache,
+                "stage_preservation_armed": self.persisted_stage_preservation.is_some(),
+                "stage_preservation": self
+                    .persisted_stage_preservation
+                    .as_ref()
+                    .map(PersistedStageArming::evidence_json),
+            }),
+        )
     }
 
     /// Adopts this project's preserved stage into the fresh stage, or refuses with
@@ -1224,6 +1276,7 @@ impl ShadowPublication {
             "owner": self.owner,
             "recovery_manifest": self.recovery_manifest,
             "metadata_acknowledgement": self.metadata_acknowledgement,
+            "stage_preservation": self.persisted_stage_preservation,
             "evidence": evidence,
         }))?;
         let mut file = OpenOptions::new()
@@ -2550,6 +2603,7 @@ fn write_recovery_journal(
         owner: journal.owner.clone(),
         recovery_manifest: journal.recovery_manifest.clone(),
         metadata_acknowledgement: journal.metadata_acknowledgement.clone(),
+        stage_preservation: journal.stage_preservation.clone(),
         evidence: json!({
             "schema": "astrolabe.shadow-publication-recovery.v1",
             "prior_phase": journal.phase,
@@ -2936,6 +2990,20 @@ fn reconcile_metadata_acknowledgement(
     ))
 }
 
+/// A transaction that never reached installation owns no live artifact backups.
+/// A backup directory with entries means the journal phase and the physical tree
+/// disagree, which is never reconciled automatically.
+fn validate_preinstall_backup_empty(journal: &PublicationJournal) -> Result<(), DynError> {
+    if journal.backup_dir.exists() && fs::read_dir(&journal.backup_dir)?.next().is_some() {
+        return Err(format!(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_PREINSTALL_BACKUP_NOT_EMPTY: phase {:?} has backup artifacts; remediation: preserve every byte because the journal and physical phase disagree",
+            journal.phase
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn reconcile_completed_transactions(
     project_root: &Path,
     live_cache: &Path,
@@ -2973,14 +3041,8 @@ fn reconcile_completed_transactions(
         }
         match value.phase.as_str() {
             "complete" => {}
-            "initializing" | "staged" | "unchanged_validated" | "aborted" => {
-                if value.backup_dir.exists() && fs::read_dir(&value.backup_dir)?.next().is_some() {
-                    return Err(format!(
-                        "ASTRO_SHADOW_PUBLICATION_RECOVERY_PREINSTALL_BACKUP_NOT_EMPTY: phase {:?} has backup artifacts; remediation: preserve every byte because the journal and physical phase disagree",
-                        value.phase
-                    )
-                    .into());
-                }
+            "initializing" | "unchanged_validated" | "aborted" => {
+                validate_preinstall_backup_empty(&value)?;
                 write_recovery_journal(
                     &transaction,
                     &value,
@@ -2988,6 +3050,82 @@ fn reconcile_completed_transactions(
                     json!({"owner_state": owner_state, "live_generation_mutated": false}),
                 )?;
                 value.phase = "rolled_back".to_string();
+            }
+            // #1040: these are the only phases that can hold a completed CBM store
+            // whose owner never got to preserve it — an external kill leaves no
+            // abort path to run. Rescue the staged store into the preserved-stage
+            // slot before the transaction tree is unlinked, or refuse and keep
+            // every byte. `staged` is here for the journals of builds that
+            // predate the persisted arming: they carry none, so they take the
+            // labeled skip below rather than a silent destruction.
+            "staged" | "cbm_complete" => {
+                validate_preinstall_backup_empty(&value)?;
+                let (resolved_phase, orphaned_stage) = match value.stage_preservation.as_ref() {
+                    Some(arming) => {
+                        let evidence = rescue_orphaned_stage(
+                            live_cache,
+                            project,
+                            &transaction,
+                            &value.stage_cache,
+                            &value.generation,
+                            value.owner.pid,
+                            value.owner.process_start_utc_ticks,
+                            &owner_state,
+                            arming,
+                        )?;
+                        eprintln!(
+                            "astro.shadow.orphaned_stage project={project} status=rescued evidence={evidence}"
+                        );
+                        ("stage_rescued", evidence)
+                    }
+                    None => {
+                        let evidence = json!({
+                            "schema": "astrolabe.shadow-orphaned-stage-rescue.v1",
+                            "code": ASTRO_SHADOW_ORPHANED_STAGE_ARMING_ABSENT,
+                            "owner_state": owner_state,
+                            "orphan_transaction": transaction,
+                            "orphan_phase": value.phase,
+                            "preserved": Value::Null,
+                        });
+                        eprintln!(
+                            "astro.shadow.orphaned_stage project={project} status=skipped reason=arming_absent evidence={evidence}"
+                        );
+                        ("rolled_back", evidence)
+                    }
+                };
+                write_recovery_journal(
+                    &transaction,
+                    &value,
+                    resolved_phase,
+                    json!({
+                        "owner_state": owner_state,
+                        "live_generation_mutated": false,
+                        "orphaned_stage": orphaned_stage,
+                    }),
+                )?;
+                value.phase = resolved_phase.to_string();
+            }
+            // Terminal: the rescue published and read back the staged store, but
+            // the process died before the husk was removed. Prove the move
+            // happened before finishing that removal (#1040).
+            "stage_rescued" => {
+                let arming = value.stage_preservation.as_ref().ok_or_else(|| -> DynError {
+                    format!(
+                        "{ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED}: transaction {} is journalled as rescued but carries no stage arming to verify that rescue against; remediation: preserve every byte and inspect the journal producer",
+                        transaction.display()
+                    )
+                    .into()
+                })?;
+                let readback = verify_orphaned_stage_rescue(
+                    live_cache,
+                    project,
+                    &transaction,
+                    &value.stage_cache,
+                    arming,
+                )?;
+                eprintln!(
+                    "astro.shadow.orphaned_stage project={project} status=already_rescued evidence={readback}"
+                );
             }
             "validated" | "artifacts_installed" | "committed_readback_failed" => {
                 let manifest = value.recovery_manifest.as_ref().ok_or_else(|| -> DynError {
