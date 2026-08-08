@@ -41,6 +41,40 @@ pub mod state;
 /// Name given to the explicitly sized host thread used by fleet CLI entrypoints.
 pub const FLEET_HOST_THREAD_NAME: &str = "astrolabe-fleet-host";
 
+/// Exit code substituted when a computed exit code collides with the
+/// external-termination signature `-1`/`0xFFFFFFFF` (#1059).
+///
+/// `Process.Kill()` / `Stop-Process -Force` terminate with `TerminateProcess(h,
+/// -1)`, so an externally killed process exits `0xFFFFFFFF`. Astrolabe binaries
+/// therefore never self-exit `-1`: the collision is disclosed on stderr and
+/// remapped to this sentinel, which makes `0xFFFFFFFF` provably foreign.
+pub const EXIT_CODE_SENTINEL_COLLISION: u32 = 0xA57F_0006;
+
+/// Structured code emitted when the collision above is observed.
+pub const ASTRO_EXIT_CODE_SENTINEL_COLLISION: &str = "ASTRO_EXIT_CODE_SENTINEL_COLLISION";
+
+/// Disambiguates a computed exit code from the external-termination signature.
+///
+/// Fail-closed disclosure, not a fallback: the run still fails, only the
+/// *encoding* of the failure changes, and the substitution is announced on
+/// stderr as one structured line.
+fn disambiguate_external_termination_signature(code: i32) -> i32 {
+    if code != -1 {
+        return code;
+    }
+    eprintln!(
+        "{{\"code\":\"{ASTRO_EXIT_CODE_SENTINEL_COLLISION}\",\
+\"message\":\"computed process exit code -1 (0xFFFFFFFF) collides with the Windows \
+external-termination signature written by TerminateProcess(handle, -1) \
+(Process.Kill/Stop-Process -Force); it is remapped to 0x{EXIT_CODE_SENTINEL_COLLISION:08X} so \
+0xFFFFFFFF stays provably foreign\",\
+\"remediation\":\"treat this exit code as the original in-process failure and read the run \
+stderr for its cause; if a run record instead shows 0xFFFFFFFF, the process was terminated by \
+another process - read C:\\\\ProgramData\\\\astrolabe-kill-attribution\\\\kills.log\"}}"
+    );
+    EXIT_CODE_SENTINEL_COLLISION as i32
+}
+
 /// Runs a fleet binary entrypoint on the same registry-sized host thread used by
 /// the server before it can enter CBM/Astrolabe-heavy code paths.
 ///
@@ -50,6 +84,9 @@ pub const FLEET_HOST_THREAD_NAME: &str = "astrolabe-fleet-host";
 /// publish structured diagnostics. Fleet binaries link and dispatch through the
 /// same crate graph, so their entrypoints use the declared host-thread reserve
 /// by construction instead of depending on a caller-specific PE stack setting.
+///
+/// #1059: every fleet binary's exit code passes through here, so the
+/// external-termination sentinel guard lives here rather than in each `main`.
 pub fn run_on_sized_host_thread<F>(entrypoint: F) -> i32
 where
     F: FnOnce() -> i32 + Send + 'static,
@@ -59,13 +96,14 @@ where
         .stack_size(astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes())
         .spawn(entrypoint)
         .expect("spawn sized fleet host thread");
-    match host.join() {
+    let code = match host.join() {
         Ok(code) => code,
         Err(_) => {
             eprintln!("astrolabe-fleet: host thread panicked");
             1
         }
-    }
+    };
+    disambiguate_external_termination_signature(code)
 }
 
 pub use catalog::{

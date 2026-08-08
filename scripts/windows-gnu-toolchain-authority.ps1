@@ -2714,6 +2714,61 @@ function Resolve-CudaToolkitLibRoot {
     return $libRoot
 }
 
+# #1059: launcher relay-kill sentinel. `Process.Kill()` is
+# `TerminateProcess(handle, -1)` in the BCL, so every BCL-killed process exits
+# 0xFFFFFFFF — indistinguishable from a foreign `Stop-Process -Force` (the g26
+# evidence-run kill). The launcher terminates its exact dedicated owner with this
+# explicit sentinel instead, so 0xFFFFFFFF from an Astrolabe process is provably
+# external. Sentinel family: 0xA57F0001..3 native-fsv-run runner sentinels,
+# 0xA57F0004 launcher relay (here), 0xA57F0006 in-process exit-code collision
+# remap.
+# The `L` suffix is load-bearing: PowerShell parses a bare 0xA57F0004 as a
+# two's-complement Int32 (-1518403580), which cannot be cast to [uint32].
+$script:AstroLauncherRelayTerminateSentinel = [uint32]0xA57F0004L
+
+function Initialize-AstroLauncherExactTerminate {
+    if ($null -ne ('AstroLauncherExactTerminate' -as [type])) {
+        return
+    }
+
+    Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Globalization;
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.InteropServices;
+
+public static class AstroLauncherExactTerminate
+{
+    [DllImport("kernel32", SetLastError = true)]
+    private static extern bool TerminateProcess(SafeProcessHandle process, uint exitCode);
+
+    // Terminates ONLY the retained exact process handle supplied by the caller.
+    // No PID is reopened here: a numeric PID never grants termination authority.
+    public static void Terminate(SafeProcessHandle process, uint exitCode)
+    {
+        if (process == null)
+            throw new InvalidOperationException(
+                "exact process handle is absent; refusing to terminate by PID");
+        if (process.IsInvalid || process.IsClosed)
+            throw new InvalidOperationException(
+                "exact process handle is invalid or already closed; refusing to terminate by PID");
+        if (!TerminateProcess(process, exitCode))
+        {
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(
+                error,
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "TerminateProcess(exact retained handle, 0x{0:X8}) failed with Win32 error {1}",
+                    exitCode,
+                    error));
+        }
+    }
+}
+'@
+}
+
 function Initialize-AstroLauncherBoundedStreamSha256 {
     if ($null -ne ('AstroLauncherBoundedStreamSha256' -as [type])) {
         return
@@ -7530,9 +7585,26 @@ exit `$dedicatedExit
                     # process-lifetime Job handle close; KILL_ON_JOB_CLOSE then
                     # removes its attributed descendants while protocol bytes
                     # remain preserved for tracker-bound recovery.
-                    $dedicatedProcess.Kill()
+                    #
+                    # #1059: never call Process.Kill() here. The BCL implements
+                    # it as TerminateProcess(handle, -1), so the relayed owner
+                    # would exit 0xFFFFFFFF — byte-identical to the signature a
+                    # foreign Stop-Process/Process.Kill leaves behind (the g26
+                    # incident). Terminating with the explicit launcher relay
+                    # sentinel makes 0xFFFFFFFF provably foreign: no Astrolabe
+                    # path produces it any more.
+                    Initialize-AstroLauncherExactTerminate
+                    [AstroLauncherExactTerminate]::Terminate(
+                        $dedicatedProcess.SafeHandle,
+                        $script:AstroLauncherRelayTerminateSentinel
+                    )
                     $dedicatedProcess.WaitForExit()
-                    $relayOwnerTerminal = 'exact-owner-terminated'
+                    $relayOwnerTerminal = (
+                        'exact-owner-terminated(sentinel=0x' +
+                        $script:AstroLauncherRelayTerminateSentinel.ToString(
+                            'X8', [Globalization.CultureInfo]::InvariantCulture) +
+                        ')'
+                    )
                 }
                 else {
                     $relayOwnerTerminal = 'already-absent'
@@ -7543,7 +7615,9 @@ exit `$dedicatedExit
                 $relayOwnerCleanupError = $_.Exception.Message
             }
         }
-        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED]: {code=ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED; message=`"the dedicated native launcher process could not be started or its redirected output/terminal state could not be drained exactly: $($relayFault.Exception.Message); owner_terminal=$relayOwnerTerminal; owner_cleanup_error=$relayOwnerCleanupError`"; remediation=`"preserve all existing protocol state; inspect the exact dedicated process identity plus stdout/stderr pipe state, repair the public relay, and retry only after any owner generation and Job are inactive`"}"
+        $relaySentinelText = '0x' + $script:AstroLauncherRelayTerminateSentinel.ToString(
+            'X8', [Globalization.CultureInfo]::InvariantCulture)
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED]: {code=ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED; message=`"the dedicated native launcher process could not be started or its redirected output/terminal state could not be drained exactly: $($relayFault.Exception.Message); owner_terminal=$relayOwnerTerminal; owner_cleanup_error=$relayOwnerCleanupError; relay_terminate_sentinel=$relaySentinelText`"; remediation=`"preserve all existing protocol state; inspect the exact dedicated process identity plus stdout/stderr pipe state, repair the public relay, and retry only after any owner generation and Job are inactive`"}"
     }
     finally {
         $dedicatedProcess.Dispose()

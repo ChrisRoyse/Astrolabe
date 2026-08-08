@@ -67,6 +67,43 @@ pub use astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes;
 /// Name given to the sized host thread every binary entrypoint runs on.
 const CBM_HOST_THREAD_NAME: &str = "astrolabe-cbm-host";
 
+/// Exit code substituted when a computed exit code collides with the
+/// external-termination signature `-1`/`0xFFFFFFFF` (#1059).
+///
+/// `Process.Kill()` / `Stop-Process -Force` terminate with `TerminateProcess(h,
+/// -1)`, so an externally killed Astrolabe process exits `0xFFFFFFFF`. The g26
+/// evidence run was destroyed exactly that way and the exit code proved nothing,
+/// because nothing ruled out the process having produced `-1` itself. Astrolabe
+/// therefore never self-exits `-1`: the collision is disclosed on stderr and
+/// remapped to this sentinel, which makes `0xFFFFFFFF` provably foreign.
+pub const EXIT_CODE_SENTINEL_COLLISION: u32 = 0xA57F_0006;
+
+/// Structured code emitted when the collision above is observed.
+pub const ASTRO_EXIT_CODE_SENTINEL_COLLISION: &str = "ASTRO_EXIT_CODE_SENTINEL_COLLISION";
+
+/// Disambiguates a computed exit code from the external-termination signature.
+///
+/// This is fail-closed disclosure, not a fallback: a failing run still fails and
+/// nothing is retried or downgraded. Only the *encoding* of the failure changes,
+/// and the substitution is announced on stderr as one structured line so no
+/// caller can silently read a remapped code.
+pub(crate) fn disambiguate_external_termination_signature(code: i32) -> i32 {
+    if code != -1 {
+        return code;
+    }
+    eprintln!(
+        "{{\"code\":\"{ASTRO_EXIT_CODE_SENTINEL_COLLISION}\",\
+\"message\":\"computed process exit code -1 (0xFFFFFFFF) collides with the Windows \
+external-termination signature written by TerminateProcess(handle, -1) \
+(Process.Kill/Stop-Process -Force); it is remapped to 0x{EXIT_CODE_SENTINEL_COLLISION:08X} so \
+0xFFFFFFFF stays provably foreign\",\
+\"remediation\":\"treat this exit code as the original in-process failure and read the run \
+stderr for its cause; if a run record instead shows 0xFFFFFFFF, the process was terminated by \
+another process - read C:\\\\ProgramData\\\\astrolabe-kill-attribution\\\\kills.log\"}}"
+    );
+    EXIT_CODE_SENTINEL_COLLISION as i32
+}
+
 /// Runs [`run_from_env`] on an explicitly sized host thread and returns its
 /// process exit code.
 ///
@@ -87,19 +124,24 @@ const CBM_HOST_THREAD_NAME: &str = "astrolabe-cbm-host";
 /// undersized process main thread and died exactly that way (#730). Centralising
 /// the bootstrap here makes that class of divergence unrepresentable: a new
 /// entrypoint gets the declared reserve by construction.
+///
+/// #1059: this is also the single place every `astrolabe-server` entrypoint's
+/// exit code passes through, so the external-termination sentinel guard lives
+/// here rather than being copied into each `main`.
 pub fn run_from_env_on_sized_host_thread() -> i32 {
     let host = thread::Builder::new()
         .name(CBM_HOST_THREAD_NAME.to_string())
         .stack_size(cbm_pipeline_host_stack_bytes())
         .spawn(run_from_env)
         .expect("spawn sized CBM host thread");
-    match host.join() {
+    let code = match host.join() {
         Ok(code) => code,
         Err(_) => {
             eprintln!("astrolabe: CBM host thread panicked");
             1
         }
-    }
+    };
+    disambiguate_external_termination_signature(code)
 }
 
 pub fn run_from_env() -> i32 {

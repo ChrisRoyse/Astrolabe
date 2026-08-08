@@ -52,6 +52,122 @@ function Fail-Astro {
     throw $exception
 }
 
+# #1059: classify how a child process terminated.
+#
+# The g26 evidence leg was destroyed by a concurrent session's `Stop-Process
+# -Force`; the run record recorded `exit_code = -1` and reported a generic child
+# failure, so the incident took a multi-hour forensic session to attribute.
+# `Process.Kill()`/`Stop-Process -Force` are literally `TerminateProcess(handle,
+# -1)`, which is why 0xFFFFFFFF is the external-termination signature. Astrolabe
+# no longer produces that code itself (launcher relay kills use 0xA57F0004; the
+# Rust entrypoints remap a computed -1 to 0xA57F0006), so 0xFFFFFFFF in a run
+# record is provably foreign and points straight at the kill-attribution log.
+#
+# This is additive metadata only: the verdict is computed exactly as before and
+# an unrecognised code is reported as 'unclassified' rather than guessed at.
+$script:AstroKillAttributionLog =
+    'C:\ProgramData\astrolabe-kill-attribution\kills.log'
+
+function Get-AstroTerminationClassification {
+    param([AllowNull()]$ExitCode)
+
+    if ($null -eq $ExitCode) {
+        return [ordered]@{
+            exit_code = $null
+            exit_code_hex = $null
+            classification = 'unobserved'
+            detail = 'no exit code was observed for this process'
+            remediation = 'inspect the run record process identity and observation error before drawing any conclusion'
+        }
+    }
+
+    $signed = [int]$ExitCode
+    $unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes($signed), 0)
+    $hex = '0x' + $unsigned.ToString('X8', [Globalization.CultureInfo]::InvariantCulture)
+
+    $classification = 'unclassified'
+    $detail = 'exit code is not a known Astrolabe, Windows-status, or external-termination signature'
+    $remediation = 'read the run stdout/stderr for this process and classify the code manually before reusing this evidence'
+
+    # The `L` suffixes are load-bearing: PowerShell parses a bare 0xA57F0004 as a
+    # two's-complement Int32, which never compares equal to the [uint32] subject.
+    switch ($unsigned) {
+        0x00000000L {
+            $classification = 'clean_exit'
+            $detail = 'the process exited 0 under its own control'
+            $remediation = '<none>'
+        }
+        0x00000001L {
+            $classification = 'structured_failure'
+            $detail = 'the process exited 1, its ordinary structured-failure code'
+            $remediation = 'read the structured {code,message,remediation} line on this process stderr'
+        }
+        0x00000003L {
+            $classification = 'abort'
+            $detail = 'exit 3 is the C runtime abort() code (assertion/panic=abort path)'
+            $remediation = 'read the process stderr for the abort reason and check for a Windows Error Reporting record'
+        }
+        0xA57F0001L {
+            $classification = 'runner_sentinel_bind_failure'
+            $detail = 'native-fsv-run terminated the created-suspended child because exact handle binding failed'
+            $remediation = 'inspect the runner failure record; this termination is ours, not external'
+        }
+        0xA57F0002L {
+            $classification = 'runner_sentinel_duplicate_failure'
+            $detail = 'native-fsv-run terminated the child because exact handle duplication/redirection failed'
+            $remediation = 'inspect the runner failure record; this termination is ours, not external'
+        }
+        0xA57F0003L {
+            $classification = 'runner_sentinel_cohort_failure'
+            $detail = 'native-fsv-run terminated a resident-cohort member after a cohort fault'
+            $remediation = 'inspect the cohort failure record; this termination is ours, not external'
+        }
+        0xA57F0004L {
+            $classification = 'launcher_relay_sentinel'
+            $detail = 'the launcher wrapper terminated its exact dedicated owner after a relay/drain fault'
+            $remediation = 'read the ASTRO_LAUNCHER_DEDICATED_RELAY_FAILED boundary error; this termination is ours, not external'
+        }
+        0xA57F0006L {
+            $classification = 'self_exit_sentinel_collision_remap'
+            $detail = 'the process computed exit code -1 itself and remapped it so 0xFFFFFFFF stays provably foreign'
+            $remediation = 'read the ASTRO_EXIT_CODE_SENTINEL_COLLISION stderr line and treat this as the original in-process failure'
+        }
+        0xC0000005L {
+            $classification = 'native_crash_expect_wer'
+            $detail = 'STATUS_ACCESS_VIOLATION'
+            $remediation = 'read the Windows Error Reporting record for this pid and the process stderr'
+        }
+        0xC0000409L {
+            $classification = 'native_crash_expect_wer'
+            $detail = 'STATUS_STACK_BUFFER_OVERRUN (also the Rust/__fastfail abort path)'
+            $remediation = 'read the Windows Error Reporting record for this pid and the process stderr'
+        }
+        0xC00000FDL {
+            $classification = 'native_crash_expect_wer'
+            $detail = 'STATUS_STACK_OVERFLOW; the sized host-thread contract exists for exactly this'
+            $remediation = 'read the Windows Error Reporting record for this pid and confirm the entrypoint used the sized host thread'
+        }
+        0xC000013AL {
+            $classification = 'console_interrupt'
+            $detail = 'STATUS_CONTROL_C_EXIT; the process was killed by a console CTRL event (window close, Ctrl+C, console detach)'
+            $remediation = 'rerun the leg detached from an interactive console (scripts\detach-run.ps1) so console lifetime cannot end it'
+        }
+        0xFFFFFFFFL {
+            $classification = 'external_terminate_minus_one'
+            $detail = 'TerminateProcess(handle, -1): the Process.Kill()/Stop-Process -Force signature. No Astrolabe path produces this code, so the process was terminated by another process'
+            $remediation = "read $script:AstroKillAttributionLog for the JSON line whose exiting_pid matches this process (its initiating_pid names the killer), then the Application-log ProcessExitMonitor record - provider 'Microsoft-Windows-ProcessExitMonitor', event id 3001 on Windows 11 26100 (3000 on older pairings); if the log is absent, kill attribution was not armed - arm it with scripts\kill-attribution.ps1 -Operation Enable before the next long run"
+        }
+    }
+
+    return [ordered]@{
+        exit_code = $signed
+        exit_code_hex = $hex
+        classification = $classification
+        detail = $detail
+        remediation = $remediation
+    }
+}
+
 function Path-WithTrailingSeparator([string]$Path) {
     return ([IO.Path]::GetFullPath($Path).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar)
 }
@@ -2977,6 +3093,9 @@ function Invoke-AstroResidentCohort {
                 exited_at_utc = $_.exited_at_utc
                 exit_code = $_.exit_code
                 exit_code_observation = $_.exit_code_observation
+                # #1059: additive classification of how this cohort member ended.
+                termination_classification =
+                    Get-AstroTerminationClassification $_.exit_code
                 termination_proved = [bool]$_.termination_proved
                 exact_process_handles_closed = [bool]$_.handles_closed
             }
@@ -4611,6 +4730,10 @@ try {
             standard_input = 'NUL'
             exit_code = $childExitCode
             exit_code_observation = $childExitObservation
+            # #1059: additive classification of how the child ended. The verdict
+            # above is unchanged; this only names the termination signature.
+            termination_classification =
+                Get-AstroTerminationClassification $childExitCode
             started_at = $childStartedAtUtc
             exited_at = $childExitedAtUtc
             timestamp_basis = 'runner-observed-utc'
@@ -4841,6 +4964,9 @@ catch {
                     exit_code = $childExitCode
                     exit_code_observation = $childExitObservation
                     exit_code_observation_error = Failure-Text $childExitObservationError
+                    # #1059: additive classification of how the child ended.
+                    termination_classification =
+                        Get-AstroTerminationClassification $childExitCode
                     started_at = $childStartedAtUtc
                     exited_at = $childExitedAtUtc
                     timestamp_basis = 'runner-observed-utc'
