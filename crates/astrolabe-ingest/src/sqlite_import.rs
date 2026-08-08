@@ -20,10 +20,10 @@ use astrolabe_panel::{
     validate_slot_vector_contract,
 };
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
-use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
+use calyx_aster::mvcc::{LatestOnlyReadbackStatus, is_tombstone_value, tombstone_value};
 use calyx_aster::vault::input_store::InputRetention;
 use calyx_aster::vault::{
-    AsterVault, LedgerBoundGroupReceipt, LedgerBoundWriteGroup, encode, input_store,
+    AsterVault, LedgerBoundGroupReceipt, LedgerBoundWriteGroup, OrderedCfRead, encode, input_store,
 };
 use calyx_core::{
     AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
@@ -66,6 +66,9 @@ pub const ASTRO_MISSING_CBM_PROJECT_ROW: &str = "ASTRO_MISSING_CBM_PROJECT_ROW";
 pub const ASTRO_EXACT_SOURCE_INVALID: &str = "ASTRO_EXACT_SOURCE_INVALID";
 /// Refusal code for a CBM semantic atom absent from the frozen semantic registry.
 pub const ASTRO_SEMANTIC_COVERAGE_GAP: &str = "ASTRO_SEMANTIC_COVERAGE_GAP";
+/// Refusal code when a caller asks the compact weave reader to claim bounded
+/// paging without a proven latest-only/empty-overlay/memtable-cap contract.
+pub const ASTRO_WEAVE_SOURCE_UNBOUNDED: &str = "ASTRO_WEAVE_SOURCE_UNBOUNDED";
 
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
@@ -74,6 +77,7 @@ const LEGACY_CBM_EDGE_ROWS_REMEDIATION: &str = "Re-import the project from its C
 const MISSING_CBM_PROJECT_ROW_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists an astrolabe:cbm-project:v1 row, and confirm the requested project name matches an imported project before reading or lowering its graph snapshot.";
 const EXACT_SOURCE_REMEDIATION: &str = "Preserve the vault, inspect the referenced cxinput:v1 Blob rows, and re-import the project from its exact CBM SQLite source before trusting graph source bytes.";
 const SEMANTIC_COVERAGE_REMEDIATION: &str = "Preserve the prior Calyx generation, add or correct the exact versioned typed lens rule named by this refusal, rebuild the panel, and re-ingest the same CBM source.";
+const WEAVE_SOURCE_UNBOUNDED_REMEDIATION: &str = "Open the unpublished shadow vault in latest-only mode (restore_mvcc_rows=false), require an empty MVCC overlay and a positive hard router memtable cap, then rebuild the compact weave source from the unchanged staged generation.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
 const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
@@ -1674,6 +1678,51 @@ pub struct CbmGraphSnapshot {
     pub file_hashes: Vec<CbmFileHashRow>,
     pub project_summaries: Vec<CbmProjectSummaryRow>,
     pub token_vectors: Vec<CbmTokenVectorRow>,
+}
+
+/// Identity retained by the post-import weave/invalidation path. It deliberately
+/// excludes source bytes, properties, vectors, file metadata, and every other
+/// field those phases do not consume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CbmCompactGraphNode {
+    pub source_node_id: i64,
+    pub atom_id: String,
+    pub qualified_name: String,
+    pub label: String,
+    pub cx_id: CxId,
+}
+
+/// Raw live edge endpoints needed by invalidation SCC construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CbmCompactGraphEdge {
+    pub source_node_id: i64,
+    pub target_node_id: i64,
+}
+
+/// Machine-readable proof that the compact projection was read in bounded
+/// pages from a latest-only store with no MVCC overlay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CbmCompactGraphReceipt {
+    pub schema: String,
+    pub project: String,
+    pub snapshot_seq: Seq,
+    pub node_count: u64,
+    pub edge_count: u64,
+    pub node_identity_sha256: String,
+    pub edge_endpoint_sha256: String,
+    pub page_row_cap: u64,
+    pub page_count: u64,
+    pub page_high_water_rows: u64,
+    pub page_high_water_bytes: u64,
+    pub exact_source_reassemblies: u64,
+    pub storage: LatestOnlyReadbackStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbmCompactGraphSnapshot {
+    pub nodes: Vec<CbmCompactGraphNode>,
+    pub edges: Vec<CbmCompactGraphEdge>,
+    pub receipt: CbmCompactGraphReceipt,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -8856,6 +8905,314 @@ where
     C: Clock,
 {
     read_cbm_graph_snapshot_at(vault, project, vault.latest_seq())
+}
+
+const COMPACT_WEAVE_SOURCE_SCHEMA: &str = "astrolabe.compact-weave-source.v1";
+const COMPACT_WEAVE_PAGE_ROWS: usize = 1_024;
+
+fn validate_compact_weave_storage(status: &LatestOnlyReadbackStatus) -> IngestResult<()> {
+    let per_cf_invalid = status.memtable.per_cf.iter().find(|cf| {
+        cf.cap_bytes != status.memtable_byte_cap
+            || cf.used_bytes > cf.cap_bytes
+            || cf.high_water_bytes > cf.cap_bytes
+    });
+    if !status.latest_only
+        || status.overlay_keys != 0
+        || status.overlay_versions != 0
+        || status.overlay_bytes != 0
+        || status.memtable_byte_cap == 0
+        || per_cf_invalid.is_some()
+    {
+        return Err(IngestError::refused(
+            ASTRO_WEAVE_SOURCE_UNBOUNDED,
+            format!(
+                "compact weave source requires latest_only=true, an empty MVCC overlay, and every memtable within one positive hard cap; observed latest_only={}, overlay_keys={}, overlay_versions={}, overlay_bytes={}, memtable_byte_cap={}, invalid_cf={:?}",
+                status.latest_only,
+                status.overlay_keys,
+                status.overlay_versions,
+                status.overlay_bytes,
+                status.memtable_byte_cap,
+                per_cf_invalid.map(|cf| (&cf.cf, cf.used_bytes, cf.cap_bytes, cf.high_water_bytes)),
+            ),
+            WEAVE_SOURCE_UNBOUNDED_REMEDIATION,
+        ));
+    }
+    Ok(())
+}
+
+fn compact_digest_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Reads only the identity/topology fields consumed by shadow weave and
+/// invalidation. The function never calls `read_exact_source_at` and therefore
+/// never touches or reassembles Blob-CF exact-source payloads.
+pub fn read_cbm_compact_graph_snapshot<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> IngestResult<CbmCompactGraphSnapshot>
+where
+    C: Clock,
+{
+    ensure_no_legacy_series_state(vault)?;
+    let storage_before = vault.latest_only_readback_status();
+    validate_compact_weave_storage(&storage_before)?;
+    let snapshot = vault.latest_seq();
+    let mut page_count = 0u64;
+    let mut page_high_water_rows = 0u64;
+    let mut page_high_water_bytes = 0u64;
+    let mut observe_page = |page: &[(Vec<u8>, Vec<u8>)]| -> IngestResult<()> {
+        page_count = page_count.saturating_add(1);
+        page_high_water_rows = page_high_water_rows.max(page.len() as u64);
+        let page_bytes = page.iter().try_fold(0u64, |total, (key, value)| {
+            total
+                .checked_add(key.len() as u64)
+                .and_then(|total| total.checked_add(value.len() as u64))
+                .ok_or_else(|| {
+                    IngestError::InvalidInput("compact weave page byte count overflow".to_string())
+                })
+        })?;
+        page_high_water_bytes = page_high_water_bytes.max(page_bytes);
+        Ok(())
+    };
+
+    let mut project_rows = 0usize;
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(PROJECT_ROW_PREFIX),
+        COMPACT_WEAVE_PAGE_ROWS,
+        |page| -> IngestResult<()> {
+            observe_page(&page)?;
+            for (key, value) in page {
+                let row = decode_graph_row::<CbmProjectRow>(&key, &value)?;
+                if row.project != project {
+                    continue;
+                }
+                if row.schema != SCHEMA_PROJECT_ROW {
+                    return Err(IngestError::InvalidInput(format!(
+                        "Graph CF project row for {project:?} has wrong schema {}",
+                        row.schema
+                    )));
+                }
+                project_rows += 1;
+            }
+            Ok(())
+        },
+    )?;
+    if project_rows == 0 {
+        return Err(IngestError::refused(
+            ASTRO_MISSING_CBM_PROJECT_ROW,
+            format!(
+                "vault has no astrolabe:cbm-project:v1 row for project {project:?}; the project row is missing, erased, or the requested project was never imported"
+            ),
+            MISSING_CBM_PROJECT_ROW_REMEDIATION,
+        ));
+    }
+    if project_rows != 1 {
+        return Err(IngestError::InvalidInput(format!(
+            "compact weave source found {project_rows} project rows for {project:?}; expected exactly one"
+        )));
+    }
+
+    let mut nodes = Vec::<CbmCompactGraphNode>::new();
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(NODE_MAP_PREFIX),
+        COMPACT_WEAVE_PAGE_ROWS,
+        |page| -> IngestResult<()> {
+            observe_page(&page)?;
+            for (key, value) in page {
+                let row = decode_graph_row::<NodeMapRow>(&key, &value)?;
+                if row.project != project {
+                    continue;
+                }
+                if !supported_node_map_schema(&row.schema) {
+                    return Err(IngestError::InvalidInput(format!(
+                        "node map row {} has wrong schema {}",
+                        row.node_id, row.schema
+                    )));
+                }
+                if row.series_id_schema != SERIES_ID_TAG {
+                    return Err(IngestError::InvalidInput(format!(
+                        "node map row {} has wrong SeriesId schema {}",
+                        row.node_id, row.series_id_schema
+                    )));
+                }
+                if row.atom_id.trim().is_empty() {
+                    return Err(IngestError::InvalidInput(format!(
+                        "node map row {} has an empty stable atom id",
+                        row.node_id
+                    )));
+                }
+                nodes.push(CbmCompactGraphNode {
+                    source_node_id: row.node_id,
+                    atom_id: row.atom_id,
+                    qualified_name: row.qualified_name,
+                    label: row.label,
+                    cx_id: row.cx_id,
+                });
+            }
+            Ok(())
+        },
+    )?;
+    nodes.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.source_node_id.cmp(&right.source_node_id))
+    });
+    let mut atoms = BTreeSet::new();
+    for node in &nodes {
+        if !atoms.insert(node.atom_id.as_str()) {
+            return Err(IngestError::InvalidInput(format!(
+                "compact weave source contains duplicate stable atom id {:?}",
+                node.atom_id
+            )));
+        }
+    }
+
+    // Prove every compact node still has its physical Base row without retaining
+    // a corpus-wide Base key/value map. Each readback plan is page-sized and its
+    // values are released before the next plan.
+    for chunk in nodes.chunks(COMPACT_WEAVE_PAGE_ROWS) {
+        let keys = chunk
+            .iter()
+            .map(|node| base_key(node.cx_id))
+            .collect::<Vec<_>>();
+        let reads = keys
+            .iter()
+            .enumerate()
+            .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::Base, key))
+            .collect::<Vec<_>>();
+        vault.visit_ordered_cf_plan_at(
+            snapshot,
+            &reads,
+            |ordinal, _, key, value| -> IngestResult<()> {
+                if value.is_none() {
+                    return Err(IngestError::InvalidInput(format!(
+                        "compact node {} ({:?}) points to missing Base row {}",
+                        chunk[ordinal].source_node_id,
+                        chunk[ordinal].qualified_name,
+                        hex_lower(key),
+                    )));
+                }
+                Ok(())
+            },
+        )?;
+    }
+
+    let mut edges = Vec::<CbmCompactGraphEdge>::new();
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(CBM_EDGE_ROW_PREFIX),
+        COMPACT_WEAVE_PAGE_ROWS,
+        |page| -> IngestResult<()> {
+            observe_page(&page)?;
+            for (key, value) in page {
+                let row = decode_graph_row::<CbmRawEdgeRow>(&key, &value)?;
+                if row.project != project {
+                    continue;
+                }
+                if row.schema != SCHEMA_CBM_EDGE_ROW {
+                    return Err(IngestError::InvalidInput(format!(
+                        "raw edge row {} has wrong schema {}",
+                        row.sqlite_edge_id, row.schema
+                    )));
+                }
+                edges.push(CbmCompactGraphEdge {
+                    source_node_id: row.source_node_id,
+                    target_node_id: row.target_node_id,
+                });
+            }
+            Ok(())
+        },
+    )?;
+    edges.sort_by_key(|edge| (edge.source_node_id, edge.target_node_id));
+    if edges.is_empty() {
+        let mut legacy_typed_edges = 0usize;
+        vault.scan_cf_range_pages_at(
+            snapshot,
+            ColumnFamily::Graph,
+            &prefix_range(EDGE_ROW_PREFIX),
+            COMPACT_WEAVE_PAGE_ROWS,
+            |page| -> IngestResult<()> {
+                observe_page(&page)?;
+                for (key, value) in page {
+                    let row = decode_graph_row::<EdgeGraphRow>(&key, &value)?;
+                    if row.project == project {
+                        legacy_typed_edges =
+                            legacy_typed_edges.checked_add(1).ok_or_else(|| {
+                                IngestError::InvalidInput(
+                                    "legacy typed-edge count overflow during compact weave read"
+                                        .to_string(),
+                                )
+                            })?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if legacy_typed_edges != 0 {
+            return Err(IngestError::refused(
+                ASTRO_LEGACY_CBM_EDGE_ROWS,
+                format!(
+                    "project {project:?} has {legacy_typed_edges} typed astrolabe:edge:v1 row(s) but no raw astrolabe:cbm-edge:v1 rows; compact weave would silently omit dangling and structural-endpoint edges"
+                ),
+                LEGACY_CBM_EDGE_ROWS_REMEDIATION,
+            ));
+        }
+    }
+
+    let mut node_hasher = Sha256::new();
+    for node in &nodes {
+        compact_digest_field(&mut node_hasher, &node.source_node_id.to_be_bytes());
+        compact_digest_field(&mut node_hasher, node.atom_id.as_bytes());
+        compact_digest_field(&mut node_hasher, node.qualified_name.as_bytes());
+        compact_digest_field(&mut node_hasher, node.label.as_bytes());
+        compact_digest_field(&mut node_hasher, node.cx_id.as_bytes());
+    }
+    let mut edge_hasher = Sha256::new();
+    for edge in &edges {
+        compact_digest_field(&mut edge_hasher, &edge.source_node_id.to_be_bytes());
+        compact_digest_field(&mut edge_hasher, &edge.target_node_id.to_be_bytes());
+    }
+
+    let storage_after = vault.latest_only_readback_status();
+    validate_compact_weave_storage(&storage_after)?;
+    if storage_after != storage_before || vault.latest_seq() != snapshot {
+        return Err(IngestError::refused(
+            ASTRO_WEAVE_SOURCE_UNBOUNDED,
+            format!(
+                "compact weave source storage generation changed during read: seq_before={snapshot}, seq_after={}, status_before={storage_before:?}, status_after={storage_after:?}",
+                vault.latest_seq(),
+            ),
+            WEAVE_SOURCE_UNBOUNDED_REMEDIATION,
+        ));
+    }
+
+    Ok(CbmCompactGraphSnapshot {
+        receipt: CbmCompactGraphReceipt {
+            schema: COMPACT_WEAVE_SOURCE_SCHEMA.to_string(),
+            project: project.to_string(),
+            snapshot_seq: snapshot,
+            node_count: nodes.len() as u64,
+            edge_count: edges.len() as u64,
+            node_identity_sha256: hex_lower(&node_hasher.finalize()),
+            edge_endpoint_sha256: hex_lower(&edge_hasher.finalize()),
+            page_row_cap: COMPACT_WEAVE_PAGE_ROWS as u64,
+            page_count,
+            page_high_water_rows,
+            page_high_water_bytes,
+            exact_source_reassemblies: 0,
+            storage: storage_before,
+        },
+        nodes,
+        edges,
+    })
 }
 
 /// Reads the CBM graph snapshot as it existed at an explicit MVCC `snapshot`

@@ -30,7 +30,7 @@ pub(crate) fn persist_delta_invalidations_with_snapshot<C>(
     import_changed: bool,
     delta: Option<&WeaveDelta>,
     weave: &Value,
-    preloaded_snapshot: Option<&CbmGraphSnapshot>,
+    preloaded_snapshot: Option<&CbmCompactGraphSnapshot>,
 ) -> Result<Value, DynError>
 where
     C: Clock,
@@ -47,7 +47,9 @@ where
     let t_snapshot = std::time::Instant::now();
     let owned_snapshot = match preloaded_snapshot {
         Some(_) => None,
-        None => Some(astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?),
+        None => Some(astrolabe_ingest::read_cbm_compact_graph_snapshot(
+            vault, project,
+        )?),
     };
     let snapshot = preloaded_snapshot
         .or(owned_snapshot.as_ref())
@@ -56,7 +58,6 @@ where
     let live_symbols = snapshot
         .nodes
         .iter()
-        .filter(|node| !node.structural)
         .map(|node| node.atom_id.clone())
         .collect::<BTreeSet<_>>();
     let dirty_symbols = match delta {
@@ -89,7 +90,6 @@ where
     let qualified_names = snapshot
         .nodes
         .iter()
-        .filter(|node| !node.structural)
         .map(|node| (node.atom_id.as_str(), node.qualified_name.as_str()))
         .collect::<BTreeMap<_, _>>();
     for symbol_id in &affected_symbols {
@@ -376,7 +376,7 @@ fn invalidation_subject(project: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 fn kernel_dirty_sccs(
-    snapshot: &CbmGraphSnapshot,
+    snapshot: &CbmCompactGraphSnapshot,
     dirty_symbols: &BTreeSet<String>,
     removed_symbols: &BTreeSet<String>,
 ) -> Vec<KernelDirtyScc> {
@@ -386,7 +386,7 @@ fn kernel_dirty_sccs(
     // sets, member lists are sorted before hashing, and the final list is
     // sorted by id, so the output is byte-identical to the map-based shape.
     let mut id_to_atom = BTreeMap::<i64, &str>::new();
-    for node in snapshot.nodes.iter().filter(|node| !node.structural) {
+    for node in &snapshot.nodes {
         id_to_atom.insert(node.source_node_id, node.atom_id.as_str());
     }
     // Deterministic node indexing by stable atom id (BTreeSet iteration order).

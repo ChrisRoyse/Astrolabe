@@ -49,6 +49,11 @@ pub(crate) struct RouterPlanReadMetrics {
 }
 
 impl CfRouter {
+    /// Configured hard byte cap for every active column-family memtable.
+    pub const fn memtable_byte_cap(&self) -> usize {
+        self.memtable_byte_cap
+    }
+
     pub fn open(vault_dir: impl AsRef<Path>, memtable_byte_cap: usize) -> Result<Self> {
         Self::open_with_tiering(vault_dir, memtable_byte_cap, None)
     }

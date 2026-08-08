@@ -1,6 +1,35 @@
 use super::*;
 
-impl AsterVault {
+impl<C> AsterVault<C>
+where
+    C: Clock,
+{
+    /// Streams visible rows in bounded pages at one exact sequence. The scoped
+    /// snapshot lease remains live for the entire scan, so SST merge state is
+    /// opened once rather than rebuilt for every page.
+    pub fn scan_cf_range_pages_at<F, E>(
+        &self,
+        seq: calyx_core::Seq,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        limit: usize,
+        on_page: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
+        E: From<calyx_core::CalyxError>,
+    {
+        let snapshot = self.snapshot_handle(seq);
+        self.rows.scan_cf_range_pages_at(
+            snapshot.snapshot(),
+            cf,
+            range,
+            limit,
+            &self.clock,
+            on_page,
+        )
+    }
+
     /// Scans at most `limit` visible raw CF rows using an already-pinned snapshot lease.
     pub fn scan_cf_range_page_snapshot(
         &self,

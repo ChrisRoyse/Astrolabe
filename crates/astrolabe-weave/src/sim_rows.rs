@@ -185,7 +185,21 @@ pub fn persist_similarity_edges<C>(
 where
     C: Clock,
 {
-    persist_similarity_edges_owned(vault, plan, None, actor.into())
+    persist_similarity_edges_owned(vault, plan, None, None, actor.into())
+}
+
+/// Reconciles one family-owned SIM prefix. Plans containing another family
+/// refuse before any read or write, making per-family release explicit.
+pub fn persist_similarity_family_edges<C>(
+    vault: &AsterVault<C>,
+    family: SimilarityFamily,
+    plan: &SimilarityPlan,
+    actor: impl Into<String>,
+) -> calyx_core::Result<SimilarityPersistReport>
+where
+    C: Clock,
+{
+    persist_similarity_edges_owned(vault, plan, Some(family), None, actor.into())
 }
 
 /// Reconciles only the stable-id dirty-region source ownership plus rows touching
@@ -203,6 +217,28 @@ where
     persist_similarity_edges_owned(
         vault,
         plan,
+        None,
+        Some((owned_sources, removed_symbol_ids)),
+        actor.into(),
+    )
+}
+
+/// Dirty-region reconciliation restricted to one family-owned SIM prefix.
+pub fn persist_similarity_family_edges_delta<C>(
+    vault: &AsterVault<C>,
+    family: SimilarityFamily,
+    plan: &SimilarityPlan,
+    owned_sources: &BTreeSet<String>,
+    removed_symbol_ids: &BTreeSet<String>,
+    actor: impl Into<String>,
+) -> calyx_core::Result<SimilarityPersistReport>
+where
+    C: Clock,
+{
+    persist_similarity_edges_owned(
+        vault,
+        plan,
+        Some(family),
         Some((owned_sources, removed_symbol_ids)),
         actor.into(),
     )
@@ -211,6 +247,7 @@ where
 fn persist_similarity_edges_owned<C>(
     vault: &AsterVault<C>,
     plan: &SimilarityPlan,
+    family_scope: Option<SimilarityFamily>,
     ownership: Option<(&BTreeSet<String>, &BTreeSet<String>)>,
     actor: String,
 ) -> calyx_core::Result<SimilarityPersistReport>
@@ -218,6 +255,17 @@ where
     C: Clock,
 {
     refuse_legacy_similarity_rows(vault)?;
+    if let Some(family) = family_scope
+        && let Some(edge) = plan.edges.iter().find(|edge| edge.family != family)
+    {
+        return Err(sim_edge_corrupt(format!(
+            "family-scoped {} persistence received {} edge {} -> {}",
+            family.wire_name(),
+            edge.family.wire_name(),
+            edge.source_id,
+            edge.target_id,
+        )));
+    }
     let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
     let mut phase_start = std::time::Instant::now();
     let dump = similarity_edge_dump_bytes(&plan.edges);
@@ -243,12 +291,16 @@ where
     timing_ms.push(("encode_plan", phase_start.elapsed().as_millis() as u64));
     phase_start = std::time::Instant::now();
     let snapshot = vault.snapshot();
+    let scan_prefix = match family_scope {
+        Some(family) => {
+            let mut prefix = SIM_EDGE_ROW_PREFIX.to_vec();
+            prefix.push(family.sort_index());
+            prefix
+        }
+        None => SIM_EDGE_ROW_PREFIX.to_vec(),
+    };
     let mut existing: BTreeMap<Vec<u8>, Vec<u8>> = vault
-        .scan_cf_range_at(
-            snapshot,
-            ColumnFamily::Graph,
-            &prefix_range(SIM_EDGE_ROW_PREFIX),
-        )?
+        .scan_cf_range_at(snapshot, ColumnFamily::Graph, &prefix_range(&scan_prefix))?
         .into_iter()
         .collect();
     timing_ms.push(("scan_existing", phase_start.elapsed().as_millis() as u64));

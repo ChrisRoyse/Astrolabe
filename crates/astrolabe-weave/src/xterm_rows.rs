@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use astrolabe_domain::fsv::FsvAck;
 use astrolabe_ingest::VaultMutationPlan;
-use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
-use calyx_aster::mvcc::tombstone_value;
+use calyx_aster::cf::{ColumnFamily, XTermKind, prefix_range, xterm_key};
+use calyx_aster::mvcc::{LatestOnlyReadbackStatus, tombstone_value};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, CxId, LedgerRef, SlotId, VaultStore};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -41,6 +41,10 @@ pub const AGREEMENT_GRAPH_ASPECT_PROVENANCE: &str = "AsterVault:ColumnFamily::XT
 pub const ASTRO_XTERM_ROW_CORRUPT: &str = "ASTRO_XTERM_ROW_CORRUPT";
 /// Stable failure code for a plan row whose symbol has no CxId mapping.
 pub const ASTRO_XTERM_CX_ID_MISSING: &str = "ASTRO_XTERM_CX_ID_MISSING";
+/// Stable failure code for a stale, reused, or incomplete persisted-key inventory.
+pub const ASTRO_XTERM_INVENTORY_INVALID: &str = "ASTRO_XTERM_INVENTORY_INVALID";
+
+const XTERM_SCAN_PAGE_ROWS: usize = 1_024;
 
 const XTERM_REMEDIATION: &str = "regenerate eager cross-term rows with astrolabe_weave::persist_eager_cross_terms from a fresh plan";
 
@@ -65,6 +69,221 @@ pub struct EagerCrossTermPersistReport {
     /// Unforgeable full-readback witness when XTerm rows changed.
     /// A ledger-only no-delta replay carries labeled absence (`None`).
     pub fsv: Option<FsvAck>,
+}
+
+/// Physical read receipt for the one snapshot-bound XTerm inventory shared by
+/// all six kind-scoped reconciliation passes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EagerCrossTermInventoryReceipt {
+    pub snapshot_seq: u64,
+    pub pages: usize,
+    pub page_rows_high_water: usize,
+    pub page_bytes_high_water: u64,
+    pub scanned_rows: usize,
+    pub scanned_bytes: u64,
+    pub designed_rows: usize,
+    pub cotenant_rows_skipped: usize,
+    pub storage: LatestOnlyReadbackStatus,
+}
+
+/// Validated persisted designed-row keys, partitioned once by agreement kind.
+/// Each kind can be consumed exactly once so a caller cannot accidentally
+/// reconcile two plans against the same stale ownership set.
+#[derive(Debug)]
+pub struct EagerCrossTermKeyInventory {
+    receipt: EagerCrossTermInventoryReceipt,
+    keys_by_kind: BTreeMap<EagerAgreementKind, BTreeSet<Vec<u8>>>,
+}
+
+impl EagerCrossTermKeyInventory {
+    pub fn receipt(&self) -> &EagerCrossTermInventoryReceipt {
+        &self.receipt
+    }
+
+    fn take_kind(&mut self, kind: EagerAgreementKind) -> calyx_core::Result<BTreeSet<Vec<u8>>> {
+        self.keys_by_kind.remove(&kind).ok_or_else(|| CalyxError {
+            code: ASTRO_XTERM_INVENTORY_INVALID,
+            message: format!(
+                "persisted XTerm key inventory has already consumed or never contained {}",
+                kind.wire_name()
+            ),
+            remediation: "discard the inventory, take one fresh snapshot-bound inventory, and consume each designed kind exactly once",
+        })
+    }
+
+    pub fn finish(self) -> calyx_core::Result<EagerCrossTermInventoryReceipt> {
+        if !self.keys_by_kind.is_empty() {
+            let remaining = self
+                .keys_by_kind
+                .keys()
+                .map(|kind| kind.wire_name())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(CalyxError {
+                code: ASTRO_XTERM_INVENTORY_INVALID,
+                message: format!(
+                    "persisted XTerm key inventory was not fully consumed; remaining kinds={remaining}"
+                ),
+                remediation: "reconcile every designed agreement kind exactly once before accepting the inventory receipt",
+            });
+        }
+        Ok(self.receipt)
+    }
+}
+
+/// Scans the shared XTerm CF exactly once in bounded pages, validates every
+/// row under the same contract as the live reader, and partitions only compact
+/// designed-row keys for sequential kind reconciliation.
+pub fn inventory_eager_cross_term_keys<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<EagerCrossTermKeyInventory>
+where
+    C: Clock,
+{
+    let storage_before = vault.latest_only_readback_status();
+    ensure_bounded_inventory_storage(&storage_before, "persisted-key inventory pre-scan")?;
+    let snapshot_seq = vault.snapshot();
+    let accepted_cotenants = crate::accepted_xterm_cotenant_schemas();
+    let mut keys_by_kind = EagerAgreementKind::ALL
+        .into_iter()
+        .map(|kind| (kind, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut receipt = EagerCrossTermInventoryReceipt {
+        snapshot_seq,
+        pages: 0,
+        page_rows_high_water: 0,
+        page_bytes_high_water: 0,
+        scanned_rows: 0,
+        scanned_bytes: 0,
+        designed_rows: 0,
+        cotenant_rows_skipped: 0,
+        storage: storage_before.clone(),
+    };
+    vault.scan_cf_range_pages_at(
+        snapshot_seq,
+        ColumnFamily::XTerm,
+        &prefix_range(&[]),
+        XTERM_SCAN_PAGE_ROWS,
+        |page| -> calyx_core::Result<()> {
+            receipt.pages = receipt.pages.saturating_add(1);
+            receipt.page_rows_high_water = receipt.page_rows_high_water.max(page.len());
+            let page_bytes = page.iter().try_fold(0u64, |total, (key, value)| {
+                total
+                    .checked_add(key.len() as u64)
+                    .and_then(|total| total.checked_add(value.len() as u64))
+                    .ok_or_else(|| xterm_corrupt("XTerm inventory byte count overflow".to_string()))
+            })?;
+            receipt.page_bytes_high_water = receipt.page_bytes_high_water.max(page_bytes);
+            receipt.scanned_bytes = receipt
+                .scanned_bytes
+                .checked_add(page_bytes)
+                .ok_or_else(|| xterm_corrupt("XTerm inventory byte count overflow".to_string()))?;
+            receipt.scanned_rows = receipt
+                .scanned_rows
+                .checked_add(page.len())
+                .ok_or_else(|| xterm_corrupt("XTerm inventory row count overflow".to_string()))?;
+            for (key, value) in page {
+                let row: XtermRow = match serde_json::from_slice(&value) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        if crate::is_accepted_xterm_cotenant(&value, &accepted_cotenants) {
+                            receipt.cotenant_rows_skipped = receipt
+                                .cotenant_rows_skipped
+                                .checked_add(1)
+                                .ok_or_else(|| {
+                                    xterm_corrupt("XTerm co-tenant row count overflow".to_string())
+                                })?;
+                            continue;
+                        }
+                        return Err(xterm_corrupt(format!(
+                            "decode XTerm row {} during inventory: {error}",
+                            hex_lower_bytes(&key)
+                        )));
+                    }
+                };
+                let expected_key = xterm_key(
+                    row.key.cx_id,
+                    row.key.a,
+                    row.key.b,
+                    xterm_kind_wire(row.key.kind),
+                );
+                if key != expected_key {
+                    return Err(xterm_corrupt(format!(
+                        "XTerm row key {} does not match its decoded fields during inventory",
+                        hex_lower_bytes(&key)
+                    )));
+                }
+                if row.key.kind != LoomCrossTermKind::Agreement {
+                    continue;
+                }
+                let Some(kind) = designed_kind_for_slots(row.key.a, row.key.b) else {
+                    continue;
+                };
+                let inserted = keys_by_kind
+                    .get_mut(&kind)
+                    .expect("all designed kinds were initialized")
+                    .insert(key);
+                if !inserted {
+                    return Err(xterm_corrupt(format!(
+                        "XTerm inventory encountered a duplicate {} key",
+                        kind.wire_name()
+                    )));
+                }
+                receipt.designed_rows = receipt.designed_rows.checked_add(1).ok_or_else(|| {
+                    xterm_corrupt("designed XTerm row count overflow".to_string())
+                })?;
+            }
+            Ok(())
+        },
+    )?;
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_inventory_storage(&storage_after, "persisted-key inventory post-scan")?;
+    if storage_after != storage_before || vault.snapshot() != snapshot_seq {
+        return Err(CalyxError {
+            code: ASTRO_XTERM_INVENTORY_INVALID,
+            message: format!(
+                "XTerm storage generation changed during persisted-key inventory: seq_before={snapshot_seq}, seq_after={}, status_before={storage_before:?}, status_after={storage_after:?}",
+                vault.snapshot()
+            ),
+            remediation: "preserve the staged generation, identify the concurrent writer, and take a new inventory only after one stable latest-only generation is available",
+        });
+    }
+    Ok(EagerCrossTermKeyInventory {
+        receipt,
+        keys_by_kind,
+    })
+}
+
+fn ensure_bounded_inventory_storage(
+    status: &LatestOnlyReadbackStatus,
+    phase: &str,
+) -> calyx_core::Result<()> {
+    let invalid_cf = status.memtable.per_cf.iter().find(|cf| {
+        cf.cap_bytes != status.memtable_byte_cap
+            || cf.used_bytes > cf.cap_bytes
+            || cf.high_water_bytes > cf.cap_bytes
+    });
+    if !status.latest_only
+        || status.overlay_keys != 0
+        || status.overlay_versions != 0
+        || status.overlay_bytes != 0
+        || status.memtable_byte_cap == 0
+        || invalid_cf.is_some()
+    {
+        return Err(CalyxError {
+            code: ASTRO_XTERM_INVENTORY_INVALID,
+            message: format!(
+                "{phase} requires latest-only storage, an empty MVCC overlay, and every active memtable inside one positive hard cap; observed latest_only={}, overlay_keys={}, overlay_versions={}, overlay_bytes={}, memtable_byte_cap={}, invalid_cf={invalid_cf:?}",
+                status.latest_only,
+                status.overlay_keys,
+                status.overlay_versions,
+                status.overlay_bytes,
+                status.memtable_byte_cap,
+            ),
+            remediation: "preserve the staged generation and rebuild it through latest-only shadow import before inventorying eager XTerm ownership",
+        });
+    }
+    Ok(())
 }
 
 /// One designed-pair agreement edge recomputed from persisted XTerm CF rows
@@ -104,7 +323,53 @@ pub fn persist_eager_cross_terms<C>(
 where
     C: Clock,
 {
-    persist_eager_cross_terms_owned(vault, plan, cx_ids, None, actor.into())
+    persist_eager_cross_terms_owned(
+        vault,
+        plan,
+        cx_ids,
+        &EagerAgreementKind::ALL,
+        None,
+        actor.into(),
+    )
+}
+
+/// Reconciles exactly one designed agreement ownership domain.
+pub fn persist_eager_cross_term_kind<C>(
+    vault: &AsterVault<C>,
+    kind: EagerAgreementKind,
+    plan: &EagerCrossTermPlan,
+    cx_ids: &BTreeMap<String, CxId>,
+    actor: impl Into<String>,
+) -> calyx_core::Result<EagerCrossTermPersistReport>
+where
+    C: Clock,
+{
+    persist_eager_cross_terms_owned(vault, plan, cx_ids, &[kind], None, actor.into())
+}
+
+/// Reconciles one designed kind using a previously validated, single-use
+/// inventory so six sequential kinds do not rescan or retain the whole CF.
+pub fn persist_eager_cross_term_kind_from_inventory<C>(
+    vault: &AsterVault<C>,
+    kind: EagerAgreementKind,
+    plan: &EagerCrossTermPlan,
+    cx_ids: &BTreeMap<String, CxId>,
+    inventory: &mut EagerCrossTermKeyInventory,
+    actor: impl Into<String>,
+) -> calyx_core::Result<EagerCrossTermPersistReport>
+where
+    C: Clock,
+{
+    let existing_owned_keys = inventory.take_kind(kind)?;
+    persist_eager_cross_terms_owned_with_inventory(
+        vault,
+        plan,
+        cx_ids,
+        &[kind],
+        None,
+        Some(existing_owned_keys),
+        actor.into(),
+    )
 }
 
 /// Persists a dirty-symbol eager cross-term delta without touching clean symbols.
@@ -123,19 +388,89 @@ pub fn persist_eager_cross_terms_delta<C>(
 where
     C: Clock,
 {
-    persist_eager_cross_terms_owned(vault, plan, cx_ids, Some(removed_cx_ids), actor.into())
+    persist_eager_cross_terms_owned(
+        vault,
+        plan,
+        cx_ids,
+        &EagerAgreementKind::ALL,
+        Some(removed_cx_ids),
+        actor.into(),
+    )
+}
+
+/// Dirty-symbol reconciliation for one designed agreement ownership domain.
+pub fn persist_eager_cross_term_kind_delta<C>(
+    vault: &AsterVault<C>,
+    kind: EagerAgreementKind,
+    plan: &EagerCrossTermPlan,
+    cx_ids: &BTreeMap<String, CxId>,
+    removed_cx_ids: &BTreeSet<CxId>,
+    actor: impl Into<String>,
+) -> calyx_core::Result<EagerCrossTermPersistReport>
+where
+    C: Clock,
+{
+    persist_eager_cross_terms_owned(
+        vault,
+        plan,
+        cx_ids,
+        &[kind],
+        Some(removed_cx_ids),
+        actor.into(),
+    )
 }
 
 fn persist_eager_cross_terms_owned<C>(
     vault: &AsterVault<C>,
     plan: &EagerCrossTermPlan,
     cx_ids: &BTreeMap<String, CxId>,
+    reconcile_kinds: &[EagerAgreementKind],
     removed_cx_ids: Option<&BTreeSet<CxId>>,
     actor: String,
 ) -> calyx_core::Result<EagerCrossTermPersistReport>
 where
     C: Clock,
 {
+    persist_eager_cross_terms_owned_with_inventory(
+        vault,
+        plan,
+        cx_ids,
+        reconcile_kinds,
+        removed_cx_ids,
+        None,
+        actor,
+    )
+}
+
+fn persist_eager_cross_terms_owned_with_inventory<C>(
+    vault: &AsterVault<C>,
+    plan: &EagerCrossTermPlan,
+    cx_ids: &BTreeMap<String, CxId>,
+    reconcile_kinds: &[EagerAgreementKind],
+    removed_cx_ids: Option<&BTreeSet<CxId>>,
+    existing_owned_keys: Option<BTreeSet<Vec<u8>>>,
+    actor: String,
+) -> calyx_core::Result<EagerCrossTermPersistReport>
+where
+    C: Clock,
+{
+    let reconcile_kinds = reconcile_kinds.iter().copied().collect::<BTreeSet<_>>();
+    if reconcile_kinds.is_empty() {
+        return Err(xterm_corrupt(
+            "eager xterm persistence received an empty kind ownership set".to_string(),
+        ));
+    }
+    if let Some(row) = plan
+        .rows
+        .iter()
+        .find(|row| !reconcile_kinds.contains(&row.kind))
+    {
+        return Err(xterm_corrupt(format!(
+            "kind-scoped persistence does not own planned {} row for {:?}",
+            row.kind.wire_name(),
+            row.symbol_id,
+        )));
+    }
     let mut new_rows = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     let mut owned_keys = BTreeSet::<Vec<u8>>::new();
     let mut absent_by_kind = BTreeMap::<EagerAgreementKind, usize>::new();
@@ -175,16 +510,28 @@ where
     // the fresh plan. A removed live symbol is absent from `cx_ids`; retaining
     // its old XTerm row would make the live agreement/anomaly projection stale.
     // MVCC still preserves the tombstoned row at prior snapshots.
-    match removed_cx_ids {
-        None => {
+    match (removed_cx_ids, existing_owned_keys) {
+        (None, Some(existing)) => owned_keys.extend(existing),
+        (Some(_), Some(_)) => {
+            return Err(CalyxError {
+                code: ASTRO_XTERM_INVENTORY_INVALID,
+                message:
+                    "a full persisted-key inventory cannot be combined with dirty-region ownership"
+                        .to_string(),
+                remediation: "use the inventory only for full reconciliation, or pass the explicit removed-CxId delta without an inventory",
+            });
+        }
+        (None, None) => {
             for persisted in read_eager_cross_term_rows(vault)? {
-                owned_keys.insert(persisted.key);
+                if reconcile_kinds.contains(&persisted.kind) {
+                    owned_keys.insert(persisted.key);
+                }
             }
         }
-        Some(removed) => {
+        (Some(removed), None) => {
             for cx_id in removed {
-                for kind in EagerAgreementKind::ALL {
-                    owned_keys.insert(eager_xterm_key(*cx_id, kind));
+                for kind in &reconcile_kinds {
+                    owned_keys.insert(eager_xterm_key(*cx_id, *kind));
                 }
             }
         }
@@ -224,7 +571,7 @@ where
     let payload = serde_json::to_vec(&serde_json::json!({
         "schema": XTERM_EAGER_LEDGER_SCHEMA,
         "symbol_count": symbols.len(),
-        "designed_pair_count": EagerAgreementKind::ALL.len(),
+        "designed_pair_count": reconcile_kinds.len(),
         "rows_written": rows_written,
         "rows_unchanged": rows_unchanged,
         "rows_tombstoned": rows_tombstoned,

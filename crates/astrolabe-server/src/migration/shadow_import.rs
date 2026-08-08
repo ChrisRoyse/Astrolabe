@@ -242,14 +242,11 @@ pub(crate) struct WeaveDelta {
 }
 
 fn snapshot_cx_by_atom(
-    snapshot: &CbmGraphSnapshot,
+    snapshot: &CbmCompactGraphSnapshot,
     phase: &str,
 ) -> Result<BTreeMap<String, calyx_core::CxId>, DynError> {
     let mut by_atom = BTreeMap::new();
     for node in &snapshot.nodes {
-        let Some(cx_id) = node.cx_id else {
-            continue;
-        };
         if node.atom_id.trim().is_empty() {
             return Err(format!(
                 "{phase} graph snapshot node {} ({:?}) has an empty stable atom id",
@@ -257,10 +254,10 @@ fn snapshot_cx_by_atom(
             )
             .into());
         }
-        if let Some(existing) = by_atom.insert(node.atom_id.clone(), cx_id) {
+        if let Some(existing) = by_atom.insert(node.atom_id.clone(), node.cx_id) {
             return Err(format!(
                 "{phase} graph snapshot contains duplicate stable atom id {:?}: CxIds {} and {}",
-                node.atom_id, existing, cx_id
+                node.atom_id, existing, node.cx_id
             )
             .into());
         }
@@ -1882,7 +1879,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // project has no prior constellation to diff, so the before-map is legitimately empty
     // (the delta below is already `None` for an empty map). Only that exact refusal is
     // absorbed; every other read error still fails closed (#335).
-    let before_cx_by_atom = match astrolabe_ingest::read_cbm_graph_snapshot(&vault, project) {
+    let before_cx_by_atom = match astrolabe_ingest::read_cbm_compact_graph_snapshot(&vault, project)
+    {
         Ok(snapshot) => snapshot_cx_by_atom(&snapshot, "pre-import")?,
         Err(err) if err.code() == Some(astrolabe_ingest::ASTRO_MISSING_CBM_PROJECT_ROW) => {
             BTreeMap::new()
@@ -2186,11 +2184,11 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         }),
     };
     shadow_phase!("git_archaeology");
-    // Read the post-import snapshot ONCE and share it with the weave and the
-    // invalidation lane below (#23): re-reading the full graph in each phase
-    // tripled the largest fixed cost of the delta path at M scale.
-    let after_snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
-    shadow_phase!("after_snapshot_read");
+    // Read only the live identity/topology projection. Exact source, properties,
+    // vectors, structural nodes, and metadata are not inputs to either consumer;
+    // reconstructing them here multiplied corpus memory without changing output.
+    let after_snapshot = astrolabe_ingest::read_cbm_compact_graph_snapshot(&vault, project)?;
+    shadow_phase!("after_compact_snapshot_read");
     let after_cx_by_atom = snapshot_cx_by_atom(&after_snapshot, "post-import")?;
     let new_cx_ids = report
         .new_cx_id_values
@@ -2372,6 +2370,228 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 // post-import snapshot (#23), so only tests exercise this shape. Gated to test
 // builds rather than shipped as dead code (invariant 6).
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct WeaveSlotScanReceipt {
+    slot: u16,
+    source_snapshot_seq: u64,
+    pages: u64,
+    page_high_water_rows: u64,
+    page_high_water_bytes: u64,
+    rows_loaded: u64,
+    rows_for_other_constellations: u64,
+    rows_absent: u64,
+    rows_missing: u64,
+    scanned_bytes: u64,
+    encoded_bytes: u64,
+    decoded_owned_bytes: u64,
+    storage: calyx_aster::mvcc::LatestOnlyReadbackStatus,
+    process: Value,
+}
+
+fn ensure_bounded_weave_storage(
+    status: &calyx_aster::mvcc::LatestOnlyReadbackStatus,
+    phase: &str,
+) -> Result<(), DynError> {
+    let invalid_cf = status.memtable.per_cf.iter().find(|cf| {
+        cf.cap_bytes != status.memtable_byte_cap
+            || cf.used_bytes > cf.cap_bytes
+            || cf.high_water_bytes > cf.cap_bytes
+    });
+    if !status.latest_only
+        || status.overlay_keys != 0
+        || status.overlay_versions != 0
+        || status.overlay_bytes != 0
+        || status.memtable_byte_cap == 0
+        || invalid_cf.is_some()
+    {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_UNBOUNDED: {phase} requires latest-only storage, an empty MVCC overlay, and every active memtable inside one positive hard cap; observed latest_only={}, overlay_keys={}, overlay_versions={}, overlay_bytes={}, memtable_byte_cap={}, invalid_cf={invalid_cf:?}; remediation: preserve the staged generation and rebuild it through latest-only shadow import",
+            status.latest_only,
+            status.overlay_keys,
+            status.overlay_versions,
+            status.overlay_bytes,
+            status.memtable_byte_cap,
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn process_phase_usage_value(usage: calyx_aster::vault::VaultPhaseUsage) -> Value {
+    json!({
+        "kernel_time_100ns": usage.kernel_time_100ns,
+        "user_time_100ns": usage.user_time_100ns,
+        "read_operations": usage.read_operations,
+        "read_bytes": usage.read_bytes,
+        "write_operations": usage.write_operations,
+        "write_bytes": usage.write_bytes,
+        "page_faults": usage.page_faults,
+        "working_set_bytes_after": usage.working_set_bytes_after,
+        "peak_working_set_bytes_after": usage.peak_working_set_bytes_after,
+        "private_bytes_after": usage.private_bytes_after,
+        "peak_private_bytes_after": usage.peak_private_bytes_after,
+    })
+}
+
+fn slot_vector_owned_bytes(vector: &SlotVector) -> u64 {
+    match vector {
+        SlotVector::Dense { data, .. } => (data.len() * std::mem::size_of::<f32>()) as u64,
+        SlotVector::Sparse { entries, .. } => {
+            (entries.len() * std::mem::size_of::<calyx_core::SparseEntry>()) as u64
+        }
+        SlotVector::Multi { tokens, .. } => tokens
+            .iter()
+            .map(|token| (token.len() * std::mem::size_of::<f32>()) as u64)
+            .sum(),
+        SlotVector::Absent { .. } => 0,
+    }
+}
+
+fn load_weave_slot_at<C>(
+    vault: &AsterVault<C>,
+    source_snapshot_seq: u64,
+    slot: SlotId,
+    node_by_cx: &BTreeMap<calyx_core::CxId, usize>,
+    nodes: &mut [SimilarityNode],
+) -> Result<WeaveSlotScanReceipt, DynError>
+where
+    C: Clock,
+{
+    if let Some(node) = nodes.iter().find(|node| node.slots.contains_key(&slot)) {
+        return Err(format!(
+            "ASTRO_WEAVE_SLOT_ALREADY_LIVE: refusing to cold-load S{} while symbol {:?} still owns that decoded vector; remediation: release the exact prior slot family before loading it again",
+            slot.get(), node.symbol_id
+        )
+        .into());
+    }
+    let storage_before = vault.latest_only_readback_status();
+    ensure_bounded_weave_storage(&storage_before, &format!("S{} pre-scan", slot.get()))?;
+    let process_before = vault.process_usage_snapshot()?;
+    let mut pages = 0u64;
+    let mut page_high_water_rows = 0u64;
+    let mut page_high_water_bytes = 0u64;
+    let mut rows_loaded = 0u64;
+    let mut rows_for_other_constellations = 0u64;
+    let mut rows_absent = 0u64;
+    let mut scanned_bytes = 0u64;
+    let mut encoded_bytes = 0u64;
+    let mut decoded_owned_bytes = 0u64;
+    vault.scan_cf_range_pages_at(
+        source_snapshot_seq,
+        ColumnFamily::slot(slot),
+        &prefix_range(&[]),
+        1_024,
+        |page| -> Result<(), DynError> {
+            pages = pages.saturating_add(1);
+            page_high_water_rows = page_high_water_rows.max(page.len() as u64);
+            let page_bytes = page.iter().try_fold(0u64, |total, (key, value)| {
+                total
+                    .checked_add(key.len() as u64)
+                    .and_then(|total| total.checked_add(value.len() as u64))
+                    .ok_or_else(|| -> DynError {
+                        format!("S{} page byte count overflow", slot.get()).into()
+                    })
+            })?;
+            page_high_water_bytes = page_high_water_bytes.max(page_bytes);
+            scanned_bytes = scanned_bytes.saturating_add(page_bytes);
+            for (key, value) in page {
+                let raw_cx = <[u8; 16]>::try_from(key.as_slice()).map_err(|_| -> DynError {
+                    format!(
+                        "ASTRO_WEAVE_SLOT_KEY_INVALID: S{} row key has {} bytes, expected exactly 16; remediation: preserve the staged vault and rebuild the corrupt Slot CF",
+                        slot.get(), key.len()
+                    )
+                    .into()
+                })?;
+                let cx_id = calyx_core::CxId::from_bytes(raw_cx);
+                let Some(&node_index) = node_by_cx.get(&cx_id) else {
+                    rows_for_other_constellations =
+                        rows_for_other_constellations.saturating_add(1);
+                    continue;
+                };
+                let vector = calyx_aster::vault::encode::decode_slot_vector(&value)?;
+                if matches!(vector, SlotVector::Absent { .. }) {
+                    rows_absent = rows_absent.saturating_add(1);
+                }
+                decoded_owned_bytes =
+                    decoded_owned_bytes.saturating_add(slot_vector_owned_bytes(&vector));
+                encoded_bytes = encoded_bytes.saturating_add(value.len() as u64);
+                if nodes[node_index].slots.insert(slot, vector).is_some() {
+                    return Err(format!(
+                        "ASTRO_WEAVE_SLOT_DUPLICATE: S{} produced duplicate live row for CxId {}; remediation: preserve the staged vault and rebuild the corrupt Slot CF",
+                        slot.get(), cx_id
+                    )
+                    .into());
+                }
+                rows_loaded = rows_loaded.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
+    let process = vault.process_usage_snapshot()?.phase_since(process_before);
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_weave_storage(&storage_after, &format!("S{} post-scan", slot.get()))?;
+    if storage_after != storage_before {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN: S{} storage state changed during a read-only source scan: before={storage_before:?}, after={storage_after:?}; remediation: preserve the staged generation and inspect the concurrent writer before retrying",
+            slot.get()
+        )
+        .into());
+    }
+    Ok(WeaveSlotScanReceipt {
+        slot: slot.get(),
+        source_snapshot_seq,
+        pages,
+        page_high_water_rows,
+        page_high_water_bytes,
+        rows_loaded,
+        rows_for_other_constellations,
+        rows_absent,
+        rows_missing: (nodes.len() as u64).saturating_sub(rows_loaded),
+        scanned_bytes,
+        encoded_bytes,
+        decoded_owned_bytes,
+        storage: storage_before,
+        process: process_phase_usage_value(process),
+    })
+}
+
+fn release_weave_slot(nodes: &mut [SimilarityNode], slot: SlotId) -> u64 {
+    nodes
+        .iter_mut()
+        .filter_map(|node| node.slots.remove(&slot))
+        .map(|vector| slot_vector_owned_bytes(&vector))
+        .sum()
+}
+
+fn eager_kind_index(kind: EagerAgreementKind) -> usize {
+    EagerAgreementKind::ALL
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .expect("designed eager kind is in EagerAgreementKind::ALL")
+}
+
+fn update_similarity_dump_hasher(
+    hasher: &mut blake3::Hasher,
+    edges: &[astrolabe_weave::SimilarityEdge],
+) {
+    for edge in edges {
+        let line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:08x}\t{:08x}\n",
+            edge.family.wire_name(),
+            edge.source_id,
+            edge.target_id,
+            edge.source_qn,
+            edge.target_qn,
+            edge.slot.get(),
+            edge.graph_edge_kind.as_str(),
+            edge.metric.as_str(),
+            edge.weight.to_bits(),
+            edge.threshold.to_bits(),
+        );
+        hasher.update(line.as_bytes());
+    }
+}
+
 /// [`run_live_weave`] with an optional caller-preloaded graph snapshot (#23).
 ///
 /// A shadow import already reads the full CBM graph snapshot to derive the
@@ -2384,7 +2604,7 @@ pub(crate) fn run_live_weave_with_snapshot<C>(
     project: &str,
     import_changed: bool,
     delta: Option<&WeaveDelta>,
-    snapshot: Option<&CbmGraphSnapshot>,
+    snapshot: Option<&CbmCompactGraphSnapshot>,
 ) -> Result<Value, DynError>
 where
     C: Clock,
@@ -2402,212 +2622,425 @@ where
     let t_snapshot = std::time::Instant::now();
     let owned_snapshot = match snapshot {
         Some(_) => None,
-        None => Some(astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?),
+        None => Some(astrolabe_ingest::read_cbm_compact_graph_snapshot(
+            vault, project,
+        )?),
     };
     let snapshot = snapshot
         .or(owned_snapshot.as_ref())
         .expect("weave snapshot present by construction");
     let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
-    let at_seq = vault.snapshot();
+    let source_snapshot_seq = snapshot.receipt.snapshot_seq;
     let t_slot_load = std::time::Instant::now();
+    let mut nodes = Vec::with_capacity(snapshot.nodes.len());
+    let mut node_by_cx = BTreeMap::new();
+    let mut node_by_symbol = BTreeMap::new();
+    let mut cx_ids = BTreeMap::new();
+    for node in &snapshot.nodes {
+        let index = nodes.len();
+        if node_by_cx.insert(node.cx_id, index).is_some() {
+            return Err(format!(
+                "ASTRO_WEAVE_DUPLICATE_CX: compact source contains duplicate CxId {}",
+                node.cx_id
+            )
+            .into());
+        }
+        if node_by_symbol.insert(node.atom_id.clone(), index).is_some()
+            || cx_ids.insert(node.atom_id.clone(), node.cx_id).is_some()
+        {
+            return Err(format!(
+                "ASTRO_WEAVE_DUPLICATE_ATOM: compact source contains duplicate stable atom id {:?}",
+                node.atom_id
+            )
+            .into());
+        }
+        nodes.push(SimilarityNode::new(
+            node.atom_id.clone(),
+            node.qualified_name.clone(),
+        ));
+    }
     let slots = EagerAgreementKind::ALL
         .into_iter()
         .flat_map(|kind| {
             let (left, right) = kind.slots();
             [left, right]
         })
-        .chain([
-            SlotId::new(1),
-            SlotId::new(4),
-            SlotId::new(18),
-            SlotId::new(21),
-        ])
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    // One range scan per slot CF instead of one MVCC point read per (node, slot):
-    // the slot CFs are keyed by CxId, so a full-CF scan yields every row this loop
-    // previously fetched individually (~700k point reads at M scale).
-    let mut slot_rows_by_slot = BTreeMap::<SlotId, BTreeMap<Vec<u8>, Vec<u8>>>::new();
-    for slot in &slots {
-        slot_rows_by_slot.insert(
-            *slot,
-            vault
-                .scan_cf_at(at_seq, ColumnFamily::slot(*slot))?
-                .into_iter()
-                .collect(),
-        );
+        .chain(SimilarityFamily::ALL.map(SimilarityFamily::slot))
+        .collect::<BTreeSet<_>>();
+    let mut slot_scans = Vec::<WeaveSlotScanReceipt>::new();
+    let mut similarity_prepass_slot_scan_count = 0usize;
+    let mut decoded_slot_bytes_live = 0u64;
+    let mut decoded_slot_bytes_high_water = 0u64;
+    macro_rules! load_slot {
+        ($slot:expr) => {{
+            let receipt =
+                load_weave_slot_at(vault, source_snapshot_seq, $slot, &node_by_cx, &mut nodes)?;
+            decoded_slot_bytes_live =
+                decoded_slot_bytes_live.saturating_add(receipt.decoded_owned_bytes);
+            decoded_slot_bytes_high_water =
+                decoded_slot_bytes_high_water.max(decoded_slot_bytes_live);
+            slot_scans.push(receipt);
+        }};
     }
-    let live_nodes = snapshot
-        .nodes
-        .iter()
-        .filter(|node| !node.structural)
-        .collect::<Vec<_>>();
-    // Per-node slot decode is independent, so chunking the node list over
-    // measured host parallelism cannot change results (#23); chunk outputs are
-    // concatenated in input order and the duplicate check runs sequentially
-    // below, exactly as before.
-    let workers = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
-        .min(live_nodes.len())
-        .max(1);
-    let chunk_size = live_nodes.len().div_ceil(workers);
-    struct SlotChunk {
-        nodes: Vec<(SimilarityNode, calyx_core::CxId)>,
-        absent: usize,
-        missing: usize,
+    macro_rules! release_slot {
+        ($slot:expr) => {{
+            let released = release_weave_slot(&mut nodes, $slot);
+            decoded_slot_bytes_live = decoded_slot_bytes_live.saturating_sub(released);
+        }};
     }
-    let chunk_results: Vec<Result<SlotChunk, DynError>> = std::thread::scope(|scope| {
-        let slots = &slots;
-        let slot_rows_by_slot = &slot_rows_by_slot;
-        live_nodes
-            .chunks(chunk_size.max(1))
-            .map(|chunk| {
-                scope.spawn(move || -> Result<SlotChunk, DynError> {
-                    let mut built = Vec::with_capacity(chunk.len());
-                    let mut absent = 0usize;
-                    let mut missing = 0usize;
-                    for node in chunk {
-                        let cx_id = node.cx_id.ok_or_else(|| {
-                            format!(
-                                "live non-structural graph node {:?} has no CxId",
-                                node.qualified_name
-                            )
-                        })?;
-                        let mut similarity_node =
-                            SimilarityNode::new(node.atom_id.clone(), node.qualified_name.clone());
-                        for slot in slots {
-                            let Some(bytes) = slot_rows_by_slot
-                                .get(slot)
-                                .and_then(|rows| rows.get(slot_key(cx_id).as_slice()))
-                            else {
-                                missing += 1;
-                                continue;
-                            };
-                            let vector = calyx_aster::vault::encode::decode_slot_vector(bytes)?;
-                            if matches!(vector, SlotVector::Absent { .. }) {
-                                absent += 1;
-                            }
-                            similarity_node.slots.insert(*slot, vector);
-                        }
-                        built.push((similarity_node, cx_id));
-                    }
-                    Ok(SlotChunk {
-                        nodes: built,
-                        absent,
-                        missing,
-                    })
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err("weave slot worker panicked".into()))
-            })
-            .collect()
-    });
-    let mut nodes = Vec::with_capacity(live_nodes.len());
-    let mut cx_ids = BTreeMap::new();
-    let mut absent_slot_rows = 0usize;
-    let mut missing_slot_rows = 0usize;
-    for chunk in chunk_results {
-        let chunk = chunk?;
-        absent_slot_rows += chunk.absent;
-        missing_slot_rows += chunk.missing;
-        for (similarity_node, cx_id) in chunk.nodes {
-            if cx_ids
-                .insert(similarity_node.symbol_id.clone(), cx_id)
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate live stable atom id {:?} ({:?}) while planning weave",
-                    similarity_node.symbol_id, similarity_node.qualified_name
-                )
-                .into());
-            }
-            nodes.push(similarity_node);
-        }
-    }
-    let ms_slot_load = t_slot_load.elapsed().as_millis() as u64;
 
-    let t_similarity = std::time::Instant::now();
+    let similarity_config = SimilarityPlannerConfig::default();
     let mut ms_sim_read_rows = 0u64;
     let mut ms_sim_expand = 0u64;
-    let similarity_config = SimilarityPlannerConfig::default();
-    let (similarity_plan, similarity_region) = match delta {
+    let similarity_region = match delta {
         Some(delta) => {
+            let mut changed_symbols = delta.dirty_symbol_ids.clone();
+            changed_symbols.extend(delta.removed_symbol_ids.iter().cloned());
             let t_read_rows = std::time::Instant::now();
             let persisted = read_similarity_edge_rows(vault)?;
             ms_sim_read_rows = t_read_rows.elapsed().as_millis() as u64;
-            let mut changed = delta.dirty_symbol_ids.clone();
-            changed.extend(delta.removed_symbol_ids.iter().cloned());
             let t_expand = std::time::Instant::now();
-            let region =
-                expand_similarity_dirty_region(&nodes, &changed, &persisted, &similarity_config);
+            let mut region = expand_persisted_similarity_region(&changed_symbols, &persisted);
+            drop(persisted);
+            // Candidate expansion needs only one family vector at a time. The
+            // second pass below is the exact repair plan; no family vectors from
+            // this bounded prepass survive it.
+            for family in SimilarityFamily::ALL {
+                load_slot!(family.slot());
+                extend_similarity_candidate_region_for_family(
+                    &nodes,
+                    family,
+                    &changed_symbols,
+                    &similarity_config,
+                    &mut region,
+                );
+                release_slot!(family.slot());
+            }
+            similarity_prepass_slot_scan_count = slot_scans.len();
             ms_sim_expand = t_expand.elapsed().as_millis() as u64;
-            let region_nodes = nodes
-                .iter()
-                .filter(|node| region.contains(&node.symbol_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            (
-                plan_similarity_edges(&region_nodes, &similarity_config)?,
-                Some(region),
-            )
+            Some(region)
         }
-        None => (plan_similarity_edges(&nodes, &similarity_config)?, None),
+        None => None,
     };
-    let ms_sim_plan = (t_similarity.elapsed().as_millis() as u64)
-        .saturating_sub(ms_sim_read_rows)
-        .saturating_sub(ms_sim_expand);
-    let vector_skip_count = similarity_plan.skips.vector_skips.len();
-    let family_opt_out_count = similarity_plan.skips.family_opt_outs.len();
-    let t_sim_persist = std::time::Instant::now();
-    let similarity = match (delta, similarity_region.as_ref()) {
-        (Some(delta), Some(region)) => persist_similarity_edges_delta(
-            vault,
-            &similarity_plan,
-            region,
-            &delta.removed_symbol_ids,
-            "astrolabe-shadow-weave",
-        )?,
-        _ => persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?,
-    };
-    let ms_sim_persist = t_sim_persist.elapsed().as_millis() as u64;
-    let ms_similarity = t_similarity.elapsed().as_millis() as u64;
-    let t_xterm = std::time::Instant::now();
-    // Abundance accounting is derived from the panel roster that was physically
-    // persisted for this import, never a compiled-in slot count (#522): the
-    // active slot count is the frozen roster of the shadow panel version. A stale
-    // or unknown panel version fails closed here rather than overclaiming a
-    // different panel's pair yield.
+
+    let mut similarity_dump_hasher = blake3::Hasher::new();
+    let mut similarity_edge_count = 0usize;
+    let mut similarity_rows_written = 0usize;
+    let mut similarity_rows_unchanged = 0usize;
+    let mut similarity_rows_tombstoned = 0usize;
+    let mut vector_skip_count = 0usize;
+    let mut family_opt_out_count = 0usize;
+    let mut similarity_plan_timing = BTreeMap::<String, u64>::new();
+    let mut similarity_persist_timing = BTreeMap::<String, u64>::new();
+    let mut similarity_family_receipts = Vec::<Value>::new();
+    let mut similarity_fsv = Vec::<Value>::new();
+    macro_rules! reconcile_similarity_family {
+        ($family:expr) => {{
+            let family = $family;
+            let process_before = vault.process_usage_snapshot()?;
+            let family_nodes;
+            let plan_nodes = match similarity_region.as_ref() {
+                Some(region) => {
+                    family_nodes = nodes
+                        .iter()
+                        .filter(|node| region.contains(&node.symbol_id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    family_nodes.as_slice()
+                }
+                None => nodes.as_slice(),
+            };
+            let plan = plan_similarity_family_edges(plan_nodes, family, &similarity_config)?;
+            update_similarity_dump_hasher(&mut similarity_dump_hasher, &plan.edges);
+            similarity_edge_count = similarity_edge_count.saturating_add(plan.edges.len());
+            vector_skip_count =
+                vector_skip_count.saturating_add(plan.skips.vector_skips.len());
+            family_opt_out_count =
+                family_opt_out_count.saturating_add(plan.skips.family_opt_outs.len());
+            for (label, ms) in &plan.timing_ms {
+                *similarity_plan_timing.entry(label.clone()).or_default() += *ms;
+            }
+            let report = match (delta, similarity_region.as_ref()) {
+                (Some(delta), Some(region)) => persist_similarity_family_edges_delta(
+                    vault,
+                    family,
+                    &plan,
+                    region,
+                    &delta.removed_symbol_ids,
+                    "astrolabe-shadow-weave",
+                )?,
+                _ => persist_similarity_family_edges(
+                    vault,
+                    family,
+                    &plan,
+                    "astrolabe-shadow-weave",
+                )?,
+            };
+            similarity_rows_written =
+                similarity_rows_written.saturating_add(report.rows_written);
+            similarity_rows_unchanged =
+                similarity_rows_unchanged.saturating_add(report.rows_unchanged);
+            similarity_rows_tombstoned =
+                similarity_rows_tombstoned.saturating_add(report.rows_tombstoned);
+            for (label, ms) in &report.timing_ms.0 {
+                *similarity_persist_timing
+                    .entry((*label).to_string())
+                    .or_default() += *ms;
+            }
+            if let Some(fsv) = report.fsv.as_ref() {
+                similarity_fsv.push(fsv_ack_envelope(fsv));
+            }
+            let usage = vault
+                .process_usage_snapshot()?
+                .phase_since(process_before);
+            similarity_family_receipts.push(json!({
+                "family": family.wire_name(),
+                "source_slot": family.slot().get(),
+                "source_snapshot_seq": source_snapshot_seq,
+                "nodes_loaded": nodes.len(),
+                "nodes_planned": plan_nodes.len(),
+                "edge_count": plan.edges.len(),
+                "edge_dump_hash": report.edge_dump_hash,
+                "process": process_phase_usage_value(usage),
+            }));
+            drop(plan);
+        }};
+    }
+
     let active_slot_count = astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)?.len();
-    let xterm_plan = match delta {
-        Some(delta) => {
-            plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_symbol_ids, active_slot_count)?
-        }
-        None => plan_eager_cross_terms(&nodes, active_slot_count)?,
+    let dirty_cx_ids = delta.map(|delta| {
+        cx_ids
+            .iter()
+            .filter(|(symbol_id, _)| delta.dirty_symbol_ids.contains(*symbol_id))
+            .map(|(symbol_id, cx_id)| (symbol_id.clone(), *cx_id))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let mut xterm_scalar_bits = vec![[None; 6]; nodes.len()];
+    let mut xterm_rows_written = 0usize;
+    let mut xterm_rows_unchanged = 0usize;
+    let mut xterm_rows_tombstoned = 0usize;
+    let mut xterm_absent_by_kind = BTreeMap::<EagerAgreementKind, usize>::new();
+    let mut xterm_symbol_count = 0usize;
+    let mut neighborhood_capped_evaluations = 0usize;
+    let mut neighborhood_sampler_scratch_high_water = 0usize;
+    let mut xterm_kind_receipts = Vec::<Value>::new();
+    let mut xterm_fsv = Vec::<Value>::new();
+    let mut xterm_key_inventory = if delta.is_none() {
+        Some(inventory_eager_cross_term_keys(vault)?)
+    } else {
+        None
     };
-    let xterm = match delta {
-        Some(delta) => {
-            let dirty_cx_ids = cx_ids
-                .iter()
-                .filter(|(symbol_id, _)| delta.dirty_symbol_ids.contains(*symbol_id))
-                .map(|(symbol_id, cx_id)| (symbol_id.clone(), *cx_id))
-                .collect::<BTreeMap<_, _>>();
-            persist_eager_cross_terms_delta(
-                vault,
-                &xterm_plan,
-                &dirty_cx_ids,
-                &delta.removed_cx_ids,
-                "astrolabe-shadow-weave",
-            )?
+    macro_rules! reconcile_xterm_kind {
+        ($kind:expr) => {{
+            let kind = $kind;
+            let process_before = vault.process_usage_snapshot()?;
+            let plan = match delta {
+                Some(delta) => plan_eager_cross_term_kind_for_symbols(
+                    &nodes,
+                    kind,
+                    &delta.dirty_symbol_ids,
+                    active_slot_count,
+                )?,
+                None => plan_eager_cross_term_kind(&nodes, kind, active_slot_count)?,
+            };
+            xterm_symbol_count = xterm_symbol_count.max(plan.abundance.symbol_count);
+            neighborhood_capped_evaluations = neighborhood_capped_evaluations
+                .saturating_add(plan.neighborhood_capped_evaluations);
+            neighborhood_sampler_scratch_high_water = neighborhood_sampler_scratch_high_water
+                .max(plan.neighborhood_sampler_scratch_high_water);
+            let kind_index = eager_kind_index(kind);
+            for row in &plan.rows {
+                if let CrossTermValue::Scalar(value) = row.value {
+                    let node_index = node_by_symbol.get(&row.symbol_id).ok_or_else(|| -> DynError {
+                        format!(
+                            "ASTRO_WEAVE_XTERM_SYMBOL_UNKNOWN: {} plan returned unknown symbol {:?}",
+                            kind.wire_name(), row.symbol_id
+                        )
+                        .into()
+                    })?;
+                    xterm_scalar_bits[*node_index][kind_index] = Some(value.to_bits());
+                }
+            }
+            *xterm_absent_by_kind.entry(kind).or_default() += plan.abundance.absent_count;
+            let report = match (delta, dirty_cx_ids.as_ref()) {
+                (Some(delta), Some(dirty_cx_ids)) => persist_eager_cross_term_kind_delta(
+                    vault,
+                    kind,
+                    &plan,
+                    dirty_cx_ids,
+                    &delta.removed_cx_ids,
+                    "astrolabe-shadow-weave",
+                )?,
+                _ => persist_eager_cross_term_kind_from_inventory(
+                    vault,
+                    kind,
+                    &plan,
+                    &cx_ids,
+                    xterm_key_inventory.as_mut().ok_or_else(|| -> DynError {
+                        "ASTRO_XTERM_INVENTORY_INVALID: full reconciliation lost its single snapshot-bound persisted-key inventory"
+                            .into()
+                    })?,
+                    "astrolabe-shadow-weave",
+                )?,
+            };
+            xterm_rows_written = xterm_rows_written.saturating_add(report.rows_written);
+            xterm_rows_unchanged = xterm_rows_unchanged.saturating_add(report.rows_unchanged);
+            xterm_rows_tombstoned =
+                xterm_rows_tombstoned.saturating_add(report.rows_tombstoned);
+            if let Some(fsv) = report.fsv.as_ref() {
+                xterm_fsv.push(fsv_ack_envelope(fsv));
+            }
+            let usage = vault
+                .process_usage_snapshot()?
+                .phase_since(process_before);
+            xterm_kind_receipts.push(json!({
+                "kind": kind.wire_name(),
+                "source_slots": [kind.slots().0.get(), kind.slots().1.get()],
+                "source_snapshot_seq": source_snapshot_seq,
+                "symbol_count": plan.abundance.symbol_count,
+                "scalar_count": plan.abundance.scalar_count,
+                "absent_count": plan.abundance.absent_count,
+                "kind_dump_hash": report.xterm_dump_hash,
+                "sampler_scratch_high_water": plan.neighborhood_sampler_scratch_high_water,
+                "process": process_phase_usage_value(usage),
+            }));
+            drop(plan);
+        }};
+    }
+
+    // Dependency-aware schedule: every distinct Slot CF is cold-loaded once on
+    // a full build, shared only across consumers that need it, then released.
+    // At most two decoded slot families are live simultaneously.
+    let struct_slot = SimilarityFamily::Struct.slot();
+    let semantic_slot = SimilarityFamily::Semantic.slot();
+    load_slot!(struct_slot);
+    load_slot!(semantic_slot);
+    reconcile_similarity_family!(SimilarityFamily::Struct);
+    reconcile_similarity_family!(SimilarityFamily::Semantic);
+    reconcile_xterm_kind!(EagerAgreementKind::CloneTaxonomy);
+    release_slot!(struct_slot);
+
+    let doc_slot = EagerAgreementKind::DocDrift.slots().0;
+    load_slot!(doc_slot);
+    reconcile_xterm_kind!(EagerAgreementKind::DocDrift);
+    release_slot!(doc_slot);
+    let route_slot = EagerAgreementKind::RouteMatch.slots().1;
+    load_slot!(route_slot);
+    reconcile_xterm_kind!(EagerAgreementKind::RouteMatch);
+    release_slot!(route_slot);
+    release_slot!(semantic_slot);
+
+    let api_slot = SimilarityFamily::Api.slot();
+    load_slot!(api_slot);
+    reconcile_similarity_family!(SimilarityFamily::Api);
+    let name_slot = EagerAgreementKind::NameTruth.slots().0;
+    load_slot!(name_slot);
+    reconcile_xterm_kind!(EagerAgreementKind::NameTruth);
+    release_slot!(name_slot);
+    release_slot!(api_slot);
+
+    let profile_slot = SimilarityFamily::Profile.slot();
+    load_slot!(profile_slot);
+    reconcile_similarity_family!(SimilarityFamily::Profile);
+    release_slot!(profile_slot);
+
+    for kind in [
+        EagerAgreementKind::ComplexityChurn,
+        EagerAgreementKind::CentralityCoverage,
+    ] {
+        let (left, right) = kind.slots();
+        load_slot!(left);
+        load_slot!(right);
+        reconcile_xterm_kind!(kind);
+        release_slot!(right);
+        release_slot!(left);
+    }
+    let xterm_key_inventory_receipt = xterm_key_inventory
+        .take()
+        .map(|inventory| inventory.finish())
+        .transpose()?;
+    if decoded_slot_bytes_live != 0 || nodes.iter().any(|node| !node.slots.is_empty()) {
+        return Err(format!(
+            "ASTRO_WEAVE_SLOT_RELEASE_INCOMPLETE: source planning ended with decoded_slot_bytes_live={decoded_slot_bytes_live} and {} nodes still owning slots; remediation: preserve the staged generation and repair the family release schedule",
+            nodes.iter().filter(|node| !node.slots.is_empty()).count()
+        )
+        .into());
+    }
+    let ms_slot_load = t_slot_load.elapsed().as_millis() as u64;
+    let similarity_edge_dump_hash = hex_lower(similarity_dump_hasher.finalize().as_bytes());
+
+    let t_xterm_hash = std::time::Instant::now();
+    let mut symbol_order = (0..nodes.len()).collect::<Vec<_>>();
+    symbol_order.sort_by(|left, right| nodes[*left].symbol_id.cmp(&nodes[*right].symbol_id));
+    let mut xterm_dump_hasher = blake3::Hasher::new();
+    for node_index in symbol_order {
+        let node = &nodes[node_index];
+        for kind in EagerAgreementKind::ALL {
+            let Some(bits) = xterm_scalar_bits[node_index][eager_kind_index(kind)] else {
+                continue;
+            };
+            let (left, right) = kind.slots();
+            let cx_id = cx_ids.get(&node.symbol_id).ok_or_else(|| -> DynError {
+                format!("missing CxId for xterm dump symbol {:?}", node.symbol_id).into()
+            })?;
+            let line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:08x}\n",
+                kind.wire_name(),
+                node.symbol_id,
+                node.qualified_name,
+                cx_id,
+                left.get(),
+                right.get(),
+                bits,
+            );
+            xterm_dump_hasher.update(line.as_bytes());
         }
-        None => persist_eager_cross_terms(vault, &xterm_plan, &cx_ids, "astrolabe-shadow-weave")?,
-    };
+    }
+    let xterm_dump_hash = hex_lower(xterm_dump_hasher.finalize().as_bytes());
+    let ms_xterm_hash = t_xterm_hash.elapsed().as_millis() as u64;
+    let absent_slot_rows = slot_scans
+        .iter()
+        .skip(similarity_prepass_slot_scan_count)
+        .map(|receipt| receipt.rows_absent)
+        .sum::<u64>();
+    let missing_slot_rows = slot_scans
+        .iter()
+        .skip(similarity_prepass_slot_scan_count)
+        .map(|receipt| receipt.rows_missing)
+        .sum::<u64>();
+    let slot_encoded_bytes = slot_scans
+        .iter()
+        .skip(similarity_prepass_slot_scan_count)
+        .map(|receipt| receipt.encoded_bytes)
+        .sum::<u64>();
+    let physical_slot_rows = slot_scans
+        .iter()
+        .map(|receipt| {
+            receipt
+                .rows_loaded
+                .saturating_add(receipt.rows_for_other_constellations)
+        })
+        .sum::<u64>();
+    let physical_slot_encoded_bytes = slot_scans
+        .iter()
+        .map(|receipt| receipt.scanned_bytes)
+        .sum::<u64>();
+    let ms_sim_plan = similarity_plan_timing.values().copied().sum::<u64>();
+    let ms_sim_persist = similarity_persist_timing.values().copied().sum::<u64>();
+    let ms_similarity = ms_sim_read_rows
+        .saturating_add(ms_sim_expand)
+        .saturating_add(ms_sim_plan)
+        .saturating_add(ms_sim_persist);
+    let ms_xterm = xterm_kind_receipts
+        .iter()
+        .filter_map(|receipt| {
+            receipt
+                .pointer("/process/user_time_100ns")
+                .and_then(Value::as_u64)
+        })
+        .sum::<u64>()
+        / 10_000
+        + ms_xterm_hash;
     // The six designed agreements above remain the anomaly/architecture
     // comparators. The complete lane independently derives every applicable
     // roster from persisted Base + hash-verified Slot rows, then materializes one
@@ -2616,9 +3049,7 @@ where
     // unchanged constellation avoids all pair arithmetic and all ledger writes.
     let complete_xterms =
         reconcile_complete_associations(vault, "astrolabe-shadow-complete-associations")?;
-    let ms_xterm = t_xterm.elapsed().as_millis() as u64;
-    let absent_by_kind = xterm
-        .absent_by_kind
+    let absent_by_kind = xterm_absent_by_kind
         .iter()
         .map(|(kind, count)| (kind.wire_name(), *count))
         .collect::<BTreeMap<_, _>>();
@@ -2635,19 +3066,17 @@ where
             // #433 permanent labeled attribution INSIDE the plan: per-family ANN
             // candidate generation vs exact-cosine rescoring, so the superlinear
             // residue is attributable to a real sub-stage instead of guessed.
-            "similarity_plan_internal": similarity_plan
-                .timing_ms
+            "similarity_plan_internal": similarity_plan_timing
                 .iter()
                 .map(|(label, ms)| (label.clone(), json!(ms)))
                 .collect::<serde_json::Map<_, _>>(),
             "similarity_persist": ms_sim_persist,
-            "similarity_persist_internal": similarity
-                .timing_ms
-                .0
+            "similarity_persist_internal": similarity_persist_timing
                 .iter()
-                .map(|(label, ms)| ((*label).to_string(), json!(ms)))
+                .map(|(label, ms)| (label.clone(), json!(ms)))
                 .collect::<serde_json::Map<_, _>>(),
             "xterm": ms_xterm,
+            "xterm_hash": ms_xterm_hash,
         },
         "trust": "verified",
         "freshness": "current",
@@ -2657,32 +3086,49 @@ where
             "slot_rows_expected": nodes.len().saturating_mul(slots.len()),
             "slot_rows_absent": absent_slot_rows,
             "slot_rows_missing": missing_slot_rows,
+            "slot_encoded_bytes": slot_encoded_bytes,
+        },
+        "weave_source": {
+            "compact_graph": &snapshot.receipt,
+            "slot_page_row_cap": 1_024,
+            "slot_scan_count": slot_scans.len(),
+            "similarity_prepass_slot_scan_count": similarity_prepass_slot_scan_count,
+            "distinct_slot_count": slots.len(),
+            "physical_slot_rows_read": physical_slot_rows,
+            "physical_slot_encoded_bytes": physical_slot_encoded_bytes,
+            "decoded_slot_bytes_high_water": decoded_slot_bytes_high_water,
+            "decoded_slot_bytes_terminal": decoded_slot_bytes_live,
+            "slot_scans": slot_scans,
         },
         "similarity": {
-            "edge_count": similarity.edge_count,
-            "rows_written": similarity.rows_written,
-            "rows_unchanged": similarity.rows_unchanged,
-            "rows_tombstoned": similarity.rows_tombstoned,
-            "edge_dump_hash": similarity.edge_dump_hash,
+            "edge_count": similarity_edge_count,
+            "rows_written": similarity_rows_written,
+            "rows_unchanged": similarity_rows_unchanged,
+            "rows_tombstoned": similarity_rows_tombstoned,
+            "edge_dump_hash": similarity_edge_dump_hash,
             "vector_skips": vector_skip_count,
             "family_opt_outs": family_opt_out_count,
-            "fsv": similarity.fsv.as_ref().map(fsv_ack_envelope),
+            "families": similarity_family_receipts,
+            "fsv": similarity_fsv,
         },
         "eager_cross_terms": {
-            "symbol_count": xterm.symbol_count,
-            "rows_written": xterm.rows_written,
-            "rows_unchanged": xterm.rows_unchanged,
-            "rows_tombstoned": xterm.rows_tombstoned,
+            "symbol_count": xterm_symbol_count,
+            "rows_written": xterm_rows_written,
+            "rows_unchanged": xterm_rows_unchanged,
+            "rows_tombstoned": xterm_rows_tombstoned,
             "absent_by_kind": absent_by_kind,
-            "xterm_dump_hash": xterm.xterm_dump_hash,
-            "fsv": xterm.fsv.as_ref().map(fsv_ack_envelope),
+            "xterm_dump_hash": xterm_dump_hash,
+            "persisted_key_inventory": xterm_key_inventory_receipt,
+            "kinds": xterm_kind_receipts,
+            "fsv": xterm_fsv,
             // #433 neighborhood peer sample-cap disclosure (invariant 3): the
             // applied `weave_neighborhood_sample_cap` and how many (symbol, kind)
             // neighborhood agreements were scored over a seeded peer subsample of
             // the cap instead of every comparable peer. Zero capped evaluations
             // means the plan is byte-identical to the uncapped path.
-            "neighborhood_sample_cap": xterm_plan.neighborhood_sample_cap,
-            "neighborhood_capped_evaluations": xterm_plan.neighborhood_capped_evaluations,
+            "neighborhood_sample_cap": astrolabe_weave::knobs::weave_neighborhood_sample_cap(),
+            "neighborhood_capped_evaluations": neighborhood_capped_evaluations,
+            "neighborhood_sampler_scratch_high_water": neighborhood_sampler_scratch_high_water,
         },
         "complete_associations": {
             "constellations_total": complete_xterms.constellations_total,
@@ -2699,6 +3145,9 @@ where
             "witnesses_written": complete_xterms.witnesses_written,
             "witnesses_tombstoned": complete_xterms.witnesses_tombstoned,
             "commit_count": complete_xterms.commit_count,
+            "mutation_rows_high_water": complete_xterms.mutation_rows_high_water,
+            "mutation_bytes_high_water": complete_xterms.mutation_bytes_high_water,
+            "source": complete_xterms.source,
             "ledger_ref": complete_xterms.ledger_ref.as_ref().map(|ledger_ref| json!({
                 "seq": ledger_ref.seq,
                 "entry_hash": hex_lower(&ledger_ref.hash),

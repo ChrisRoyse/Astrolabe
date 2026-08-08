@@ -1,7 +1,7 @@
 use super::{AsterVault, VaultOpenDiagnostics, VaultRecoveryReport};
 use crate::cf::CfRouter;
 use crate::dedup::DedupPolicy;
-use crate::mvcc::{Freshness, Snapshot, VersionedCfStore};
+use crate::mvcc::{Freshness, LatestOnlyReadbackStatus, Snapshot, VersionedCfStore};
 use crate::sst::SstSummary;
 use crate::timetravel::RetentionHorizon;
 use calyx_core::{Clock, Result, Seq};
@@ -49,5 +49,10 @@ where
 
     pub fn flush_all_cfs(&self) -> Result<Vec<SstSummary>> {
         self.rows.flush_all_cfs()
+    }
+
+    /// Exact latest-only/overlay/memtable state used to admit bounded scans.
+    pub fn latest_only_readback_status(&self) -> LatestOnlyReadbackStatus {
+        self.rows.latest_only_readback_status()
     }
 }

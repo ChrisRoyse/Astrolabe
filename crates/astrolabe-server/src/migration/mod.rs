@@ -17,8 +17,8 @@ use astrolabe_guard::{
     dependency_ood_screen_unavailable, screen_prompt_injection_inputs,
 };
 use astrolabe_ingest::{
-    CBM_FILE_HASH_ROW_SCHEMA, CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
-    CbmSqlitePipelineRows, RowSinkStreamParams, SqliteImportOptions,
+    CBM_FILE_HASH_ROW_SCHEMA, CbmCompactGraphSnapshot, CbmFileHashRow, CbmGraphEdge, CbmGraphNode,
+    CbmGraphSnapshot, CbmSqlitePipelineRows, RowSinkStreamParams, SqliteImportOptions,
     import_cbm_row_stream_to_vault, snapshot_into_row_stream, verify_chain,
 };
 use astrolabe_kernel::{
@@ -60,16 +60,19 @@ use astrolabe_provenance::{
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, BlindSpotAnomalyInputs,
-    BlindSpotConfig, DEFAULT_BLIND_SPOT_PAIRS, DETECT_ANOMALIES_SCHEMA, EagerAgreementKind,
-    LiveAnomalyInputs, SimilarityNode, SimilarityPlannerConfig, SubscriptionId,
-    acknowledge_reactive_subscription, anomaly_report_artifact_bytes, blind_spot_anomaly_inputs,
-    blind_spot_slots, detect_anomalies, expand_similarity_dirty_region,
-    live_anomaly_inputs_from_vault, persist_eager_cross_terms, persist_eager_cross_terms_delta,
-    persist_similarity_edges, persist_similarity_edges_delta, plan_eager_cross_terms,
-    plan_eager_cross_terms_for_symbols, plan_similarity_edges, read_similarity_edge_rows,
-    reconcile_complete_associations, recover_reactive_state, run_index_time_drift,
+    BlindSpotConfig, CrossTermValue, DEFAULT_BLIND_SPOT_PAIRS, DETECT_ANOMALIES_SCHEMA,
+    EagerAgreementKind, LiveAnomalyInputs, SimilarityFamily, SimilarityNode,
+    SimilarityPlannerConfig, SubscriptionId, acknowledge_reactive_subscription,
+    anomaly_report_artifact_bytes, blind_spot_anomaly_inputs, blind_spot_slots, detect_anomalies,
+    expand_persisted_similarity_region, extend_similarity_candidate_region_for_family,
+    inventory_eager_cross_term_keys, live_anomaly_inputs_from_vault,
+    persist_eager_cross_term_kind_delta, persist_eager_cross_term_kind_from_inventory,
+    persist_similarity_family_edges, persist_similarity_family_edges_delta,
+    plan_eager_cross_term_kind, plan_eager_cross_term_kind_for_symbols,
+    plan_similarity_family_edges, read_similarity_edge_rows, reconcile_complete_associations,
+    recover_reactive_state, run_index_time_drift,
 };
-use calyx_aster::cf::{ColumnFamily, ledger_key, slot_key};
+use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range, slot_key};
 use calyx_aster::ledger_view::{LedgerPointReadTrace, parse_aster_ledger_seq};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Clock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};

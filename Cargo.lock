@@ -240,6 +240,7 @@ dependencies = [
  "astrolabe-panel",
  "astrolabe-provenance",
  "astrolabe-weave",
+ "blake3",
  "calyx-assay",
  "calyx-aster",
  "calyx-core",

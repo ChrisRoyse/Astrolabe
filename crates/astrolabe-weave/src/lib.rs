@@ -47,10 +47,12 @@ mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use complete_xterms::{
-    ASTRO_XTERM_COMPLETION_CORRUPT, ASTRO_XTERM_COMPLETION_OVERFLOW, ASTRO_XTERM_SOURCE_CORRUPT,
-    COMPLETE_PAIR_BLOCK_MAGIC, COMPLETE_PAIR_BLOCK_PREFIX, COMPLETE_PAIR_BLOCK_SCHEMA,
-    COMPLETE_WITNESS_PREFIX, COMPLETE_WITNESS_SCHEMA, CompleteAssociationPersistReport,
-    CompleteAssociationState, PairMetricCounts, PairReasonCounts, read_complete_association_state,
+    ASTRO_XTERM_COMPLETION_CORRUPT, ASTRO_XTERM_COMPLETION_OVERFLOW,
+    ASTRO_XTERM_COMPLETION_RESOURCE_EXHAUSTED, ASTRO_XTERM_SOURCE_CORRUPT,
+    ASTRO_XTERM_SOURCE_UNBOUNDED, COMPLETE_PAIR_BLOCK_MAGIC, COMPLETE_PAIR_BLOCK_PREFIX,
+    COMPLETE_PAIR_BLOCK_SCHEMA, COMPLETE_WITNESS_PREFIX, COMPLETE_WITNESS_SCHEMA,
+    CompleteAssociationPersistReport, CompleteAssociationSourceReceipt, CompleteAssociationState,
+    PairMetricCounts, PairReasonCounts, read_complete_association_state,
     read_complete_association_state_at, read_complete_association_state_vault_path,
     reconcile_complete_associations,
 };
@@ -86,6 +88,7 @@ pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
     SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
     SimilarityPersistReport, persist_similarity_edges, persist_similarity_edges_delta,
+    persist_similarity_family_edges, persist_similarity_family_edges_delta,
     read_similarity_edge_rows, sim_edge_graph_key,
 };
 pub use xterm_cotenant::{
@@ -95,11 +98,14 @@ pub use xterm_cotenant::{
 };
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
-    ASTRO_XTERM_ROW_CORRUPT, AgreementGraphAspect, EagerCrossTermPersistReport,
+    ASTRO_XTERM_INVENTORY_INVALID, ASTRO_XTERM_ROW_CORRUPT, AgreementGraphAspect,
+    EagerCrossTermInventoryReceipt, EagerCrossTermKeyInventory, EagerCrossTermPersistReport,
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
     agreement_graph_aspect, agreement_graph_from_persisted_rows,
     agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots,
-    eager_xterm_dump_bytes, eager_xterm_key, persist_eager_cross_terms,
+    eager_xterm_dump_bytes, eager_xterm_key, inventory_eager_cross_term_keys,
+    persist_eager_cross_term_kind, persist_eager_cross_term_kind_delta,
+    persist_eager_cross_term_kind_from_inventory, persist_eager_cross_terms,
     persist_eager_cross_terms_delta, read_eager_cross_term_rows,
     read_eager_cross_term_rows_with_cotenants,
 };
@@ -593,7 +599,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SimilarityFamily {
     Struct,
     Semantic,
@@ -821,7 +827,7 @@ impl SimilarityNode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimilarityMetric {
     Cosine,
 }
@@ -834,7 +840,7 @@ impl SimilarityMetric {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimilarityEdge {
     pub family: SimilarityFamily,
     pub source_id: String,
@@ -1030,70 +1036,117 @@ pub fn plan_similarity_edges(
     let mut timing_ms: Vec<(String, u64)> = Vec::new();
 
     for family in SimilarityFamily::ALL {
-        if config.disabled_families.contains(&family) {
-            skips.family_opt_outs.push(SimilarityFamilyOptOut {
-                family,
-                slot: family.slot(),
-                reason: SimilarityFamilyOptOutReason::DisabledByConfig,
-                node_count: 0,
-                limit: None,
-            });
-            continue;
-        }
-
-        let vectors = collect_family_vectors(nodes, family, &mut skips);
-        let strategy = config.candidate_strategy(family);
-        let t_generate = std::time::Instant::now();
-        let candidate_lists = match strategy {
-            SimilarityCandidateStrategy::ExactPairs => {
-                if let Some(limit) = config.exact_pair_node_limit
-                    && vectors.len() > limit
-                {
-                    skips.family_opt_outs.push(SimilarityFamilyOptOut {
-                        family,
-                        slot: family.slot(),
-                        reason: SimilarityFamilyOptOutReason::ExactCandidateLimitExceeded,
-                        node_count: vectors.len(),
-                        limit: Some(limit),
-                    });
-                    continue;
-                }
-                None
-            }
-            SimilarityCandidateStrategy::Ann => {
-                let generated = ann::generate_family_candidates(
-                    family,
-                    &vectors,
-                    &config.ann,
-                    config.per_node_cap,
-                )?;
-                skips.ann_reports.insert(family, generated.report);
-                Some(generated.per_source)
-            }
-        };
-        timing_ms.push((
-            format!("ann_generate.{family}"),
-            t_generate.elapsed().as_millis() as u64,
-        ));
-
-        let threshold = config.thresholds.threshold(family);
-        let t_rescore = std::time::Instant::now();
-        let (family_edges, pair_counts) = plan_family_edges(
-            family,
-            threshold,
-            config.per_node_cap,
-            &vectors,
-            config.worker_count,
-            candidate_lists.as_deref(),
-        );
-        timing_ms.push((
-            format!("rescore.{family}"),
-            t_rescore.elapsed().as_millis() as u64,
-        ));
-        skips.pair_counts.insert(family, pair_counts);
-        edges.extend(family_edges);
+        let family_plan = plan_similarity_family_edges_inner(nodes, family, config)?;
+        edges.extend(family_plan.edges);
+        skips.vector_skips.extend(family_plan.skips.vector_skips);
+        skips
+            .family_opt_outs
+            .extend(family_plan.skips.family_opt_outs);
+        skips.pair_counts.extend(family_plan.skips.pair_counts);
+        skips.ann_reports.extend(family_plan.skips.ann_reports);
+        timing_ms.extend(family_plan.timing_ms);
     }
 
+    edges.sort_by(stable_edge_order);
+    Ok(SimilarityPlan {
+        edges,
+        skips,
+        workers_requested: config.worker_count,
+        timing_ms,
+    })
+}
+
+/// Plans exactly one similarity family. This is the bounded production shape:
+/// callers may load one Slot CF, plan/persist its prefix, and release every
+/// decoded/normalized vector before loading the next family.
+pub fn plan_similarity_family_edges(
+    nodes: &[SimilarityNode],
+    family: SimilarityFamily,
+    config: &SimilarityPlannerConfig,
+) -> Result<SimilarityPlan, SimilarityPlanError> {
+    validate_plan_request(nodes, config)?;
+    plan_similarity_family_edges_inner(nodes, family, config)
+}
+
+fn plan_similarity_family_edges_inner(
+    nodes: &[SimilarityNode],
+    family: SimilarityFamily,
+    config: &SimilarityPlannerConfig,
+) -> Result<SimilarityPlan, SimilarityPlanError> {
+    let mut skips = SimilaritySkipReport::default();
+    if config.disabled_families.contains(&family) {
+        skips.family_opt_outs.push(SimilarityFamilyOptOut {
+            family,
+            slot: family.slot(),
+            reason: SimilarityFamilyOptOutReason::DisabledByConfig,
+            node_count: 0,
+            limit: None,
+        });
+        return Ok(SimilarityPlan {
+            edges: Vec::new(),
+            skips,
+            workers_requested: config.worker_count,
+            timing_ms: Vec::new(),
+        });
+    }
+
+    let vectors = collect_family_vectors(nodes, family, &mut skips);
+    let strategy = config.candidate_strategy(family);
+    let t_generate = std::time::Instant::now();
+    let candidate_lists = match strategy {
+        SimilarityCandidateStrategy::ExactPairs => {
+            if let Some(limit) = config.exact_pair_node_limit
+                && vectors.len() > limit
+            {
+                skips.family_opt_outs.push(SimilarityFamilyOptOut {
+                    family,
+                    slot: family.slot(),
+                    reason: SimilarityFamilyOptOutReason::ExactCandidateLimitExceeded,
+                    node_count: vectors.len(),
+                    limit: Some(limit),
+                });
+                return Ok(SimilarityPlan {
+                    edges: Vec::new(),
+                    skips,
+                    workers_requested: config.worker_count,
+                    timing_ms: vec![(
+                        format!("ann_generate.{family}"),
+                        t_generate.elapsed().as_millis() as u64,
+                    )],
+                });
+            }
+            None
+        }
+        SimilarityCandidateStrategy::Ann => {
+            let generated = ann::generate_family_candidates(
+                family,
+                &vectors,
+                &config.ann,
+                config.per_node_cap,
+            )?;
+            skips.ann_reports.insert(family, generated.report);
+            Some(generated.per_source)
+        }
+    };
+    let mut timing_ms = vec![(
+        format!("ann_generate.{family}"),
+        t_generate.elapsed().as_millis() as u64,
+    )];
+    let threshold = config.thresholds.threshold(family);
+    let t_rescore = std::time::Instant::now();
+    let (mut edges, pair_counts) = plan_family_edges(
+        family,
+        threshold,
+        config.per_node_cap,
+        &vectors,
+        config.worker_count,
+        candidate_lists.as_deref(),
+    );
+    timing_ms.push((
+        format!("rescore.{family}"),
+        t_rescore.elapsed().as_millis() as u64,
+    ));
+    skips.pair_counts.insert(family, pair_counts);
     edges.sort_by(stable_edge_order);
     Ok(SimilarityPlan {
         edges,
@@ -1116,6 +1169,19 @@ pub fn expand_similarity_dirty_region(
     persisted: &[PersistedSimilarityEdgeRow],
     config: &SimilarityPlannerConfig,
 ) -> BTreeSet<String> {
+    let mut region = expand_persisted_similarity_region(changed, persisted);
+    for family in SimilarityFamily::ALL {
+        extend_similarity_candidate_region_for_family(nodes, family, changed, config, &mut region);
+    }
+    region
+}
+
+/// Expands a changed set through two hops of the physically persisted SIM
+/// graph without requiring any Slot vectors.
+pub fn expand_persisted_similarity_region(
+    changed: &BTreeSet<String>,
+    persisted: &[PersistedSimilarityEdgeRow],
+) -> BTreeSet<String> {
     let mut region = changed.clone();
     for _ in 0..2 {
         let frontier = region.clone();
@@ -1126,40 +1192,49 @@ pub fn expand_similarity_dirty_region(
             }
         }
     }
+    region
+}
+
+/// Adds one family's exact candidate headroom to an existing dirty region.
+/// This split lets bounded callers load and release one family at a time while
+/// producing the same union as [`expand_similarity_dirty_region`].
+pub fn extend_similarity_candidate_region_for_family(
+    nodes: &[SimilarityNode],
+    family: SimilarityFamily,
+    changed: &BTreeSet<String>,
+    config: &SimilarityPlannerConfig,
+    region: &mut BTreeSet<String>,
+) {
+    if config.disabled_families.contains(&family) {
+        return;
+    }
     let candidate_cap = config
         .per_node_cap
         .saturating_mul(config.ann.candidate_multiplier)
         .max(config.per_node_cap);
-    for family in SimilarityFamily::ALL {
-        if config.disabled_families.contains(&family) {
-            continue;
-        }
-        let mut skips = SimilaritySkipReport::default();
-        let vectors = collect_family_vectors(nodes, family, &mut skips);
-        for source in vectors
+    let mut skips = SimilaritySkipReport::default();
+    let vectors = collect_family_vectors(nodes, family, &mut skips);
+    for source in vectors
+        .iter()
+        .filter(|vector| changed.contains(&vector.symbol_id))
+    {
+        let mut candidates = vectors
             .iter()
-            .filter(|vector| changed.contains(&vector.symbol_id))
-        {
-            let mut candidates = vectors
-                .iter()
-                .filter(|target| target.symbol_id != source.symbol_id)
-                .filter_map(|target| {
-                    cosine(&source.vector, &target.vector)
-                        .map(|score| (score, target.symbol_id.as_str()))
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| {
-                right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1))
-            });
-            region.extend(
-                candidates
-                    .into_iter()
-                    .take(candidate_cap)
-                    .map(|(_, symbol_id)| symbol_id.to_string()),
-            );
-        }
+            .filter(|target| target.symbol_id != source.symbol_id)
+            .filter_map(|target| {
+                cosine(&source.vector, &target.vector)
+                    .map(|score| (score, target.symbol_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        candidates
+            .sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        region.extend(
+            candidates
+                .into_iter()
+                .take(candidate_cap)
+                .map(|(_, symbol_id)| symbol_id.to_string()),
+        );
     }
-    region
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1246,6 +1321,9 @@ pub struct EagerCrossTermPlan {
     /// uncapped path.
     pub neighborhood_sample_cap: usize,
     pub neighborhood_capped_evaluations: usize,
+    /// Maximum number of peer positions retained by the sparse sampler for any
+    /// one evaluation. This is a directly reportable O(cap) scratch bound.
+    pub neighborhood_sampler_scratch_high_water: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2801,6 +2879,81 @@ pub fn plan_eager_cross_terms_for_symbols(
     plan_eager_cross_terms_selected(nodes, Some(symbol_ids), active_slot_count)
 }
 
+/// Plans exactly one designed eager agreement kind. Callers can load only the
+/// two required Slot CFs, persist that disjoint XTerm ownership domain, and
+/// release its normalized operands before moving to the next kind.
+pub fn plan_eager_cross_term_kind(
+    nodes: &[SimilarityNode],
+    kind: EagerAgreementKind,
+    active_slot_count: usize,
+) -> calyx_core::Result<EagerCrossTermPlan> {
+    plan_eager_cross_term_kind_selected(nodes, kind, None, active_slot_count)
+}
+
+/// One-kind variant restricted to dirty stable symbol ids while the full node
+/// corpus remains available as neighborhood context.
+pub fn plan_eager_cross_term_kind_for_symbols(
+    nodes: &[SimilarityNode],
+    kind: EagerAgreementKind,
+    symbol_ids: &BTreeSet<String>,
+    active_slot_count: usize,
+) -> calyx_core::Result<EagerCrossTermPlan> {
+    plan_eager_cross_term_kind_selected(nodes, kind, Some(symbol_ids), active_slot_count)
+}
+
+fn plan_eager_cross_term_kind_selected(
+    nodes: &[SimilarityNode],
+    kind: EagerAgreementKind,
+    symbol_ids: Option<&BTreeSet<String>>,
+    active_slot_count: usize,
+) -> calyx_core::Result<EagerCrossTermPlan> {
+    validate_active_roster(nodes, active_slot_count)?;
+    let selected_indices = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| symbol_ids.is_none_or(|ids| ids.contains(&node.symbol_id)))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let sample_cap = crate::knobs::weave_neighborhood_sample_cap();
+    let sample_seed = crate::knobs::WEAVE_NEIGHBORHOOD_SAMPLE_SEED;
+    let (values, capped, scratch_high_water) =
+        cross_term_values(nodes, kind, &selected_indices, sample_cap, sample_seed);
+    let (left_slot, right_slot) = kind.slots();
+    let mut rows = selected_indices
+        .iter()
+        .zip(values)
+        .map(|(&node_index, value)| EagerCrossTermRow {
+            symbol_id: nodes[node_index].symbol_id.clone(),
+            qualified_name: nodes[node_index].qualified_name.clone(),
+            kind,
+            left_slot,
+            right_slot,
+            value,
+            persisted: true,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(cross_term_row_order);
+    let scalar_count = rows
+        .iter()
+        .filter(|row| matches!(row.value, CrossTermValue::Scalar(_)))
+        .count();
+    let absent_count = rows.len().saturating_sub(scalar_count);
+    Ok(EagerCrossTermPlan {
+        agreement_graph: agreement_graph_from_cross_terms(&rows),
+        abundance: CrossTermAbundance {
+            symbol_count: selected_indices.len(),
+            designed_pair_count_per_symbol: 1,
+            materialized_count: selected_indices.len(),
+            scalar_count,
+            absent_count,
+        },
+        rows,
+        neighborhood_sample_cap: sample_cap,
+        neighborhood_capped_evaluations: capped,
+        neighborhood_sampler_scratch_high_water: scratch_high_water,
+    })
+}
+
 /// Largest panel slot id referenced by any designed eager agreement pair.
 ///
 /// The persisted panel roster must physically host every designed pair, so a
@@ -2896,11 +3049,14 @@ fn plan_eager_cross_terms_selected(
             .map(|handle| handle.join().expect("cross-term kind worker panicked"))
     });
     let mut neighborhood_capped_evaluations = 0usize;
-    for (kind, (values, capped)) in EagerAgreementKind::ALL
+    let mut neighborhood_sampler_scratch_high_water = 0usize;
+    for (kind, (values, capped, scratch_high_water)) in EagerAgreementKind::ALL
         .into_iter()
         .zip(counted_values_by_kind)
     {
         neighborhood_capped_evaluations += capped;
+        neighborhood_sampler_scratch_high_water =
+            neighborhood_sampler_scratch_high_water.max(scratch_high_water);
         let (left_slot, right_slot) = kind.slots();
         for (&node_index, value) in selected_indices.iter().zip(values) {
             let node = &nodes[node_index];
@@ -2940,6 +3096,7 @@ fn plan_eager_cross_terms_selected(
         },
         neighborhood_sample_cap: sample_cap,
         neighborhood_capped_evaluations,
+        neighborhood_sampler_scratch_high_water,
     })
 }
 
@@ -2953,7 +3110,7 @@ fn cross_term_values(
     selected_indices: &[usize],
     sample_cap: usize,
     sample_seed: u64,
-) -> (Vec<CrossTermValue>, usize) {
+) -> (Vec<CrossTermValue>, usize, usize) {
     let (left_slot, right_slot) = kind.slots();
     let operands = nodes
         .iter()
@@ -2971,6 +3128,7 @@ fn cross_term_values(
                 .iter()
                 .map(|&index| direct_cross_term_value(&operands[index].0, &operands[index].1))
                 .collect(),
+            0,
             0,
         ),
         EagerCrossTermComparator::NeighborhoodAgreement => {
@@ -2995,6 +3153,7 @@ fn cross_term_values(
                 }
             }
             let mut capped = 0usize;
+            let mut scratch_high_water = 0usize;
             let values = selected_indices
                 .iter()
                 .map(|&node_index| {
@@ -3005,6 +3164,9 @@ fn cross_term_values(
                             .unwrap_or(&[]),
                         _ => &[],
                     };
+                    if group.len().saturating_sub(1) > sample_cap {
+                        scratch_high_water = scratch_high_water.max(sample_cap.min(group.len()));
+                    }
                     neighborhood_cross_term_value(
                         node_index,
                         &nodes[node_index].symbol_id,
@@ -3017,7 +3179,7 @@ fn cross_term_values(
                     )
                 })
                 .collect();
-            (values, capped)
+            (values, capped, scratch_high_water)
         }
     }
 }
@@ -3072,12 +3234,21 @@ fn direct_cross_term_value(
 fn seeded_peer_indices(n: usize, cap: usize, seed: u64, label: &str) -> Vec<usize> {
     let m = cap.min(n);
     let mut rng = astrolabe_assay::rng::DeterministicRng::from_u64_labeled(seed, label);
-    let mut indices: Vec<usize> = (0..n).collect();
+    // Sparse representation of the exact same forward partial Fisher-Yates
+    // permutation. Missing entries mean identity; only positions displaced by
+    // the first `m` swaps are retained. This consumes the same draws and emits
+    // the same selected values as the dense `[0, n)` array in O(m) space.
+    let mut displaced = BTreeMap::<usize, usize>::new();
+    let mut chosen = Vec::with_capacity(m);
     for i in 0..m {
         let j = i + (rng.next_u64() % (n - i) as u64) as usize;
-        indices.swap(i, j);
+        let at_i = displaced.remove(&i).unwrap_or(i);
+        let at_j = displaced.remove(&j).unwrap_or(j);
+        chosen.push(at_j);
+        if i != j {
+            displaced.insert(j, at_i);
+        }
     }
-    let mut chosen = indices[..m].to_vec();
     chosen.sort_unstable();
     chosen
 }
@@ -3124,39 +3295,49 @@ fn neighborhood_cross_term_value(
     // the cap is scored whole and is byte-identical to the uncapped path.
     let comparable_peers =
         comparable_pool.len() - usize::from(comparable_pool.binary_search(&node_index).is_ok());
-    let sampled;
-    let peer_positions: &[usize] = if comparable_peers > sample_cap {
+    let sampled = if comparable_peers > sample_cap {
         *capped += 1;
-        sampled = seeded_peer_indices(
+        Some(seeded_peer_indices(
             comparable_pool.len(),
             sample_cap,
             sample_seed,
             &format!("{kind}:{source_qualified_name}:{}", comparable_pool.len()),
-        );
-        &sampled
+        ))
     } else {
-        sampled = (0..comparable_pool.len()).collect();
-        &sampled
+        None
     };
 
-    let mut left_scores = Vec::with_capacity(peer_positions.len());
-    let mut right_scores = Vec::with_capacity(peer_positions.len());
-    for &pool_position in peer_positions {
+    let peer_count = sampled.as_ref().map_or(comparable_pool.len(), Vec::len);
+    let mut left_scores = Vec::with_capacity(peer_count);
+    let mut right_scores = Vec::with_capacity(peer_count);
+    let mut score_peer = |pool_position: usize| {
         let peer_index = comparable_pool[pool_position];
         if peer_index == node_index {
-            continue;
+            return;
         }
         let (peer_left, peer_right) = &operands[peer_index];
         let (Ok(peer_left), Ok(peer_right)) = (peer_left, peer_right) else {
-            continue;
+            return;
         };
         let (Some(left_score), Some(right_score)) =
             (cosine(left, peer_left), cosine(right, peer_right))
         else {
-            continue;
+            return;
         };
         left_scores.push(left_score);
         right_scores.push(right_score);
+    };
+    match &sampled {
+        Some(positions) => {
+            for &pool_position in positions {
+                score_peer(pool_position);
+            }
+        }
+        None => {
+            for pool_position in 0..comparable_pool.len() {
+                score_peer(pool_position);
+            }
+        }
     }
 
     if left_scores.len() < 2 {

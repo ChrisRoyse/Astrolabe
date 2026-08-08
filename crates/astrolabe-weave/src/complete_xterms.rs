@@ -16,10 +16,10 @@ use std::str::FromStr;
 
 use astrolabe_domain::fsv::FsvAck;
 use astrolabe_ingest::VaultMutationPlan;
-use calyx_aster::cf::{ColumnFamily, prefix_range};
-use calyx_aster::mvcc::tombstone_value;
+use calyx_aster::cf::{ColumnFamily, KeyRange, prefix_range};
+use calyx_aster::mvcc::{LatestOnlyReadbackStatus, tombstone_value};
 use calyx_aster::vault::encode::{BaseRecord, decode_slot_vector};
-use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_aster::vault::{AsterVault, OrderedCfRead, SstReadSession, VaultOptions};
 use calyx_core::{
     AbsentReason, CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultId,
     VaultStore,
@@ -48,10 +48,18 @@ pub const COMPLETE_WITNESS_PREFIX: &[u8] = b"astrolabe:complete-xterm-witness:v2
 /// Binary schema discriminator understood by every full-XTerm co-tenant scan.
 pub const COMPLETE_PAIR_BLOCK_MAGIC: &[u8; 8] = XTERM_COMPLETE_PAIR_BLOCK_MAGIC;
 pub const ASTRO_XTERM_SOURCE_CORRUPT: &str = "ASTRO_XTERM_SOURCE_CORRUPT";
+pub const ASTRO_XTERM_SOURCE_UNBOUNDED: &str = "ASTRO_XTERM_SOURCE_UNBOUNDED";
 pub const ASTRO_XTERM_COMPLETION_CORRUPT: &str = "ASTRO_XTERM_COMPLETION_CORRUPT";
 pub const ASTRO_XTERM_COMPLETION_OVERFLOW: &str = "ASTRO_XTERM_COMPLETION_OVERFLOW";
+pub const ASTRO_XTERM_COMPLETION_RESOURCE_EXHAUSTED: &str =
+    "ASTRO_XTERM_COMPLETION_RESOURCE_EXHAUSTED";
 
 const MAX_MUTATION_ROWS_PER_COMMIT: usize = 50_000;
+const MAX_MUTATION_BYTES_PER_COMMIT: usize = 8 * 1024 * 1024;
+const SOURCE_SCAN_PAGE_ROWS: usize = 1_024;
+/// A source session reaches another physical-read progress point after at most
+/// this many complete constellations have been planned.
+const SOURCE_RECORD_BATCH: usize = 64;
 /// Bound planned records retained at once. The Rayon global pool work-steals
 /// within each batch; indexed parallel iteration preserves CxId input order.
 const PLANNING_RECORD_BATCH: usize = 8;
@@ -62,6 +70,38 @@ fn source_corrupt(message: impl Into<String>) -> CalyxError {
         message: message.into(),
         remediation: "re-index the repository from real source bytes and verify every Base slot hash against its Slot-CF row before mining associations",
     }
+}
+
+fn ensure_bounded_source_storage(
+    status: &LatestOnlyReadbackStatus,
+    phase: &str,
+) -> calyx_core::Result<()> {
+    let invalid_cf = status.memtable.per_cf.iter().find(|cf| {
+        cf.cap_bytes != status.memtable_byte_cap
+            || cf.used_bytes > cf.cap_bytes
+            || cf.high_water_bytes > cf.cap_bytes
+    });
+    if !status.latest_only
+        || status.overlay_keys != 0
+        || status.overlay_versions != 0
+        || status.overlay_bytes != 0
+        || status.memtable_byte_cap == 0
+        || invalid_cf.is_some()
+    {
+        return Err(CalyxError {
+            code: ASTRO_XTERM_SOURCE_UNBOUNDED,
+            message: format!(
+                "{phase} requires latest-only storage, an empty MVCC overlay, and every active memtable inside one positive hard cap; observed latest_only={}, overlay_keys={}, overlay_versions={}, overlay_bytes={}, memtable_byte_cap={}, invalid_cf={invalid_cf:?}",
+                status.latest_only,
+                status.overlay_keys,
+                status.overlay_versions,
+                status.overlay_bytes,
+                status.memtable_byte_cap,
+            ),
+            remediation: "preserve the staged generation and rebuild it through latest-only shadow import; do not run exhaustive association reconciliation on a full-history or over-cap handle",
+        });
+    }
+    Ok(())
 }
 
 fn completion_corrupt(message: impl Into<String>) -> CalyxError {
@@ -77,6 +117,14 @@ fn completion_overflow(context: &str) -> CalyxError {
         code: ASTRO_XTERM_COMPLETION_OVERFLOW,
         message: format!("association count overflow while calculating {context}"),
         remediation: "partition the vault into smaller project-scoped stores without sampling or dropping any constellation or pair",
+    }
+}
+
+fn completion_resource_exhausted(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: ASTRO_XTERM_COMPLETION_RESOURCE_EXHAUSTED,
+        message: message.into(),
+        remediation: "reduce the panel's per-constellation encoded footprint or partition the project into independent vaults; do not raise the bounded commit budget or split one atomic constellation migration",
     }
 }
 
@@ -136,6 +184,14 @@ struct AssociationConstellation {
     source_slot_count: usize,
     not_applicable_slot_count: usize,
     slots: BTreeMap<SlotId, PreparedSlot>,
+}
+
+#[derive(Debug, Clone)]
+struct AssociationSourceBase {
+    cx_id: CxId,
+    panel_version: u32,
+    source_hash: String,
+    slot_hashes: BTreeMap<SlotId, [u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,22 +373,51 @@ pub struct CompleteAssociationPersistReport {
     pub witnesses_written: usize,
     pub witnesses_tombstoned: usize,
     pub commit_count: usize,
+    pub mutation_rows_high_water: usize,
+    pub mutation_bytes_high_water: usize,
+    pub source: CompleteAssociationSourceReceipt,
     pub ledger_ref: Option<LedgerRef>,
     pub fsv: Vec<FsvAck>,
     pub state: CompleteAssociationState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteAssociationSourceReceipt {
+    pub snapshot_seq: u64,
+    pub base_rows: usize,
+    pub base_scan_pages: usize,
+    pub base_page_rows_high_water: usize,
+    pub source_records_loaded: usize,
+    pub source_record_batches: usize,
+    pub slot_rows_read: usize,
+    pub slot_bytes_read: u64,
+    pub slot_batch_bytes_high_water: u64,
+    pub readback_plan_bytes_high_water: u64,
+    pub exact_source_reassemblies: usize,
+    pub storage_before: Option<LatestOnlyReadbackStatus>,
+    pub storage_after: Option<LatestOnlyReadbackStatus>,
 }
 
 #[derive(Debug)]
 struct PersistedState {
     public: CompleteAssociationState,
     witnesses: BTreeMap<CxId, (Vec<u8>, CompletionWitness)>,
-    blocks: BTreeMap<CxId, Vec<u8>>,
 }
 
 #[derive(Debug)]
 struct LegacyPersistedState {
     witnesses: BTreeMap<CxId, (Vec<u8>, LegacyCompletionWitness)>,
-    rows: BTreeMap<CxId, BTreeMap<Vec<u8>, Vec<u8>>>,
+    row_owners: BTreeSet<CxId>,
+}
+
+struct AssociationSourceInventory {
+    current_ids: Vec<CxId>,
+    current_sources: BTreeMap<CxId, String>,
+    changed_ids: Vec<CxId>,
+    constellations_unchanged: usize,
+    pair_outcomes_unchanged: usize,
+    blocks_unchanged: usize,
+    receipt: CompleteAssociationSourceReceipt,
 }
 
 pub fn read_complete_association_state<C>(
@@ -358,7 +443,7 @@ where
 {
     let state = read_persisted_state_at(vault, snapshot)?;
     let legacy = read_legacy_v1_state_at(vault, snapshot)?;
-    if !legacy.witnesses.is_empty() || !legacy.rows.is_empty() {
+    if !legacy.witnesses.is_empty() || !legacy.row_owners.is_empty() {
         return Err(completion_corrupt(
             "active v1 row-per-pair associations remain; run reconciliation to atomically migrate them to v2 blocks before reading completion state",
         ));
@@ -393,6 +478,8 @@ where
     C: Clock,
 {
     let actor = actor.into();
+    let storage_before = vault.latest_only_readback_status();
+    ensure_bounded_source_storage(&storage_before, "complete-association pre-read")?;
     let snapshot = vault.snapshot();
     let persisted = read_persisted_state_at(vault, snapshot)?;
     let legacy = read_legacy_v1_state_at(vault, snapshot)?;
@@ -405,40 +492,26 @@ where
             "a constellation has both v1 and v2 completion witnesses; refusing an ambiguous partial migration",
         ));
     }
-    let records = load_constellations_at(vault, snapshot)?;
-    let current_ids = records
+    let mut roster_cache = BTreeMap::<u32, BTreeSet<SlotId>>::new();
+    let inventory =
+        inventory_association_sources_at(vault, snapshot, &persisted, &mut roster_cache)?;
+    let current_id_set = inventory
+        .current_ids
         .iter()
-        .map(|record| record.cx_id)
+        .copied()
         .collect::<BTreeSet<_>>();
-    let current_sources = records
-        .iter()
-        .map(|record| (record.cx_id, record.source_hash.clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut changed = Vec::new();
-    let mut constellations_unchanged = 0usize;
-    let mut pair_outcomes_unchanged = 0usize;
-    let mut blocks_unchanged = 0usize;
-    for record in records {
-        match persisted.witnesses.get(&record.cx_id) {
-            Some((_, witness)) if witness.association_source_hash == record.source_hash => {
-                constellations_unchanged =
-                    checked_add(constellations_unchanged, 1, "unchanged constellations")?;
-                pair_outcomes_unchanged = checked_add(
-                    pair_outcomes_unchanged,
-                    witness.expected_pair_count,
-                    "unchanged pair outcomes",
-                )?;
-                blocks_unchanged = checked_add(blocks_unchanged, 1, "unchanged pair blocks")?;
-            }
-            _ => changed.push(record),
-        }
-    }
+    let current_sources = inventory.current_sources;
+    let changed_ids = inventory.changed_ids;
+    let changed_count = changed_ids.len();
+    let constellations_unchanged = inventory.constellations_unchanged;
+    let pair_outcomes_unchanged = inventory.pair_outcomes_unchanged;
+    let blocks_unchanged = inventory.blocks_unchanged;
+    let mut source_receipt = inventory.receipt;
     let removed = persisted
         .witnesses
         .keys()
         .chain(legacy.witnesses.keys())
-        .filter(|cx_id| !current_ids.contains(cx_id))
+        .filter(|cx_id| !current_id_set.contains(cx_id))
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -456,24 +529,28 @@ where
     let mut ledger_ref = None;
     let mut fsv = Vec::new();
     let mut commit_count = 0usize;
+    let mut pending_bytes = 0usize;
+    let mut mutation_rows_high_water = 0usize;
+    let mut mutation_bytes_high_water = 0usize;
     let tombstone = tombstone_value();
 
-    for record_batch in changed.chunks(PLANNING_RECORD_BATCH) {
-        let planned_batch = record_batch
-            .par_iter()
-            .map(plan_constellation)
-            .collect::<Vec<_>>();
-        for planned in planned_batch {
-            let planned = planned?;
-            let mut record_mutations = Vec::new();
-            if persisted.blocks.get(&planned.cx_id) == Some(&planned.block_bytes) {
-                blocks_unchanged = checked_add(blocks_unchanged, 1, "unchanged pair blocks")?;
-                pair_outcomes_unchanged = checked_add(
-                    pair_outcomes_unchanged,
-                    planned.witness.expected_pair_count,
-                    "unchanged pair outcomes",
-                )?;
-            } else {
+    let source_session = vault.sst_read_session_at(snapshot)?;
+    for source_ids in changed_ids.chunks(SOURCE_RECORD_BATCH) {
+        let records = load_constellation_batch(
+            &source_session,
+            source_ids,
+            &current_sources,
+            &mut roster_cache,
+            &mut source_receipt,
+        )?;
+        for record_batch in records.chunks(PLANNING_RECORD_BATCH) {
+            let planned_batch = record_batch
+                .par_iter()
+                .map(plan_constellation)
+                .collect::<Vec<_>>();
+            for planned in planned_batch {
+                let planned = planned?;
+                let mut record_mutations = Vec::new();
                 record_mutations.push((
                     ColumnFamily::XTerm,
                     planned.block_key.clone(),
@@ -485,62 +562,92 @@ where
                     planned.witness.expected_pair_count,
                     "written pair outcomes",
                 )?;
-            }
-            let witness_unchanged = persisted
-                .witnesses
-                .get(&planned.cx_id)
-                .is_some_and(|(bytes, _)| *bytes == planned.witness_bytes);
-            if !witness_unchanged {
-                record_mutations.push((
-                    ColumnFamily::Kv,
-                    planned.witness_key.clone(),
-                    planned.witness_bytes.clone(),
-                ));
-                witnesses_written = checked_add(witnesses_written, 1, "written witnesses")?;
-            }
-            if let Some(legacy_rows) = legacy.rows.get(&planned.cx_id) {
-                for key in legacy_rows.keys() {
-                    record_mutations.push((ColumnFamily::XTerm, key.clone(), tombstone.clone()));
-                    legacy_rows_tombstoned =
-                        checked_add(legacy_rows_tombstoned, 1, "tombstoned legacy pair rows")?;
+                let witness_unchanged = persisted
+                    .witnesses
+                    .get(&planned.cx_id)
+                    .is_some_and(|(bytes, _)| *bytes == planned.witness_bytes);
+                if !witness_unchanged {
+                    record_mutations.push((
+                        ColumnFamily::Kv,
+                        planned.witness_key.clone(),
+                        planned.witness_bytes.clone(),
+                    ));
+                    witnesses_written = checked_add(witnesses_written, 1, "written witnesses")?;
                 }
-                pair_outcomes_tombstoned = checked_add(
-                    pair_outcomes_tombstoned,
-                    legacy_rows.len(),
-                    "tombstoned legacy pair outcomes",
+                if legacy.row_owners.contains(&planned.cx_id) {
+                    let legacy_witness = &legacy
+                        .witnesses
+                        .get(&planned.cx_id)
+                        .ok_or_else(|| {
+                            completion_corrupt(format!(
+                                "legacy rows for {} lost their validated witness before migration",
+                                cx_hex(planned.cx_id)
+                            ))
+                        })?
+                        .1;
+                    let legacy_rows = legacy_row_keys_for_witness(planned.cx_id, legacy_witness)?;
+                    for key in &legacy_rows {
+                        record_mutations.push((
+                            ColumnFamily::XTerm,
+                            key.clone(),
+                            tombstone.clone(),
+                        ));
+                        legacy_rows_tombstoned =
+                            checked_add(legacy_rows_tombstoned, 1, "tombstoned legacy pair rows")?;
+                    }
+                    pair_outcomes_tombstoned = checked_add(
+                        pair_outcomes_tombstoned,
+                        legacy_rows.len(),
+                        "tombstoned legacy pair outcomes",
+                    )?;
+                }
+                if legacy.witnesses.contains_key(&planned.cx_id) {
+                    record_mutations.push((
+                        ColumnFamily::Kv,
+                        legacy_witness_key(planned.cx_id),
+                        tombstone.clone(),
+                    ));
+                    witnesses_tombstoned =
+                        checked_add(witnesses_tombstoned, 1, "tombstoned legacy witnesses")?;
+                }
+                let record_bytes = mutation_retained_bytes(&record_mutations)?;
+                admit_atomic_record_mutations(
+                    record_mutations.len(),
+                    record_bytes,
+                    &planned.witness.cx_id,
                 )?;
-            }
-            if legacy.witnesses.contains_key(&planned.cx_id) {
-                record_mutations.push((
-                    ColumnFamily::Kv,
-                    legacy_witness_key(planned.cx_id),
-                    tombstone.clone(),
-                ));
-                witnesses_tombstoned =
-                    checked_add(witnesses_tombstoned, 1, "tombstoned legacy witnesses")?;
-            }
-            if !pending.is_empty()
-                && pending.len().saturating_add(record_mutations.len())
-                    > MAX_MUTATION_ROWS_PER_COMMIT
-            {
-                let (entry_ref, ack) =
-                    commit_mutations(vault, &actor, &pending_record_ids, &pending)?;
-                ledger_ref = Some(entry_ref);
-                fsv.push(ack);
-                commit_count = checked_add(commit_count, 1, "association commits")?;
-                pending.clear();
-                pending_record_ids.clear();
-            }
-            if !record_mutations.is_empty() {
-                pending.extend(record_mutations);
-                pending_record_ids.push(planned.witness.cx_id);
+                if !pending.is_empty()
+                    && (pending.len().saturating_add(record_mutations.len())
+                        > MAX_MUTATION_ROWS_PER_COMMIT
+                        || pending_bytes.saturating_add(record_bytes)
+                            > MAX_MUTATION_BYTES_PER_COMMIT)
+                {
+                    let (entry_ref, ack) =
+                        commit_mutations(vault, &actor, &pending_record_ids, &pending)?;
+                    ledger_ref = Some(entry_ref);
+                    fsv.push(ack);
+                    commit_count = checked_add(commit_count, 1, "association commits")?;
+                    pending.clear();
+                    pending_record_ids.clear();
+                    pending_bytes = 0;
+                }
+                if !record_mutations.is_empty() {
+                    pending_bytes = pending_bytes
+                        .checked_add(record_bytes)
+                        .ok_or_else(|| completion_overflow("pending mutation bytes"))?;
+                    pending.extend(record_mutations);
+                    pending_record_ids.push(planned.witness.cx_id);
+                    mutation_rows_high_water = mutation_rows_high_water.max(pending.len());
+                    mutation_bytes_high_water = mutation_bytes_high_water.max(pending_bytes);
+                }
             }
         }
     }
+    drop(source_session);
 
     for cx_id in &removed {
         let mut record_mutations = Vec::new();
-        if persisted.blocks.contains_key(cx_id) {
+        if persisted.witnesses.contains_key(cx_id) {
             record_mutations.push((ColumnFamily::XTerm, block_key(*cx_id), tombstone.clone()));
             blocks_tombstoned = checked_add(blocks_tombstoned, 1, "tombstoned pair blocks")?;
         }
@@ -553,8 +660,18 @@ where
             record_mutations.push((ColumnFamily::Kv, witness_key(*cx_id), tombstone.clone()));
             witnesses_tombstoned = checked_add(witnesses_tombstoned, 1, "tombstoned witnesses")?;
         }
-        if let Some(rows) = legacy.rows.get(cx_id) {
-            for key in rows.keys() {
+        if legacy.row_owners.contains(cx_id) {
+            let legacy_witness = &legacy
+                .witnesses
+                .get(cx_id)
+                .ok_or_else(|| {
+                    completion_corrupt(format!(
+                        "legacy rows for {} lost their validated witness before removal",
+                        cx_hex(*cx_id)
+                    ))
+                })?
+                .1;
+            for key in legacy_row_keys_for_witness(*cx_id, legacy_witness)? {
                 record_mutations.push((ColumnFamily::XTerm, key.clone(), tombstone.clone()));
                 legacy_rows_tombstoned =
                     checked_add(legacy_rows_tombstoned, 1, "tombstoned legacy pair rows")?;
@@ -573,8 +690,11 @@ where
             ));
             witnesses_tombstoned = checked_add(witnesses_tombstoned, 1, "tombstoned witnesses")?;
         }
+        let record_bytes = mutation_retained_bytes(&record_mutations)?;
+        admit_atomic_record_mutations(record_mutations.len(), record_bytes, &cx_hex(*cx_id))?;
         if !pending.is_empty()
-            && pending.len().saturating_add(record_mutations.len()) > MAX_MUTATION_ROWS_PER_COMMIT
+            && (pending.len().saturating_add(record_mutations.len()) > MAX_MUTATION_ROWS_PER_COMMIT
+                || pending_bytes.saturating_add(record_bytes) > MAX_MUTATION_BYTES_PER_COMMIT)
         {
             let (entry_ref, ack) = commit_mutations(vault, &actor, &pending_record_ids, &pending)?;
             ledger_ref = Some(entry_ref);
@@ -582,9 +702,17 @@ where
             commit_count = checked_add(commit_count, 1, "association commits")?;
             pending.clear();
             pending_record_ids.clear();
+            pending_bytes = 0;
         }
-        pending.extend(record_mutations);
-        pending_record_ids.push(cx_hex(*cx_id));
+        if !record_mutations.is_empty() {
+            pending_bytes = pending_bytes
+                .checked_add(record_bytes)
+                .ok_or_else(|| completion_overflow("pending mutation bytes"))?;
+            pending.extend(record_mutations);
+            pending_record_ids.push(cx_hex(*cx_id));
+            mutation_rows_high_water = mutation_rows_high_water.max(pending.len());
+            mutation_bytes_high_water = mutation_bytes_high_water.max(pending_bytes);
+        }
     }
     if !pending.is_empty() {
         let (entry_ref, ack) = commit_mutations(vault, &actor, &pending_record_ids, &pending)?;
@@ -595,18 +723,18 @@ where
 
     let final_state = read_persisted_state_at(vault, vault.snapshot())?;
     let final_legacy = read_legacy_v1_state_at(vault, vault.snapshot())?;
-    if !final_legacy.witnesses.is_empty() || !final_legacy.rows.is_empty() {
+    if !final_legacy.witnesses.is_empty() || !final_legacy.row_owners.is_empty() {
         return Err(completion_corrupt(
             "post-commit readback still contains active v1 association rows or witnesses",
         ));
     }
-    if final_state.witnesses.len() != current_ids.len()
+    if final_state.witnesses.len() != current_id_set.len()
         || final_state
             .witnesses
             .keys()
             .copied()
             .collect::<BTreeSet<_>>()
-            != current_ids
+            != current_id_set
     {
         return Err(completion_corrupt(
             "post-commit completion witness CxId set does not equal the live Base CxId set",
@@ -626,10 +754,14 @@ where
             )));
         }
     }
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_source_storage(&storage_after, "complete-association post-readback")?;
+    source_receipt.storage_before = Some(storage_before);
+    source_receipt.storage_after = Some(storage_after);
 
     Ok(CompleteAssociationPersistReport {
-        constellations_total: current_ids.len(),
-        constellations_recomputed: changed.len(),
+        constellations_total: current_id_set.len(),
+        constellations_recomputed: changed_count,
         constellations_unchanged,
         constellations_removed: removed.len(),
         pair_outcomes_written,
@@ -642,6 +774,9 @@ where
         witnesses_written,
         witnesses_tombstoned,
         commit_count,
+        mutation_rows_high_water,
+        mutation_bytes_high_water,
+        source: source_receipt,
         ledger_ref,
         fsv,
         state: final_state.public,
@@ -700,89 +835,275 @@ where
     Ok((ledger_ref_at_commit(vault, seq)?, ack))
 }
 
-fn load_constellations_at<C>(
-    vault: &AsterVault<C>,
-    snapshot: u64,
-) -> calyx_core::Result<Vec<AssociationConstellation>>
-where
-    C: Clock,
-{
-    struct SourceBase {
-        cx_id: CxId,
-        panel_version: u32,
-        slot_hashes: BTreeMap<SlotId, [u8; 32]>,
-    }
+fn mutation_retained_bytes(
+    mutations: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+) -> calyx_core::Result<usize> {
+    mutations
+        .iter()
+        .try_fold(0usize, |total, (cf, key, value)| {
+            total
+                .checked_add(cf.name().len())
+                .and_then(|value_total| value_total.checked_add(key.len()))
+                .and_then(|value_total| value_total.checked_add(value.len()))
+                .ok_or_else(|| completion_overflow("retained mutation bytes"))
+        })
+}
 
-    let mut bases = Vec::new();
-    let mut all_slots = BTreeSet::new();
-    for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let cx_id = cx_from_exact_key(&key, "Base")?;
-        let base = BaseRecord::decode_for_key(cx_id, &bytes)?;
-        let panel_version = base.constellation().panel_version;
+fn admit_atomic_record_mutations(
+    rows: usize,
+    bytes: usize,
+    record_id: &str,
+) -> calyx_core::Result<()> {
+    if rows > MAX_MUTATION_ROWS_PER_COMMIT || bytes > MAX_MUTATION_BYTES_PER_COMMIT {
+        return Err(completion_resource_exhausted(format!(
+            "complete-association record {record_id} requires {rows} mutation rows / {bytes} retained bytes, exceeding the atomic limits {MAX_MUTATION_ROWS_PER_COMMIT} rows / {MAX_MUTATION_BYTES_PER_COMMIT} bytes; no mutation was committed for this record"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_association_source_base(
+    key: &[u8],
+    bytes: &[u8],
+    roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+) -> calyx_core::Result<AssociationSourceBase> {
+    let cx_id = cx_from_exact_key(key, "Base")?;
+    let base = BaseRecord::decode_for_key(cx_id, bytes)?;
+    let panel_version = base.constellation().panel_version;
+    if !roster_cache.contains_key(&panel_version) {
         let roster = astrolabe_panel::slots_for_version(panel_version).map_err(|error| {
             source_corrupt(format!(
                 "Base {} names unknown panel version {panel_version}: {error}",
                 cx_hex(cx_id)
             ))
         })?;
-        let roster_ids = roster
-            .iter()
-            .map(|slot| slot.slot_id())
-            .collect::<BTreeSet<_>>();
-        for slot in base.slot_hashes().keys() {
-            if !roster_ids.contains(slot) {
+        roster_cache.insert(
+            panel_version,
+            roster.iter().map(|slot| slot.slot_id()).collect(),
+        );
+    }
+    let roster_ids = roster_cache.get(&panel_version).ok_or_else(|| {
+        source_corrupt(format!(
+            "panel version {panel_version} roster disappeared while decoding Base {}",
+            cx_hex(cx_id)
+        ))
+    })?;
+    for slot in base.slot_hashes().keys() {
+        if !roster_ids.contains(slot) {
+            return Err(source_corrupt(format!(
+                "Base {} carries S{} outside persisted panel version {panel_version}",
+                cx_hex(cx_id),
+                slot.get()
+            )));
+        }
+    }
+    let slot_hashes = base.slot_hashes().clone();
+    let mut source_bytes = Vec::new();
+    append_part(&mut source_bytes, b"astrolabe.association_source.v1");
+    append_part(&mut source_bytes, &panel_version.to_be_bytes());
+    append_part(&mut source_bytes, &(slot_hashes.len() as u64).to_be_bytes());
+    for (slot, slot_hash) in &slot_hashes {
+        append_part(&mut source_bytes, &slot.get().to_be_bytes());
+        append_part(&mut source_bytes, slot_hash);
+    }
+    Ok(AssociationSourceBase {
+        cx_id,
+        panel_version,
+        source_hash: hex_lower_bytes(blake3::hash(&source_bytes).as_bytes()),
+        slot_hashes,
+    })
+}
+
+fn inventory_association_sources_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    persisted: &PersistedState,
+    roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+) -> calyx_core::Result<AssociationSourceInventory>
+where
+    C: Clock,
+{
+    let mut current_ids = Vec::new();
+    let mut current_sources = BTreeMap::new();
+    let mut changed_ids = Vec::new();
+    let mut constellations_unchanged = 0usize;
+    let mut pair_outcomes_unchanged = 0usize;
+    let mut blocks_unchanged = 0usize;
+    let mut receipt = CompleteAssociationSourceReceipt {
+        snapshot_seq: snapshot,
+        ..CompleteAssociationSourceReceipt::default()
+    };
+    let range = KeyRange {
+        start: Vec::new(),
+        end: None,
+    };
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::Base,
+        &range,
+        SOURCE_SCAN_PAGE_ROWS,
+        |page| -> calyx_core::Result<()> {
+            receipt.base_scan_pages = checked_add(receipt.base_scan_pages, 1, "Base scan pages")?;
+            receipt.base_page_rows_high_water = receipt.base_page_rows_high_water.max(page.len());
+            for (key, bytes) in page {
+                let base = decode_association_source_base(&key, &bytes, roster_cache)?;
+                if current_sources
+                    .insert(base.cx_id, base.source_hash.clone())
+                    .is_some()
+                {
+                    return Err(source_corrupt(format!(
+                        "duplicate Base row for {} at snapshot {snapshot}",
+                        cx_hex(base.cx_id)
+                    )));
+                }
+                current_ids.push(base.cx_id);
+                receipt.base_rows = checked_add(receipt.base_rows, 1, "Base rows")?;
+                match persisted.witnesses.get(&base.cx_id) {
+                    Some((_, witness)) if witness.association_source_hash == base.source_hash => {
+                        constellations_unchanged =
+                            checked_add(constellations_unchanged, 1, "unchanged constellations")?;
+                        pair_outcomes_unchanged = checked_add(
+                            pair_outcomes_unchanged,
+                            witness.expected_pair_count,
+                            "unchanged pair outcomes",
+                        )?;
+                        blocks_unchanged =
+                            checked_add(blocks_unchanged, 1, "unchanged pair blocks")?;
+                    }
+                    _ => changed_ids.push(base.cx_id),
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if current_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(source_corrupt(
+            "Base page scan did not publish strictly increasing CxIds",
+        ));
+    }
+    Ok(AssociationSourceInventory {
+        current_ids,
+        current_sources,
+        changed_ids,
+        constellations_unchanged,
+        pair_outcomes_unchanged,
+        blocks_unchanged,
+        receipt,
+    })
+}
+
+fn load_constellation_batch<C>(
+    source: &SstReadSession<'_, C>,
+    cx_ids: &[CxId],
+    current_sources: &BTreeMap<CxId, String>,
+    roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+    receipt: &mut CompleteAssociationSourceReceipt,
+) -> calyx_core::Result<Vec<AssociationConstellation>>
+where
+    C: Clock,
+{
+    let base_reads = cx_ids
+        .iter()
+        .enumerate()
+        .map(|(ordinal, cx_id)| OrderedCfRead::new(ordinal, ColumnFamily::Base, cx_id.as_bytes()))
+        .collect::<Vec<_>>();
+    let mut bases = (0..cx_ids.len()).map(|_| None).collect::<Vec<_>>();
+    let base_metrics = source.visit_ordered_cf_plan(
+        &base_reads,
+        |ordinal, cf, key, value| -> calyx_core::Result<()> {
+            if cf != ColumnFamily::Base || key != cx_ids[ordinal].as_bytes() {
                 return Err(source_corrupt(format!(
-                    "Base {} carries S{} outside persisted panel version {panel_version}",
-                    cx_hex(cx_id),
+                    "ordered Base readback ordinal {ordinal} changed identity"
+                )));
+            }
+            let bytes = value.ok_or_else(|| {
+                source_corrupt(format!(
+                    "Base {} disappeared from source snapshot {}",
+                    cx_hex(cx_ids[ordinal]),
+                    source.snapshot_seq()
+                ))
+            })?;
+            let base = decode_association_source_base(key, bytes, roster_cache)?;
+            if current_sources.get(&base.cx_id) != Some(&base.source_hash) {
+                return Err(source_corrupt(format!(
+                    "Base {} source identity changed between inventory and hydration",
+                    cx_hex(base.cx_id)
+                )));
+            }
+            bases[ordinal] = Some(base);
+            Ok(())
+        },
+    )?;
+    receipt.readback_plan_bytes_high_water = receipt
+        .readback_plan_bytes_high_water
+        .max(base_metrics.plan_index_bytes);
+    let bases = bases
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, base)| {
+            base.ok_or_else(|| {
+                source_corrupt(format!(
+                    "ordered Base readback did not publish ordinal {ordinal}"
+                ))
+            })
+        })
+        .collect::<calyx_core::Result<Vec<_>>>()?;
+
+    let mut routes = Vec::<(usize, SlotId)>::new();
+    for (base_ordinal, base) in bases.iter().enumerate() {
+        for slot in base.slot_hashes.keys() {
+            routes.push((base_ordinal, *slot));
+        }
+    }
+    let slot_reads = routes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (base_ordinal, slot))| {
+            OrderedCfRead::new(
+                ordinal,
+                ColumnFamily::slot(*slot),
+                bases[*base_ordinal].cx_id.as_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut records = bases
+        .iter()
+        .map(|base| AssociationConstellation {
+            cx_id: base.cx_id,
+            panel_version: base.panel_version,
+            source_hash: base.source_hash.clone(),
+            source_slot_count: base.slot_hashes.len(),
+            not_applicable_slot_count: 0,
+            slots: BTreeMap::new(),
+        })
+        .collect::<Vec<_>>();
+    let slot_metrics = source.visit_ordered_cf_plan(
+        &slot_reads,
+        |ordinal, cf, key, value| -> calyx_core::Result<()> {
+            let (base_ordinal, slot) = routes[ordinal];
+            let base = &bases[base_ordinal];
+            if cf != ColumnFamily::slot(slot) || key != base.cx_id.as_bytes() {
+                return Err(source_corrupt(format!(
+                    "ordered Slot readback ordinal {ordinal} changed identity for Base {} S{}",
+                    cx_hex(base.cx_id),
                     slot.get()
                 )));
             }
-            all_slots.insert(*slot);
-        }
-        bases.push(SourceBase {
-            cx_id,
-            panel_version,
-            slot_hashes: base.slot_hashes().clone(),
-        });
-    }
-    bases.sort_by_key(|base| base.cx_id);
-
-    let mut slot_rows = BTreeMap::<SlotId, BTreeMap<Vec<u8>, Vec<u8>>>::new();
-    for slot in all_slots {
-        slot_rows.insert(
-            slot,
-            vault
-                .scan_cf_at(snapshot, ColumnFamily::slot(slot))?
-                .into_iter()
-                .collect(),
-        );
-    }
-
-    let mut records = Vec::with_capacity(bases.len());
-    for base in bases {
-        let mut source_bytes = Vec::new();
-        append_part(&mut source_bytes, b"astrolabe.association_source.v1");
-        append_part(&mut source_bytes, &base.panel_version.to_be_bytes());
-        append_part(
-            &mut source_bytes,
-            &(base.slot_hashes.len() as u64).to_be_bytes(),
-        );
-        let mut slots = BTreeMap::new();
-        let mut not_applicable_slot_count = 0usize;
-        for (slot, expected_hash) in &base.slot_hashes {
-            append_part(&mut source_bytes, &slot.get().to_be_bytes());
-            append_part(&mut source_bytes, expected_hash);
-            let key = base.cx_id.as_bytes().as_slice();
-            let bytes = slot_rows
-                .get(slot)
-                .and_then(|rows| rows.get(key))
-                .ok_or_else(|| {
-                    source_corrupt(format!(
-                        "Base {} hashes S{} but its Slot-CF row is absent at snapshot {snapshot}",
-                        cx_hex(base.cx_id),
-                        slot.get()
-                    ))
-                })?;
+            let bytes = value.ok_or_else(|| {
+                source_corrupt(format!(
+                    "Base {} hashes S{} but its Slot-CF row is absent at snapshot {}",
+                    cx_hex(base.cx_id),
+                    slot.get(),
+                    source.snapshot_seq()
+                ))
+            })?;
+            let expected_hash = base.slot_hashes.get(&slot).ok_or_else(|| {
+                source_corrupt(format!(
+                    "ordered Slot readback produced unrequested S{} for Base {}",
+                    slot.get(),
+                    cx_hex(base.cx_id)
+                ))
+            })?;
             let observed_hash = blake3::hash(bytes);
             if observed_hash.as_bytes() != expected_hash {
                 return Err(source_corrupt(format!(
@@ -800,21 +1121,48 @@ where
                     reason: AbsentReason::NotApplicable
                 }
             ) {
-                not_applicable_slot_count =
-                    checked_add(not_applicable_slot_count, 1, "NotApplicable slot count")?;
-                continue;
+                records[base_ordinal].not_applicable_slot_count = checked_add(
+                    records[base_ordinal].not_applicable_slot_count,
+                    1,
+                    "NotApplicable slot count",
+                )?;
+            } else if records[base_ordinal]
+                .slots
+                .insert(slot, prepare_slot(slot, vector)?)
+                .is_some()
+            {
+                return Err(source_corrupt(format!(
+                    "ordered Slot readback duplicated Base {} S{}",
+                    cx_hex(base.cx_id),
+                    slot.get()
+                )));
             }
-            slots.insert(*slot, prepare_slot(*slot, vector)?);
-        }
-        records.push(AssociationConstellation {
-            cx_id: base.cx_id,
-            panel_version: base.panel_version,
-            source_hash: hex_lower_bytes(blake3::hash(&source_bytes).as_bytes()),
-            source_slot_count: base.slot_hashes.len(),
-            not_applicable_slot_count,
-            slots,
-        });
-    }
+            Ok(())
+        },
+    )?;
+    receipt.source_records_loaded = checked_add(
+        receipt.source_records_loaded,
+        records.len(),
+        "source records loaded",
+    )?;
+    receipt.source_record_batches =
+        checked_add(receipt.source_record_batches, 1, "source record batches")?;
+    receipt.slot_rows_read = checked_add(
+        receipt.slot_rows_read,
+        usize::try_from(slot_metrics.rows_read_back)
+            .map_err(|_| completion_overflow("Slot rows read"))?,
+        "Slot rows read",
+    )?;
+    receipt.slot_bytes_read = receipt
+        .slot_bytes_read
+        .checked_add(slot_metrics.bytes_read_back)
+        .ok_or_else(|| completion_overflow("Slot bytes read"))?;
+    receipt.slot_batch_bytes_high_water = receipt
+        .slot_batch_bytes_high_water
+        .max(slot_metrics.max_readback_batch_bytes);
+    receipt.readback_plan_bytes_high_water = receipt
+        .readback_plan_bytes_high_water
+        .max(slot_metrics.plan_index_bytes);
     Ok(records)
 }
 
@@ -1679,48 +2027,32 @@ where
     C: Clock,
 {
     let mut witnesses = BTreeMap::<CxId, (Vec<u8>, CompletionWitness)>::new();
-    for (key, value) in vault.scan_cf_range_at(
+    vault.scan_cf_range_pages_at(
         snapshot,
         ColumnFamily::Kv,
         &prefix_range(COMPLETE_WITNESS_PREFIX),
-    )? {
-        let cx_id = parse_witness_key(&key)?;
-        let witness: CompletionWitness = serde_json::from_slice(&value).map_err(|error| {
-            completion_corrupt(format!(
-                "decode v2 witness {}: {error}",
-                hex_lower_bytes(&key)
-            ))
-        })?;
-        validate_witness_identity(cx_id, &witness)?;
-        if witnesses.insert(cx_id, (value, witness)).is_some() {
-            return Err(completion_corrupt(format!(
-                "duplicate v2 completion witness for {}",
-                cx_hex(cx_id)
-            )));
-        }
-    }
-    let mut blocks = BTreeMap::<CxId, Vec<u8>>::new();
-    for (key, value) in vault.scan_cf_range_at(
-        snapshot,
-        ColumnFamily::XTerm,
-        &prefix_range(COMPLETE_PAIR_BLOCK_PREFIX),
-    )? {
-        let cx_id = parse_block_key(&key)?;
-        if blocks.insert(cx_id, value).is_some() {
-            return Err(completion_corrupt(format!(
-                "duplicate pair block for {}",
-                cx_hex(cx_id)
-            )));
-        }
-    }
-    for cx_id in blocks.keys() {
-        if !witnesses.contains_key(cx_id) {
-            return Err(completion_corrupt(format!(
-                "pair block {} has no atomic v2 witness",
-                cx_hex(*cx_id)
-            )));
-        }
-    }
+        SOURCE_SCAN_PAGE_ROWS,
+        |page| -> calyx_core::Result<()> {
+            for (key, value) in page {
+                let cx_id = parse_witness_key(&key)?;
+                let witness: CompletionWitness =
+                    serde_json::from_slice(&value).map_err(|error| {
+                        completion_corrupt(format!(
+                            "decode v2 witness {}: {error}",
+                            hex_lower_bytes(&key)
+                        ))
+                    })?;
+                validate_witness_identity(cx_id, &witness)?;
+                if witnesses.insert(cx_id, (value.clone(), witness)).is_some() {
+                    return Err(completion_corrupt(format!(
+                        "duplicate v2 completion witness for {}",
+                        cx_hex(cx_id)
+                    )));
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     let mut public = CompleteAssociationState {
         constellation_count: witnesses.len(),
@@ -1731,7 +2063,7 @@ where
         computed_pair_count: 0,
         typed_incompatible_pair_count: 0,
         completion_row_count: 0,
-        physical_block_count: blocks.len(),
+        physical_block_count: 0,
         panel_version_counts: BTreeMap::new(),
         metric_counts: PairMetricCounts::default(),
         typed_reason_counts: PairReasonCounts::default(),
@@ -1740,112 +2072,44 @@ where
         pair_key_stream_hash: String::new(),
         pair_value_stream_hash: String::new(),
     };
-    let mut witness_stream = Vec::new();
+    let mut witness_stream = blake3::Hasher::new();
     let mut global_key_stream = blake3::Hasher::new();
     let mut global_value_stream = blake3::Hasher::new();
-    for (cx_id, (witness_bytes, witness)) in &witnesses {
-        let block_bytes = blocks.get(cx_id).ok_or_else(|| {
-            completion_corrupt(format!("v2 witness {} has no pair block", cx_hex(*cx_id)))
-        })?;
-        let decoded = decode_pair_block(*cx_id, block_bytes)?;
-        validate_witness_block(*cx_id, witness, block_bytes, &decoded)?;
-        public.source_slot_count = checked_add(
-            public.source_slot_count,
-            decoded.source_slot_count,
-            "source slots",
-        )?;
-        public.not_applicable_slot_count = checked_add(
-            public.not_applicable_slot_count,
-            decoded.not_applicable_slot_count,
-            "NotApplicable slots",
-        )?;
-        public.applicable_slot_count = checked_add(
-            public.applicable_slot_count,
-            decoded.applicable_slot_ids.len(),
-            "applicable slots",
-        )?;
-        public.expected_pair_count = checked_add(
-            public.expected_pair_count,
-            decoded.expected_pair_count,
-            "expected pairs",
-        )?;
-        public.computed_pair_count = checked_add(
-            public.computed_pair_count,
-            decoded.computed_pair_count,
-            "computed pairs",
-        )?;
-        public.typed_incompatible_pair_count = checked_add(
-            public.typed_incompatible_pair_count,
-            decoded.typed_incompatible_pair_count,
-            "typed-incompatible pairs",
-        )?;
-        public.completion_row_count = checked_add(
-            public.completion_row_count,
-            decoded.expected_pair_count,
-            "logical completion rows",
-        )?;
-        increment_u32_map_count(
-            &mut public.panel_version_counts,
-            decoded.panel_version,
-            "panel version count",
-        )?;
-        public.metric_counts.cosine = checked_add(
-            public.metric_counts.cosine,
-            decoded.metric_counts.get("cosine").copied().unwrap_or(0),
-            "cosine count",
-        )?;
-        public.metric_counts.symmetric_mean_maxsim_cosine = checked_add(
-            public.metric_counts.symmetric_mean_maxsim_cosine,
-            decoded
-                .metric_counts
-                .get("symmetric_mean_maxsim_cosine")
-                .copied()
-                .unwrap_or(0),
-            "symmetric MaxSim count",
-        )?;
-        public.typed_reason_counts.absent_slot = checked_add(
-            public.typed_reason_counts.absent_slot,
-            decoded
-                .typed_reason_counts
-                .get("absent_slot")
-                .copied()
-                .unwrap_or(0),
-            "absent-slot count",
-        )?;
-        public.typed_reason_counts.shape_mismatch = checked_add(
-            public.typed_reason_counts.shape_mismatch,
-            decoded
-                .typed_reason_counts
-                .get("shape_mismatch")
-                .copied()
-                .unwrap_or(0),
-            "shape-mismatch count",
-        )?;
-        public.typed_reason_counts.zero_norm = checked_add(
-            public.typed_reason_counts.zero_norm,
-            decoded
-                .typed_reason_counts
-                .get("zero_norm")
-                .copied()
-                .unwrap_or(0),
-            "zero-norm count",
-        )?;
-        for (reason, count) in &decoded.absent_slot_reason_counts {
-            let current = public
-                .absent_slot_reason_counts
-                .get(reason)
-                .copied()
-                .unwrap_or(0);
-            public.absent_slot_reason_counts.insert(
-                reason.clone(),
-                checked_add(current, *count, "global absent slot reason count")?,
-            );
-        }
-        append_part(&mut witness_stream, &witness_key(*cx_id));
-        append_part(&mut witness_stream, witness_bytes);
-        global_key_stream.update(&decoded.pair_key_stream);
-        global_value_stream.update(&decoded.pair_value_stream);
-    }
+    let mut last_block = None;
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::XTerm,
+        &prefix_range(COMPLETE_PAIR_BLOCK_PREFIX),
+        SOURCE_SCAN_PAGE_ROWS,
+        |page| -> calyx_core::Result<()> {
+            for (key, block_bytes) in page {
+                let cx_id = parse_block_key(&key)?;
+                if last_block.is_some_and(|last| last >= cx_id) {
+                    return Err(completion_corrupt(format!(
+                        "pair blocks are not strictly ordered at {}",
+                        cx_hex(cx_id)
+                    )));
+                }
+                last_block = Some(cx_id);
+                let (witness_bytes, witness) = witnesses.get(&cx_id).ok_or_else(|| {
+                    completion_corrupt(format!(
+                        "pair block {} has no atomic v2 witness",
+                        cx_hex(cx_id)
+                    ))
+                })?;
+                let decoded = decode_pair_block(cx_id, &block_bytes)?;
+                validate_witness_block(cx_id, witness, &block_bytes, &decoded)?;
+                public.physical_block_count =
+                    checked_add(public.physical_block_count, 1, "physical pair blocks")?;
+                accumulate_decoded_block(&mut public, &decoded)?;
+                update_hash_part(&mut witness_stream, &witness_key(cx_id));
+                update_hash_part(&mut witness_stream, witness_bytes);
+                global_key_stream.update(&decoded.pair_key_stream);
+                global_value_stream.update(&decoded.pair_value_stream);
+            }
+            Ok(())
+        },
+    )?;
     if checked_add(
         public.computed_pair_count,
         public.typed_incompatible_pair_count,
@@ -1858,14 +2122,109 @@ where
             "global v2 completion equation or one-block-per-witness invariant failed",
         ));
     }
-    public.witness_state_hash = hex_lower_bytes(blake3::hash(&witness_stream).as_bytes());
+    public.witness_state_hash = hex_lower_bytes(witness_stream.finalize().as_bytes());
     public.pair_key_stream_hash = hex_lower_bytes(global_key_stream.finalize().as_bytes());
     public.pair_value_stream_hash = hex_lower_bytes(global_value_stream.finalize().as_bytes());
-    Ok(PersistedState {
-        public,
-        witnesses,
-        blocks,
-    })
+    Ok(PersistedState { public, witnesses })
+}
+
+fn accumulate_decoded_block(
+    public: &mut CompleteAssociationState,
+    decoded: &DecodedPairBlock,
+) -> calyx_core::Result<()> {
+    public.source_slot_count = checked_add(
+        public.source_slot_count,
+        decoded.source_slot_count,
+        "source slots",
+    )?;
+    public.not_applicable_slot_count = checked_add(
+        public.not_applicable_slot_count,
+        decoded.not_applicable_slot_count,
+        "NotApplicable slots",
+    )?;
+    public.applicable_slot_count = checked_add(
+        public.applicable_slot_count,
+        decoded.applicable_slot_ids.len(),
+        "applicable slots",
+    )?;
+    public.expected_pair_count = checked_add(
+        public.expected_pair_count,
+        decoded.expected_pair_count,
+        "expected pairs",
+    )?;
+    public.computed_pair_count = checked_add(
+        public.computed_pair_count,
+        decoded.computed_pair_count,
+        "computed pairs",
+    )?;
+    public.typed_incompatible_pair_count = checked_add(
+        public.typed_incompatible_pair_count,
+        decoded.typed_incompatible_pair_count,
+        "typed-incompatible pairs",
+    )?;
+    public.completion_row_count = checked_add(
+        public.completion_row_count,
+        decoded.expected_pair_count,
+        "logical completion rows",
+    )?;
+    increment_u32_map_count(
+        &mut public.panel_version_counts,
+        decoded.panel_version,
+        "panel version count",
+    )?;
+    public.metric_counts.cosine = checked_add(
+        public.metric_counts.cosine,
+        decoded.metric_counts.get("cosine").copied().unwrap_or(0),
+        "cosine count",
+    )?;
+    public.metric_counts.symmetric_mean_maxsim_cosine = checked_add(
+        public.metric_counts.symmetric_mean_maxsim_cosine,
+        decoded
+            .metric_counts
+            .get("symmetric_mean_maxsim_cosine")
+            .copied()
+            .unwrap_or(0),
+        "symmetric MaxSim count",
+    )?;
+    public.typed_reason_counts.absent_slot = checked_add(
+        public.typed_reason_counts.absent_slot,
+        decoded
+            .typed_reason_counts
+            .get("absent_slot")
+            .copied()
+            .unwrap_or(0),
+        "absent-slot count",
+    )?;
+    public.typed_reason_counts.shape_mismatch = checked_add(
+        public.typed_reason_counts.shape_mismatch,
+        decoded
+            .typed_reason_counts
+            .get("shape_mismatch")
+            .copied()
+            .unwrap_or(0),
+        "shape-mismatch count",
+    )?;
+    public.typed_reason_counts.zero_norm = checked_add(
+        public.typed_reason_counts.zero_norm,
+        decoded
+            .typed_reason_counts
+            .get("zero_norm")
+            .copied()
+            .unwrap_or(0),
+        "zero-norm count",
+    )?;
+    for (reason, count) in &decoded.absent_slot_reason_counts {
+        let current = public
+            .absent_slot_reason_counts
+            .get(reason)
+            .copied()
+            .unwrap_or(0);
+        public.absent_slot_reason_counts.insert(
+            reason.clone(),
+            checked_add(current, *count, "global absent slot reason count")?,
+        );
+    }
+    Ok(())
 }
 
 fn validate_witness_identity(cx_id: CxId, witness: &CompletionWitness) -> calyx_core::Result<()> {
@@ -1982,61 +2341,138 @@ where
     C: Clock,
 {
     let mut witnesses = BTreeMap::<CxId, (Vec<u8>, LegacyCompletionWitness)>::new();
-    for (key, value) in vault.scan_cf_range_at(
+    vault.scan_cf_range_pages_at(
         snapshot,
         ColumnFamily::Kv,
         &prefix_range(LEGACY_COMPLETE_WITNESS_PREFIX),
-    )? {
-        let cx_id = parse_legacy_witness_key(&key)?;
-        let witness: LegacyCompletionWitness = serde_json::from_slice(&value).map_err(|error| {
-            completion_corrupt(format!("decode witness {}: {error}", hex_lower_bytes(&key)))
-        })?;
-        validate_legacy_witness_identity(cx_id, &witness)?;
-        if witnesses.insert(cx_id, (value, witness)).is_some() {
-            return Err(completion_corrupt(format!(
-                "duplicate completion witness for {}",
-                cx_hex(cx_id)
-            )));
-        }
-    }
+        SOURCE_SCAN_PAGE_ROWS,
+        |page| -> calyx_core::Result<()> {
+            for (key, value) in page {
+                let cx_id = parse_legacy_witness_key(&key)?;
+                let witness: LegacyCompletionWitness =
+                    serde_json::from_slice(&value).map_err(|error| {
+                        completion_corrupt(format!(
+                            "decode witness {}: {error}",
+                            hex_lower_bytes(&key)
+                        ))
+                    })?;
+                validate_legacy_witness_identity(cx_id, &witness)?;
+                if witnesses.insert(cx_id, (value.clone(), witness)).is_some() {
+                    return Err(completion_corrupt(format!(
+                        "duplicate completion witness for {}",
+                        cx_hex(cx_id)
+                    )));
+                }
+            }
+            Ok(())
+        },
+    )?;
 
-    let mut rows = BTreeMap::<CxId, BTreeMap<Vec<u8>, Vec<u8>>>::new();
-    for (key, value) in vault.scan_cf_range_at(
+    let mut row_owners = BTreeSet::new();
+    let mut validated_owners = BTreeSet::new();
+    let mut current_owner = None;
+    let mut current_rows = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    vault.scan_cf_range_pages_at(
         snapshot,
         ColumnFamily::XTerm,
         &prefix_range(LEGACY_COMPLETE_PAIR_ROW_PREFIX),
-    )? {
-        let (cx_id, left, right) = parse_legacy_pair_row_key(&key)?;
-        let row: LegacyCompletePairRow = serde_json::from_slice(&value).map_err(|error| {
-            completion_corrupt(format!(
-                "decode pair row {}: {error}",
-                hex_lower_bytes(&key)
-            ))
-        })?;
-        validate_legacy_pair_row(cx_id, left, right, &row)?;
-        if rows.entry(cx_id).or_default().insert(key, value).is_some() {
-            return Err(completion_corrupt(format!(
-                "duplicate complete pair row for {} S{}-S{}",
-                cx_hex(cx_id),
-                left.get(),
-                right.get()
-            )));
-        }
+        SOURCE_SCAN_PAGE_ROWS,
+        |page| -> calyx_core::Result<()> {
+            for (key, value) in page {
+                let (cx_id, left, right) = parse_legacy_pair_row_key(&key)?;
+                if current_owner.is_some_and(|owner| owner != cx_id) {
+                    let owner = current_owner.ok_or_else(|| {
+                        completion_corrupt("legacy row owner disappeared during validation")
+                    })?;
+                    let witness = &witnesses
+                        .get(&owner)
+                        .ok_or_else(|| {
+                            completion_corrupt(format!(
+                                "complete pair rows for {} have no atomic completion witness",
+                                cx_hex(owner)
+                            ))
+                        })?
+                        .1;
+                    validate_legacy_witness_rows(owner, witness, &current_rows)?;
+                    validated_owners.insert(owner);
+                    current_rows.clear();
+                }
+                current_owner = Some(cx_id);
+                row_owners.insert(cx_id);
+                let row: LegacyCompletePairRow =
+                    serde_json::from_slice(&value).map_err(|error| {
+                        completion_corrupt(format!(
+                            "decode pair row {}: {error}",
+                            hex_lower_bytes(&key)
+                        ))
+                    })?;
+                validate_legacy_pair_row(cx_id, left, right, &row)?;
+                if current_rows.insert(key.clone(), value.clone()).is_some() {
+                    return Err(completion_corrupt(format!(
+                        "duplicate complete pair row for {} S{}-S{}",
+                        cx_hex(cx_id),
+                        left.get(),
+                        right.get()
+                    )));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(owner) = current_owner {
+        let witness = &witnesses
+            .get(&owner)
+            .ok_or_else(|| {
+                completion_corrupt(format!(
+                    "complete pair rows for {} have no atomic completion witness",
+                    cx_hex(owner)
+                ))
+            })?
+            .1;
+        validate_legacy_witness_rows(owner, witness, &current_rows)?;
+        validated_owners.insert(owner);
     }
-    for cx_id in rows.keys() {
-        if !witnesses.contains_key(cx_id) {
-            return Err(completion_corrupt(format!(
-                "complete pair rows for {} have no atomic completion witness",
-                cx_hex(*cx_id)
-            )));
-        }
-    }
-
+    let empty_rows = BTreeMap::new();
     for (cx_id, (_, witness)) in &witnesses {
-        let actual_rows = rows.get(cx_id).cloned().unwrap_or_default();
-        validate_legacy_witness_rows(*cx_id, witness, &actual_rows)?;
+        if !validated_owners.contains(cx_id) {
+            validate_legacy_witness_rows(*cx_id, witness, &empty_rows)?;
+        }
     }
-    Ok(LegacyPersistedState { witnesses, rows })
+    Ok(LegacyPersistedState {
+        witnesses,
+        row_owners,
+    })
+}
+
+fn legacy_row_keys_for_witness(
+    cx_id: CxId,
+    witness: &LegacyCompletionWitness,
+) -> calyx_core::Result<Vec<Vec<u8>>> {
+    let ids = witness
+        .applicable_slot_ids
+        .iter()
+        .map(|slot| SlotId::new(*slot))
+        .collect::<Vec<_>>();
+    let expected = choose_two(ids.len())?;
+    let mut keys = Vec::with_capacity(expected);
+    for left_index in 0..ids.len() {
+        for right_index in (left_index + 1)..ids.len() {
+            keys.push(legacy_pair_row_key(
+                cx_id,
+                ids[left_index],
+                ids[right_index],
+            ));
+        }
+    }
+    if keys.len() != witness.expected_pair_count {
+        return Err(completion_corrupt(format!(
+            "legacy witness {} key reconstruction produced {} rows instead of {}",
+            cx_hex(cx_id),
+            keys.len(),
+            witness.expected_pair_count
+        )));
+    }
+    Ok(keys)
 }
 
 fn validate_legacy_witness_identity(
@@ -2398,6 +2834,11 @@ fn cx_hex(cx_id: CxId) -> String {
 fn append_part(out: &mut Vec<u8>, part: &[u8]) {
     out.extend_from_slice(&(part.len() as u64).to_be_bytes());
     out.extend_from_slice(part);
+}
+
+fn update_hash_part(out: &mut blake3::Hasher, part: &[u8]) {
+    out.update(&(part.len() as u64).to_be_bytes());
+    out.update(part);
 }
 
 fn choose_two(count: usize) -> calyx_core::Result<usize> {

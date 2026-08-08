@@ -35,6 +35,23 @@ pub const CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC: &str =
 /// open. Absence cannot be inferred from an unavailable keyspace.
 pub const CALYX_ASTER_CF_NOT_SELECTED: &str = "CALYX_ASTER_CF_NOT_SELECTED";
 
+/// Exact readback of the storage preconditions required by a bounded
+/// latest-state analytical scan.
+///
+/// A page limit bounds only callback ownership. It is not a memory bound when
+/// the MVCC overlay is populated, because the router merge materializes that
+/// overlay before the first page. Callers that require a hard bound must bind
+/// this receipt and require `latest_only=true` plus zero overlay rows/bytes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LatestOnlyReadbackStatus {
+    pub latest_only: bool,
+    pub overlay_keys: u64,
+    pub overlay_versions: u64,
+    pub overlay_bytes: u64,
+    pub memtable_byte_cap: u64,
+    pub memtable: MemtableStatus,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VersionedValue {
     seq: Seq,
@@ -473,6 +490,40 @@ impl VersionedCfStore {
             total_used_bytes,
             total_cap_bytes,
             per_cf,
+        }
+    }
+
+    /// Reads the complete latest-only/overlay/memtable contract under the row
+    /// and router locks that govern those exact structures.
+    pub fn latest_only_readback_status(&self) -> LatestOnlyReadbackStatus {
+        let latest_only = self.router_latest_readback.load(Ordering::Acquire);
+        let rows = self.rows.read().expect("mvcc row table poisoned");
+        let overlay_keys = rows.len() as u64;
+        let mut overlay_versions = 0u64;
+        let mut overlay_bytes = 0u64;
+        for ((_, key), versions) in rows.iter() {
+            overlay_versions = overlay_versions.saturating_add(versions.len() as u64);
+            overlay_bytes = overlay_bytes.saturating_add(key.len() as u64);
+            for version in versions {
+                overlay_bytes = overlay_bytes
+                    .saturating_add(std::mem::size_of::<Seq>() as u64)
+                    .saturating_add(version.value.len() as u64);
+            }
+        }
+        drop(rows);
+        let memtable_byte_cap = self
+            .router
+            .read()
+            .expect("mvcc router poisoned")
+            .as_ref()
+            .map_or(0, |router| router.memtable_byte_cap() as u64);
+        LatestOnlyReadbackStatus {
+            latest_only,
+            overlay_keys,
+            overlay_versions,
+            overlay_bytes,
+            memtable_byte_cap,
+            memtable: self.memtable_status(),
         }
     }
 
