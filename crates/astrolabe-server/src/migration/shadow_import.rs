@@ -2373,7 +2373,9 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 #[derive(Debug, Clone, serde::Serialize)]
 struct WeaveSlotScanReceipt {
     slot: u16,
-    source_snapshot_seq: u64,
+    read_snapshot_seq: u64,
+    source_cf_generation_seq: u64,
+    content_sha256: String,
     pages: u64,
     page_high_water_rows: u64,
     page_high_water_bytes: u64,
@@ -2447,9 +2449,9 @@ fn slot_vector_owned_bytes(vector: &SlotVector) -> u64 {
     }
 }
 
-fn load_weave_slot_at<C>(
+fn load_weave_slot_latest<C>(
     vault: &AsterVault<C>,
-    source_snapshot_seq: u64,
+    expected_source_cf_generation: u64,
     slot: SlotId,
     node_by_cx: &BTreeMap<calyx_core::CxId, usize>,
     nodes: &mut [SimilarityNode],
@@ -2464,8 +2466,25 @@ where
         )
         .into());
     }
+    let source_cf = ColumnFamily::slot(slot);
     let storage_before = vault.latest_only_readback_status();
     ensure_bounded_weave_storage(&storage_before, &format!("S{} pre-scan", slot.get()))?;
+    let source_cf_generation_before = vault.cf_content_generation(source_cf)?;
+    if source_cf_generation_before != expected_source_cf_generation {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_CF_CHANGED: S{} source generation changed before its latest-only scan: expected={}, observed={}; remediation: preserve the staged generation and identify the write that mutated the source Slot CF",
+            slot.get(), expected_source_cf_generation, source_cf_generation_before,
+        )
+        .into());
+    }
+    let read_snapshot_seq = vault.latest_seq();
+    if source_cf_generation_before > read_snapshot_seq {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_GENERATION_AHEAD: S{} source generation {} is ahead of latest vault seq {}; remediation: preserve the staged generation and inspect commit-generation publication ordering",
+            slot.get(), source_cf_generation_before, read_snapshot_seq,
+        )
+        .into());
+    }
     let process_before = vault.process_usage_snapshot()?;
     let mut pages = 0u64;
     let mut page_high_water_rows = 0u64;
@@ -2476,9 +2495,12 @@ where
     let mut scanned_bytes = 0u64;
     let mut encoded_bytes = 0u64;
     let mut decoded_owned_bytes = 0u64;
+    let mut content_hasher = Sha256::new();
+    hash_str(&mut content_hasher, "astrolabe.weave-slot-content.v1");
+    hash_u64(&mut content_hasher, slot.get() as u64);
     vault.scan_cf_range_pages_at(
-        source_snapshot_seq,
-        ColumnFamily::slot(slot),
+        read_snapshot_seq,
+        source_cf,
         &prefix_range(&[]),
         1_024,
         |page| -> Result<(), DynError> {
@@ -2495,6 +2517,10 @@ where
             page_high_water_bytes = page_high_water_bytes.max(page_bytes);
             scanned_bytes = scanned_bytes.saturating_add(page_bytes);
             for (key, value) in page {
+                hash_u64(&mut content_hasher, key.len() as u64);
+                content_hasher.update(&key);
+                hash_u64(&mut content_hasher, value.len() as u64);
+                content_hasher.update(&value);
                 let raw_cx = <[u8; 16]>::try_from(key.as_slice()).map_err(|_| -> DynError {
                     format!(
                         "ASTRO_WEAVE_SLOT_KEY_INVALID: S{} row key has {} bytes, expected exactly 16; remediation: preserve the staged vault and rebuild the corrupt Slot CF",
@@ -2530,16 +2556,27 @@ where
     let process = vault.process_usage_snapshot()?.phase_since(process_before);
     let storage_after = vault.latest_only_readback_status();
     ensure_bounded_weave_storage(&storage_after, &format!("S{} post-scan", slot.get()))?;
-    if storage_after != storage_before {
+    let read_snapshot_seq_after = vault.latest_seq();
+    let source_cf_generation_after = vault.cf_content_generation(source_cf)?;
+    if storage_after != storage_before
+        || read_snapshot_seq_after != read_snapshot_seq
+        || source_cf_generation_after != expected_source_cf_generation
+    {
         return Err(format!(
-            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN: S{} storage state changed during a read-only source scan: before={storage_before:?}, after={storage_after:?}; remediation: preserve the staged generation and inspect the concurrent writer before retrying",
-            slot.get()
+            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN: S{} storage generation changed during a read-only source scan: seq_before={}, seq_after={}, expected_cf_generation={}, cf_generation_after={}, status_before={storage_before:?}, status_after={storage_after:?}; remediation: preserve the staged generation and inspect the exact source-CF writer before retrying",
+            slot.get(),
+            read_snapshot_seq,
+            read_snapshot_seq_after,
+            expected_source_cf_generation,
+            source_cf_generation_after,
         )
         .into());
     }
     Ok(WeaveSlotScanReceipt {
         slot: slot.get(),
-        source_snapshot_seq,
+        read_snapshot_seq,
+        source_cf_generation_seq: expected_source_cf_generation,
+        content_sha256: hex_lower(&content_hasher.finalize()),
         pages,
         page_high_water_rows,
         page_high_water_bytes,
@@ -2667,14 +2704,60 @@ where
         })
         .chain(SimilarityFamily::ALL.map(SimilarityFamily::slot))
         .collect::<BTreeSet<_>>();
+    // Capture every source Slot CF generation before the first derived write.
+    // Latest-only reads may use a later global sequence, but a source CF must
+    // retain this exact generation for the complete operation.
+    let source_slot_generations = slots
+        .iter()
+        .map(|slot| {
+            Ok((
+                *slot,
+                vault.cf_content_generation(ColumnFamily::slot(*slot))?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
     let mut slot_scans = Vec::<WeaveSlotScanReceipt>::new();
+    let mut slot_content_witnesses = BTreeMap::<SlotId, (u64, u64, String)>::new();
     let mut similarity_prepass_slot_scan_count = 0usize;
     let mut decoded_slot_bytes_live = 0u64;
     let mut decoded_slot_bytes_high_water = 0u64;
     macro_rules! load_slot {
         ($slot:expr) => {{
-            let receipt =
-                load_weave_slot_at(vault, source_snapshot_seq, $slot, &node_by_cx, &mut nodes)?;
+            let expected_source_cf_generation = *source_slot_generations
+                .get(&$slot)
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_WEAVE_SOURCE_GENERATION_MISSING: S{} was not captured before derived writes",
+                        $slot.get()
+                    )
+                    .into()
+                })?;
+            let receipt = load_weave_slot_latest(
+                vault,
+                expected_source_cf_generation,
+                $slot,
+                &node_by_cx,
+                &mut nodes,
+            )?;
+            let content_witness = (
+                receipt
+                    .rows_loaded
+                    .saturating_add(receipt.rows_for_other_constellations),
+                receipt.scanned_bytes,
+                receipt.content_sha256.clone(),
+            );
+            if let Some(expected) = slot_content_witnesses.get(&$slot)
+                && expected != &content_witness
+            {
+                return Err(format!(
+                    "ASTRO_WEAVE_SOURCE_CONTENT_CHANGED: repeated S{} scan disagrees with its first ordered physical witness: expected={expected:?}, observed={content_witness:?}; remediation: preserve the staged generation and inspect source Slot-CF mutation or corruption",
+                    $slot.get(),
+                )
+                .into());
+            }
+            slot_content_witnesses
+                .entry($slot)
+                .or_insert(content_witness);
             decoded_slot_bytes_live =
                 decoded_slot_bytes_live.saturating_add(receipt.decoded_owned_bytes);
             decoded_slot_bytes_high_water =
@@ -2796,7 +2879,7 @@ where
             similarity_family_receipts.push(json!({
                 "family": family.wire_name(),
                 "source_slot": family.slot().get(),
-                "source_snapshot_seq": source_snapshot_seq,
+                "compact_source_snapshot_seq": source_snapshot_seq,
                 "nodes_loaded": nodes.len(),
                 "nodes_planned": plan_nodes.len(),
                 "edge_count": plan.edges.len(),
@@ -2896,7 +2979,7 @@ where
             xterm_kind_receipts.push(json!({
                 "kind": kind.wire_name(),
                 "source_slots": [kind.slots().0.get(), kind.slots().1.get()],
-                "source_snapshot_seq": source_snapshot_seq,
+                "compact_source_snapshot_seq": source_snapshot_seq,
                 "symbol_count": plan.abundance.symbol_count,
                 "scalar_count": plan.abundance.scalar_count,
                 "absent_count": plan.abundance.absent_count,
@@ -3049,6 +3132,21 @@ where
     // unchanged constellation avoids all pair arithmetic and all ledger writes.
     let complete_xterms =
         reconcile_complete_associations(vault, "astrolabe-shadow-complete-associations")?;
+    let source_slot_generations_after = source_slot_generations
+        .keys()
+        .map(|slot| {
+            Ok((
+                *slot,
+                vault.cf_content_generation(ColumnFamily::slot(*slot))?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    if source_slot_generations_after != source_slot_generations {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_CF_CHANGED: source Slot-CF generations changed across derived reconciliation: before={source_slot_generations:?}, after={source_slot_generations_after:?}; remediation: preserve the staged generation and identify the source Slot writer"
+        )
+        .into());
+    }
     let absent_by_kind = xterm_absent_by_kind
         .iter()
         .map(|(kind, count)| (kind.wire_name(), *count))
@@ -3090,6 +3188,13 @@ where
         },
         "weave_source": {
             "compact_graph": &snapshot.receipt,
+            "slot_cf_generations": source_slot_generations
+                .iter()
+                .map(|(slot, generation)| json!({
+                    "slot": slot.get(),
+                    "generation_seq": generation,
+                }))
+                .collect::<Vec<_>>(),
             "slot_page_row_cap": 1_024,
             "slot_scan_count": slot_scans.len(),
             "similarity_prepass_slot_scan_count": similarity_prepass_slot_scan_count,

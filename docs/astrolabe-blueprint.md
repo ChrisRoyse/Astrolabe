@@ -1691,6 +1691,7 @@ Serving targets: `search_graph` p99 â‰¤ 50ms warm (tripwire 200ms); `get_con
 
 - Global: CBM's process-RSS budget (25/35/50% of RAM) remains the master budget; one vendored mimalloc implementation is routed per platform, and extraction retention caps + backpressure naps remain unchanged.
 - Calyx side: bounded allocators (arena/slab), LRU-TTL caches (byte-capped), memtable caps, reader-lease GC (5s default), background lane 15% CPU / 512MiB.
+- Latest-only analytical stages bind source identity per column family, not to a vault-global sequence that derived writes legitimately advance. Capture every source-CF generation before the first derived commit; read each bounded batch at the then-current latest sequence; prove the source generation and ordered content witness unchanged before/after; release the read generation before writing. Historical fallback, whole-corpus re-verification, and a reader retained across its own commits are correctness defects, not recovery strategies (PC-03/PC-13/PC-29).
 - Vault sizing at L: ~500K constellations Ã— (~1.2KB header/meta + quantized slots ~1.6KB [768d @3.5bpc Ã—3 dense + small dense + sparse avg]) â‰ˆ **1.5â€“2.5 GB** + graph CF ~0.5GB + indexes ~1GB â‡’ ~3â€“4 GB on disk (vs ~0.5â€“1GB SQLite today). Quantization is the lever; raw sidecars only for guard slots.
 - In-RAM serving: HNSW quantized (~700MB at L) â€” DiskANN option below 1/10th RAM if needed.
 

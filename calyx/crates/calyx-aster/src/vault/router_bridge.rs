@@ -1,5 +1,5 @@
 use super::{AsterVault, VaultOpenDiagnostics, VaultRecoveryReport};
-use crate::cf::CfRouter;
+use crate::cf::{CfRouter, ColumnFamily};
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{Freshness, LatestOnlyReadbackStatus, Snapshot, VersionedCfStore};
 use crate::sst::SstSummary;
@@ -54,5 +54,13 @@ where
     /// Exact latest-only/overlay/memtable state used to admit bounded scans.
     pub fn latest_only_readback_status(&self) -> LatestOnlyReadbackStatus {
         self.rows.latest_only_readback_status()
+    }
+
+    /// Handle-local generation for the logical content of one column family.
+    /// Unlike the vault-global commit sequence, this remains stable when a
+    /// disjoint CF is mutated and advances before a mutation to this CF becomes
+    /// visible.
+    pub fn cf_content_generation(&self, cf: ColumnFamily) -> Result<Seq> {
+        self.rows.cf_content_generation(cf)
     }
 }

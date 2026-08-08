@@ -383,7 +383,13 @@ pub struct CompleteAssociationPersistReport {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteAssociationSourceReceipt {
+    /// Latest vault sequence used for the initial persisted-state and Base
+    /// inventory. Later bounded hydration sessions may read at newer global
+    /// sequences after writes to disjoint derived CFs.
     pub snapshot_seq: u64,
+    pub hydration_snapshot_first: Option<u64>,
+    pub hydration_snapshot_last: Option<u64>,
+    pub source_cf_generations: BTreeMap<String, u64>,
     pub base_rows: usize,
     pub base_scan_pages: usize,
     pub base_page_rows_high_water: usize,
@@ -480,6 +486,7 @@ where
     let actor = actor.into();
     let storage_before = vault.latest_only_readback_status();
     ensure_bounded_source_storage(&storage_before, "complete-association pre-read")?;
+    let base_generation_before = vault.cf_content_generation(ColumnFamily::Base)?;
     let snapshot = vault.snapshot();
     let persisted = read_persisted_state_at(vault, snapshot)?;
     let legacy = read_legacy_v1_state_at(vault, snapshot)?;
@@ -507,6 +514,28 @@ where
     let pair_outcomes_unchanged = inventory.pair_outcomes_unchanged;
     let blocks_unchanged = inventory.blocks_unchanged;
     let mut source_receipt = inventory.receipt;
+    let base_generation_after_inventory = vault.cf_content_generation(ColumnFamily::Base)?;
+    if vault.snapshot() != snapshot || base_generation_after_inventory != base_generation_before {
+        return Err(source_corrupt(format!(
+            "complete-association Base source changed during inventory: seq_before={snapshot}, seq_after={}, generation_before={base_generation_before}, generation_after={base_generation_after_inventory}",
+            vault.snapshot(),
+        )));
+    }
+    let mut source_cfs = BTreeSet::from([ColumnFamily::Base]);
+    source_cfs.extend(
+        roster_cache
+            .values()
+            .flat_map(|slots| slots.iter().copied())
+            .map(ColumnFamily::slot),
+    );
+    let source_cf_generations = source_cfs
+        .iter()
+        .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
+        .collect::<calyx_core::Result<BTreeMap<_, _>>>()?;
+    source_receipt.source_cf_generations = source_cf_generations
+        .iter()
+        .map(|(cf, generation)| (cf.name().to_string(), *generation))
+        .collect();
     let removed = persisted
         .witnesses
         .keys()
@@ -534,8 +563,14 @@ where
     let mut mutation_bytes_high_water = 0usize;
     let tombstone = tombstone_value();
 
-    let source_session = vault.sst_read_session_at(snapshot)?;
     for source_ids in changed_ids.chunks(SOURCE_RECORD_BATCH) {
+        ensure_complete_source_generations(vault, &source_cf_generations, "pre-hydration")?;
+        let hydration_snapshot = vault.snapshot();
+        source_receipt
+            .hydration_snapshot_first
+            .get_or_insert(hydration_snapshot);
+        source_receipt.hydration_snapshot_last = Some(hydration_snapshot);
+        let source_session = vault.sst_read_session_at(hydration_snapshot)?;
         let records = load_constellation_batch(
             &source_session,
             source_ids,
@@ -543,6 +578,14 @@ where
             &mut roster_cache,
             &mut source_receipt,
         )?;
+        drop(source_session);
+        if vault.snapshot() != hydration_snapshot {
+            return Err(source_corrupt(format!(
+                "complete-association global generation changed during source hydration: seq_before={hydration_snapshot}, seq_after={}",
+                vault.snapshot(),
+            )));
+        }
+        ensure_complete_source_generations(vault, &source_cf_generations, "post-hydration")?;
         for record_batch in records.chunks(PLANNING_RECORD_BATCH) {
             let planned_batch = record_batch
                 .par_iter()
@@ -643,7 +686,6 @@ where
             }
         }
     }
-    drop(source_session);
 
     for cx_id in &removed {
         let mut record_mutations = Vec::new();
@@ -756,6 +798,7 @@ where
     }
     let storage_after = vault.latest_only_readback_status();
     ensure_bounded_source_storage(&storage_after, "complete-association post-readback")?;
+    ensure_complete_source_generations(vault, &source_cf_generations, "post-reconciliation")?;
     source_receipt.storage_before = Some(storage_before);
     source_receipt.storage_after = Some(storage_after);
 
@@ -781,6 +824,26 @@ where
         fsv,
         state: final_state.public,
     })
+}
+
+fn ensure_complete_source_generations<C>(
+    vault: &AsterVault<C>,
+    expected: &BTreeMap<ColumnFamily, u64>,
+    phase: &str,
+) -> calyx_core::Result<()>
+where
+    C: Clock,
+{
+    let observed = expected
+        .keys()
+        .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
+        .collect::<calyx_core::Result<BTreeMap<_, _>>>()?;
+    if observed != *expected {
+        return Err(source_corrupt(format!(
+            "complete-association source CF generation changed at {phase}: expected={expected:?}, observed={observed:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn commit_mutations<C>(

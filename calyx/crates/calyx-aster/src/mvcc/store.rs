@@ -255,6 +255,16 @@ pub fn is_tombstone_value(value: &[u8]) -> bool {
 #[derive(Debug)]
 pub struct VersionedCfStore {
     seqs: SeqAllocator,
+    /// Conservative handle-local generation for recovered CF content. Durable
+    /// latest-only recovery does not materialize historical row seqnos, so every
+    /// CF starts in the exact generation at which this handle opened. A live
+    /// write to one CF advances only that CF's generation.
+    content_generation_floor_seq: AtomicU64,
+    /// Latest handle-local generation that mutated each column family. This is
+    /// deliberately separate from the vault-global sequence: a write to a
+    /// derived CF must not invalidate a latest-only reader of an unchanged
+    /// source CF.
+    cf_content_generations: RwLock<BTreeMap<ColumnFamily, Seq>>,
     /// Max committed seq whose batch wrote at least one row in a CF that
     /// feeds derived search content (issue #1100). Advances inside the row
     /// write lock *before* the seq becomes visible, so any reader that
@@ -300,6 +310,8 @@ impl VersionedCfStore {
     pub fn new(start_seq: Seq) -> Self {
         Self {
             seqs: SeqAllocator::new(start_seq),
+            content_generation_floor_seq: AtomicU64::new(start_seq),
+            cf_content_generations: RwLock::new(BTreeMap::new()),
             derived_content_seq: AtomicU64::new(0),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
@@ -319,6 +331,8 @@ impl VersionedCfStore {
         let selected_cfs = router.selected_cfs().cloned();
         Self {
             seqs: SeqAllocator::new(start_seq),
+            content_generation_floor_seq: AtomicU64::new(start_seq),
+            cf_content_generations: RwLock::new(BTreeMap::new()),
             derived_content_seq: AtomicU64::new(0),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
@@ -345,11 +359,34 @@ impl VersionedCfStore {
     }
 
     pub fn set_start_seq(&self, seq: Seq) -> Result<()> {
-        self.seqs.set_start_seq(seq)
+        self.seqs.set_start_seq(seq)?;
+        self.content_generation_floor_seq
+            .fetch_max(seq, Ordering::AcqRel);
+        Ok(())
     }
 
     pub fn advance_to_at_least(&self, seq: Seq) {
         self.seqs.advance_to_at_least(seq);
+    }
+
+    /// Returns the handle-local content generation for one column family.
+    ///
+    /// The generation is initialized conservatively to the durable sequence at
+    /// open and advances before every later commit that touches this CF becomes
+    /// globally visible. It therefore answers the question latest-only readers
+    /// actually need: "has this source CF changed?" A vault-global sequence
+    /// cannot answer that after writes to disjoint derived CFs.
+    pub fn cf_content_generation(&self, cf: ColumnFamily) -> Result<Seq> {
+        self.ensure_cf_selected(cf)?;
+        let floor = self.content_generation_floor_seq.load(Ordering::Acquire);
+        Ok(self
+            .cf_content_generations
+            .read()
+            .expect("CF content generations poisoned")
+            .get(&cf)
+            .copied()
+            .unwrap_or(floor)
+            .max(floor))
     }
 
     /// Latest committed seq whose batch wrote derived-search-content inputs.
@@ -733,6 +770,19 @@ impl VersionedCfStore {
                 router.put_at(row.cf(), row.key(), row.value(), commit_watermark)?;
             }
         }
+        let commit_seq = self.current_seq() + 1;
+        {
+            let mut generations = self
+                .cf_content_generations
+                .write()
+                .expect("CF content generations poisoned");
+            for row in &rows {
+                generations
+                    .entry(row.cf())
+                    .and_modify(|generation| *generation = (*generation).max(commit_seq))
+                    .or_insert(commit_seq);
+            }
+        }
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
         // this commit's seq must already observe its watermark (issue #1100).
@@ -744,9 +794,10 @@ impl VersionedCfStore {
             .any(|row| row.cf().feeds_derived_search_content())
         {
             self.derived_content_seq
-                .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
+                .fetch_max(commit_seq, Ordering::AcqRel);
         }
         let seq = self.seqs.allocate();
+        debug_assert_eq!(seq, commit_seq);
         if !self.router_latest_readback.load(Ordering::Acquire) {
             for row in rows {
                 let (cf, key, value) = row.into_owned();
@@ -771,6 +822,18 @@ impl VersionedCfStore {
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
         let mut table = self.rows.write().expect("mvcc row table poisoned");
+        {
+            let mut generations = self
+                .cf_content_generations
+                .write()
+                .expect("CF content generations poisoned");
+            for (cf, _, _) in &rows {
+                generations
+                    .entry(*cf)
+                    .and_modify(|generation| *generation = (*generation).max(seq))
+                    .or_insert(seq);
+            }
+        }
         if rows
             .iter()
             .any(|(cf, _, _)| cf.feeds_derived_search_content())
