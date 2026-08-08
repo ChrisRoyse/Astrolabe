@@ -81,8 +81,13 @@ function Get-AstroTerminationClassification {
         }
     }
 
-    $signed = [int]$ExitCode
-    $unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes($signed), 0)
+    # Callers pass exit codes in both native shapes: signed Int32 (-1 from
+    # Process.ExitCode) and unsigned UInt32 (4294967295 from the exact
+    # GetExitCodeProcess observation). [int] on the latter overflows - the run
+    # record writer must never be unable to persist exactly the code the g26
+    # incident produced. Normalize through Int64 and keep the low 32 bits.
+    $unsigned = [uint32]([int64]$ExitCode -band 0xFFFFFFFFL)
+    $signed = [BitConverter]::ToInt32([BitConverter]::GetBytes($unsigned), 0)
     $hex = '0x' + $unsigned.ToString('X8', [Globalization.CultureInfo]::InvariantCulture)
 
     $classification = 'unclassified'
