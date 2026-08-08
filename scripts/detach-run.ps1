@@ -349,6 +349,13 @@ $prestartStage = 'task-service-connect'
 try {
     $taskService = Get-AstroDetachedTaskService
     $actionValues = @(
+        # The task runs on the interactive desktop (InteractiveToken), so without
+        # window suppression every detached run parks a visible console there for
+        # its whole multi-hour lifetime. Hidden keeps the protocol output in the
+        # run records/launcher.log where it already lands; the window still
+        # flashes sub-second at start (PowerShell hides itself post-launch).
+        '-WindowStyle',
+        'Hidden',
         '-NoProfile',
         '-NonInteractive',
         '-ExecutionPolicy',
