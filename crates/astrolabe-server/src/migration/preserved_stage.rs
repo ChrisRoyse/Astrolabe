@@ -14,7 +14,6 @@
 use super::*;
 use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
 
 pub(crate) const PRESERVED_STAGE_DIR: &str = ".astrolabe-shadow-preserved-stage";
 const PRESERVED_STAGE_MANIFEST: &str = "preserved-stage.json";
