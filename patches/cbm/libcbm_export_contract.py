@@ -29,6 +29,9 @@ COFF_CLASS_EXTERNAL = 2
 COFF_CLASS_STATIC = 3
 COFF_SECTION_COMDAT = 0x00001000
 COFF_AMD64_ADDR64 = 0x0001
+AR_MAGIC = b"!<arch>\n"
+AR_HEADER_BYTES = 60
+AR_HEADER_END = b"`\n"
 
 
 class ContractError(Exception):
@@ -186,7 +189,7 @@ def coff_layout(data: mmap.mmap) -> dict[str, int]:
             f"combined object has {len(data)} bytes, smaller than a COFF header",
             "inspect the failed partial link; never localize a truncated object",
         )
-    machine, section_count, _timestamp, symbol_offset, symbol_count, optional_bytes, _flags = (
+    machine, section_count, timestamp, symbol_offset, symbol_count, optional_bytes, _flags = (
         struct.unpack_from("<HHLLLHH", data, 0)
     )
     if machine != COFF_AMD64:
@@ -200,6 +203,12 @@ def coff_layout(data: mmap.mmap) -> dict[str, int]:
             "ASTRO_LIBCBM_COFF_OBJECT_SHAPE_INVALID",
             f"combined object sections={section_count}, optional_header_bytes={optional_bytes}",
             "supply a standard relocatable COFF object, never an image or empty object",
+        )
+    if timestamp != 0:
+        refuse(
+            "ASTRO_LIBCBM_COFF_TIMESTAMP_NONZERO",
+            f"combined COFF object timestamp={timestamp}, expected 0",
+            "keep --no-insert-timestamp on the pinned MinGW partial link; never rewrite or patch a timestamped object",
         )
     section_table_bytes = section_count * COFF_SECTION_BYTES
     section_table_end = COFF_HEADER_BYTES + section_table_bytes
@@ -232,6 +241,7 @@ def coff_layout(data: mmap.mmap) -> dict[str, int]:
         )
     return {
         "machine": machine,
+        "timestamp": timestamp,
         "section_count": section_count,
         "section_table_offset": COFF_HEADER_BYTES,
         "section_table_bytes": section_table_bytes,
@@ -855,6 +865,175 @@ def verify(args: argparse.Namespace) -> None:
     durable_write(args.audit, json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
+def archive_decimal(raw: bytes, field: str, member_name: str) -> int:
+    try:
+        text = raw.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        refuse(
+            "ASTRO_LIBCBM_ARCHIVE_HEADER_INVALID",
+            f"archive member {member_name!r} has non-ASCII {field}: {error}",
+            "recreate the archive with the pinned GNU ar deterministic mode",
+        )
+    if not text or not text.isdecimal():
+        refuse(
+            "ASTRO_LIBCBM_ARCHIVE_HEADER_INVALID",
+            f"archive member {member_name!r} has invalid decimal {field}: {text!r}",
+            "recreate the archive with the pinned GNU ar deterministic mode",
+        )
+    return int(text, 10)
+
+
+def archive_octal(raw: bytes, field: str, member_name: str) -> int:
+    try:
+        text = raw.decode("ascii").strip()
+        if not text or any(character not in "01234567" for character in text):
+            raise ValueError(f"invalid octal text {text!r}")
+        return int(text, 8)
+    except (UnicodeDecodeError, ValueError) as error:
+        refuse(
+            "ASTRO_LIBCBM_ARCHIVE_HEADER_INVALID",
+            f"archive member {member_name!r} has invalid {field}: {error}",
+            "recreate the archive with the pinned GNU ar deterministic mode",
+        )
+
+
+def verify_archive(args: argparse.Namespace) -> None:
+    try:
+        archive_bytes = args.archive.stat().st_size
+        reloc_bytes = args.reloc.stat().st_size
+        members: list[dict[str, int | str]] = []
+        with args.archive.open("rb", buffering=0) as archive_file:
+            if archive_file.read(len(AR_MAGIC)) != AR_MAGIC:
+                refuse(
+                    "ASTRO_LIBCBM_ARCHIVE_MAGIC_INVALID",
+                    f"archive {args.archive} does not start with the canonical ar magic",
+                    "recreate libcbm.a with the pinned GNU ar tool",
+                )
+            offset = len(AR_MAGIC)
+            while offset < archive_bytes:
+                archive_file.seek(offset)
+                header = archive_file.read(AR_HEADER_BYTES)
+                if len(header) != AR_HEADER_BYTES:
+                    refuse(
+                        "ASTRO_LIBCBM_ARCHIVE_HEADER_TRUNCATED",
+                        f"archive member header at offset {offset} has {len(header)} bytes",
+                        "discard the truncated archive and rerun the exact native build",
+                    )
+                if header[58:60] != AR_HEADER_END:
+                    refuse(
+                        "ASTRO_LIBCBM_ARCHIVE_HEADER_INVALID",
+                        f"archive member header at offset {offset} has invalid terminator {header[58:60]!r}",
+                        "recreate libcbm.a with the pinned GNU ar tool",
+                    )
+                try:
+                    member_name = header[0:16].decode("ascii").rstrip()
+                except UnicodeDecodeError as error:
+                    refuse(
+                        "ASTRO_LIBCBM_ARCHIVE_HEADER_INVALID",
+                        f"archive member at offset {offset} has a non-ASCII name: {error}",
+                        "recreate libcbm.a with the pinned GNU ar tool",
+                    )
+                if not member_name:
+                    refuse(
+                        "ASTRO_LIBCBM_ARCHIVE_MEMBER_NAME_EMPTY",
+                        f"archive member at offset {offset} has an empty name",
+                        "recreate libcbm.a with one exact libcbm.o member",
+                    )
+                timestamp = archive_decimal(header[16:28], "timestamp", member_name)
+                uid = archive_decimal(header[28:34], "uid", member_name)
+                gid = archive_decimal(header[34:40], "gid", member_name)
+                mode = archive_octal(header[40:48], "mode", member_name)
+                size = archive_decimal(header[48:58], "size", member_name)
+                payload_offset = offset + AR_HEADER_BYTES
+                payload_end = payload_offset + size
+                if payload_end > archive_bytes:
+                    refuse(
+                        "ASTRO_LIBCBM_ARCHIVE_MEMBER_TRUNCATED",
+                        f"archive member {member_name!r} payload ends at {payload_end}, archive bytes={archive_bytes}",
+                        "discard the incomplete archive and rerun the exact native build",
+                    )
+                if timestamp != 0 or uid != 0 or gid != 0:
+                    refuse(
+                        "ASTRO_LIBCBM_ARCHIVE_METADATA_NONDETERMINISTIC",
+                        f"archive member {member_name!r} timestamp={timestamp}, uid={uid}, gid={gid}",
+                        "keep GNU ar's explicit D modifier; never accept host time or identity in libcbm.a",
+                    )
+                members.append(
+                    {
+                        "name": member_name,
+                        "header_offset": offset,
+                        "payload_offset": payload_offset,
+                        "bytes": size,
+                        "timestamp": timestamp,
+                        "uid": uid,
+                        "gid": gid,
+                        "mode": mode,
+                    }
+                )
+                offset = payload_end
+                if size % 2:
+                    archive_file.seek(offset)
+                    if archive_file.read(1) != b"\n":
+                        refuse(
+                            "ASTRO_LIBCBM_ARCHIVE_PADDING_INVALID",
+                            f"archive member {member_name!r} has invalid odd-byte padding",
+                            "recreate libcbm.a with the pinned GNU ar tool",
+                        )
+                    offset += 1
+            if offset != archive_bytes:
+                refuse(
+                    "ASTRO_LIBCBM_ARCHIVE_BOUNDS_INVALID",
+                    f"archive walk ended at {offset}, archive bytes={archive_bytes}",
+                    "discard the malformed archive and rerun the exact native build",
+                )
+            ordinary = [member for member in members if member["name"] not in {"/", "/SYM64/", "//"}]
+            if len(ordinary) != 1 or ordinary[0]["name"] != "libcbm.o/":
+                refuse(
+                    "ASTRO_LIBCBM_ARCHIVE_MEMBER_SET_INVALID",
+                    f"expected one libcbm.o/ member, observed {[member['name'] for member in ordinary]}",
+                    "archive only the verified combined object; never add or infer another member",
+                )
+            if ordinary[0]["bytes"] != reloc_bytes:
+                refuse(
+                    "ASTRO_LIBCBM_ARCHIVE_MEMBER_SIZE_MISMATCH",
+                    f"archive libcbm.o bytes={ordinary[0]['bytes']}, source reloc bytes={reloc_bytes}",
+                    "recreate the archive from the exact verified combined object",
+                )
+            archive_file.seek(int(ordinary[0]["payload_offset"]))
+            archived_coff_header = archive_file.read(COFF_HEADER_BYTES)
+        with args.reloc.open("rb", buffering=0) as reloc_file:
+            source_coff_header = reloc_file.read(COFF_HEADER_BYTES)
+    except OSError as error:
+        refuse(
+            "ASTRO_LIBCBM_ARCHIVE_READ_FAILED",
+            f"cannot inspect archive {args.archive} and reloc {args.reloc}: {error}",
+            "repair the launcher-owned build volume and rerun the exact native build",
+        )
+    if archived_coff_header != source_coff_header:
+        refuse(
+            "ASTRO_LIBCBM_ARCHIVE_MEMBER_HEADER_MISMATCH",
+            "archived libcbm.o COFF header differs from the verified source object",
+            "discard the archive and recreate it from the exact verified combined object",
+        )
+    audit = {
+        "format": "astrolabe.libcbm-archive-determinism.v1",
+        "archive": {
+            "path": args.archive.as_posix(),
+            "bytes": archive_bytes,
+            "member_count": len(members),
+            "members": members,
+            "metadata_zero": True,
+        },
+        "reloc": {
+            "path": args.reloc.as_posix(),
+            "bytes": reloc_bytes,
+            "coff_header_sha256": sha256(source_coff_header),
+            "archive_header_match": True,
+        },
+    }
+    durable_write(args.audit, json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     subparsers = root.add_subparsers(dest="operation", required=True)
@@ -875,6 +1054,10 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--reloc", required=True, type=Path)
     verify_parser.add_argument("--exports", required=True, type=Path)
     verify_parser.add_argument("--audit", required=True, type=Path)
+    archive_parser = subparsers.add_parser("verify-archive")
+    archive_parser.add_argument("--archive", required=True, type=Path)
+    archive_parser.add_argument("--reloc", required=True, type=Path)
+    archive_parser.add_argument("--audit", required=True, type=Path)
     return root
 
 
@@ -885,8 +1068,10 @@ def main() -> int:
             prepare(args)
         elif args.operation == "localize":
             localize(args)
-        else:
+        elif args.operation == "verify":
             verify(args)
+        else:
+            verify_archive(args)
     except ContractError as error:
         print(
             f"{error.code}: {error.message}; remediation: {error.remediation}",

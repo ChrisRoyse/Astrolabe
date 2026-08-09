@@ -1,6 +1,21 @@
 #![forbid(unsafe_code)]
 
+const NATIVE_REPRODUCIBILITY_CONTRACT: &str = "astrolabe.native-reproducibility.v1";
+
 fn main() {
+    let mut arguments = std::env::args_os();
+    let _executable = arguments.next();
+    if matches!(
+        (arguments.next(), arguments.next()),
+        (Some(argument), None) if argument == std::ffi::OsStr::new("--version")
+    ) {
+        println!(
+            "codebase-memory-mcp {} (native-reproducibility={NATIVE_REPRODUCIBILITY_CONTRACT})",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+
     // #730: this shim — not `astrolabe` — is the binary the installed MCP server
     // and every CLI driver execute, so it must enter the CBM pipeline through the
     // same registry-sized host thread. Calling `run_from_env` directly here left

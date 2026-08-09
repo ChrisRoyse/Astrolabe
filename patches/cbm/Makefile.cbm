@@ -130,7 +130,7 @@ WIN32_LIBS :=
 MINGW_RELOC_LD_FLAGS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
-MINGW_RELOC_LD_FLAGS := --allow-multiple-definition
+MINGW_RELOC_LD_FLAGS := --allow-multiple-definition --no-insert-timestamp
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -670,6 +670,7 @@ LIBCBM_OBJECTS_RSP = $(BUILD_DIR)/libcbm.objects.rsp
 LIBCBM_EXPORT_AUDIT = $(BUILD_DIR)/libcbm.exports.audit.json
 LIBCBM_LOCALIZATION_AUDIT = $(BUILD_DIR)/libcbm.localization.audit.json
 LIBCBM_RELOC_AUDIT = $(BUILD_DIR)/libcbm.reloc.audit.json
+LIBCBM_ARCHIVE_AUDIT = $(BUILD_DIR)/libcbm.archive.audit.json
 
 $(LIBCBM_DIR)/$(CBM_DIR)/grammar_%.o: $(CBM_DIR)/grammar_%.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -757,9 +758,12 @@ $(LIBCBM_RELOC): $(LIBCBM_OBJS) $(LIBCBM_EXPORTS) $(LIBCBM_EXPORT_CONTRACT)
 	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) localize --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_LOCALIZATION_AUDIT)
 	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) verify --nm "$(NM)" --objdump "$(OBJDUMP)" --objects-response $(LIBCBM_OBJECTS_RSP) --reloc $@ --exports $(LIBCBM_EXPORTS) --audit $(LIBCBM_RELOC_AUDIT)
 
-$(LIBCBM_A): $(LIBCBM_RELOC)
+$(LIBCBM_A): $(LIBCBM_RELOC) $(LIBCBM_EXPORT_CONTRACT)
 	rm -f $@
-	$(AR) rcs $@ $(LIBCBM_RELOC)
+	# The D modifier is explicit: build reproducibility never depends on how the
+	# pinned binutils package happened to configure ar's default mode.
+	$(AR) rcsD $@ $(LIBCBM_RELOC)
+	$(PYTHON) $(LIBCBM_EXPORT_CONTRACT) verify-archive --archive $@ --reloc $(LIBCBM_RELOC) --audit $(LIBCBM_ARCHIVE_AUDIT)
 
 libcbm: $(LIBCBM_A)
 	@echo "Built static library: $(LIBCBM_A)"
