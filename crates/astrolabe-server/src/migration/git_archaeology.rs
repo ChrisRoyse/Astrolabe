@@ -1383,11 +1383,21 @@ fn elapsed_ms(elapsed: std::time::Duration) -> u64 {
 
 /// Validate and durably bind the exact archaeology scratch scope before the
 /// shadow publication or native index pass starts. A non-git corpus never calls
-/// this preflight; its archaeology result remains explicitly unavailable.
+/// this preflight; its archaeology result remains explicitly unavailable. An
+/// unborn repository has no historical work and therefore returns before any
+/// scratch namespace is created. If the first commit appears after this
+/// preflight, `run_git_archaeology` reclassifies the publication snapshot and
+/// validates its scratch scope immediately before history work.
 pub(crate) fn preflight_git_archaeology_scratch(
     repo: &Path,
     project: &str,
 ) -> Result<(), DynError> {
+    if matches!(
+        astrolabe_anchors::archaeology::git_history_state(repo)?,
+        GitHistoryState::Unborn { .. }
+    ) {
+        return Ok(());
+    }
     let git_root = git_toplevel(repo)?;
     let _ = archaeology_scratch_scope(&git_root, project)?;
     Ok(())
