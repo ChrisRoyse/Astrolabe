@@ -2900,7 +2900,7 @@ fn stream_eager_cross_term_kind_selected<F>(
     kind: EagerAgreementKind,
     symbol_ids: Option<&BTreeSet<String>>,
     active_slot_count: usize,
-    mut emit: F,
+    emit: F,
 ) -> calyx_core::Result<EagerCrossTermStreamReport>
 where
     F: FnMut(EagerCrossTermRow) -> calyx_core::Result<()>,
