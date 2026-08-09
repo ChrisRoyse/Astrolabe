@@ -35,6 +35,9 @@ pub const CALYX_ASTER_LATEST_ONLY_COMPRESSION_REQUIRES_MVCC: &str =
 /// open. Absence cannot be inferred from an unavailable keyspace.
 pub const CALYX_ASTER_CF_NOT_SELECTED: &str = "CALYX_ASTER_CF_NOT_SELECTED";
 
+/// A full historical restore was attempted against a latest-router handle.
+pub const CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE: &str = "CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE";
+
 /// Exact readback of the storage preconditions required by a bounded
 /// latest-state analytical scan.
 ///
@@ -351,6 +354,134 @@ impl VersionedCfStore {
         let store = Self::new_with_router(start_seq, router);
         store.router_latest_readback.store(true, Ordering::Release);
         store
+    }
+
+    pub(crate) fn uses_latest_router(&self) -> bool {
+        self.router_latest_readback.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn latest_router_memtable_byte_cap(&self) -> Result<usize> {
+        if !self.uses_latest_router() {
+            return Err(CalyxError {
+                code: CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE,
+                message: "latest-router recovery metadata requested from a full-MVCC handle"
+                    .to_string(),
+                remediation: "select the recovery mode from the handle before constructing a replacement router",
+            });
+        }
+        self.router
+            .read()
+            .expect("mvcc router poisoned")
+            .as_ref()
+            .map(CfRouter::memtable_byte_cap)
+            .ok_or_else(|| {
+                CalyxError::aster_corrupt_shard("latest-router handle has no physical CF router")
+            })
+    }
+
+    /// Atomically publishes a completely reconstructed latest-state router.
+    /// The caller builds the candidate from the current immutable SST version
+    /// plus its WAL tail before entering this method. Publication verifies the
+    /// old generation and empty-overlay invariant under the established
+    /// row-write -> router-write lock order, then advances metadata and the
+    /// visible sequence before releasing either lock.
+    pub(crate) fn replace_latest_recovered_router<I>(
+        &self,
+        expected_current: Seq,
+        recovered_seq: Seq,
+        manifested_floor_seq: Seq,
+        derived_floor_seq: Seq,
+        recovered_rows: I,
+        mut candidate: CfRouter,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (Seq, ColumnFamily)>,
+    {
+        if recovered_seq < expected_current
+            || manifested_floor_seq > recovered_seq
+            || derived_floor_seq > recovered_seq
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "latest-router replacement sequence tuple is invalid: expected_current={expected_current}, recovered={recovered_seq}, manifested_floor={manifested_floor_seq}, derived_floor={derived_floor_seq}"
+            )));
+        }
+        let mut recovered_generations = BTreeMap::<ColumnFamily, Seq>::new();
+        let mut recovered_derived_seq = derived_floor_seq;
+        for (seq, cf) in recovered_rows {
+            if seq > recovered_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "latest-router replacement row sequence {seq} exceeds recovered tip {recovered_seq}"
+                )));
+            }
+            recovered_generations
+                .entry(cf)
+                .and_modify(|generation| *generation = (*generation).max(seq))
+                .or_insert(seq);
+            if cf.feeds_derived_search_content() {
+                recovered_derived_seq = recovered_derived_seq.max(seq);
+            }
+        }
+
+        let table = self.rows.write().expect("mvcc row table poisoned");
+        if !self.uses_latest_router() {
+            return Err(CalyxError {
+                code: CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE,
+                message: "latest-router replacement attempted against a full-MVCC handle"
+                    .to_string(),
+                remediation: "restore historical rows through restore_mvcc_batch for a full-MVCC handle",
+            });
+        }
+        let current = self.current_seq();
+        if current != expected_current {
+            return Err(sequence_conflict(expected_current, current));
+        }
+        if !table.is_empty() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "latest-router replacement requires an empty MVCC overlay, found {} keys",
+                table.len()
+            )));
+        }
+
+        let mut live_router = self.router.write().expect("mvcc router poisoned");
+        let live = live_router.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "latest-router replacement found no live physical CF router",
+            )
+        })?;
+        if candidate.memtable_byte_cap() != live.memtable_byte_cap()
+            || candidate.selected_cfs() != live.selected_cfs()
+            || candidate.selected_cfs() != self.selected_cfs.as_ref()
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "latest-router replacement capability mismatch: candidate_cap={}, live_cap={}, candidate_selected={:?}, live_selected={:?}, store_selected={:?}",
+                candidate.memtable_byte_cap(),
+                live.memtable_byte_cap(),
+                candidate.selected_cfs(),
+                live.selected_cfs(),
+                self.selected_cfs
+            )));
+        }
+        candidate.bind_resource_counters(Arc::clone(&self.resource_counters));
+        *live_router = Some(candidate);
+
+        self.content_generation_floor_seq
+            .fetch_max(manifested_floor_seq, Ordering::AcqRel);
+        {
+            let mut generations = self
+                .cf_content_generations
+                .write()
+                .expect("CF content generations poisoned");
+            for (cf, seq) in recovered_generations {
+                generations
+                    .entry(cf)
+                    .and_modify(|generation| *generation = (*generation).max(seq))
+                    .or_insert(seq);
+            }
+        }
+        self.derived_content_seq
+            .fetch_max(recovered_derived_seq, Ordering::AcqRel);
+        self.seqs.advance_to_at_least(recovered_seq);
+        Ok(())
     }
 
     /// Latest committed sequence.
@@ -810,13 +941,23 @@ impl VersionedCfStore {
         Ok(seq)
     }
 
-    /// Restores one durable write group at its original sequence before live writes begin.
-    pub fn restore_batch<I, K, V>(&self, seq: Seq, rows: I) -> Result<()>
+    /// Restores one durable write group into an explicitly historical MVCC
+    /// handle at its original sequence before live writes begin.
+    pub(crate) fn restore_mvcc_batch<I, K, V>(&self, seq: Seq, rows: I) -> Result<()>
     where
         I: IntoIterator<Item = (ColumnFamily, K, V)>,
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
+        if self.uses_latest_router() {
+            return Err(CalyxError {
+                code: CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE,
+                message: format!(
+                    "full MVCC restore for sequence {seq} was requested from a latest-router handle"
+                ),
+                remediation: "reconstruct the latest router from immutable SST state plus the WAL tail, or open explicitly with restore_mvcc_rows=true",
+            });
+        }
         let rows: Vec<_> = rows
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))

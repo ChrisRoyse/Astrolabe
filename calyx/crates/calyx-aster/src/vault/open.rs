@@ -59,7 +59,7 @@ where
         };
         let router_started = std::time::Instant::now();
         let router_usage_before = current_process_usage()?;
-        let router = match &options.selected_cfs {
+        let mut router = match &options.selected_cfs {
             Some(cfs) if options.read_only => CfRouter::open_selected_existing_cfs(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
@@ -70,26 +70,36 @@ where
                 options.memtable_byte_cap,
                 cfs.iter().copied(),
             )?,
-            None if options.read_only && recovery.router_latest_readback => {
+            None if options.read_only && recovery.mode == durable::RecoveryMode::LatestRouter => {
                 CfRouter::open_existing_latest(vault_dir.as_ref(), options.memtable_byte_cap)?
             }
             None if options.read_only => {
                 CfRouter::open_existing(vault_dir.as_ref(), options.memtable_byte_cap)?
             }
-            None if recovery.router_latest_readback => CfRouter::open_with_tiering_latest(
-                vault_dir.as_ref(),
-                options.memtable_byte_cap,
-                options.tiering_policy.clone(),
-            )?,
+            None if recovery.mode == durable::RecoveryMode::LatestRouter => {
+                CfRouter::open_with_tiering_latest(
+                    vault_dir.as_ref(),
+                    options.memtable_byte_cap,
+                    options.tiering_policy.clone(),
+                )?
+            }
             None => CfRouter::open_with_tiering(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
                 options.tiering_policy.clone(),
             )?,
         };
+        if recovery.mode == durable::RecoveryMode::LatestRouter {
+            router.replay_latest_rows(recovery.batches.iter().flat_map(|batch| {
+                batch
+                    .rows
+                    .iter()
+                    .map(move |row| (batch.seq, row.cf, row.key.as_slice(), row.value.as_slice()))
+            }))?;
+        }
         let router_us = elapsed_us(router_started);
         let router_usage = current_process_usage()?.phase_since(router_usage_before);
-        let rows = if recovery.router_latest_readback {
+        let rows = if recovery.mode == durable::RecoveryMode::LatestRouter {
             VersionedCfStore::new_with_router_latest_readback(recovery.last_recovered_seq, router)
         } else {
             VersionedCfStore::new_with_router(recovery.last_recovered_seq, router)
@@ -112,14 +122,27 @@ where
                 .collect()
         };
         for batch in recovery.batches {
-            let rows_at_seq = batch
-                .rows
-                .into_iter()
-                .map(|row| (row.cf, row.key, row.value));
-            rows.restore_batch(batch.seq, rows_at_seq)?;
+            match recovery.mode {
+                durable::RecoveryMode::FullMvcc => {
+                    let rows_at_seq = batch
+                        .rows
+                        .into_iter()
+                        .map(|row| (row.cf, row.key, row.value));
+                    rows.restore_mvcc_batch(batch.seq, rows_at_seq)?;
+                }
+                durable::RecoveryMode::LatestRouter => {
+                    if batch
+                        .rows
+                        .iter()
+                        .any(|row| row.cf.feeds_derived_search_content())
+                    {
+                        rows.advance_derived_content_seq_to_at_least(batch.seq);
+                    }
+                }
+            }
         }
         rows.set_start_seq(recovery.last_recovered_seq)?;
-        if !recovery.router_latest_readback {
+        if recovery.mode == durable::RecoveryMode::FullMvcc {
             // Full-restore contract (issue #1132): every row physically held
             // in Router-class SSTs must be visible to the restored MVCC state,
             // otherwise snapshot reads on this handle silently miss it.

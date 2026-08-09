@@ -19,12 +19,6 @@ use std::collections::BTreeMap;
 use std::fs;
 
 impl DurableVault {
-    pub(in crate::vault) fn checkpoint_batch(&self, seq: u64, rows: &[WriteRow]) -> Result<()> {
-        self.write_rows(seq, rows)?;
-        self.advance_checkpointed_derived_content(seq, rows);
-        self.write_manifest(seq)
-    }
-
     pub(in crate::vault) fn stage_checkpoint_batch_owned(
         &self,
         seq: u64,

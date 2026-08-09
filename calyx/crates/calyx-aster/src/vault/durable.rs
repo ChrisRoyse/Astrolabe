@@ -104,6 +104,22 @@ pub(super) struct RecoveredBatch {
     pub rows: Vec<WriteRow>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RecoveryMode {
+    FullMvcc,
+    LatestRouter,
+}
+
+impl RecoveryMode {
+    fn from_options(options: &VaultOptions) -> Self {
+        if options.restore_mvcc_rows {
+            Self::FullMvcc
+        } else {
+            Self::LatestRouter
+        }
+    }
+}
+
 pub(super) struct RecoveredBatches {
     pub batches: Vec<RecoveredBatch>,
     pub last_recovered_seq: u64,
@@ -115,7 +131,7 @@ pub(super) struct RecoveredBatches {
     pub temporal_policy: Option<TemporalPolicy>,
     pub dedup_policy: Option<DedupPolicy>,
     pub retention_horizon: RetentionHorizon,
-    pub router_latest_readback: bool,
+    pub mode: RecoveryMode,
 }
 
 impl DurableVault {
@@ -240,8 +256,8 @@ impl DurableVault {
             if let Some(policy) = &recovery.manifest.dedup_policy {
                 validate_dedup_policy(policy, options.panel.as_ref())?;
             }
-            let router_latest_readback = !options.restore_mvcc_rows;
-            let mut batches = if options.restore_mvcc_rows {
+            let mode = RecoveryMode::from_options(options);
+            let mut batches = if mode == RecoveryMode::FullMvcc {
                 read_manifested_batches(
                     root,
                     options.tiering_policy.as_ref(),
@@ -265,7 +281,7 @@ impl DurableVault {
                 temporal_policy: recovery.manifest.temporal_policy,
                 dedup_policy: recovery.manifest.dedup_policy,
                 retention_horizon: recovery.manifest.retention_horizon,
-                router_latest_readback,
+                mode,
             });
         }
 
@@ -281,7 +297,7 @@ impl DurableVault {
         // With no manifest the whole WAL is uncheckpointed tail, so both modes
         // must restore it: latest readers compose that tail over router SSTs,
         // while historical readers rebuild MVCC from the same committed rows.
-        let router_latest_readback = !options.restore_mvcc_rows;
+        let mode = RecoveryMode::from_options(options);
         let batches = replay
             .records
             .iter()
@@ -301,7 +317,7 @@ impl DurableVault {
             temporal_policy: options.temporal_policy,
             dedup_policy: options.dedup_policy.clone(),
             retention_horizon: options.retention_horizon.clone(),
-            router_latest_readback,
+            mode,
         })
     }
 
@@ -379,7 +395,7 @@ impl DurableVault {
         self.root.join("locks").join("durable.commit.lock")
     }
 
-    pub(super) fn recover_current_batches(&self) -> Result<RecoveredBatches> {
+    pub(super) fn recover_current_batches(&self, mode: RecoveryMode) -> Result<RecoveredBatches> {
         let options = VaultOptions {
             tiering_policy: self.tiering_policy.clone(),
             ledger_checkpoint: self.ledger_checkpoint.clone(),
@@ -388,7 +404,7 @@ impl DurableVault {
             retention_horizon: self.retention_horizon(),
             panel: self.panel.clone(),
             disk_pressure_guard: self.disk_pressure_guard.clone(),
-            restore_mvcc_rows: true,
+            restore_mvcc_rows: mode == RecoveryMode::FullMvcc,
             ..VaultOptions::default()
         };
         Self::recover_batches(&self.root, &options)

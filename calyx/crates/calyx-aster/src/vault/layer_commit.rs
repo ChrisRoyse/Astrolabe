@@ -148,7 +148,7 @@ where
                 temporal_policy: None,
                 dedup_policy: None,
                 retention_horizon: crate::timetravel::RetentionHorizon::default(),
-                router_latest_readback: false,
+                mode: durable::RecoveryMode::FullMvcc,
             },
             None,
             std::sync::Arc::clone(&self.clock),

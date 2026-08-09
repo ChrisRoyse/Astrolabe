@@ -20,6 +20,9 @@ const DEFAULT_MEMTABLE_BYTES: usize = 8 * 1024 * 1024;
 /// shadows commit-domain data elsewhere.
 pub const NO_COMMIT_DOMAIN: u64 = 0;
 
+/// Latest-state WAL replay cannot fit in the configured bounded memtable.
+pub const CALYX_ASTER_LATEST_REPLAY_UNBOUNDED: &str = "CALYX_ASTER_LATEST_REPLAY_UNBOUNDED";
+
 #[derive(Debug)]
 pub struct CfRouter {
     vault_dir: PathBuf,
@@ -318,6 +321,127 @@ impl CfRouter {
             .collect::<Vec<_>>();
         usage.sort_by_key(|left| left.0.name());
         usage
+    }
+
+    /// Reconstructs the bounded latest-state WAL overlay without writing an
+    /// SST or mutating the durable namespace.
+    ///
+    /// The caller supplies WAL rows in durable order. Duplicate keys reduce to
+    /// the highest `(seq, input_ordinal)`, existing immutable values are read
+    /// through one ordered plan per CF, and only byte-different final values
+    /// enter the memtables. Every CF's complete differing set is admitted
+    /// before the first write, so an over-cap recovery never publishes a
+    /// partial router generation.
+    pub(crate) fn replay_latest_rows<'a, I>(&mut self, rows: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (u64, ColumnFamily, &'a [u8], &'a [u8])>,
+    {
+        if self.memtables.values().any(|table| !table.is_empty()) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "latest-state WAL replay requires a fresh router with empty memtables",
+            ));
+        }
+
+        let mut latest = BTreeMap::<(ColumnFamily, &'a [u8]), (u64, usize, &'a [u8])>::new();
+        for (ordinal, (seq, cf, key, value)) in rows.into_iter().enumerate() {
+            if self
+                .selected_cfs
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(&cf))
+            {
+                continue;
+            }
+            let replace = latest
+                .get(&(cf, key))
+                .is_none_or(|(current_seq, current_ordinal, _)| {
+                    (seq, ordinal) > (*current_seq, *current_ordinal)
+                });
+            if replace {
+                latest.insert((cf, key), (seq, ordinal, value));
+            }
+        }
+
+        let planned = latest
+            .into_iter()
+            .map(|((cf, key), (_, _, value))| (cf, key, value))
+            .collect::<Vec<_>>();
+        let mut differs = vec![false; planned.len()];
+        let mut start = 0usize;
+        while start < planned.len() {
+            let cf = planned[start].0;
+            let mut end = start + 1;
+            while end < planned.len() && planned[end].0 == cf {
+                end += 1;
+            }
+            let keys = (start..end)
+                .map(|ordinal| (ordinal, planned[ordinal].1))
+                .collect::<Vec<_>>();
+            self.visit_key_plan(cf, &keys, &mut |ordinal, existing| {
+                differs[ordinal] = existing != Some(planned[ordinal].2);
+                Ok::<(), CalyxError>(())
+            })?;
+            start = end;
+        }
+
+        let mut admitted = BTreeMap::<ColumnFamily, (usize, usize)>::new();
+        for (ordinal, (cf, key, value)) in planned.iter().enumerate() {
+            if !differs[ordinal] {
+                continue;
+            }
+            let row_bytes = Memtable::entry_size(key, value);
+            let (key_count, byte_count) = admitted.entry(*cf).or_default();
+            *key_count = key_count.checked_add(1).ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(
+                    "latest-state WAL replay differing-key count overflow",
+                )
+            })?;
+            *byte_count = byte_count.checked_add(row_bytes).ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(
+                    "latest-state WAL replay differing-byte count overflow",
+                )
+            })?;
+            if *byte_count > self.memtable_byte_cap {
+                return Err(CalyxError {
+                    code: CALYX_ASTER_LATEST_REPLAY_UNBOUNDED,
+                    message: format!(
+                        "latest-state WAL replay for {} requires {} differing keys / {} bytes, exceeding memtable cap {}",
+                        cf.name(),
+                        key_count,
+                        byte_count,
+                        self.memtable_byte_cap
+                    ),
+                    remediation: "checkpoint the WAL tail through a write-capable full-MVCC handle, then reopen latest-only; do not raise the cap or retry unchanged state",
+                });
+            }
+        }
+
+        for cf in admitted.keys().copied() {
+            self.memtables
+                .entry(cf)
+                .or_insert_with(|| Memtable::new(self.memtable_byte_cap));
+            self.levels.entry(cf).or_default();
+            self.next_file.entry(cf).or_insert(1);
+        }
+        for (ordinal, (cf, key, value)) in planned.into_iter().enumerate() {
+            if !differs[ordinal] {
+                continue;
+            }
+            self.memtable_mut(cf).write(key, value, 0).map_err(|error| {
+                CalyxError {
+                    code: CALYX_ASTER_LATEST_REPLAY_UNBOUNDED,
+                    message: format!(
+                        "latest-state WAL replay admission diverged while writing {} key after complete preflight: [{}] {}",
+                        cf.name(), error.code, error.message
+                    ),
+                    remediation: "inspect memtable accounting and the recovered WAL keyset; no router generation was published",
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_resource_counters(&mut self, counters: Arc<ResourceCounters>) {
+        self.resource_counters = counters;
     }
 
     /// Raw flush with no commit domain; see [`Self::flush_cf_at`].

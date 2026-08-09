@@ -1,7 +1,7 @@
 mod generation_injection;
 
-use super::{AsterVault, encode, ledger_hook};
-use crate::cf::ColumnFamily;
+use super::{AsterVault, durable, encode, ledger_hook};
+use crate::cf::{CfRouter, ColumnFamily};
 use calyx_core::{CalyxError, Clock, Result, Seq};
 use generation_injection::validate_generation_injection_shape;
 
@@ -54,7 +54,28 @@ where
             return Ok(());
         };
         let current = self.latest_seq();
-        let recovered = durable.recover_current_batches()?;
+        let mode = if self.rows.uses_latest_router() {
+            durable::RecoveryMode::LatestRouter
+        } else {
+            durable::RecoveryMode::FullMvcc
+        };
+        let recovered = durable.recover_current_batches(mode)?;
+        let latest_candidate = if mode == durable::RecoveryMode::LatestRouter {
+            let mut router = CfRouter::open_with_tiering_latest(
+                durable.root(),
+                self.rows.latest_router_memtable_byte_cap()?,
+                durable.tiering_policy().cloned(),
+            )?;
+            router.replay_latest_rows(recovered.batches.iter().flat_map(|batch| {
+                batch
+                    .rows
+                    .iter()
+                    .map(move |row| (batch.seq, row.cf, row.key.as_slice(), row.value.as_slice()))
+            }))?;
+            Some(router)
+        } else {
+            None
+        };
         if let Some(hook) = &self.ledger_hook {
             ledger_hook::refresh_hook(
                 hook,
@@ -66,12 +87,45 @@ where
             )?;
         }
         self.replace_retention_horizon(recovered.retention_horizon.clone())?;
-        self.rows
-            .advance_derived_content_seq_to_at_least(recovered.derived_content_floor_seq);
         durable.advance_derived_content_watermark_to_at_least(recovered.derived_content_floor_seq);
         // WAL-tail batches from a foreign writer have no durable-batch SSTs
         // yet; stage them here so this handle's next checkpoint flush cannot
         // advance the manifest past them if that writer dies (issue #1132).
+        match mode {
+            durable::RecoveryMode::FullMvcc => {
+                self.rows
+                    .advance_derived_content_seq_to_at_least(recovered.derived_content_floor_seq);
+                for batch in &recovered.batches {
+                    if batch.seq <= current {
+                        continue;
+                    }
+                    let rows_at_seq = batch
+                        .rows
+                        .iter()
+                        .map(|row| (row.cf, row.key.clone(), row.value.clone()));
+                    self.rows.restore_mvcc_batch(batch.seq, rows_at_seq)?;
+                }
+                self.rows.advance_to_at_least(recovered.last_recovered_seq);
+            }
+            durable::RecoveryMode::LatestRouter => {
+                let candidate = latest_candidate.ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(
+                        "latest-router refresh completed recovery without a candidate router",
+                    )
+                })?;
+                self.rows.replace_latest_recovered_router(
+                    current,
+                    recovered.last_recovered_seq,
+                    recovered.wal_replay_floor_seq,
+                    recovered.derived_content_floor_seq,
+                    recovered
+                        .batches
+                        .iter()
+                        .flat_map(|batch| batch.rows.iter().map(move |row| (batch.seq, row.cf))),
+                    candidate,
+                )?;
+            }
+        }
         durable.stage_recovered_wal_batches(
             recovered
                 .batches
@@ -80,17 +134,6 @@ where
                 .map(|batch| (batch.seq, batch.rows.clone()))
                 .collect(),
         )?;
-        for batch in &recovered.batches {
-            if batch.seq <= current {
-                continue;
-            }
-            let rows_at_seq = batch
-                .rows
-                .iter()
-                .map(|row| (row.cf, row.key.clone(), row.value.clone()));
-            self.rows.restore_batch(batch.seq, rows_at_seq)?;
-        }
-        self.rows.advance_to_at_least(recovered.last_recovered_seq);
         Ok(())
     }
 
@@ -316,8 +359,18 @@ where
         let mvcc_seq = match mvcc_result {
             Ok(seq) => seq,
             Err(mvcc_error) => {
-                let restore = self.restore_committed_rows(durable_seq, &rows);
-                let checkpoint = durable.checkpoint_batch(durable_seq, &rows);
+                let restore = self.refresh_from_durable();
+                let checkpoint = match &restore {
+                    Ok(()) => self.flush_locked().map(|_| ()),
+                    Err(error) => Err(CalyxError {
+                        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                        message: format!(
+                            "checkpoint skipped because durable refresh failed first: [{}] {}",
+                            error.code, error.message
+                        ),
+                        remediation: "reopen the vault to reconstruct the exact durable generation before attempting a checkpoint",
+                    }),
+                };
                 return Err(post_wal_commit_error(
                     durable_seq,
                     &mvcc_error,
@@ -370,16 +423,6 @@ where
         } else {
             self.rows.commit_batch_borrowed(&batch)
         }
-    }
-
-    fn restore_committed_rows(&self, seq: Seq, rows: &[encode::WriteRow]) -> Result<()> {
-        self.rows.restore_batch(
-            seq,
-            rows.iter()
-                .map(|row| (row.cf, row.key.clone(), row.value.clone())),
-        )?;
-        self.rows.advance_to_at_least(seq);
-        Ok(())
     }
 }
 
