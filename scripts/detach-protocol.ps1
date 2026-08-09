@@ -179,8 +179,11 @@ function Initialize-AstroDetachedPowerShellModulePath {
         throw "DETACH_PROTOCOL[ASTRO_DETACH_PSMODULEPATH_INVALID]: {code=ASTRO_DETACH_PSMODULEPATH_INVALID; message=`"PowerShell module path cannot load required module for $Role after policy $($policy.action): $($policy.import_error)`"; remediation=`"preserve the process state, inspect the recorded PSModulePath, and restore the canonical Windows PowerShell 5.1 module roots`"}"
     }
 
-    $summary = ($policy | ConvertTo-Json -Compress -Depth 12)
-    Write-Host "DETACH_PROTOCOL[ASTRO_DETACH_PSMODULEPATH_POLICY]: $summary"
+    # This is protocol state, not operator-facing UI. Both callers persist the
+    # returned object in their append-only intent/runner record. Writing the
+    # successful measurement to the host leaks internal JSON into any console
+    # attached by a legacy or invalid runner boundary before that boundary can
+    # be rejected. Import failures above remain cause-specific hard errors.
     return $policy
 }
 
