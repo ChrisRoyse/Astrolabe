@@ -8,7 +8,7 @@
     are immutable files below one fresh run directory and form a SHA-256 predecessor chain.
 
 .NOTES
-    Refs #616.
+    Refs #616, #1065.
 #>
 
 Set-StrictMode -Version Latest
@@ -25,7 +25,11 @@ if (-not (Test-Path Function:\ConvertFrom-AstroStrictFlatJsonObject)) {
 }
 
 function Get-AstroDetachedSha256Bytes {
-    param([Parameter(Mandatory)][byte[]]$Bytes)
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [byte[]]$Bytes
+    )
 
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
@@ -722,6 +726,127 @@ function Read-AstroDetachedRecord {
     }
 }
 
+function Read-AstroDetachedBootstrapRecord {
+    <#
+    The GUI bootstrap cannot import PowerShell protocol code before it creates the
+    runner, so its three records are deliberately flat JSON. Parse them with the
+    same duplicate-key/type-preserving reader as the main record chain and accept
+    only the exact schema-specific property set.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunDirectory,
+        [Parameter(Mandatory)]
+        [ValidateSet(
+            'bootstrap-start.json',
+            'bootstrap-completion.json',
+            'bootstrap-fault.json'
+        )]
+        [string]$Name
+    )
+
+    $run = Assert-AstroDetachedRunDirectory $RunDirectory
+    $snapshot = Read-AstroDetachedOrdinaryFile (Join-Path $run $Name)
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($snapshot.Bytes)
+        $strict = ConvertFrom-AstroStrictFlatJsonObject -Json $text
+    }
+    catch {
+        throw "detached bootstrap record strict JSON decode failed for $Name`: $($_.Exception.Message)"
+    }
+
+    $definitions = @{
+        'bootstrap-start.json' = [ordered]@{
+            schema = 'astrolabe.detached.bootstrap-start.v1'
+            strings = @(
+                'schema', 'run_id', 'bootstrap_path', 'bootstrap_sha256',
+                'powershell_path', 'powershell_sha256', 'runner_path',
+                'runner_sha256', 'working_directory', 'runner_log_path'
+            )
+            integers = @(
+                'written_utc_ticks', 'bootstrap_pid',
+                'bootstrap_start_utc_ticks', 'bootstrap_session_id',
+                'bootstrap_bytes', 'powershell_bytes', 'runner_bytes',
+                'creation_flags', 'startup_show_window'
+            )
+        }
+        'bootstrap-completion.json' = [ordered]@{
+            schema = 'astrolabe.detached.bootstrap-completion.v1'
+            strings = @(
+                'schema', 'run_id', 'runner_exit_code_hex', 'command_line',
+                'runner_log_path', 'runner_log_sha256'
+            )
+            integers = @(
+                'written_utc_ticks', 'bootstrap_pid',
+                'bootstrap_start_utc_ticks', 'bootstrap_session_id',
+                'runner_pid', 'runner_start_utc_ticks', 'runner_session_id',
+                'runner_exit_code', 'wait_result', 'creation_flags',
+                'runner_log_bytes'
+            )
+        }
+        'bootstrap-fault.json' = [ordered]@{
+            schema = 'astrolabe.detached.bootstrap-fault.v1'
+            strings = @(
+                'schema', 'run_id', 'stage', 'code', 'message',
+                'remediation', 'bootstrap_path'
+            )
+            integers = @(
+                'written_utc_ticks', 'bootstrap_pid',
+                'bootstrap_start_utc_ticks', 'bootstrap_session_id',
+                'native_error'
+            )
+        }
+    }
+    $definition = $definitions[$Name]
+    $expectedNames = @($definition.strings) + @($definition.integers)
+    $observedNames = @($strict.Names)
+    if ($observedNames.Count -ne $expectedNames.Count) {
+        throw "detached bootstrap record has the wrong property count: $Name"
+    }
+    foreach ($propertyName in $expectedNames) {
+        if (-not ($observedNames -ccontains $propertyName)) {
+            throw "detached bootstrap record misses '$propertyName': $Name"
+        }
+    }
+    foreach ($propertyName in $definition.strings) {
+        if ($strict.Properties[$propertyName].Kind -cne 'string') {
+            throw "detached bootstrap property '$propertyName' must be a JSON string: $Name"
+        }
+    }
+    foreach ($propertyName in $definition.integers) {
+        if ($strict.Properties[$propertyName].Kind -cne 'integer') {
+            throw "detached bootstrap property '$propertyName' must be an integral JSON number: $Name"
+        }
+    }
+
+    $values = [ordered]@{}
+    foreach ($propertyName in $definition.strings) {
+        $values[$propertyName] = [string]$strict.Properties[$propertyName].Value
+    }
+    foreach ($propertyName in $definition.integers) {
+        $values[$propertyName] = [int64]::Parse(
+            [string]$strict.Properties[$propertyName].Raw,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    if ($values.schema -cne [string]$definition.schema -or
+        $values.run_id -cne [IO.Path]::GetFileName($run) -or
+        $values.written_utc_ticks -le 0 -or
+        $values.bootstrap_pid -le 0 -or
+        $values.bootstrap_pid -gt [int]::MaxValue -or
+        $values.bootstrap_start_utc_ticks -le 0 -or
+        $values.bootstrap_session_id -lt 0 -or
+        $values.bootstrap_session_id -gt [int]::MaxValue) {
+        throw "detached bootstrap record identity/schema/range validation failed: $Name"
+    }
+    return [pscustomobject]@{
+        Name = $Name
+        Path = $snapshot.Path
+        Sha256 = $snapshot.Sha256
+        Length = $snapshot.Length
+        Values = [pscustomobject]$values
+    }
+}
+
 function Assert-AstroDetachedRecordLink {
     param(
         [Parameter(Mandatory)]$Previous,
@@ -767,6 +892,10 @@ function Get-AstroDetachedTaskSnapshot {
         throw "detached scheduled task must have exactly one action"
     }
     $action = $definition.Actions.Item(1)
+    $lastTaskResult = [int]$RegisteredTask.LastTaskResult
+    $taskHasNotRun = $lastTaskResult -eq 267011
+    $lastRunTime = [DateTime]$RegisteredTask.LastRunTime
+    $hasLastRunTime = -not $taskHasNotRun -and $lastRunTime.Year -ge 1900
     $xml = [string]$RegisteredTask.Xml
     $xmlBytes = Get-AstroDetachedUtf8Bytes $xml
     $xmlDocument = [xml]$xml
@@ -787,6 +916,24 @@ function Get-AstroDetachedTaskSnapshot {
         path = [string]$RegisteredTask.Path
         name = [string]$RegisteredTask.Name
         enabled = [bool]$RegisteredTask.Enabled
+        scheduler_state = [int]$RegisteredTask.State
+        last_task_result = $lastTaskResult
+        last_task_result_hex = '0x{0:x8}' -f (
+            [int64]$lastTaskResult -band 0xffffffffL
+        )
+        task_has_not_run = $taskHasNotRun
+        last_run_time_utc_ticks = if ($hasLastRunTime) {
+            [long]$lastRunTime.ToUniversalTime().Ticks
+        }
+        else {
+            $null
+        }
+        last_run_time_utc = if ($hasLastRunTime) {
+            $lastRunTime.ToUniversalTime().ToString('o')
+        }
+        else {
+            $null
+        }
         principal_user_id = [string]$definition.Principal.UserId
         principal_sid = [string]$principalSidNode.InnerText
         principal_logon_type = [int]$definition.Principal.LogonType
@@ -795,6 +942,7 @@ function Get-AstroDetachedTaskSnapshot {
         action_path = [string]$action.Path
         action_arguments = [string]$action.Arguments
         action_working_directory = [string]$action.WorkingDirectory
+        hidden = [bool]$definition.Settings.Hidden
         allow_demand_start = [bool]$definition.Settings.AllowDemandStart
         disallow_start_on_batteries =
             [bool]$definition.Settings.DisallowStartIfOnBatteries
@@ -840,6 +988,7 @@ function Register-AstroDetachedTaskCreateOnly {
     $definition.Principal.LogonType = $logonValue
     $definition.Principal.RunLevel = 0
     $definition.Settings.Enabled = $true
+    $definition.Settings.Hidden = $false
     $definition.Settings.AllowDemandStart = $true
     $definition.Settings.DisallowStartIfOnBatteries = $false
     $definition.Settings.StopIfGoingOnBatteries = $false

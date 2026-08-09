@@ -14,7 +14,7 @@
 
 .NOTES
     Production uses an explicit InteractiveToken principal. S4U is accepted only with
-    -AllowS4UIsolatedLocalFsv and is never selected as a fallback. Refs #616.
+    -AllowS4UIsolatedLocalFsv and is never selected as a fallback. Refs #616, #1065.
 #>
 
 [CmdletBinding()]
@@ -52,6 +52,7 @@ $compilerStatePath = Join-Path $PSScriptRoot 'detach-compiler-state.ps1'
 $lockHelperPath = Join-Path $PSScriptRoot 'launcher-lock.ps1'
 $spawnPath = Join-Path $PSScriptRoot 'detach-spawn.ps1'
 $runnerPath = Join-Path $PSScriptRoot 'detach-runner.ps1'
+$bootstrapSourcePath = Join-Path $PSScriptRoot 'detach-bootstrap.cs'
 $launcherPath = Join-Path $PSScriptRoot 'windows-gnu-toolchain.ps1'
 . $protocolPath
 $modulePathPolicy = Initialize-AstroDetachedPowerShellModulePath `
@@ -160,6 +161,71 @@ function Get-AstroDetachedScriptBinding {
     }
 }
 
+function Get-AstroDetachedPeSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$ProtectedHandle
+    )
+
+    $snapshot = Read-AstroDetachedOrdinaryFile $Path
+    $bytes = $snapshot.Bytes
+    if ($bytes.Length -lt 256 -or
+        $bytes[0] -ne 0x4d -or
+        $bytes[1] -ne 0x5a) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_PE_DOS_INVALID]: {code=ASTRO_DETACH_BOOTSTRAP_PE_DOS_INVALID; message=`"compiled bootstrap lacks one bounded MZ header: $Path`"; remediation=`"preserve the compiler output/log and inspect the exact compiler invocation`"}"
+    }
+    $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+    if ($peOffset -lt 0x40 -or $peOffset -gt ($bytes.Length - 96) -or
+        $bytes[$peOffset] -ne 0x50 -or
+        $bytes[$peOffset + 1] -ne 0x45 -or
+        $bytes[$peOffset + 2] -ne 0 -or
+        $bytes[$peOffset + 3] -ne 0) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_PE_SIGNATURE_INVALID]: {code=ASTRO_DETACH_BOOTSTRAP_PE_SIGNATURE_INVALID; message=`"compiled bootstrap lacks one in-range PE signature: $Path`"; remediation=`"preserve the compiler output/log and inspect the exact compiler invocation`"}"
+    }
+    $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    $sectionCount = [BitConverter]::ToUInt16($bytes, $peOffset + 6)
+    $timeDateStamp = [BitConverter]::ToUInt32($bytes, $peOffset + 8)
+    $optionalBytes = [BitConverter]::ToUInt16($bytes, $peOffset + 20)
+    $characteristics = [BitConverter]::ToUInt16($bytes, $peOffset + 22)
+    $optionalOffset = $peOffset + 24
+    if ($optionalBytes -lt 70 -or
+        $optionalOffset + $optionalBytes -gt $bytes.Length) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_PE_OPTIONAL_INVALID]: {code=ASTRO_DETACH_BOOTSTRAP_PE_OPTIONAL_INVALID; message=`"compiled bootstrap optional header is out of range: offset=$optionalOffset bytes=$optionalBytes length=$($bytes.Length)`"; remediation=`"preserve the compiler output/log and inspect the exact compiler invocation`"}"
+    }
+    $magic = [BitConverter]::ToUInt16($bytes, $optionalOffset)
+    $subsystem = [BitConverter]::ToUInt16($bytes, $optionalOffset + 68)
+    $isExecutable = ($characteristics -band 0x0002) -ne 0
+    $isDll = ($characteristics -band 0x2000) -ne 0
+    if ($machine -ne 0x8664 -or
+        $sectionCount -le 0 -or
+        $magic -ne 0x020b -or
+        $subsystem -ne 2 -or
+        -not $isExecutable -or
+        $isDll) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_PE_POLICY_INVALID]: {code=ASTRO_DETACH_BOOTSTRAP_PE_POLICY_INVALID; message=`"compiled bootstrap is not one x64 PE32+ Windows GUI executable: machine=0x$($machine.ToString('x4')) sections=$sectionCount magic=0x$($magic.ToString('x4')) subsystem=$subsystem characteristics=0x$($characteristics.ToString('x4'))`"; remediation=`"preserve the output and correct the checked compiler target/options before task creation`"}"
+    }
+    $fileId = [AstroLauncherLockNative]::GetFileIdentity($ProtectedHandle)
+    return [ordered]@{
+        path = $snapshot.Path
+        sha256 = $snapshot.Sha256
+        bytes = [long]$snapshot.Length
+        file_id = $fileId
+        dos_magic = 'MZ'
+        pe_signature = 'PE00'
+        pe_offset = $peOffset
+        machine = ('0x{0:x4}' -f $machine)
+        section_count = [int]$sectionCount
+        time_date_stamp = [uint32]$timeDateStamp
+        optional_header_bytes = [int]$optionalBytes
+        optional_header_magic = ('0x{0:x4}' -f $magic)
+        subsystem = [int]$subsystem
+        subsystem_name = 'IMAGE_SUBSYSTEM_WINDOWS_GUI'
+        characteristics = ('0x{0:x4}' -f $characteristics)
+        executable_image = $isExecutable
+        dll = $isDll
+    }
+}
+
 function Write-AstroDetachedPrestartFault {
     param(
         [Parameter(Mandatory)]$PreviousRecord,
@@ -233,8 +299,48 @@ elseif ($RunId -cnotmatch '^[0-9a-f]{32}$') {
 }
 
 $runDirectory = New-AstroDetachedRunDirectory $RunId
+$powershellPath = Join-Path `
+    ([Environment]::SystemDirectory) `
+    'WindowsPowerShell\v1.0\powershell.exe'
+$dotnetPath = 'C:\Program Files\dotnet\dotnet.exe'
+$roslynVersion = '10.0.100'
+$roslynCscPath = Join-Path `
+    'C:\Program Files\dotnet\sdk' `
+    "$roslynVersion\Roslyn\bincore\csc.dll"
+$frameworkReferenceRoot =
+    'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8'
+$frameworkReferencePaths = @(
+    Join-Path $frameworkReferenceRoot 'mscorlib.dll'
+    Join-Path $frameworkReferenceRoot 'System.dll'
+    Join-Path $frameworkReferenceRoot 'System.Core.dll'
+)
+foreach ($requiredFile in @(
+        $powershellPath,
+        $dotnetPath,
+        $roslynCscPath,
+        $bootstrapSourcePath
+    ) + $frameworkReferencePaths) {
+    if (-not [IO.File]::Exists($requiredFile)) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_INPUT_MISSING]: {code=ASTRO_DETACH_BOOTSTRAP_INPUT_MISSING; message=`"required windowless-bootstrap input is missing: $requiredFile`"; remediation=`"restore the checked-in source or supported native Windows runtime before detached execution`"}"
+    }
+}
+$bootstrapPath = Join-Path $runDirectory 'detach-bootstrap.exe'
+$bootstrapCompilerLogPath = Join-Path $runDirectory 'bootstrap-compiler.log'
+foreach ($outputPath in @($bootstrapPath, $bootstrapCompilerLogPath)) {
+    if ([IO.File]::Exists($outputPath) -or [IO.Directory]::Exists($outputPath)) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_OUTPUT_COLLISION]: {code=ASTRO_DETACH_BOOTSTRAP_OUTPUT_COLLISION; message=`"bootstrap output is not absent: $outputPath`"; remediation=`"preserve the fresh-run collision and investigate run-directory admission; do not overwrite it`"}"
+    }
+}
 $compilerState = $null
 $compilerEvidence = $null
+$compilerProcessRecord = $null
+$compilerArtifactRecord = $null
+$bootstrapArtifactLease = $null
+$compilerProcessLease = $null
+$bootstrapSourceLease = $null
+$dotnetSourceLease = $null
+$roslynSourceLease = $null
+$frameworkReferenceLeases = @()
 try {
     $compilerState = Start-AstroDetachedCompilerScope `
         -RunDirectory $runDirectory `
@@ -242,26 +348,261 @@ try {
         -Issue $Issue
     . $lockHelperPath
     . $spawnPath
+
+    $bootstrapSourceLease =
+        [AstroLauncherLockNative]::OpenExactProtectedReadFile(
+            $bootstrapSourcePath
+        )
+    $dotnetSourceLease =
+        [AstroLauncherLockNative]::OpenProtectedOrdinaryReadFile($dotnetPath)
+    $roslynSourceLease =
+        [AstroLauncherLockNative]::OpenProtectedOrdinaryReadFile($roslynCscPath)
+    foreach ($referencePath in $frameworkReferencePaths) {
+        $frameworkReferenceLeases +=
+            [AstroLauncherLockNative]::OpenProtectedOrdinaryReadFile(
+                $referencePath
+            )
+    }
+    $bootstrapSource = Read-AstroDetachedOrdinaryFile $bootstrapSourcePath
+    $dotnetSource = Read-AstroDetachedOrdinaryFile $dotnetPath
+    $roslynSource = Read-AstroDetachedOrdinaryFile $roslynCscPath
+    $frameworkReferences = @(
+        $frameworkReferencePaths |
+            ForEach-Object { Read-AstroDetachedOrdinaryFile $_ }
+    )
+    $compilerArguments = @(
+        'exec',
+        $roslynCscPath,
+        '/nologo',
+        '/noconfig',
+        '/nostdlib+',
+        '/target:winexe',
+        '/platform:x64',
+        '/optimize+',
+        '/debug-',
+        '/deterministic+',
+        '/checked+',
+        '/warn:4',
+        '/warnaserror+',
+        '/langversion:7.3',
+        "/pathmap:$script:AstroDetachedCanonicalRoot=/_/Astrolabe",
+        "/reference:$($frameworkReferencePaths[0])",
+        "/reference:$($frameworkReferencePaths[1])",
+        "/reference:$($frameworkReferencePaths[2])",
+        "/out:$bootstrapPath",
+        $bootstrapSourcePath
+    )
+    $compilerProcessLease = Start-AstroDetachedProcessRetained `
+        -FilePath $dotnetPath `
+        -ArgumentList ([string[]]$compilerArguments) `
+        -LogFile $bootstrapCompilerLogPath `
+        -WorkingDirectory $script:AstroDetachedCanonicalRoot
+    $compilerProcess = [ordered]@{
+        pid = [int]$compilerProcessLease.ProcessId
+        process_start_utc_ticks =
+            [long]$compilerProcessLease.ProcessStartUtcTicks
+        process_started_utc = [string]$compilerProcessLease.ProcessStartedUtc
+        session_id = [int]$compilerProcessLease.SessionId
+        application_path = [string]$compilerProcessLease.ApplicationPath
+        command_line = [string]$compilerProcessLease.CommandLine
+    }
+    $compilerExitCode = [int]$compilerProcessLease.Wait()
+    $compilerProcessLease.Dispose()
+    $compilerProcessLease = $null
+    $compilerLog = Read-AstroDetachedOrdinaryFile $bootstrapCompilerLogPath
+    $bootstrapSourceReadback = Read-AstroDetachedOrdinaryFile $bootstrapSourcePath
+    $dotnetSourceReadback = Read-AstroDetachedOrdinaryFile $dotnetPath
+    $roslynSourceReadback = Read-AstroDetachedOrdinaryFile $roslynCscPath
+    $frameworkReferenceReadbacks = @(
+        $frameworkReferencePaths |
+            ForEach-Object { Read-AstroDetachedOrdinaryFile $_ }
+    )
+    if ($bootstrapSourceReadback.Sha256 -cne $bootstrapSource.Sha256 -or
+        $bootstrapSourceReadback.Length -ne $bootstrapSource.Length -or
+        $dotnetSourceReadback.Sha256 -cne $dotnetSource.Sha256 -or
+        $dotnetSourceReadback.Length -ne $dotnetSource.Length -or
+        $roslynSourceReadback.Sha256 -cne $roslynSource.Sha256 -or
+        $roslynSourceReadback.Length -ne $roslynSource.Length) {
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_COMPILER_INPUT_CHANGED]: {code=ASTRO_DETACH_BOOTSTRAP_COMPILER_INPUT_CHANGED; message=`"compiler source or executable changed across exact retained execution`"; remediation=`"preserve all run/compiler bytes and inspect the recorded file identities and hashes`"}"
+    }
+    for ($referenceIndex = 0;
+        $referenceIndex -lt $frameworkReferences.Count;
+        $referenceIndex++) {
+        if ($frameworkReferenceReadbacks[$referenceIndex].Sha256 -cne
+                $frameworkReferences[$referenceIndex].Sha256 -or
+            $frameworkReferenceReadbacks[$referenceIndex].Length -ne
+                $frameworkReferences[$referenceIndex].Length) {
+            throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_REFERENCE_CHANGED]: {code=ASTRO_DETACH_BOOTSTRAP_REFERENCE_CHANGED; message=`"framework reference changed across exact retained compilation: $($frameworkReferences[$referenceIndex].Path)`"; remediation=`"preserve all run/compiler bytes and inspect the exact file identity and hash`"}"
+        }
+    }
+    if ($compilerExitCode -ne 0) {
+        $compilerProcessRecord = Write-AstroDetachedCompilerRecord `
+            -RunDirectory $runDirectory `
+            -Role coordinator `
+            -Stage process `
+            -Payload ([ordered]@{
+                issue = $Issue
+                source = [ordered]@{
+                    path = $bootstrapSource.Path
+                    sha256 = $bootstrapSource.Sha256
+                    bytes = [long]$bootstrapSource.Length
+                    file_id = [AstroLauncherLockNative]::GetFileIdentity(
+                        $bootstrapSourceLease
+                    )
+                }
+                compiler = [ordered]@{
+                    host_path = $dotnetSource.Path
+                    host_sha256 = $dotnetSource.Sha256
+                    roslyn_version = $roslynVersion
+                    roslyn_path = $roslynSource.Path
+                    roslyn_sha256 = $roslynSource.Sha256
+                    process = $compilerProcess
+                    arguments = [string[]]$compilerArguments
+                    exit_code = $compilerExitCode
+                    log_path = $compilerLog.Path
+                    log_sha256 = $compilerLog.Sha256
+                    log_bytes = [long]$compilerLog.Length
+                }
+                outcome = 'known-compiler-nonzero'
+                artifact_admitted = $false
+                policy = [ordered]@{
+                    retry_or_fallback = $false
+                    exact_owner_cleanup_before_outer_failure = $true
+                    unknown_fault_preservation_unchanged = $true
+                }
+            })
+        $compilerEvidence = Complete-AstroDetachedCompilerScope $compilerState
+        throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_COMPILE_FAILED]: {code=ASTRO_DETACH_BOOTSTRAP_COMPILE_FAILED; message=`"exact csc child exited $compilerExitCode; log=$bootstrapCompilerLogPath sha256=$($compilerLog.Sha256); process_record=$($compilerProcessRecord.Path) sha256=$($compilerProcessRecord.Sha256)`"; remediation=`"the exact live owner removed its compiler scope; preserve the run records/log and fix the reported source error before creating a fresh run`"}"
+    }
+    $bootstrapArtifactLease =
+        [AstroLauncherLockNative]::OpenExactProtectedReadFile($bootstrapPath)
+    $bootstrapPe = Get-AstroDetachedPeSnapshot `
+        -Path $bootstrapPath `
+        -ProtectedHandle $bootstrapArtifactLease
+    $compilerArtifactRecord = Write-AstroDetachedCompilerRecord `
+        -RunDirectory $runDirectory `
+        -Role coordinator `
+        -Stage artifact `
+        -Payload ([ordered]@{
+            issue = $Issue
+            source = [ordered]@{
+                path = $bootstrapSource.Path
+                sha256 = $bootstrapSource.Sha256
+                bytes = [long]$bootstrapSource.Length
+                file_id = [AstroLauncherLockNative]::GetFileIdentity(
+                    $bootstrapSourceLease
+                )
+            }
+            compiler = [ordered]@{
+                host_path = $dotnetSource.Path
+                host_sha256 = $dotnetSource.Sha256
+                host_bytes = [long]$dotnetSource.Length
+                host_file_id = [AstroLauncherLockNative]::GetFileIdentity(
+                    $dotnetSourceLease
+                )
+                roslyn_version = $roslynVersion
+                roslyn_path = $roslynSource.Path
+                roslyn_sha256 = $roslynSource.Sha256
+                roslyn_bytes = [long]$roslynSource.Length
+                roslyn_file_id = [AstroLauncherLockNative]::GetFileIdentity(
+                    $roslynSourceLease
+                )
+                framework_reference_root = $frameworkReferenceRoot
+                framework_references = @(
+                    for ($referenceIndex = 0;
+                        $referenceIndex -lt $frameworkReferences.Count;
+                        $referenceIndex++) {
+                        [ordered]@{
+                            path = $frameworkReferences[$referenceIndex].Path
+                            sha256 =
+                                $frameworkReferences[$referenceIndex].Sha256
+                            bytes = [long](
+                                $frameworkReferences[$referenceIndex].Length
+                            )
+                            file_id =
+                                [AstroLauncherLockNative]::GetFileIdentity(
+                                    $frameworkReferenceLeases[$referenceIndex]
+                                )
+                        }
+                    }
+                )
+                process = $compilerProcess
+                arguments = [string[]]$compilerArguments
+                exit_code = $compilerExitCode
+                log_path = $compilerLog.Path
+                log_sha256 = $compilerLog.Sha256
+                log_bytes = [long]$compilerLog.Length
+            }
+            artifact = $bootstrapPe
+            policy = [ordered]@{
+                compile_count = 1
+                process_count = 1
+                output_publication = 'fresh-run-direct-create'
+                task_admission = 'x64-pe32-plus-windows-gui-only'
+                retained_artifact_lease = $true
+                retry_or_fallback = $false
+            }
+        })
     $compilerEvidence = Complete-AstroDetachedCompilerScope $compilerState
 }
 catch {
     $compilerFailure = $_
+    $compilerWaitFailure = $null
+    if ($null -ne $compilerProcessLease) {
+        try {
+            [void]$compilerProcessLease.Wait()
+        }
+        catch {
+            $compilerWaitFailure = $_.Exception.Message
+        }
+        $compilerProcessLease.Dispose()
+        $compilerProcessLease = $null
+    }
+    if ($null -ne $bootstrapArtifactLease) {
+        $bootstrapArtifactLease.Dispose()
+        $bootstrapArtifactLease = $null
+    }
+    $compilerFailureMessage = $compilerFailure.Exception.Message
+    if ($null -ne $compilerWaitFailure) {
+        $compilerFailureMessage +=
+            " | exact compiler cleanup wait also failed: $compilerWaitFailure"
+    }
     if ($null -ne $compilerState) {
+        $compilerScopeTerminal = $null -ne $compilerEvidence -and
+            [string]$compilerEvidence.ScopeState -ceq 'absent' -and
+            [string]$compilerEvidence.TombstoneState -ceq 'absent'
+        $compilerFaultRemediation = if ($compilerScopeTerminal) {
+            'compiler scope reached exact-owner terminal absence; preserve the ' +
+            'run records/log and fix the reported compiler error before a fresh run'
+        }
+        else {
+            'preserve the run and compiler scope; inspect the immutable ' +
+            'compiler intent/fault before tracker-bound recovery'
+        }
         try {
             [void](Write-AstroDetachedCompilerFault `
                 -State $compilerState `
                 -Code 'ASTRO_DETACH_COORDINATOR_COMPILER_FAILED' `
-                -Message $compilerFailure.Exception.Message `
-                -Remediation 'preserve the run and compiler scope; inspect the immutable compiler intent/fault before tracker-bound recovery' `
+                -Message $compilerFailureMessage `
+                -Remediation $compilerFaultRemediation `
                 -Stage 'coordinator-import-or-cleanup')
         }
         catch {
             throw "DETACH_RUN[ASTRO_DETACH_COMPILER_FAULT_PUBLISH_FAILED]: {code=ASTRO_DETACH_COMPILER_FAULT_PUBLISH_FAILED; message=`"coordinator compiler failed ('$($compilerFailure.Exception.Message)') and its durable fault also failed ('$($_.Exception.Message)')`"; remediation=`"preserve every run/compiler byte and inspect both failures before recovery`"}"
         }
     }
-    throw "DETACH_RUN[ASTRO_DETACH_COORDINATOR_COMPILER_FAILED]: {code=ASTRO_DETACH_COORDINATOR_COMPILER_FAILED; message=`"$($compilerFailure.Exception.Message)`"; remediation=`"preserve the run and inspect compiler-state records; do not create or start a task`"}"
+    throw "DETACH_RUN[ASTRO_DETACH_COORDINATOR_COMPILER_FAILED]: {code=ASTRO_DETACH_COORDINATOR_COMPILER_FAILED; message=`"$compilerFailureMessage`"; remediation=`"preserve the run and inspect compiler-state records; do not create or start a task`"}"
+}
+finally {
+    foreach ($referenceLease in $frameworkReferenceLeases) {
+        $referenceLease.Dispose()
+    }
+    if ($null -ne $roslynSourceLease) { $roslynSourceLease.Dispose() }
+    if ($null -ne $dotnetSourceLease) { $dotnetSourceLease.Dispose() }
+    if ($null -ne $bootstrapSourceLease) { $bootstrapSourceLease.Dispose() }
 }
 
+try {
 $bindings = [ordered]@{
     protocol = Get-AstroDetachedScriptBinding $protocolPath
     strict_json = Get-AstroDetachedScriptBinding $strictJsonPath
@@ -269,14 +610,28 @@ $bindings = [ordered]@{
     launcher_lock = Get-AstroDetachedScriptBinding $lockHelperPath
     spawn = Get-AstroDetachedScriptBinding $spawnPath
     runner = Get-AstroDetachedScriptBinding $runnerPath
+    bootstrap_source = Get-AstroDetachedScriptBinding $bootstrapSourcePath
     launcher = Get-AstroDetachedScriptBinding $launcherPath
 }
-$powershellPath = Join-Path `
-    ([Environment]::SystemDirectory) `
-    'WindowsPowerShell\v1.0\powershell.exe'
-if (-not [IO.File]::Exists($powershellPath)) {
-    throw "DETACH_RUN[ASTRO_DETACH_SYSTEM_POWERSHELL_MISSING]: {code=ASTRO_DETACH_SYSTEM_POWERSHELL_MISSING; message=`"absolute System32 Windows PowerShell is missing: $powershellPath`"; remediation=`"repair the supported Windows runtime before detached execution`"}"
+if ($bindings.bootstrap_source.sha256 -cne $bootstrapSource.Sha256) {
+    throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_SOURCE_CHANGED_AFTER_COMPILE]: {code=ASTRO_DETACH_BOOTSTRAP_SOURCE_CHANGED_AFTER_COMPILE; message=`"checked-in bootstrap source changed after the retained compiler child: compiled=$($bootstrapSource.Sha256) observed=$($bindings.bootstrap_source.sha256)`"; remediation=`"preserve the compiled artifact/evidence and start no task from an output whose source binding changed`"}"
 }
+$powershellBinding = Get-AstroDetachedScriptBinding $powershellPath
+$actionValues = @(
+    '--run-directory', $runDirectory,
+    '--run-id', $RunId,
+    '--powershell-path', $powershellPath,
+    '--powershell-sha256', $powershellBinding.sha256,
+    '--runner-path', $runnerPath,
+    '--runner-sha256', $bindings.runner.sha256,
+    '--bootstrap-path', $bootstrapPath,
+    '--bootstrap-sha256', $bootstrapPe.sha256,
+    '--working-directory', $script:AstroDetachedCanonicalRoot
+)
+$actionArguments = (
+    $actionValues |
+        ForEach-Object { [AstroDetachV2]::QuoteArgument([string]$_) }
+) -join ' '
 
 $taskNameExact = "Astrolabe.Detached.$RunId"
 $principal = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -307,6 +662,7 @@ $intentRecord = Write-AstroDetachedRecord `
         principal_user_id = $principal
         principal_sid = $principalSid
         powershell_path = $powershellPath
+        powershell_sha256 = $powershellBinding.sha256
         psmodulepath_policy = $modulePathPolicy
         protocol_path = $bindings.protocol.path
         protocol_sha256 = $bindings.protocol.sha256
@@ -320,6 +676,17 @@ $intentRecord = Write-AstroDetachedRecord `
         spawn_sha256 = $bindings.spawn.sha256
         runner_path = $bindings.runner.path
         runner_sha256 = $bindings.runner.sha256
+        bootstrap_source_path = $bindings.bootstrap_source.path
+        bootstrap_source_sha256 = $bindings.bootstrap_source.sha256
+        bootstrap_path = $bootstrapPe.path
+        bootstrap_sha256 = $bootstrapPe.sha256
+        bootstrap_bytes = $bootstrapPe.bytes
+        bootstrap_file_id = $bootstrapPe.file_id
+        bootstrap_subsystem = $bootstrapPe.subsystem
+        bootstrap_subsystem_name = $bootstrapPe.subsystem_name
+        bootstrap_compiler_artifact_path = $compilerArtifactRecord.Path
+        bootstrap_compiler_artifact_sha256 = $compilerArtifactRecord.Sha256
+        bootstrap_action_arguments = $actionArguments
         launcher_path = $bindings.launcher.path
         launcher_sha256 = $bindings.launcher.sha256
         coordinator_compiler = [ordered]@{
@@ -348,34 +715,13 @@ $taskStarted = $false
 $prestartStage = 'task-service-connect'
 try {
     $taskService = Get-AstroDetachedTaskService
-    $actionValues = @(
-        # The task runs on the interactive desktop (InteractiveToken), so without
-        # window suppression every detached run parks a visible console there for
-        # its whole multi-hour lifetime. Hidden keeps the protocol output in the
-        # run records/launcher.log where it already lands; the window still
-        # flashes sub-second at start (PowerShell hides itself post-launch).
-        '-WindowStyle',
-        'Hidden',
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        $runnerPath,
-        '-RunDirectory',
-        $runDirectory
-    )
-    $actionArguments = (
-        $actionValues |
-            ForEach-Object { [AstroDetachV2]::QuoteArgument([string]$_) }
-    ) -join ' '
     $prestartStage = 'task-create'
     $registered = Register-AstroDetachedTaskCreateOnly `
         -TaskService $taskService `
         -TaskName $taskNameExact `
         -PrincipalUserId $principal `
         -LogonType $TaskLogonType `
-        -ActionPath $powershellPath `
+        -ActionPath $bootstrapPath `
         -ActionArguments $actionArguments `
         -WorkingDirectory $script:AstroDetachedCanonicalRoot `
         -Description "Astrolabe issue #$Issue detached launcher run $RunId"
@@ -391,10 +737,11 @@ try {
         $taskSnapshot.principal_logon_type -ne $expectedLogon -or
         $taskSnapshot.principal_run_level -ne 0 -or
         $taskSnapshot.action_count -ne 1 -or
-        $taskSnapshot.action_path -cne $powershellPath -or
+        $taskSnapshot.action_path -cne $bootstrapPath -or
         $taskSnapshot.action_arguments -cne $actionArguments -or
         $taskSnapshot.action_working_directory -cne
             $script:AstroDetachedCanonicalRoot -or
+        $taskSnapshot.hidden -or
         -not $taskSnapshot.allow_demand_start -or
         $taskSnapshot.disallow_start_on_batteries -or
         $taskSnapshot.stop_if_going_on_batteries -or
@@ -543,6 +890,26 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $boundaryRecord = $records[3]
         $workRecord = $records[4]
         $leaseRecord = $records[5]
+        $bootstrapStart = Read-AstroDetachedBootstrapRecord `
+            -RunDirectory $runDirectory `
+            -Name 'bootstrap-start.json'
+        $bootstrapValues = $bootstrapStart.Values
+        if ($bootstrapValues.bootstrap_path -cne $bootstrapPath -or
+            $bootstrapValues.bootstrap_sha256 -cne $bootstrapPe.sha256 -or
+            $bootstrapValues.bootstrap_bytes -ne $bootstrapPe.bytes -or
+            $bootstrapValues.powershell_path -cne $powershellPath -or
+            $bootstrapValues.powershell_sha256 -cne
+                $powershellBinding.sha256 -or
+            $bootstrapValues.runner_path -cne $runnerPath -or
+            $bootstrapValues.runner_sha256 -cne $bindings.runner.sha256 -or
+            $bootstrapValues.working_directory -cne
+                $script:AstroDetachedCanonicalRoot -or
+            $bootstrapValues.creation_flags -ne 134743552 -or
+            $bootstrapValues.startup_show_window -ne 0 -or
+            $bootstrapValues.runner_log_path -cne
+                (Join-Path $runDirectory 'bootstrap-runner.log')) {
+            throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_START_MISMATCH]: {code=ASTRO_DETACH_BOOTSTRAP_START_MISMATCH; message=`"bootstrap start record differs from the retained artifact/task intent`"; remediation=`"preserve the run/task/process bytes and inspect the exact binding that changed`"}"
+        }
         $liveTaskReadback = Get-AstroDetachedTaskSnapshot (
             Get-AstroDetachedRegisteredTask `
                 -TaskService $taskService `
@@ -571,15 +938,22 @@ while ([DateTime]::UtcNow -lt $deadline) {
                 [long]$runnerRecord.Payload.identity.process_start_utc_ticks
             ) `
             -SessionId ([int]$runnerRecord.Payload.identity.session_id)
+        $bootstrapProbe = Get-AstroDetachedProcessProbe `
+            -ProcessId ([int]$bootstrapValues.bootstrap_pid) `
+            -ProcessStartUtcTicks (
+                [long]$bootstrapValues.bootstrap_start_utc_ticks
+            ) `
+            -SessionId ([int]$bootstrapValues.bootstrap_session_id)
         $workProbe = Get-AstroDetachedProcessProbe `
             -ProcessId ([int]$workRecord.Payload.identity.pid) `
             -ProcessStartUtcTicks (
                 [long]$workRecord.Payload.identity.process_start_utc_ticks
             ) `
             -SessionId ([int]$workRecord.Payload.identity.session_id)
-        if ($runnerProbe.state -cne 'exact-live' -or
+        if ($bootstrapProbe.state -cne 'exact-live' -or
+            $runnerProbe.state -cne 'exact-live' -or
             $workProbe.state -cne 'exact-live') {
-            throw "DETACH_RUN[ASTRO_DETACH_READY_OWNER_NOT_LIVE]: {code=ASTRO_DETACH_READY_OWNER_NOT_LIVE; message=`"runner/work probes are not both exact-live: runner=$($runnerProbe.state), work=$($workProbe.state)`"; remediation=`"read terminal records instead of claiming live readiness`"}"
+            throw "DETACH_RUN[ASTRO_DETACH_READY_OWNER_NOT_LIVE]: {code=ASTRO_DETACH_READY_OWNER_NOT_LIVE; message=`"bootstrap/runner/work probes are not all exact-live: bootstrap=$($bootstrapProbe.state), runner=$($runnerProbe.state), work=$($workProbe.state)`"; remediation=`"read terminal records instead of claiming live readiness`"}"
         }
         $result = [ordered]@{
             schema = 'astrolabe.detached.start-result.v1'
@@ -593,6 +967,14 @@ while ([DateTime]::UtcNow -lt $deadline) {
             task_logon_type = $TaskLogonType
             task_action_path = $taskSnapshot.action_path
             task_session_id = [int]$runnerRecord.Payload.identity.session_id
+            bootstrap_identity = [ordered]@{
+                pid = [int]$bootstrapValues.bootstrap_pid
+                process_start_utc_ticks =
+                    [long]$bootstrapValues.bootstrap_start_utc_ticks
+                session_id = [int]$bootstrapValues.bootstrap_session_id
+            }
+            bootstrap_start_path = $bootstrapStart.Path
+            bootstrap_start_sha256 = $bootstrapStart.Sha256
             runner_identity = $runnerRecord.Payload.identity
             launcher_boundary_identity = $boundaryRecord.Payload.identity
             work_launcher_identity = $workRecord.Payload.identity
@@ -605,6 +987,8 @@ while ([DateTime]::UtcNow -lt $deadline) {
             'DETACH_RUN[ASTRO_DETACH_STARTED]: ' +
             ($result | ConvertTo-Json -Depth 8 -Compress)
         )
+        $bootstrapArtifactLease.Dispose()
+        $bootstrapArtifactLease = $null
         exit 0
     }
     $fault = Get-ChildItem `
@@ -615,6 +999,12 @@ while ([DateTime]::UtcNow -lt $deadline) {
         Sort-Object Name |
         Select-Object -First 1
     if ($null -ne $fault) {
+        if ($fault.Name -ceq 'bootstrap-fault.json') {
+            $bootstrapFault = Read-AstroDetachedBootstrapRecord `
+                -RunDirectory $runDirectory `
+                -Name 'bootstrap-fault.json'
+            throw "DETACH_RUN[ASTRO_DETACH_BOOTSTRAP_FAULT_RECORDED]: {code=$($bootstrapFault.Values.code); stage=$($bootstrapFault.Values.stage); native_error=$($bootstrapFault.Values.native_error); message=`"$($bootstrapFault.Values.message)`"; remediation=`"$($bootstrapFault.Values.remediation)`"}"
+        }
         throw "DETACH_RUN[ASTRO_DETACH_RUNNER_FAULT_RECORDED]: {code=ASTRO_DETACH_RUNNER_FAULT_RECORDED; message=`"detached runner persisted a fault record: $($fault.FullName)`"; remediation=`"read the immutable fault chain and launcher.log; do not infer readiness`"}"
     }
     $lastLock = Read-AstroLauncherLock (
@@ -692,3 +1082,10 @@ $timeoutRecord = Write-AstroDetachedRecord `
         action = 'preserved-without-task-delete-or-process-stop'
     })
 throw "DETACH_RUN[ASTRO_DETACH_READINESS_TIMEOUT]: {code=ASTRO_DETACH_READINESS_TIMEOUT; message=`"readiness was not proven within $ReadinessWaitSeconds seconds; exact observation=$($timeoutRecord.Path)`"; remediation=`"preserve the live task/process/run state and inspect the immutable observation plus subsequent lifecycle records`"}"
+}
+finally {
+    if ($null -ne $bootstrapArtifactLease) {
+        $bootstrapArtifactLease.Dispose()
+        $bootstrapArtifactLease = $null
+    }
+}

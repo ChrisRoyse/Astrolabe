@@ -9,7 +9,7 @@
     persists completion and exact task cleanup readback.
 
 .NOTES
-    This file is invoked only by scripts/detach-run.ps1. Refs #616.
+    This file is invoked only by scripts/detach-run.ps1. Refs #616, #1065.
 #>
 
 [CmdletBinding()]
@@ -90,6 +90,72 @@ try {
     }
     $taskName = [string]$intentPayload.task_name
     $taskXmlSha256 = [string]$taskPayload.task.xml_sha256
+    $runnerIdentity = Get-AstroDetachedCurrentIdentity
+    $bootstrapStart = Read-AstroDetachedBootstrapRecord `
+        -RunDirectory $run `
+        -Name 'bootstrap-start.json'
+    $bootstrapValues = $bootstrapStart.Values
+    $bootstrapSnapshot = Read-AstroDetachedOrdinaryFile (
+        [string]$intentPayload.bootstrap_path
+    )
+    $powershellSnapshot = Read-AstroDetachedOrdinaryFile (
+        [string]$intentPayload.powershell_path
+    )
+    $runnerSnapshot = Read-AstroDetachedOrdinaryFile $PSCommandPath
+    if ($bootstrapValues.bootstrap_path -cne
+            [string]$intentPayload.bootstrap_path -or
+        $bootstrapValues.bootstrap_sha256 -cne
+            [string]$intentPayload.bootstrap_sha256 -or
+        $bootstrapValues.bootstrap_bytes -ne
+            [long]$intentPayload.bootstrap_bytes -or
+        $bootstrapSnapshot.Sha256 -cne
+            [string]$intentPayload.bootstrap_sha256 -or
+        $bootstrapSnapshot.Length -ne [long]$intentPayload.bootstrap_bytes -or
+        $powershellSnapshot.Sha256 -cne
+            [string]$intentPayload.powershell_sha256 -or
+        $bootstrapValues.powershell_path -cne
+            [string]$intentPayload.powershell_path -or
+        $bootstrapValues.powershell_sha256 -cne
+            [string]$intentPayload.powershell_sha256 -or
+        $runnerSnapshot.Sha256 -cne [string]$intentPayload.runner_sha256 -or
+        $bootstrapValues.runner_path -cne $PSCommandPath -or
+        $bootstrapValues.runner_sha256 -cne
+            [string]$intentPayload.runner_sha256 -or
+        $bootstrapValues.working_directory -cne
+            $script:AstroDetachedCanonicalRoot -or
+        $bootstrapValues.creation_flags -ne 134743552 -or
+        $bootstrapValues.startup_show_window -ne 0 -or
+        $bootstrapValues.runner_log_path -cne
+            (Join-Path $run 'bootstrap-runner.log') -or
+        [string]$taskPayload.task.action_path -cne
+            [string]$intentPayload.bootstrap_path -or
+        [string]$taskPayload.task.action_arguments -cne
+            [string]$intentPayload.bootstrap_action_arguments -or
+        [bool]$taskPayload.task.hidden) {
+        throw "DETACH_RUNNER[ASTRO_DETACH_BOOTSTRAP_BINDING_INVALID]: {code=ASTRO_DETACH_BOOTSTRAP_BINDING_INVALID; message=`"bootstrap start/artifact/task bindings do not equal the immutable intent and physical bytes`"; remediation=`"preserve the task/run/process and inspect the first mismatching path, hash, size, flag, or setting`"}"
+    }
+    $bootstrapProbe = Get-AstroDetachedProcessProbe `
+        -ProcessId ([int]$bootstrapValues.bootstrap_pid) `
+        -ProcessStartUtcTicks (
+            [long]$bootstrapValues.bootstrap_start_utc_ticks
+        ) `
+        -SessionId ([int]$bootstrapValues.bootstrap_session_id)
+    if ($bootstrapProbe.state -cne 'exact-live') {
+        throw "DETACH_RUNNER[ASTRO_DETACH_BOOTSTRAP_NOT_LIVE]: {code=ASTRO_DETACH_BOOTSTRAP_NOT_LIVE; message=`"bootstrap is not exact-live during runner admission: $($bootstrapProbe.state)`"; remediation=`"preserve the run/task bytes and inspect process ancestry without restarting`"}"
+    }
+    $runnerParent = Get-AstroDetachedParentIdentity `
+        -ChildProcessId ([int]$runnerIdentity.pid) `
+        -ChildProcessStartUtcTicks (
+            [long]$runnerIdentity.process_start_utc_ticks
+        ) `
+        -ChildSessionId ([int]$runnerIdentity.session_id)
+    if ($runnerParent.pid -ne [int]$bootstrapValues.bootstrap_pid -or
+        $runnerParent.process_start_utc_ticks -ne
+            [long]$bootstrapValues.bootstrap_start_utc_ticks -or
+        $runnerParent.session_id -ne
+            [int]$bootstrapValues.bootstrap_session_id) {
+        throw "DETACH_RUNNER[ASTRO_DETACH_BOOTSTRAP_PARENT_INVALID]: {code=ASTRO_DETACH_BOOTSTRAP_PARENT_INVALID; message=`"runner parent is not the exact bootstrap generation`"; remediation=`"preserve every byte and inspect the recorded exact process tree; do not accept the runner`"}"
+    }
 
     foreach ($binding in @(
             @{ Path = $protocolPath; Expected = [string]$intentPayload.protocol_sha256 },
@@ -144,11 +210,15 @@ try {
         -TaskService $taskService `
         -TaskName $taskName
     $liveTaskSnapshot = Get-AstroDetachedTaskSnapshot $liveTask
-    if ($liveTaskSnapshot.xml_sha256 -cne $taskXmlSha256) {
+    if ($liveTaskSnapshot.xml_sha256 -cne $taskXmlSha256 -or
+        $liveTaskSnapshot.action_path -cne
+            [string]$intentPayload.bootstrap_path -or
+        $liveTaskSnapshot.action_arguments -cne
+            [string]$intentPayload.bootstrap_action_arguments -or
+        $liveTaskSnapshot.hidden) {
         throw "registered task XML differs from the immutable task record before runner acceptance"
     }
 
-    $runnerIdentity = Get-AstroDetachedCurrentIdentity
     $runnerRecord = Write-AstroDetachedRecord `
         -RunDirectory $run `
         -Name '002-runner.json' `
@@ -164,6 +234,29 @@ try {
             task_session_id = $runnerIdentity.session_id
             task_logon_type = [string]$intentPayload.task_logon_type
             psmodulepath_policy = $modulePathPolicy
+            bootstrap = [ordered]@{
+                identity = [ordered]@{
+                    pid = [int]$bootstrapValues.bootstrap_pid
+                    process_start_utc_ticks =
+                        [long]$bootstrapValues.bootstrap_start_utc_ticks
+                    session_id = [int]$bootstrapValues.bootstrap_session_id
+                }
+                exact_parent = $runnerParent
+                probe = $bootstrapProbe
+                start_path = $bootstrapStart.Path
+                start_sha256 = $bootstrapStart.Sha256
+                start_bytes = [long]$bootstrapStart.Length
+                path = $bootstrapValues.bootstrap_path
+                sha256 = $bootstrapValues.bootstrap_sha256
+                bytes = [long]$bootstrapValues.bootstrap_bytes
+                pe_subsystem = [int]$intentPayload.bootstrap_subsystem
+                pe_subsystem_name =
+                    [string]$intentPayload.bootstrap_subsystem_name
+                creation_flags = [long]$bootstrapValues.creation_flags
+                startup_show_window =
+                    [int]$bootstrapValues.startup_show_window
+                runner_log_path = $bootstrapValues.runner_log_path
+            }
             compiler = [ordered]@{
                 intent_path = $compilerEvidence.Intent.Path
                 intent_sha256 = $compilerEvidence.Intent.Sha256

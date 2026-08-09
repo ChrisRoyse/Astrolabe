@@ -6,8 +6,10 @@
     Creates one compiler scope inside an already-created detached run, persists
     its exact process/principal/security intent before changing TEMP, and after
     imports double-inventories, handle-renames, and deletes only that bound
-    ordinary tree. Any compiler or cleanup fault is persisted outside the scope
-    and leaves the remaining namespace bytes untouched. Refs #717.
+    ordinary tree. A caller may durably classify a known compiler nonzero before
+    invoking normal exact-owner cleanup; unknown compiler or cleanup faults are
+    persisted outside the scope and leave remaining namespace bytes untouched.
+    Refs #717/#1068.
 #>
 
 Set-StrictMode -Version Latest
@@ -76,7 +78,15 @@ function Write-AstroDetachedCompilerRecord {
         [ValidateSet('coordinator', 'runner')]
         [string]$Role,
         [Parameter(Mandatory)]
-        [ValidateSet('intent', 'authorization', 'renamed', 'completion', 'fault')]
+        [ValidateSet(
+            'intent',
+            'process',
+            'artifact',
+            'authorization',
+            'renamed',
+            'completion',
+            'fault'
+        )]
         [string]$Stage,
         [Parameter(Mandatory)]$Payload
     )
