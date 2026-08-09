@@ -135,6 +135,9 @@ void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operat
                                            int requested_workers, int admitted_workers,
                                            int created_workers, int failed_worker_index,
                                            int error_domain, unsigned long error_code);
+int cbm_pipeline_set_execution_contract(
+    cbm_pipeline_t *p, cbm_pipeline_execution_route_t route,
+    cbm_pipeline_parallel_dispatch_expectation_t dispatch_expectation);
 
 /* Allocation-free native worker phase probe shared by the full and incremental
  * pipelines. Completion appends one retained metric to the owning pipeline and

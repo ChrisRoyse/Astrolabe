@@ -3949,9 +3949,15 @@ pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN:
     cbm_pipeline_execution_route_t = 0;
 pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY:
     cbm_pipeline_execution_route_t = 1;
-pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED:
+pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED:
     cbm_pipeline_execution_route_t = 2;
+pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED:
+    cbm_pipeline_execution_route_t = 3;
 pub type cbm_pipeline_execution_route_t = ::std::os::raw::c_int;
+pub const cbm_pipeline_parallel_dispatch_expectation_t_CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN : cbm_pipeline_parallel_dispatch_expectation_t = 0 ;
+pub const cbm_pipeline_parallel_dispatch_expectation_t_CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO : cbm_pipeline_parallel_dispatch_expectation_t = 1 ;
+pub const cbm_pipeline_parallel_dispatch_expectation_t_CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO : cbm_pipeline_parallel_dispatch_expectation_t = 2 ;
+pub type cbm_pipeline_parallel_dispatch_expectation_t = ::std::os::raw::c_int;
 pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_9 = -2001;
 pub type _bindgen_ty_9 = ::std::os::raw::c_int;
 unsafe extern "C" {
@@ -4039,6 +4045,11 @@ unsafe extern "C" {
     pub fn cbm_pipeline_get_execution_route(
         p: *const cbm_pipeline_t,
     ) -> cbm_pipeline_execution_route_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_parallel_dispatch_expectation(
+        p: *const cbm_pipeline_t,
+    ) -> cbm_pipeline_parallel_dispatch_expectation_t;
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_get_ambiguous_reference_skips(p: *const cbm_pipeline_t) -> uint_least64_t;

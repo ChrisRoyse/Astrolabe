@@ -101,15 +101,39 @@ typedef struct {
     unsigned long error_code;
 } cbm_pipeline_parallel_dispatch_t;
 
-/* Exact successful execution route. The response layer uses this state to
- * distinguish a verified read-only unchanged result (which must admit zero
- * worker dispatches) from a materialized index (which must retain at least one
- * dispatch). UNKNOWN is never a successful response state. */
+/* Exact successful execution route. Route describes the persisted operation;
+ * worker-dispatch cardinality is an independent measured fact below. UNKNOWN
+ * is never a successful response state. */
 typedef enum {
     CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN = 0,
     CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY = 1,
-    CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED = 2,
+    CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED = 2,
+    CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED = 3,
 } cbm_pipeline_execution_route_t;
+
+/* Exact retained-dispatch cardinality required by the selected successful
+ * branch. ZERO is a measured zero, not missing telemetry. NONZERO requires at
+ * least one retained dispatch record. UNKNOWN is never successful. */
+typedef enum {
+    CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN = 0,
+    CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO = 1,
+    CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO = 2,
+} cbm_pipeline_parallel_dispatch_expectation_t;
+
+/* The single exhaustive route/expectation relation used by both the producer
+ * and response verifier. Keep the relation unrepresentable in one place so a
+ * future route cannot silently acquire a guessed dispatch policy. */
+static inline bool cbm_pipeline_execution_contract_valid(
+    cbm_pipeline_execution_route_t route,
+    cbm_pipeline_parallel_dispatch_expectation_t expectation) {
+    return (route == CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY &&
+            expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO) ||
+           (route == CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED &&
+            (expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO ||
+             expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO)) ||
+           (route == CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED &&
+            expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO);
+}
 
 /* Distinct terminal result for a repository with no non-auxiliary source
  * files. Callers must surface this as a structured refusal; it is never a
@@ -194,9 +218,11 @@ void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
                                           const cbm_pipeline_parallel_dispatch_t **out,
                                           size_t *count, bool *complete);
 
-/* Return the exact successful route selected by the current run. A caller must
- * reject UNKNOWN and any route/dispatch-cardinality contradiction. */
+/* Return the exact successful route and dispatch expectation selected by the
+ * current run. A caller must reject UNKNOWN and every contradictory tuple. */
 cbm_pipeline_execution_route_t cbm_pipeline_get_execution_route(const cbm_pipeline_t *p);
+cbm_pipeline_parallel_dispatch_expectation_t cbm_pipeline_get_parallel_dispatch_expectation(
+    const cbm_pipeline_t *p);
 
 /* Reference edges skipped because their source syntax resolved to several
  * stable atoms in one semantic domain (#727). The corpus still publishes, so

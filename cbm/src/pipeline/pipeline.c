@@ -315,6 +315,7 @@ struct cbm_pipeline {
     size_t parallel_dispatch_count;
     bool parallel_dispatches_complete;
     cbm_pipeline_execution_route_t execution_route;
+    cbm_pipeline_parallel_dispatch_expectation_t parallel_dispatch_expectation;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -1227,15 +1228,41 @@ cbm_pipeline_execution_route_t cbm_pipeline_get_execution_route(const cbm_pipeli
     return p ? p->execution_route : CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN;
 }
 
-void cbm_pipeline_get_compile_context_diagnostics(
-    const cbm_pipeline_t *p, cbm_compile_context_diagnostics_t *out) {
+cbm_pipeline_parallel_dispatch_expectation_t cbm_pipeline_get_parallel_dispatch_expectation(
+    const cbm_pipeline_t *p) {
+    return p ? p->parallel_dispatch_expectation
+             : CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN;
+}
+
+int cbm_pipeline_set_execution_contract(
+    cbm_pipeline_t *p, cbm_pipeline_execution_route_t route,
+    cbm_pipeline_parallel_dispatch_expectation_t dispatch_expectation) {
+    bool unset =
+        p && p->execution_route == CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN &&
+        p->parallel_dispatch_expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN;
+    if (!p || !cbm_pipeline_execution_contract_valid(route, dispatch_expectation) || !unset) {
+        cbm_pipeline_record_fatal_error(p, "CBM_PIPELINE_EXECUTION_CONTRACT_INVALID",
+                                        "set_execution_contract", "execution_contract",
+                                        p ? p->repo_path : "", 0,
+                                        "the pipeline selected an invalid, contradictory, or "
+                                        "duplicate successful execution contract",
+                                        "preserve the source family and repair the exact "
+                                        "route-selection branch before retrying");
+        return CBM_NOT_FOUND;
+    }
+    p->execution_route = route;
+    p->parallel_dispatch_expectation = dispatch_expectation;
+    return 0;
+}
+
+void cbm_pipeline_get_compile_context_diagnostics(const cbm_pipeline_t *p,
+                                                  cbm_compile_context_diagnostics_t *out) {
     if (!out) {
         return;
     }
     memset(out, 0, sizeof(*out));
-    out->authority = p && p->compile_context_authority
-                         ? p->compile_context_authority
-                         : "not_applicable";
+    out->authority =
+        p && p->compile_context_authority ? p->compile_context_authority : "not_applicable";
     if (!p) {
         return;
     }
@@ -2972,7 +2999,11 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
     (void)snprintf(p->routed_store_sha256, sizeof(p->routed_store_sha256), "%s",
                    verification.db_sha256);
     cbm_pipeline_set_committed_counts(p, committed_nodes, committed_edges);
-    p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY;
+    if (cbm_pipeline_set_execution_contract(p, CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY,
+                                            CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO) != 0) {
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
     cbm_pipeline_phase_probe_end(p, "unchanged_result_readback", &finish_probe);
     cbm_log_info("pipeline.route", "path", "unchanged_read_only", "source_snapshot_started",
                  "false", "sqlite_publication_started", "false", "nodes", itoa_buf(committed_nodes),
@@ -4001,6 +4032,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->parallel_dispatch_count = 0;
     p->parallel_dispatches_complete = true;
     p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN;
+    p->parallel_dispatch_expectation = CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN;
     cbm_pipeline_phase_probe_t total_probe = cbm_pipeline_phase_probe_start(p, "total");
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_source_snapshot_t source_snapshot = {0};
@@ -4094,8 +4126,6 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
-    p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED;
-
     CBM_PROF_START(t_snapshot);
     cbm_pipeline_phase_probe_t snapshot_probe =
         cbm_pipeline_phase_probe_start(p, "source_snapshot");
@@ -4237,6 +4267,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     rc = 0;
     cbm_log_info("pipeline.route", "path", "full");
+    if (cbm_pipeline_set_execution_contract(p, CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED,
+                                            CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO) !=
+        0) {
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);

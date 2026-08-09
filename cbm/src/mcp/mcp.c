@@ -7891,24 +7891,50 @@ static const char *pipeline_execution_route_name(cbm_pipeline_execution_route_t 
     switch (route) {
     case CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY:
         return "unchanged_read_only";
-    case CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED:
-        return "materialized";
+    case CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED:
+        return "incremental_materialized";
+    case CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED:
+        return "full_materialized";
     case CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN:
-    default:
         return "unknown";
+    default:
+        return "invalid";
     }
 }
 
-static char *build_index_parallel_dispatch_error(const char *project_name, size_t dispatch_count,
-                                                 bool complete,
-                                                 cbm_pipeline_execution_route_t route) {
-    bool dispatches_required = route == CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED;
+static const char *pipeline_parallel_dispatch_expectation_name(
+    cbm_pipeline_parallel_dispatch_expectation_t expectation) {
+    switch (expectation) {
+    case CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO:
+        return "zero";
+    case CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO:
+        return "nonzero";
+    case CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN:
+        return "unknown";
+    default:
+        return "invalid";
+    }
+}
+
+static char *build_index_parallel_dispatch_error(
+    const char *project_name, size_t dispatch_count, bool complete,
+    cbm_pipeline_execution_route_t route,
+    cbm_pipeline_parallel_dispatch_expectation_t expectation) {
+    bool route_known = route == CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY ||
+                       route == CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED ||
+                       route == CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED;
+    bool expectation_known = expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO ||
+                             expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO;
+    bool dispatches_required = expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO;
     const char *reason =
-        !complete                                       ? "retention_incomplete"
-        : route == CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN ? "execution_route_unknown"
-        : route == CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY && dispatch_count != 0
-            ? "unchanged_route_has_dispatches"
-            : "materialized_route_has_no_dispatches";
+        !complete            ? "retention_incomplete"
+        : !route_known       ? "execution_route_unknown_or_invalid"
+        : !expectation_known ? "dispatch_expectation_unknown_or_invalid"
+        : !cbm_pipeline_execution_contract_valid(route, expectation)
+            ? "execution_contract_contradictory"
+        : expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO && dispatch_count != 0
+            ? "zero_expectation_has_dispatches"
+            : "nonzero_expectation_has_no_dispatches";
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return heap_strdup(
@@ -7924,6 +7950,8 @@ static char *build_index_parallel_dispatch_error(const char *project_name, size_
     yyjson_mut_obj_add_str(doc, root, "reason", reason);
     yyjson_mut_obj_add_str(doc, root, "pipeline_execution_route",
                            pipeline_execution_route_name(route));
+    yyjson_mut_obj_add_str(doc, root, "parallel_dispatch_expectation",
+                           pipeline_parallel_dispatch_expectation_name(expectation));
     yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_required", dispatches_required);
     yyjson_mut_obj_add_str(
         doc, root, "message",
@@ -7935,7 +7963,9 @@ static char *build_index_parallel_dispatch_error(const char *project_name, size_
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
     yyjson_mut_obj_add_uint(doc, root, "parallel_dispatch_count", (uint64_t)dispatch_count);
     yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_complete", complete);
-    yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", dispatches_required);
+    yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started",
+                            route == CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED ||
+                                route == CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED);
     yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
@@ -7983,10 +8013,10 @@ static bool add_pipeline_phase_metrics(yyjson_mut_doc *doc, yyjson_mut_val *root
     return complete && metrics && metric_count > 0;
 }
 
-static bool add_pipeline_parallel_dispatches(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                             const cbm_pipeline_t *p, size_t *dispatch_count_out,
-                                             bool *complete_out,
-                                             cbm_pipeline_execution_route_t route) {
+static bool add_pipeline_parallel_dispatches(
+    yyjson_mut_doc *doc, yyjson_mut_val *root, const cbm_pipeline_t *p, size_t *dispatch_count_out,
+    bool *complete_out, cbm_pipeline_execution_route_t route,
+    cbm_pipeline_parallel_dispatch_expectation_t expectation) {
     const cbm_pipeline_parallel_dispatch_t *dispatches = NULL;
     size_t dispatch_count = 0;
     bool complete = false;
@@ -8016,13 +8046,15 @@ static bool add_pipeline_parallel_dispatches(yyjson_mut_doc *doc, yyjson_mut_val
     yyjson_mut_obj_add_val(doc, root, "parallel_dispatches", items);
     yyjson_mut_obj_add_uint(doc, root, "parallel_dispatch_count", (uint64_t)dispatch_count);
     yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_complete", complete);
-    bool dispatches_required = route == CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED;
+    bool dispatches_required = expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO;
     yyjson_mut_obj_add_str(doc, root, "pipeline_execution_route",
                            pipeline_execution_route_name(route));
+    yyjson_mut_obj_add_str(doc, root, "parallel_dispatch_expectation",
+                           pipeline_parallel_dispatch_expectation_name(expectation));
     yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_required", dispatches_required);
     bool cardinality_matches =
-        (route == CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY && dispatch_count == 0) ||
-        (dispatches_required && dispatch_count > 0);
+        (expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO && dispatch_count == 0) ||
+        (expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO && dispatch_count > 0);
     return complete && dispatches && cardinality_matches;
 }
 
@@ -8131,10 +8163,15 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     size_t parallel_dispatch_count = 0;
     bool parallel_dispatches_complete = false;
     cbm_pipeline_execution_route_t execution_route = cbm_pipeline_get_execution_route(p);
+    cbm_pipeline_parallel_dispatch_expectation_t dispatch_expectation =
+        cbm_pipeline_get_parallel_dispatch_expectation(p);
     if (!add_pipeline_parallel_dispatches(doc, root, p, &parallel_dispatch_count,
-                                          &parallel_dispatches_complete, execution_route)) {
+                                          &parallel_dispatches_complete, execution_route,
+                                          dispatch_expectation) ||
+        !cbm_pipeline_execution_contract_valid(execution_route, dispatch_expectation)) {
         return build_index_parallel_dispatch_error(project_name, parallel_dispatch_count,
-                                                   parallel_dispatches_complete, execution_route);
+                                                   parallel_dispatches_complete, execution_route,
+                                                   dispatch_expectation);
     }
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);

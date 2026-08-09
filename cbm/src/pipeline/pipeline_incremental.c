@@ -752,9 +752,21 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     (void)cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
-/* Run parallel or sequential extract+resolve for changed files. */
-static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
+/* Run parallel or sequential extract+resolve for changed files and publish the
+ * exact retained-dispatch expectation selected by this branch. */
+static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
+                               cbm_pipeline_parallel_dispatch_expectation_t *expectation_out) {
     struct timespec t;
+
+    if (!expectation_out) {
+        cbm_pipeline_record_fatal_error(
+            ctx ? ctx->pipeline : NULL, "CBM_INCREMENTAL_DISPATCH_EXPECTATION_MISSING",
+            "select_incremental_dispatch_expectation", "incremental", "", 0,
+            "incremental execution has no output for its exact dispatch expectation",
+            "repair the incremental route contract before retrying");
+        return CBM_NOT_FOUND;
+    }
+    *expectation_out = CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN;
 
     /* Per-file LSP always runs (every mode). Cross-file LSP stays disabled in
      * incremental regardless (cbm_parallel_resolve is called with NULL
@@ -770,6 +782,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         return CBM_NOT_FOUND;
     }
     bool use_parallel = (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
+    *expectation_out = use_parallel ? CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO
+                                    : CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO;
 
     if (use_parallel) {
         cbm_log_info("incremental.mode", "mode", "parallel", "workers", itoa_buf(worker_count),
@@ -1254,6 +1268,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_store_close_required(&store, "incremental.noop_count_failed");
             return CBM_NOT_FOUND;
         }
+        if (cbm_pipeline_set_execution_contract(p, CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY,
+                                                CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO) !=
+            0) {
+            free(is_changed);
+            free_deleted_paths(deleted, deleted_count);
+            free_mode_skipped(mode_skipped, mode_skipped_count);
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close_required(&store, "incremental.noop_contract_failed");
+            return CBM_NOT_FOUND;
+        }
         cbm_store_close_required(&store, "incremental.noop_complete");
         store = NULL;
         free(is_changed);
@@ -1351,6 +1375,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_pipeline_set_ambiguous_reference_skips(p, cbm_gbuf_ambiguous_reference_skips(existing));
         cbm_pipeline_set_unresolved_reference_source_skips(
             p, cbm_gbuf_unresolved_reference_source_skips(existing));
+        if (cbm_pipeline_set_execution_contract(
+                p, CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED,
+                CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_ZERO) != 0) {
+            cbm_gbuf_free(existing);
+            free(changed_files);
+            free_deleted_paths(deleted, deleted_count);
+            free_mode_skipped(mode_skipped, mode_skipped_count);
+            return CBM_NOT_FOUND;
+        }
         int persist_rc =
             dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
                              mode_skipped_count, cbm_pipeline_repo_path(p));
@@ -1571,7 +1604,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_gbuf_free(existing);
         return CBM_NOT_FOUND;
     }
-    int extract_rc = run_extract_resolve(&ctx, changed_files, ci);
+    cbm_pipeline_parallel_dispatch_expectation_t dispatch_expectation =
+        CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN;
+    int extract_rc = run_extract_resolve(&ctx, changed_files, ci, &dispatch_expectation);
     cbm_pxc_destroy_rust_manifest(&ctx);
     if (extract_rc != 0) {
         incr_free_edge_capture(&edge_cap);
@@ -1581,6 +1616,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_gbuf_free(existing);
         return extract_rc;
+    }
+    if (cbm_pipeline_set_execution_contract(
+            p, CBM_PIPELINE_EXECUTION_ROUTE_INCREMENTAL_MATERIALIZED, dispatch_expectation) != 0) {
+        incr_free_edge_capture(&edge_cap);
+        free(changed_files);
+        cbm_registry_free(registry);
+        cbm_path_alias_collection_free(path_aliases);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_gbuf_free(existing);
+        return CBM_NOT_FOUND;
     }
     cbm_pipeline_phase_probe_t k8s_probe = cbm_pipeline_phase_probe_start(p, "incr_k8s");
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
