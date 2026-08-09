@@ -2215,6 +2215,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     shadow_phase!("weave_delta_prepare");
     let mut weave = run_live_weave_with_snapshot(
         &vault,
+        cache_dir,
         project,
         import_changed,
         delta.as_ref(),
@@ -2607,28 +2608,6 @@ fn eager_kind_index(kind: EagerAgreementKind) -> usize {
         .expect("designed eager kind is in EagerAgreementKind::ALL")
 }
 
-fn update_similarity_dump_hasher(
-    hasher: &mut blake3::Hasher,
-    edges: &[astrolabe_weave::SimilarityEdge],
-) {
-    for edge in edges {
-        let line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:08x}\t{:08x}\n",
-            edge.family.wire_name(),
-            edge.source_id,
-            edge.target_id,
-            edge.source_qn,
-            edge.target_qn,
-            edge.slot.get(),
-            edge.graph_edge_kind.as_str(),
-            edge.metric.as_str(),
-            edge.weight.to_bits(),
-            edge.threshold.to_bits(),
-        );
-        hasher.update(line.as_bytes());
-    }
-}
-
 /// [`run_live_weave`] with an optional caller-preloaded graph snapshot (#23).
 ///
 /// A shadow import already reads the full CBM graph snapshot to derive the
@@ -2638,6 +2617,7 @@ fn update_similarity_dump_hasher(
 /// self-reading behavior.
 pub(crate) fn run_live_weave_with_snapshot<C>(
     vault: &AsterVault<C>,
+    run_parent: &Path,
     project: &str,
     import_changed: bool,
     delta: Option<&WeaveDelta>,
@@ -2775,16 +2755,23 @@ where
     let similarity_config = SimilarityPlannerConfig::default();
     let mut ms_sim_read_rows = 0u64;
     let mut ms_sim_expand = 0u64;
+    let mut similarity_region_scan = None;
     let similarity_region = match delta {
         Some(delta) => {
             let mut changed_symbols = delta.dirty_symbol_ids.clone();
             changed_symbols.extend(delta.removed_symbol_ids.iter().cloned());
             let t_read_rows = std::time::Instant::now();
-            let persisted = read_similarity_edge_rows(vault)?;
+            let scan = expand_persisted_similarity_region_from_vault(vault, &changed_symbols)?;
             ms_sim_read_rows = t_read_rows.elapsed().as_millis() as u64;
             let t_expand = std::time::Instant::now();
-            let mut region = expand_persisted_similarity_region(&changed_symbols, &persisted);
-            drop(persisted);
+            let mut region = scan.region.clone();
+            similarity_region_scan = Some(json!({
+                "passes": 2,
+                "pages": scan.pages,
+                "rows_scanned": scan.rows_scanned,
+                "page_rows_high_water": scan.page_rows_high_water,
+                "region_after_persisted_hops": scan.region.len(),
+            }));
             // Candidate expansion needs only one family vector at a time. The
             // second pass below is the exact repair plan; no family vectors from
             // this bounded prepass survive it.
@@ -2833,29 +2820,54 @@ where
                 }
                 None => nodes.as_slice(),
             };
-            let plan = plan_similarity_family_edges(plan_nodes, family, &similarity_config)?;
-            update_similarity_dump_hasher(&mut similarity_dump_hasher, &plan.edges);
-            similarity_edge_count = similarity_edge_count.saturating_add(plan.edges.len());
+            let source_slot_generation = source_slot_generations
+                .get(&family.slot())
+                .copied()
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_WEAVE_SOURCE_GENERATION_MISSING: {} planning lost S{} generation",
+                        family.wire_name(),
+                        family.slot().get()
+                    )
+                    .into()
+                })?;
+            let run_directory = run_parent.join(format!(
+                ".astrolabe-weave-run-v1-sim-{}",
+                family.wire_name().to_ascii_lowercase()
+            ));
+            let plan = plan_similarity_family_run(
+                vault,
+                run_directory,
+                format!(
+                    "project={project};compact_source_snapshot_seq={source_snapshot_seq};slot={};slot_generation={source_slot_generation}",
+                    family.slot().get()
+                ),
+                plan_nodes,
+                family,
+                &similarity_config,
+            )?;
+            let planned_edge_count = plan.edge_count();
+            similarity_edge_count = similarity_edge_count.saturating_add(planned_edge_count);
             vector_skip_count =
-                vector_skip_count.saturating_add(plan.skips.vector_skips.len());
+                vector_skip_count.saturating_add(plan.stream_report().skips.vector_skips.len());
             family_opt_out_count =
-                family_opt_out_count.saturating_add(plan.skips.family_opt_outs.len());
-            for (label, ms) in &plan.timing_ms {
+                family_opt_out_count.saturating_add(plan.stream_report().skips.family_opt_outs.len());
+            for (label, ms) in &plan.stream_report().timing_ms {
                 *similarity_plan_timing.entry(label.clone()).or_default() += *ms;
             }
             let report = match (delta, similarity_region.as_ref()) {
-                (Some(delta), Some(region)) => persist_similarity_family_edges_delta(
+                (Some(delta), Some(region)) => persist_similarity_family_run_delta(
                     vault,
-                    family,
-                    &plan,
+                    plan,
                     region,
                     &delta.removed_symbol_ids,
+                    &mut similarity_dump_hasher,
                     "astrolabe-shadow-weave",
                 )?,
-                _ => persist_similarity_family_edges(
+                _ => persist_similarity_family_run(
                     vault,
-                    family,
-                    &plan,
+                    plan,
+                    &mut similarity_dump_hasher,
                     "astrolabe-shadow-weave",
                 )?,
             };
@@ -2870,9 +2882,7 @@ where
                     .entry((*label).to_string())
                     .or_default() += *ms;
             }
-            if let Some(fsv) = report.fsv.as_ref() {
-                similarity_fsv.push(fsv_ack_envelope(fsv));
-            }
+            similarity_fsv.extend(report.fsv.iter().map(fsv_ack_envelope));
             let usage = vault
                 .process_usage_snapshot()?
                 .phase_since(process_before);
@@ -2882,11 +2892,11 @@ where
                 "compact_source_snapshot_seq": source_snapshot_seq,
                 "nodes_loaded": nodes.len(),
                 "nodes_planned": plan_nodes.len(),
-                "edge_count": plan.edges.len(),
+                "edge_count": planned_edge_count,
                 "edge_dump_hash": report.edge_dump_hash,
+                "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
-            drop(plan);
         }};
     }
 
@@ -2908,61 +2918,101 @@ where
     let mut neighborhood_sampler_scratch_high_water = 0usize;
     let mut xterm_kind_receipts = Vec::<Value>::new();
     let mut xterm_fsv = Vec::<Value>::new();
-    let mut xterm_key_inventory = if delta.is_none() {
-        Some(inventory_eager_cross_term_keys(vault)?)
-    } else {
-        None
-    };
     macro_rules! reconcile_xterm_kind {
         ($kind:expr) => {{
             let kind = $kind;
             let process_before = vault.process_usage_snapshot()?;
-            let plan = match delta {
-                Some(delta) => plan_eager_cross_term_kind_for_symbols(
+            let (left_slot, right_slot) = kind.slots();
+            let left_generation = source_slot_generations
+                .get(&left_slot)
+                .copied()
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_WEAVE_SOURCE_GENERATION_MISSING: {} planning lost S{} generation",
+                        kind.wire_name(),
+                        left_slot.get()
+                    )
+                    .into()
+                })?;
+            let right_generation = source_slot_generations
+                .get(&right_slot)
+                .copied()
+                .ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_WEAVE_SOURCE_GENERATION_MISSING: {} planning lost S{} generation",
+                        kind.wire_name(),
+                        right_slot.get()
+                    )
+                    .into()
+                })?;
+            let run_directory = run_parent.join(format!(
+                ".astrolabe-weave-run-v1-xterm-{}",
+                kind.wire_name().to_ascii_lowercase()
+            ));
+            let source_binding = format!(
+                "project={project};compact_source_snapshot_seq={source_snapshot_seq};left_slot={};left_generation={left_generation};right_slot={};right_generation={right_generation}",
+                left_slot.get(),
+                right_slot.get()
+            );
+            let kind_index = eager_kind_index(kind);
+            let mut observe = |row: &astrolabe_weave::EagerCrossTermRow| -> calyx_core::Result<()> {
+                if let CrossTermValue::Scalar(value) = &row.value {
+                    let Some(node_index) = node_by_symbol.get(&row.symbol_id) else {
+                        return Err(calyx_core::CalyxError {
+                            code: "ASTRO_WEAVE_XTERM_SYMBOL_UNKNOWN",
+                            message: format!(
+                                "{} planner returned unknown symbol {:?}",
+                                kind.wire_name(),
+                                row.symbol_id
+                            ),
+                            remediation: "preserve the staged generation and rebuild the compact identity projection and XTerm run from one source binding",
+                        });
+                    };
+                    xterm_scalar_bits[*node_index][kind_index] = Some(value.to_bits());
+                }
+                Ok(())
+            };
+            let plan = match (delta, dirty_cx_ids.as_ref()) {
+                (Some(delta), Some(dirty_cx_ids)) => plan_eager_cross_term_kind_run_delta(
+                    vault,
+                    run_directory,
+                    source_binding,
                     &nodes,
                     kind,
                     &delta.dirty_symbol_ids,
+                    dirty_cx_ids,
                     active_slot_count,
+                    &mut observe,
                 )?,
-                None => plan_eager_cross_term_kind(&nodes, kind, active_slot_count)?,
-            };
-            xterm_symbol_count = xterm_symbol_count.max(plan.abundance.symbol_count);
-            neighborhood_capped_evaluations = neighborhood_capped_evaluations
-                .saturating_add(plan.neighborhood_capped_evaluations);
-            neighborhood_sampler_scratch_high_water = neighborhood_sampler_scratch_high_water
-                .max(plan.neighborhood_sampler_scratch_high_water);
-            let kind_index = eager_kind_index(kind);
-            for row in &plan.rows {
-                if let CrossTermValue::Scalar(value) = row.value {
-                    let node_index = node_by_symbol.get(&row.symbol_id).ok_or_else(|| -> DynError {
-                        format!(
-                            "ASTRO_WEAVE_XTERM_SYMBOL_UNKNOWN: {} plan returned unknown symbol {:?}",
-                            kind.wire_name(), row.symbol_id
-                        )
-                        .into()
-                    })?;
-                    xterm_scalar_bits[*node_index][kind_index] = Some(value.to_bits());
-                }
-            }
-            *xterm_absent_by_kind.entry(kind).or_default() += plan.abundance.absent_count;
-            let report = match (delta, dirty_cx_ids.as_ref()) {
-                (Some(delta), Some(dirty_cx_ids)) => persist_eager_cross_term_kind_delta(
+                _ => plan_eager_cross_term_kind_run(
                     vault,
+                    run_directory,
+                    source_binding,
+                    &nodes,
                     kind,
-                    &plan,
+                    &cx_ids,
+                    active_slot_count,
+                    &mut observe,
+                )?,
+            };
+            let stream = plan.stream_report().clone();
+            xterm_symbol_count = xterm_symbol_count.max(stream.abundance.symbol_count);
+            neighborhood_capped_evaluations = neighborhood_capped_evaluations
+                .saturating_add(stream.neighborhood_capped_evaluations);
+            neighborhood_sampler_scratch_high_water = neighborhood_sampler_scratch_high_water
+                .max(stream.neighborhood_sampler_scratch_high_water);
+            *xterm_absent_by_kind.entry(kind).or_default() += stream.abundance.absent_count;
+            let report = match (delta, dirty_cx_ids.as_ref()) {
+                (Some(delta), Some(dirty_cx_ids)) => persist_eager_cross_term_kind_run_delta(
+                    vault,
+                    plan,
                     dirty_cx_ids,
                     &delta.removed_cx_ids,
                     "astrolabe-shadow-weave",
                 )?,
-                _ => persist_eager_cross_term_kind_from_inventory(
+                _ => persist_eager_cross_term_kind_run(
                     vault,
-                    kind,
-                    &plan,
-                    &cx_ids,
-                    xterm_key_inventory.as_mut().ok_or_else(|| -> DynError {
-                        "ASTRO_XTERM_INVENTORY_INVALID: full reconciliation lost its single snapshot-bound persisted-key inventory"
-                            .into()
-                    })?,
+                    plan,
                     "astrolabe-shadow-weave",
                 )?,
             };
@@ -2970,24 +3020,22 @@ where
             xterm_rows_unchanged = xterm_rows_unchanged.saturating_add(report.rows_unchanged);
             xterm_rows_tombstoned =
                 xterm_rows_tombstoned.saturating_add(report.rows_tombstoned);
-            if let Some(fsv) = report.fsv.as_ref() {
-                xterm_fsv.push(fsv_ack_envelope(fsv));
-            }
+            xterm_fsv.extend(report.fsv.iter().map(fsv_ack_envelope));
             let usage = vault
                 .process_usage_snapshot()?
                 .phase_since(process_before);
             xterm_kind_receipts.push(json!({
                 "kind": kind.wire_name(),
-                "source_slots": [kind.slots().0.get(), kind.slots().1.get()],
+                "source_slots": [left_slot.get(), right_slot.get()],
                 "compact_source_snapshot_seq": source_snapshot_seq,
-                "symbol_count": plan.abundance.symbol_count,
-                "scalar_count": plan.abundance.scalar_count,
-                "absent_count": plan.abundance.absent_count,
+                "symbol_count": stream.abundance.symbol_count,
+                "scalar_count": stream.abundance.scalar_count,
+                "absent_count": stream.abundance.absent_count,
                 "kind_dump_hash": report.xterm_dump_hash,
-                "sampler_scratch_high_water": plan.neighborhood_sampler_scratch_high_water,
+                "sampler_scratch_high_water": stream.neighborhood_sampler_scratch_high_water,
+                "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
-            drop(plan);
         }};
     }
 
@@ -3038,10 +3086,6 @@ where
         release_slot!(right);
         release_slot!(left);
     }
-    let xterm_key_inventory_receipt = xterm_key_inventory
-        .take()
-        .map(|inventory| inventory.finish())
-        .transpose()?;
     if decoded_slot_bytes_live != 0 || nodes.iter().any(|node| !node.slots.is_empty()) {
         return Err(format!(
             "ASTRO_WEAVE_SLOT_RELEASE_INCOMPLETE: source planning ended with decoded_slot_bytes_live={decoded_slot_bytes_live} and {} nodes still owning slots; remediation: preserve the staged generation and repair the family release schedule",
@@ -3213,6 +3257,7 @@ where
             "edge_dump_hash": similarity_edge_dump_hash,
             "vector_skips": vector_skip_count,
             "family_opt_outs": family_opt_out_count,
+            "persisted_region_scan": similarity_region_scan,
             "families": similarity_family_receipts,
             "fsv": similarity_fsv,
         },
@@ -3223,7 +3268,6 @@ where
             "rows_tombstoned": xterm_rows_tombstoned,
             "absent_by_kind": absent_by_kind,
             "xterm_dump_hash": xterm_dump_hash,
-            "persisted_key_inventory": xterm_key_inventory_receipt,
             "kinds": xterm_kind_receipts,
             "fsv": xterm_fsv,
             // #433 neighborhood peer sample-cap disclosure (invariant 3): the

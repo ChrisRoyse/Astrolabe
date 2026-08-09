@@ -7,11 +7,11 @@ pub mod search_eval;
 pub mod search_index;
 pub mod search_production;
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt;
-use std::ops::Range;
 use std::thread;
 
 use astrolabe_domain::EdgeKind;
@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod ann;
+mod bounded_run;
 mod complete_xterms;
 pub mod drift_producer;
 pub mod signal_cards;
@@ -85,11 +86,13 @@ pub use signal_cards::{
     derive_symbol_axes, measure_index_time_signal_cards, signal_cards_from_symbol_axes,
 };
 pub use sim_rows::{
-    ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
-    SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
-    SimilarityPersistReport, persist_similarity_edges, persist_similarity_edges_delta,
-    persist_similarity_family_edges, persist_similarity_family_edges_delta,
-    read_similarity_edge_rows, sim_edge_graph_key,
+    ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT,
+    ASTRO_SIM_EDGE_RUN_RESOURCE_EXHAUSTED, BoundedSimilarityFamilyPlan, PersistedSimilarityEdgeRow,
+    PersistedSimilarityRegionScan, SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA,
+    SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow, SimilarityPersistReport, SimilarityRunTelemetry,
+    expand_persisted_similarity_region_from_vault, persist_similarity_family_run,
+    persist_similarity_family_run_delta, plan_similarity_family_run, read_similarity_edge_rows,
+    sim_edge_graph_key,
 };
 pub use xterm_cotenant::{
     XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
@@ -98,16 +101,14 @@ pub use xterm_cotenant::{
 };
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
-    ASTRO_XTERM_INVENTORY_INVALID, ASTRO_XTERM_ROW_CORRUPT, AgreementGraphAspect,
-    EagerCrossTermInventoryReceipt, EagerCrossTermKeyInventory, EagerCrossTermPersistReport,
+    ASTRO_XTERM_ROW_CORRUPT, ASTRO_XTERM_RUN_SOURCE_INVALID, AgreementGraphAspect,
+    BoundedEagerCrossTermKindPlan, EagerCrossTermPersistReport, EagerCrossTermRunTelemetry,
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
     agreement_graph_aspect, agreement_graph_from_persisted_rows,
-    agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots,
-    eager_xterm_dump_bytes, eager_xterm_key, inventory_eager_cross_term_keys,
-    persist_eager_cross_term_kind, persist_eager_cross_term_kind_delta,
-    persist_eager_cross_term_kind_from_inventory, persist_eager_cross_terms,
-    persist_eager_cross_terms_delta, read_eager_cross_term_rows,
-    read_eager_cross_term_rows_with_cotenants,
+    agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots, eager_xterm_key,
+    persist_eager_cross_term_kind_run, persist_eager_cross_term_kind_run_delta,
+    plan_eager_cross_term_kind_run, plan_eager_cross_term_kind_run_delta,
+    read_eager_cross_term_rows, read_eager_cross_term_rows_with_cotenants,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -882,6 +883,16 @@ pub struct SimilarityPlan {
     pub timing_ms: Vec<(String, u64)>,
 }
 
+/// Metadata from one family plan whose admitted edges were delivered in exact
+/// key order to a bounded sink rather than retained in a corpus-sized `Vec`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarityFamilyStreamReport {
+    pub edge_count: usize,
+    pub skips: SimilaritySkipReport,
+    pub workers_requested: usize,
+    pub timing_ms: Vec<(String, u64)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SimilaritySkipReport {
     pub vector_skips: Vec<SimilarityVectorSkip>,
@@ -966,6 +977,12 @@ pub enum SimilarityPlanError {
         family: SimilarityFamily,
         message: String,
     },
+    /// The ordered persistence sink refused a planned source row. The planner
+    /// never substitutes an in-memory plan or another persistence route.
+    PersistenceSinkFailure {
+        family: SimilarityFamily,
+        message: String,
+    },
 }
 
 impl fmt::Display for SimilarityPlanError {
@@ -1020,6 +1037,12 @@ impl fmt::Display for SimilarityPlanError {
             Self::AnnCandidateFailure { family, message } => {
                 write!(f, "ann candidate generation failed for {family}: {message}")
             }
+            Self::PersistenceSinkFailure { family, message } => {
+                write!(
+                    f,
+                    "similarity persistence sink failed for {family}: {message}"
+                )
+            }
         }
     }
 }
@@ -1068,11 +1091,54 @@ pub fn plan_similarity_family_edges(
     plan_similarity_family_edges_inner(nodes, family, config)
 }
 
+/// Plans one family and emits each source-owned edge row in canonical
+/// `(source_id, target_id)` order to a bounded sink.
+///
+/// The callback receives at most `per_node_cap` edges. Worker result channels
+/// have capacity one and the recorder consumes source ordinals in ascending
+/// order, so concurrency cannot change output order or accumulate the complete
+/// edge plan.
+pub fn stream_similarity_family_edges<F>(
+    nodes: &[SimilarityNode],
+    family: SimilarityFamily,
+    config: &SimilarityPlannerConfig,
+    emit: F,
+) -> Result<SimilarityFamilyStreamReport, SimilarityPlanError>
+where
+    F: FnMut(Vec<SimilarityEdge>) -> Result<(), SimilarityPlanError>,
+{
+    validate_plan_request(nodes, config)?;
+    stream_similarity_family_edges_inner(nodes, family, config, emit)
+}
+
 fn plan_similarity_family_edges_inner(
     nodes: &[SimilarityNode],
     family: SimilarityFamily,
     config: &SimilarityPlannerConfig,
 ) -> Result<SimilarityPlan, SimilarityPlanError> {
+    let mut edges = Vec::new();
+    let report =
+        stream_similarity_family_edges_inner(nodes, family, config, |mut source_edges| {
+            edges.append(&mut source_edges);
+            Ok(())
+        })?;
+    Ok(SimilarityPlan {
+        edges,
+        skips: report.skips,
+        workers_requested: report.workers_requested,
+        timing_ms: report.timing_ms,
+    })
+}
+
+fn stream_similarity_family_edges_inner<F>(
+    nodes: &[SimilarityNode],
+    family: SimilarityFamily,
+    config: &SimilarityPlannerConfig,
+    mut emit: F,
+) -> Result<SimilarityFamilyStreamReport, SimilarityPlanError>
+where
+    F: FnMut(Vec<SimilarityEdge>) -> Result<(), SimilarityPlanError>,
+{
     let mut skips = SimilaritySkipReport::default();
     if config.disabled_families.contains(&family) {
         skips.family_opt_outs.push(SimilarityFamilyOptOut {
@@ -1082,8 +1148,8 @@ fn plan_similarity_family_edges_inner(
             node_count: 0,
             limit: None,
         });
-        return Ok(SimilarityPlan {
-            edges: Vec::new(),
+        return Ok(SimilarityFamilyStreamReport {
+            edge_count: 0,
             skips,
             workers_requested: config.worker_count,
             timing_ms: Vec::new(),
@@ -1105,8 +1171,8 @@ fn plan_similarity_family_edges_inner(
                     node_count: vectors.len(),
                     limit: Some(limit),
                 });
-                return Ok(SimilarityPlan {
-                    edges: Vec::new(),
+                return Ok(SimilarityFamilyStreamReport {
+                    edge_count: 0,
                     skips,
                     workers_requested: config.worker_count,
                     timing_ms: vec![(
@@ -1134,70 +1200,34 @@ fn plan_similarity_family_edges_inner(
     )];
     let threshold = config.thresholds.threshold(family);
     let t_rescore = std::time::Instant::now();
-    let (mut edges, pair_counts) = plan_family_edges(
+    let pair_counts = stream_family_edges(
         family,
         threshold,
         config.per_node_cap,
         &vectors,
         config.worker_count,
         candidate_lists.as_deref(),
-    );
+        &mut emit,
+    )?;
     timing_ms.push((
         format!("rescore.{family}"),
         t_rescore.elapsed().as_millis() as u64,
     ));
     skips.pair_counts.insert(family, pair_counts);
-    edges.sort_by(stable_edge_order);
-    Ok(SimilarityPlan {
-        edges,
+    let edge_count = skips
+        .pair_counts
+        .get(&family)
+        .map_or(0, |counts| counts.admitted_pairs);
+    Ok(SimilarityFamilyStreamReport {
+        edge_count,
         skips,
         workers_requested: config.worker_count,
         timing_ms,
     })
 }
 
-/// Expands changed symbols into a bounded L2 similarity repair region.
-///
-/// The region includes two hops of currently persisted SIM neighbors plus the
-/// best exact candidates for every changed symbol in each enabled family. The
-/// candidate budget is the registry-declared ANN headroom
-/// (`per_node_cap * candidate_multiplier`), so work is linear in corpus size
-/// per changed symbol and never an all-pairs rebuild.
-pub fn expand_similarity_dirty_region(
-    nodes: &[SimilarityNode],
-    changed: &BTreeSet<String>,
-    persisted: &[PersistedSimilarityEdgeRow],
-    config: &SimilarityPlannerConfig,
-) -> BTreeSet<String> {
-    let mut region = expand_persisted_similarity_region(changed, persisted);
-    for family in SimilarityFamily::ALL {
-        extend_similarity_candidate_region_for_family(nodes, family, changed, config, &mut region);
-    }
-    region
-}
-
-/// Expands a changed set through two hops of the physically persisted SIM
-/// graph without requiring any Slot vectors.
-pub fn expand_persisted_similarity_region(
-    changed: &BTreeSet<String>,
-    persisted: &[PersistedSimilarityEdgeRow],
-) -> BTreeSet<String> {
-    let mut region = changed.clone();
-    for _ in 0..2 {
-        let frontier = region.clone();
-        for edge in persisted {
-            if frontier.contains(&edge.row.source_id) || frontier.contains(&edge.row.target_id) {
-                region.insert(edge.row.source_id.clone());
-                region.insert(edge.row.target_id.clone());
-            }
-        }
-    }
-    region
-}
-
 /// Adds one family's exact candidate headroom to an existing dirty region.
-/// This split lets bounded callers load and release one family at a time while
-/// producing the same union as [`expand_similarity_dirty_region`].
+/// This lets bounded callers load and release one family at a time.
 pub fn extend_similarity_candidate_region_for_family(
     nodes: &[SimilarityNode],
     family: SimilarityFamily,
@@ -1306,23 +1336,11 @@ impl fmt::Display for EagerAgreementKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct EagerCrossTermPlan {
-    pub rows: Vec<EagerCrossTermRow>,
-    pub agreement_graph: Vec<AgreementGraphEdge>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EagerCrossTermStreamReport {
     pub abundance: CrossTermAbundance,
-    /// #433 neighborhood peer sample-cap accounting. `neighborhood_sample_cap` is
-    /// the applied `weave_neighborhood_sample_cap` knob value;
-    /// `neighborhood_capped_evaluations` counts the (symbol, kind) neighborhood
-    /// agreements whose profile was scored over a seeded peer subsample of the cap
-    /// rather than every comparable peer (loud disclosure of the labeled
-    /// degradation — invariant 3). Zero when the corpus has no more comparable
-    /// peers than the cap, in which case the plan is byte-identical to the
-    /// uncapped path.
     pub neighborhood_sample_cap: usize,
     pub neighborhood_capped_evaluations: usize,
-    /// Maximum number of peer positions retained by the sparse sampler for any
-    /// one evaluation. This is a directly reportable O(cap) scratch bound.
     pub neighborhood_sampler_scratch_high_water: usize,
 }
 
@@ -1359,16 +1377,6 @@ pub enum CrossTermAbsentReason {
     ShapeMismatch,
     InsufficientNeighborhood { comparable_peer_count: usize },
     ZeroSimilarityProfile { slot: SlotId },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgreementGraphEdge {
-    pub kind: EagerAgreementKind,
-    pub left_slot: SlotId,
-    pub right_slot: SlotId,
-    pub mean_agreement: Option<f32>,
-    pub scalar_count: usize,
-    pub absent_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2862,92 +2870,105 @@ pub fn blind_spot_anomaly_inputs(
     Ok(out)
 }
 
-pub fn plan_eager_cross_terms(
-    nodes: &[SimilarityNode],
-    active_slot_count: usize,
-) -> calyx_core::Result<EagerCrossTermPlan> {
-    plan_eager_cross_terms_selected(nodes, None, active_slot_count)
-}
-
-/// Plans eager agreements only for the named dirty symbols while retaining the
-/// full corpus as neighborhood context.
-pub fn plan_eager_cross_terms_for_symbols(
-    nodes: &[SimilarityNode],
-    symbol_ids: &BTreeSet<String>,
-    active_slot_count: usize,
-) -> calyx_core::Result<EagerCrossTermPlan> {
-    plan_eager_cross_terms_selected(nodes, Some(symbol_ids), active_slot_count)
-}
-
-/// Plans exactly one designed eager agreement kind. Callers can load only the
-/// two required Slot CFs, persist that disjoint XTerm ownership domain, and
-/// release its normalized operands before moving to the next kind.
-pub fn plan_eager_cross_term_kind(
+pub fn stream_eager_cross_term_kind<F>(
     nodes: &[SimilarityNode],
     kind: EagerAgreementKind,
     active_slot_count: usize,
-) -> calyx_core::Result<EagerCrossTermPlan> {
-    plan_eager_cross_term_kind_selected(nodes, kind, None, active_slot_count)
+    emit: F,
+) -> calyx_core::Result<EagerCrossTermStreamReport>
+where
+    F: FnMut(EagerCrossTermRow) -> calyx_core::Result<()>,
+{
+    stream_eager_cross_term_kind_selected(nodes, kind, None, active_slot_count, emit)
 }
 
-/// One-kind variant restricted to dirty stable symbol ids while the full node
-/// corpus remains available as neighborhood context.
-pub fn plan_eager_cross_term_kind_for_symbols(
+pub fn stream_eager_cross_term_kind_for_symbols<F>(
     nodes: &[SimilarityNode],
     kind: EagerAgreementKind,
     symbol_ids: &BTreeSet<String>,
     active_slot_count: usize,
-) -> calyx_core::Result<EagerCrossTermPlan> {
-    plan_eager_cross_term_kind_selected(nodes, kind, Some(symbol_ids), active_slot_count)
+    emit: F,
+) -> calyx_core::Result<EagerCrossTermStreamReport>
+where
+    F: FnMut(EagerCrossTermRow) -> calyx_core::Result<()>,
+{
+    stream_eager_cross_term_kind_selected(nodes, kind, Some(symbol_ids), active_slot_count, emit)
 }
 
-fn plan_eager_cross_term_kind_selected(
+fn stream_eager_cross_term_kind_selected<F>(
     nodes: &[SimilarityNode],
     kind: EagerAgreementKind,
     symbol_ids: Option<&BTreeSet<String>>,
     active_slot_count: usize,
-) -> calyx_core::Result<EagerCrossTermPlan> {
-    validate_active_roster(nodes, active_slot_count)?;
-    let selected_indices = nodes
+    mut emit: F,
+) -> calyx_core::Result<EagerCrossTermStreamReport>
+where
+    F: FnMut(EagerCrossTermRow) -> calyx_core::Result<()>,
+{
+    let mut selected_indices = nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| symbol_ids.is_none_or(|ids| ids.contains(&node.symbol_id)))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    selected_indices.sort_by(|left, right| nodes[*left].symbol_id.cmp(&nodes[*right].symbol_id));
+    stream_eager_cross_term_kind_ordered(nodes, kind, &selected_indices, active_slot_count, emit)
+}
+
+pub(crate) fn stream_eager_cross_term_kind_ordered<F>(
+    nodes: &[SimilarityNode],
+    kind: EagerAgreementKind,
+    selected_indices: &[usize],
+    active_slot_count: usize,
+    mut emit: F,
+) -> calyx_core::Result<EagerCrossTermStreamReport>
+where
+    F: FnMut(EagerCrossTermRow) -> calyx_core::Result<()>,
+{
+    validate_active_roster(nodes, active_slot_count)?;
+    let mut seen = BTreeSet::new();
+    for &node_index in selected_indices {
+        if node_index >= nodes.len() || !seen.insert(node_index) {
+            return Err(cross_term_plan_failed(format!(
+                "ordered {} plan contains out-of-range or duplicate node index {node_index} for corpus {}",
+                kind.wire_name(),
+                nodes.len()
+            )));
+        }
+    }
     let sample_cap = crate::knobs::weave_neighborhood_sample_cap();
     let sample_seed = crate::knobs::WEAVE_NEIGHBORHOOD_SAMPLE_SEED;
-    let (values, capped, scratch_high_water) =
-        cross_term_values(nodes, kind, &selected_indices, sample_cap, sample_seed);
     let (left_slot, right_slot) = kind.slots();
-    let mut rows = selected_indices
-        .iter()
-        .zip(values)
-        .map(|(&node_index, value)| EagerCrossTermRow {
-            symbol_id: nodes[node_index].symbol_id.clone(),
-            qualified_name: nodes[node_index].qualified_name.clone(),
-            kind,
-            left_slot,
-            right_slot,
-            value,
-            persisted: true,
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(cross_term_row_order);
-    let scalar_count = rows
-        .iter()
-        .filter(|row| matches!(row.value, CrossTermValue::Scalar(_)))
-        .count();
-    let absent_count = rows.len().saturating_sub(scalar_count);
-    Ok(EagerCrossTermPlan {
-        agreement_graph: agreement_graph_from_cross_terms(&rows),
-        abundance: CrossTermAbundance {
-            symbol_count: selected_indices.len(),
-            designed_pair_count_per_symbol: 1,
-            materialized_count: selected_indices.len(),
-            scalar_count,
-            absent_count,
+    let mut scalar_count = 0usize;
+    let (capped, scratch_high_water) = cross_term_values_into(
+        nodes,
+        kind,
+        &selected_indices,
+        sample_cap,
+        sample_seed,
+        |node_index, value| {
+            scalar_count = scalar_count
+                .saturating_add(usize::from(matches!(value, CrossTermValue::Scalar(_))));
+            emit(EagerCrossTermRow {
+                symbol_id: nodes[node_index].symbol_id.clone(),
+                qualified_name: nodes[node_index].qualified_name.clone(),
+                kind,
+                left_slot,
+                right_slot,
+                value,
+                persisted: true,
+            })
         },
-        rows,
+    )?;
+    let symbol_count = selected_indices.len();
+    Ok(EagerCrossTermStreamReport {
+        abundance: CrossTermAbundance {
+            symbol_count,
+            designed_pair_count_per_symbol: 1,
+            materialized_count: symbol_count,
+            scalar_count,
+            absent_count: symbol_count.saturating_sub(scalar_count),
+        },
         neighborhood_sample_cap: sample_cap,
         neighborhood_capped_evaluations: capped,
         neighborhood_sampler_scratch_high_water: scratch_high_water,
@@ -2977,6 +2998,14 @@ fn xterm_panel_roster_invalid(message: String) -> calyx_core::CalyxError {
         remediation: "Derive the active slot count from the persisted panel roster \
              (astrolabe_panel::slots_for_version) so abundance describes the panel that \
              was physically persisted; re-index if the persisted panel version is stale.",
+    }
+}
+
+fn cross_term_plan_failed(message: impl Into<String>) -> calyx_core::CalyxError {
+    calyx_core::CalyxError {
+        code: "ASTRO_XTERM_PLAN_FAILED",
+        message: message.into(),
+        remediation: "preserve the unpublished shadow generation and inspect the exact cross-term operand, worker, or ordered-sink diagnostic; do not substitute an absent value or another comparator",
     }
 }
 
@@ -3012,105 +3041,17 @@ fn validate_active_roster(
     Ok(())
 }
 
-fn plan_eager_cross_terms_selected(
-    nodes: &[SimilarityNode],
-    symbol_ids: Option<&BTreeSet<String>>,
-    active_slot_count: usize,
-) -> calyx_core::Result<EagerCrossTermPlan> {
-    validate_active_roster(nodes, active_slot_count)?;
-    let selected_indices = nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| symbol_ids.is_none_or(|ids| ids.contains(&node.symbol_id)))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let mut rows = Vec::with_capacity(selected_indices.len() * EagerAgreementKind::ALL.len());
-    // #433 neighborhood peer sample-cap: the five NeighborhoodAgreement kinds score
-    // each symbol's agreement as the cosine between its two per-slot similarity
-    // neighborhood profiles, each built against every comparable peer — an O(n²)
-    // per-kind pass that measurement shows re-dominating the cold index at monorepo
-    // scale. Capping the peer set to a seeded without-replacement subsample bounds
-    // it to O(n·cap); a corpus with no more comparable peers than the cap is scored
-    // whole (byte-identical to the uncapped plan).
-    let sample_cap = crate::knobs::weave_neighborhood_sample_cap();
-    let sample_seed = crate::knobs::WEAVE_NEIGHBORHOOD_SAMPLE_SEED;
-    // Each kind's value pass is independent of the others, so computing the six
-    // kinds on scoped threads cannot change any value (#23); rows are still
-    // appended in `EagerAgreementKind::ALL` order and sorted below, keeping the
-    // plan byte-identical to the sequential shape.
-    let selected = &selected_indices;
-    let counted_values_by_kind = std::thread::scope(|scope| {
-        EagerAgreementKind::ALL
-            .map(|kind| {
-                scope.spawn(move || {
-                    cross_term_values(nodes, kind, selected, sample_cap, sample_seed)
-                })
-            })
-            .map(|handle| handle.join().expect("cross-term kind worker panicked"))
-    });
-    let mut neighborhood_capped_evaluations = 0usize;
-    let mut neighborhood_sampler_scratch_high_water = 0usize;
-    for (kind, (values, capped, scratch_high_water)) in EagerAgreementKind::ALL
-        .into_iter()
-        .zip(counted_values_by_kind)
-    {
-        neighborhood_capped_evaluations += capped;
-        neighborhood_sampler_scratch_high_water =
-            neighborhood_sampler_scratch_high_water.max(scratch_high_water);
-        let (left_slot, right_slot) = kind.slots();
-        for (&node_index, value) in selected_indices.iter().zip(values) {
-            let node = &nodes[node_index];
-            rows.push(EagerCrossTermRow {
-                symbol_id: node.symbol_id.clone(),
-                qualified_name: node.qualified_name.clone(),
-                kind,
-                left_slot,
-                right_slot,
-                value,
-                persisted: true,
-            });
-        }
-    }
-    rows.sort_by(cross_term_row_order);
-
-    let agreement_graph = agreement_graph_from_cross_terms(&rows);
-    let scalar_count = rows
-        .iter()
-        .filter(|row| matches!(row.value, CrossTermValue::Scalar(_)))
-        .count();
-    let absent_count = rows.len() - scalar_count;
-    let symbol_count = selected_indices.len();
-    // This is deliberately a specialized-comparator report, not an active-panel
-    // abundance claim. Exhaustive applicable-roster counts and the strict
-    // computed+typed-incompatible equation are owned by complete_xterms (#522).
-    let eager = EagerAgreementKind::ALL.len();
-    Ok(EagerCrossTermPlan {
-        rows,
-        agreement_graph,
-        abundance: CrossTermAbundance {
-            symbol_count,
-            designed_pair_count_per_symbol: eager,
-            materialized_count: symbol_count * eager,
-            scalar_count,
-            absent_count,
-        },
-        neighborhood_sample_cap: sample_cap,
-        neighborhood_capped_evaluations,
-        neighborhood_sampler_scratch_high_water,
-    })
-}
-
-/// Computes one kind's cross-term values for the selected symbols, returning the
-/// values plus the count of neighborhood evaluations that scored over a capped
-/// peer subsample (#433; always zero for the DirectAgreement kind and for any
-/// corpus with no more comparable peers than `sample_cap`).
-fn cross_term_values(
+fn cross_term_values_into<F>(
     nodes: &[SimilarityNode],
     kind: EagerAgreementKind,
     selected_indices: &[usize],
     sample_cap: usize,
     sample_seed: u64,
-) -> (Vec<CrossTermValue>, usize, usize) {
+    mut emit: F,
+) -> calyx_core::Result<(usize, usize)>
+where
+    F: FnMut(usize, CrossTermValue) -> calyx_core::Result<()>,
+{
     let (left_slot, right_slot) = kind.slots();
     let operands = nodes
         .iter()
@@ -3123,14 +3064,15 @@ fn cross_term_values(
         .collect::<Vec<_>>();
 
     match kind.comparator() {
-        EagerCrossTermComparator::DirectAgreement => (
-            selected_indices
-                .iter()
-                .map(|&index| direct_cross_term_value(&operands[index].0, &operands[index].1))
-                .collect(),
-            0,
-            0,
-        ),
+        EagerCrossTermComparator::DirectAgreement => {
+            for &index in selected_indices {
+                emit(
+                    index,
+                    direct_cross_term_value(&operands[index].0, &operands[index].1),
+                )?;
+            }
+            Ok((0, 0))
+        }
         EagerCrossTermComparator::NeighborhoodAgreement => {
             // #433: a peer contributes to a source's neighborhood profile iff BOTH
             // its operand vectors match the source's shapes exactly (`cosine` is
@@ -3154,32 +3096,30 @@ fn cross_term_values(
             }
             let mut capped = 0usize;
             let mut scratch_high_water = 0usize;
-            let values = selected_indices
-                .iter()
-                .map(|&node_index| {
-                    let group = match &operands[node_index] {
-                        (Ok(left), Ok(right)) => sig_groups
-                            .get(&(vector_sig(left), vector_sig(right)))
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
-                        _ => &[],
-                    };
-                    if group.len().saturating_sub(1) > sample_cap {
-                        scratch_high_water = scratch_high_water.max(sample_cap.min(group.len()));
-                    }
-                    neighborhood_cross_term_value(
-                        node_index,
-                        &nodes[node_index].symbol_id,
-                        kind,
-                        &operands,
-                        group,
-                        sample_cap,
-                        sample_seed,
-                        &mut capped,
-                    )
-                })
-                .collect();
-            (values, capped, scratch_high_water)
+            for &node_index in selected_indices {
+                let group = match &operands[node_index] {
+                    (Ok(left), Ok(right)) => sig_groups
+                        .get(&(vector_sig(left), vector_sig(right)))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    _ => &[],
+                };
+                if group.len().saturating_sub(1) > sample_cap {
+                    scratch_high_water = scratch_high_water.max(sample_cap.min(group.len()));
+                }
+                let value = neighborhood_cross_term_value(
+                    node_index,
+                    &nodes[node_index].symbol_id,
+                    kind,
+                    &operands,
+                    group,
+                    sample_cap,
+                    sample_seed,
+                    &mut capped,
+                );
+                emit(node_index, value)?;
+            }
+            Ok((capped, scratch_high_water))
         }
     }
 }
@@ -3188,16 +3128,16 @@ fn cross_term_values(
 /// `Some` iff their signatures are equal (same kind, same dim).
 type VectorSig = (bool, u32);
 
-fn vector_sig(vector: &NormalizedVector) -> VectorSig {
+fn vector_sig(vector: &CrossTermVector<'_>) -> VectorSig {
     match vector {
-        NormalizedVector::Dense { dim, .. } => (true, *dim),
-        NormalizedVector::Sparse { dim, .. } => (false, *dim),
+        CrossTermVector::Dense { dim, .. } => (true, *dim),
+        CrossTermVector::Sparse { dim, .. } => (false, *dim),
     }
 }
 
 fn direct_cross_term_value(
-    left: &Result<NormalizedVector, CrossTermAbsentReason>,
-    right: &Result<NormalizedVector, CrossTermAbsentReason>,
+    left: &Result<CrossTermVector<'_>, CrossTermAbsentReason>,
+    right: &Result<CrossTermVector<'_>, CrossTermAbsentReason>,
 ) -> CrossTermValue {
     let left = match left {
         Ok(value) => value,
@@ -3215,7 +3155,7 @@ fn direct_cross_term_value(
             };
         }
     };
-    match cosine(left, right) {
+    match cross_term_cosine(left, right) {
         Some(value) => CrossTermValue::Scalar(value),
         None => CrossTermValue::Absent {
             reason: CrossTermAbsentReason::ShapeMismatch,
@@ -3258,7 +3198,7 @@ fn neighborhood_cross_term_value(
     node_index: usize,
     source_qualified_name: &str,
     kind: EagerAgreementKind,
-    operands: &[CrossTermOperandPair],
+    operands: &[CrossTermOperandPair<'_>],
     comparable_pool: &[usize],
     sample_cap: usize,
     sample_seed: u64,
@@ -3319,9 +3259,10 @@ fn neighborhood_cross_term_value(
         let (Ok(peer_left), Ok(peer_right)) = (peer_left, peer_right) else {
             return;
         };
-        let (Some(left_score), Some(right_score)) =
-            (cosine(left, peer_left), cosine(right, peer_right))
-        else {
+        let (Some(left_score), Some(right_score)) = (
+            cross_term_cosine(left, peer_left),
+            cross_term_cosine(right, peer_right),
+        ) else {
             return;
         };
         left_scores.push(left_score);
@@ -3361,84 +3302,94 @@ fn neighborhood_cross_term_value(
         };
     }
 
-    let profile_dim = left_scores.len() as u32;
-    let left_profile = NormalizedVector::Dense {
-        dim: profile_dim,
-        data: left_scores,
-        norm: left_norm,
-    };
-    let right_profile = NormalizedVector::Dense {
-        dim: profile_dim,
-        data: right_scores,
-        norm: right_norm,
-    };
-    direct_cross_term_value(&Ok(left_profile), &Ok(right_profile))
+    let value = dense_dot(&left_scores, &right_scores) / (left_norm.sqrt() * right_norm.sqrt());
+    CrossTermValue::Scalar(value)
 }
 
-fn cross_term_operand(
-    node: &SimilarityNode,
+fn cross_term_operand<'a>(
+    node: &'a SimilarityNode,
     slot: SlotId,
-) -> Result<NormalizedVector, CrossTermAbsentReason> {
+) -> Result<CrossTermVector<'a>, CrossTermAbsentReason> {
     let Some(vector) = node.slots.get(&slot) else {
         return Err(CrossTermAbsentReason::MissingSlot { slot });
     };
-    match normalized_vector(vector) {
-        Ok(vector) => Ok(vector),
-        Err(reason) => Err(cross_term_absent_reason(slot, reason)),
+    if let Err(error) = vector.validate_schema() {
+        return Err(CrossTermAbsentReason::InvalidSchema {
+            slot,
+            message: error.to_string(),
+        });
     }
-}
-
-fn cross_term_absent_reason(
-    slot: SlotId,
-    reason: SimilarityVectorSkipReason,
-) -> CrossTermAbsentReason {
-    match reason {
-        SimilarityVectorSkipReason::MissingSlot => CrossTermAbsentReason::MissingSlot { slot },
-        SimilarityVectorSkipReason::AbsentSlot => CrossTermAbsentReason::SlotAbsent { slot },
-        SimilarityVectorSkipReason::UnsupportedSlotShape { shape } => {
-            CrossTermAbsentReason::UnsupportedSlotShape { slot, shape }
-        }
-        SimilarityVectorSkipReason::ZeroNorm => CrossTermAbsentReason::ZeroNorm { slot },
-        SimilarityVectorSkipReason::InvalidSchema { message } => {
-            CrossTermAbsentReason::InvalidSchema { slot, message }
-        }
-    }
-}
-
-fn cross_term_row_order(left: &EagerCrossTermRow, right: &EagerCrossTermRow) -> Ordering {
-    left.symbol_id
-        .cmp(&right.symbol_id)
-        .then_with(|| left.kind.cmp(&right.kind))
-}
-
-fn agreement_graph_from_cross_terms(rows: &[EagerCrossTermRow]) -> Vec<AgreementGraphEdge> {
-    let mut sums = BTreeMap::<EagerAgreementKind, (f32, usize, usize)>::new();
-    for row in rows {
-        let entry = sums.entry(row.kind).or_default();
-        match row.value {
-            CrossTermValue::Scalar(value) => {
-                entry.0 += value;
-                entry.1 += 1;
+    match vector {
+        SlotVector::Dense { dim, data } => {
+            let norm = dense_norm(data);
+            if zero_norm(norm) {
+                return Err(CrossTermAbsentReason::ZeroNorm { slot });
             }
-            CrossTermValue::Absent { .. } => entry.2 += 1,
+            Ok(CrossTermVector::Dense {
+                dim: *dim,
+                data,
+                norm,
+            })
         }
-    }
-
-    EagerAgreementKind::ALL
-        .into_iter()
-        .map(|kind| {
-            let (sum, scalar_count, absent_count) = sums.get(&kind).copied().unwrap_or_default();
-            let (left_slot, right_slot) = kind.slots();
-            AgreementGraphEdge {
-                kind,
-                left_slot,
-                right_slot,
-                mean_agreement: (scalar_count > 0).then_some(sum / scalar_count as f32),
-                scalar_count,
-                absent_count,
+        SlotVector::Sparse { dim, entries } => {
+            let norm = sparse_norm(entries);
+            if zero_norm(norm) {
+                return Err(CrossTermAbsentReason::ZeroNorm { slot });
             }
-        })
-        .collect()
+            let entries = if entries.windows(2).all(|pair| pair[0].idx < pair[1].idx) {
+                Cow::Borrowed(entries.as_slice())
+            } else {
+                let mut ordered = entries.clone();
+                ordered.sort_by_key(|entry| entry.idx);
+                Cow::Owned(ordered)
+            };
+            Ok(CrossTermVector::Sparse {
+                dim: *dim,
+                entries,
+                norm,
+            })
+        }
+        SlotVector::Multi { .. } => Err(CrossTermAbsentReason::UnsupportedSlotShape {
+            slot,
+            shape: "multi",
+        }),
+        SlotVector::Absent { .. } => Err(CrossTermAbsentReason::SlotAbsent { slot }),
+    }
+}
+
+fn cross_term_cosine(left: &CrossTermVector<'_>, right: &CrossTermVector<'_>) -> Option<f32> {
+    let score = match (left, right) {
+        (
+            CrossTermVector::Dense {
+                dim: left_dim,
+                data: left_data,
+                norm: left_norm,
+            },
+            CrossTermVector::Dense {
+                dim: right_dim,
+                data: right_data,
+                norm: right_norm,
+            },
+        ) if left_dim == right_dim => {
+            dense_dot(left_data, right_data) / (left_norm.sqrt() * right_norm.sqrt())
+        }
+        (
+            CrossTermVector::Sparse {
+                dim: left_dim,
+                entries: left_entries,
+                norm: left_norm,
+            },
+            CrossTermVector::Sparse {
+                dim: right_dim,
+                entries: right_entries,
+                norm: right_norm,
+            },
+        ) if left_dim == right_dim => {
+            sparse_dot(left_entries, right_entries) / (left_norm.sqrt() * right_norm.sqrt())
+        }
+        _ => return None,
+    };
+    score.is_finite().then_some(score.clamp(-1.0, 1.0))
 }
 
 fn validate_plan_request(
@@ -3626,141 +3577,199 @@ fn normalized_vector(vector: &SlotVector) -> Result<NormalizedVector, Similarity
 /// identical to the former sort-then-cap implementation. (Reducing the O(n²)
 /// cosine *evaluation* count — as opposed to candidate memory — is the ANN/LSH
 /// candidate-generation work tracked in #20.)
-fn plan_family_edges(
+fn stream_family_edges<F>(
     family: SimilarityFamily,
     threshold: f32,
     per_node_cap: usize,
     vectors: &[IndexedVector],
     worker_count: usize,
     candidates: Option<&[Vec<usize>]>,
-) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
-    // Each source `i` computes its own bounded top-`per_node_cap` outgoing edges
-    // against the strictly-greater targets `j > i`, and every
-    // [`SimilarityPairCounts`] field is a plain sum over sources. The source
-    // ranges therefore partition into independent shards whose per-shard outputs
-    // reduce order-invariantly (edge concatenation followed by the total
-    // [`stable_edge_order`] sort in the caller; count fields by integer addition).
-    // Sharding by source range across `worker_count` workers is the parallel path
-    // the planner config exposes; a non-invariant reduction (double-counting at a
-    // shard boundary, or splitting one source's per-cap admission across shards)
-    // would change the plan, which the worker-invariance test asserts against.
+    emit: &mut F,
+) -> Result<SimilarityPairCounts, SimilarityPlanError>
+where
+    F: FnMut(Vec<SimilarityEdge>) -> Result<(), SimilarityPlanError>,
+{
+    // Each source owns one independent, bounded result row. Workers publish
+    // through capacity-one channels, and the recorder drains contiguous ranges
+    // in source order. The reduction is integer addition plus a total edge order,
+    // so worker scheduling cannot affect bytes.
     let source_count = vectors.len();
+    if source_count == 0 {
+        return Ok(SimilarityPairCounts::default());
+    }
     let worker_count = worker_count.min(source_count).max(1);
     if worker_count == 1 {
-        return plan_source_range(
-            family,
-            threshold,
-            per_node_cap,
-            vectors,
-            0..source_count,
-            candidates,
-        );
+        let mut counts = SimilarityPairCounts::default();
+        for source in 0..source_count {
+            let (mut edges, source_counts) =
+                plan_one_source(family, threshold, per_node_cap, vectors, source, candidates);
+            edges.sort_by(stable_edge_order);
+            add_pair_counts(&mut counts, &source_counts);
+            emit(edges)?;
+        }
+        return Ok(counts);
     }
 
     let chunk_size = source_count.div_ceil(worker_count);
-    let shards = thread::scope(|scope| {
+    thread::scope(|scope| {
         let mut handles = Vec::new();
+        handles.try_reserve_exact(worker_count).map_err(|error| {
+            SimilarityPlanError::PersistenceSinkFailure {
+                family,
+                message: format!(
+                    "ASTRO_WEAVE_SIM_STREAM_CAPACITY_EXHAUSTED: reserve {worker_count} worker handles: {error}"
+                ),
+            }
+        })?;
+        let mut receivers = Vec::new();
+        receivers.try_reserve_exact(worker_count).map_err(|error| {
+            SimilarityPlanError::PersistenceSinkFailure {
+                family,
+                message: format!(
+                    "ASTRO_WEAVE_SIM_STREAM_CAPACITY_EXHAUSTED: reserve {worker_count} result channels: {error}"
+                ),
+            }
+        })?;
         let mut start = 0;
         while start < source_count {
             let end = (start + chunk_size).min(source_count);
             let range = start..end;
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            receivers.push((range.clone(), receiver));
             handles.push(scope.spawn(move || {
-                plan_source_range(family, threshold, per_node_cap, vectors, range, candidates)
+                for source in range {
+                    let planned = plan_one_source(
+                        family,
+                        threshold,
+                        per_node_cap,
+                        vectors,
+                        source,
+                        candidates,
+                    );
+                    if sender.send((source, planned)).is_err() {
+                        return;
+                    }
+                }
             }));
             start = end;
         }
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("similarity planner worker panicked"))
-            .collect::<Vec<_>>()
-    });
 
-    let mut admitted = Vec::new();
-    let mut counts = SimilarityPairCounts::default();
-    for (shard_edges, shard_counts) in shards {
-        admitted.extend(shard_edges);
-        counts.candidate_pairs += shard_counts.candidate_pairs;
-        counts.incompatible_shape_pairs += shard_counts.incompatible_shape_pairs;
-        counts.below_threshold_pairs += shard_counts.below_threshold_pairs;
-        counts.cap_dropped_pairs += shard_counts.cap_dropped_pairs;
-    }
-    counts.admitted_pairs = admitted.len();
-    (admitted, counts)
+        let mut counts = SimilarityPairCounts::default();
+        let mut terminal_error = None;
+        'workers: for (range, receiver) in &receivers {
+            for expected_source in range.clone() {
+                let (observed_source, (mut edges, source_counts)) = match receiver.recv() {
+                    Ok(result) => result,
+                    Err(error) => {
+                        terminal_error = Some(SimilarityPlanError::PersistenceSinkFailure {
+                            family,
+                            message: format!(
+                                "ASTRO_WEAVE_SIM_STREAM_DISCONNECTED: expected source ordinal {expected_source}: {error}"
+                            ),
+                        });
+                        break 'workers;
+                    }
+                };
+                if observed_source != expected_source {
+                    terminal_error = Some(SimilarityPlanError::PersistenceSinkFailure {
+                        family,
+                        message: format!(
+                            "ASTRO_WEAVE_SIM_STREAM_ORDER_DRIFT: expected source ordinal {expected_source}, observed {observed_source}"
+                        ),
+                    });
+                    break 'workers;
+                }
+                edges.sort_by(stable_edge_order);
+                add_pair_counts(&mut counts, &source_counts);
+                if let Err(error) = emit(edges) {
+                    terminal_error = Some(error);
+                    break 'workers;
+                }
+            }
+        }
+        drop(receivers);
+        for handle in handles {
+            if handle.join().is_err() && terminal_error.is_none() {
+                terminal_error = Some(SimilarityPlanError::PersistenceSinkFailure {
+                    family,
+                    message: "ASTRO_WEAVE_SIM_STREAM_WORKER_PANICKED: no partial family plan was accepted"
+                        .to_string(),
+                });
+            }
+        }
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(counts),
+        }
+    })
 }
 
-/// Plans the bounded per-source admissions for one shard of source indices.
-///
-/// `sources` is a contiguous slice of source positions into `vectors`; each
-/// source still scans every strictly-greater target `j > i`, so a shard reads all
-/// of `vectors` but only emits edges (and counts pairs) for the sources it owns.
-/// This keeps each source's per-`per_node_cap` admission wholly inside one shard,
-/// which is what makes the sharded plan byte-identical to the serial plan.
-fn plan_source_range(
+fn plan_one_source(
     family: SimilarityFamily,
     threshold: f32,
     per_node_cap: usize,
     vectors: &[IndexedVector],
-    sources: Range<usize>,
+    source: usize,
     candidates: Option<&[Vec<usize>]>,
 ) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
     let mut counts = SimilarityPairCounts::default();
-    let mut admitted = Vec::new();
-
-    for i in sources {
-        let left = &vectors[i];
-        // Top-`per_node_cap` targets for this source. The heap's max (`peek`) is
-        // the *least preferred* admitted edge (lowest weight, ties broken by the
-        // larger target qualified name) — exactly the edge a better candidate
-        // evicts. `per_node_cap` is validated as non-zero upstream, so once the
-        // heap is full `peek` is always `Some`.
-        let mut top: BinaryHeap<AdmissionCandidate> = BinaryHeap::with_capacity(per_node_cap);
-        match candidates {
-            // Exhaustive scoring: every strictly-greater target is a candidate.
-            None => {
-                for right in vectors.iter().skip(i + 1) {
-                    consider_target(left, right, threshold, per_node_cap, &mut top, &mut counts);
-                }
-            }
-            // ANN scoring: only the generated per-source candidate targets are
-            // scored; every list entry is a strictly-greater index (the lower
-            // qualified name owns the pair), so ownership and admission are the
-            // same discipline as the exhaustive path.
-            Some(lists) => {
-                for &right_index in &lists[i] {
-                    debug_assert!(
-                        right_index > i,
-                        "candidate lists must hold targets > source"
-                    );
-                    consider_target(
-                        left,
-                        &vectors[right_index],
-                        threshold,
-                        per_node_cap,
-                        &mut top,
-                        &mut counts,
-                    );
-                }
+    let left = &vectors[source];
+    // Top-`per_node_cap` targets for this source. The heap's max (`peek`) is
+    // the least-preferred admitted edge and therefore the eviction point.
+    let mut top: BinaryHeap<AdmissionCandidate> = BinaryHeap::with_capacity(per_node_cap);
+    match candidates {
+        None => {
+            for right in vectors.iter().skip(source + 1) {
+                consider_target(left, right, threshold, per_node_cap, &mut top, &mut counts);
             }
         }
-
-        for candidate in top.into_vec() {
-            admitted.push(SimilarityEdge {
-                family,
-                source_id: left.symbol_id.clone(),
-                target_id: candidate.target_id,
-                source_qn: left.qualified_name.clone(),
-                target_qn: candidate.target_qn,
-                slot: family.slot(),
-                graph_edge_kind: family.graph_edge_kind(),
-                metric: SimilarityMetric::Cosine,
-                weight: candidate.weight,
-                threshold,
-            });
+        Some(lists) => {
+            for &right_index in &lists[source] {
+                debug_assert!(right_index > source, "candidate targets must exceed source");
+                consider_target(
+                    left,
+                    &vectors[right_index],
+                    threshold,
+                    per_node_cap,
+                    &mut top,
+                    &mut counts,
+                );
+            }
         }
     }
 
+    let admitted = top
+        .into_vec()
+        .into_iter()
+        .map(|candidate| SimilarityEdge {
+            family,
+            source_id: left.symbol_id.clone(),
+            target_id: candidate.target_id,
+            source_qn: left.qualified_name.clone(),
+            target_qn: candidate.target_qn,
+            slot: family.slot(),
+            graph_edge_kind: family.graph_edge_kind(),
+            metric: SimilarityMetric::Cosine,
+            weight: candidate.weight,
+            threshold,
+        })
+        .collect::<Vec<_>>();
     counts.admitted_pairs = admitted.len();
     (admitted, counts)
+}
+
+fn add_pair_counts(total: &mut SimilarityPairCounts, source: &SimilarityPairCounts) {
+    total.candidate_pairs = total.candidate_pairs.saturating_add(source.candidate_pairs);
+    total.incompatible_shape_pairs = total
+        .incompatible_shape_pairs
+        .saturating_add(source.incompatible_shape_pairs);
+    total.below_threshold_pairs = total
+        .below_threshold_pairs
+        .saturating_add(source.below_threshold_pairs);
+    total.cap_dropped_pairs = total
+        .cap_dropped_pairs
+        .saturating_add(source.cap_dropped_pairs);
+    total.admitted_pairs = total.admitted_pairs.saturating_add(source.admitted_pairs);
 }
 
 /// Scores one candidate pair with the exact cosine and applies threshold and
@@ -3874,10 +3883,26 @@ pub(crate) enum NormalizedVector {
     },
 }
 
-type CrossTermOperandPair = (
-    Result<NormalizedVector, CrossTermAbsentReason>,
-    Result<NormalizedVector, CrossTermAbsentReason>,
+type CrossTermOperandPair<'a> = (
+    Result<CrossTermVector<'a>, CrossTermAbsentReason>,
+    Result<CrossTermVector<'a>, CrossTermAbsentReason>,
 );
+
+/// Normalized cross-term operand borrowing the decoded Slot row. Dense values
+/// are never cloned; sparse entries borrow when already index-ordered and own
+/// only the sorted exceptional case required for exact cosine semantics.
+enum CrossTermVector<'a> {
+    Dense {
+        dim: u32,
+        data: &'a [f32],
+        norm: f32,
+    },
+    Sparse {
+        dim: u32,
+        entries: Cow<'a, [SparseEntry]>,
+        norm: f32,
+    },
+}
 
 fn cosine(left: &NormalizedVector, right: &NormalizedVector) -> Option<f32> {
     let score = match (left, right) {
