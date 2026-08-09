@@ -1280,6 +1280,14 @@ switch ($Operation) {
             Join-Path $script:AstroDetachedCanonicalRoot '.tmp'
         ) 'astrolabe-launcher.lock'
         $mutexLease = Enter-AstroLauncherLockMutex $launcherLockPath
+        if (-not $mutexLease.Acquired) {
+            $contendedMutexName = [string]$mutexLease.Name
+            Exit-AstroLauncherLockMutex $mutexLease
+            Fail-AstroModernRecovery `
+                'ASTRO_DETACHED_MODERN_RECOVERY_MUTEX_CONTENDED' `
+                "canonical launcher mutex is held: $contendedMutexName" `
+                'preserve state and invoke Recover only after the active owner exits'
+        }
         try {
             $compiler = Get-AstroModernRecoveryCompilerBinding $runDirectory
             if ([int]$compiler.source_issue -ne
@@ -1370,6 +1378,17 @@ switch ($Operation) {
                         protocol_second = $protocolSecond
                         target_reprobe = $target
                         native_compiler = $nativeCompiler
+                        launcher_mutex = [ordered]@{
+                            name = [string]$mutexLease.Name
+                            acquired = [bool]$mutexLease.Acquired
+                            was_abandoned = [bool]$mutexLease.WasAbandoned
+                            created_new = [bool]$mutexLease.CreatedNew
+                            root = [string]$mutexLease.Root
+                            root_final_path =
+                                [string]$mutexLease.RootFinalPath
+                            root_identity =
+                                [string]$mutexLease.RootIdentity
+                        }
                         namespace_operation =
                             'same-volume-handle-no-replace-rename'
                         deletion_operation =
