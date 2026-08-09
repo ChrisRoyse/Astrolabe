@@ -98,7 +98,7 @@ const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v3";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v3";
 const LEGACY_SCHEMA_STRUCTURAL_NODE_V2: &str = "astrolabe-structural-node-v2";
 const SCHEMA_EXACT_SOURCE_REF: &str = "astrolabe-exact-source-ref-v1";
-const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
+const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v2";
 pub const CBM_FILE_HASH_ROW_SCHEMA: &str = "astrolabe-file-hash-v1";
 const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
 const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
@@ -157,7 +157,9 @@ const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 /// (check-cross-process-vault.py). Mirrors LOWERED_DB_BUSY_TIMEOUT_MS
 /// (astrolabe-lower) and CONFIG_DB_BUSY_TIMEOUT_MS (astrolabe-server).
 const CBM_SOURCE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
-pub const CBM_SQLITE_SCHEMA_VERSION: i64 = 5;
+pub const CBM_SQLITE_SCHEMA_VERSION: i64 = 6;
+const CBM_SEMANTIC_VECTOR_DIMENSION: i64 = 768;
+const CBM_SEMANTIC_MIN_ELIGIBLE_NODES: i64 = 2;
 
 /// Frozen semantic source-column contract for the seven CBM product tables.
 /// `(name, declared_type, hidden)` is compared in exact `cid` order against
@@ -170,6 +172,12 @@ const CBM_SEMANTIC_SOURCE_TABLES: &[(&str, &[(&str, &str, i64)])] = &[
             ("name", "TEXT", 0),
             ("indexed_at", "TEXT", 0),
             ("root_path", "TEXT", 0),
+            ("index_mode", "TEXT", 0),
+            ("semantic_state", "TEXT", 0),
+            ("semantic_vector_dimension", "INTEGER", 0),
+            ("semantic_eligible_node_count", "INTEGER", 0),
+            ("node_vector_count", "INTEGER", 0),
+            ("token_vector_count", "INTEGER", 0),
         ],
     ),
     (
@@ -965,6 +973,12 @@ struct RawProjectRow {
     name: String,
     indexed_at: String,
     root_path: String,
+    index_mode: String,
+    semantic_state: String,
+    semantic_vector_dimension: i64,
+    semantic_eligible_node_count: Option<i64>,
+    node_vector_count: i64,
+    token_vector_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1573,6 +1587,12 @@ pub struct CbmProjectRow {
     pub project: String,
     pub indexed_at: String,
     pub root_path: String,
+    pub index_mode: String,
+    pub semantic_state: String,
+    pub semantic_vector_dimension: i64,
+    pub semantic_eligible_node_count: Option<i64>,
+    pub node_vector_count: i64,
+    pub token_vector_count: i64,
     pub commit: String,
     pub sqlite_fingerprint_sha256: String,
 }
@@ -1792,6 +1812,11 @@ where
     let raw_metadata = read_metadata_rows(&connection, options)?;
     let raw_nodes = read_nodes(&connection, &options.project)?;
     let raw_edges = read_edges(&connection, &options.project)?;
+    validate_persisted_semantic_state(
+        &raw_metadata.projects,
+        &raw_nodes,
+        &raw_metadata.token_vectors,
+    )?;
     let semantic_child_rows = raw_metadata.file_hashes.len()
         + raw_metadata.project_summaries.len()
         + raw_metadata.token_vectors.len()
@@ -1993,7 +2018,7 @@ fn semantic_sqlite_source_schema_sha256(connection: &Connection) -> IngestResult
     let mut canonical = Vec::new();
     append_semantic_frame(
         &mut canonical,
-        b"astrolabe.cbm.sqlite-semantic-source-schema.v2",
+        b"astrolabe.cbm.sqlite-semantic-source-schema.v3",
     );
     append_semantic_frame(&mut canonical, &user_version.to_be_bytes());
     let mut statement = connection
@@ -2030,8 +2055,8 @@ fn semantic_sqlite_source_schema_sha256(connection: &Connection) -> IngestResult
 
 fn snapshot_semantic_source_schema_sha256() -> [u8; 32] {
     sha256_digest(
-        b"astrolabe.cbm.direct-snapshot.semantic-source-schema.v2\0\
-projects{name:text,indexed_at:text,root_path:text}\0\
+        b"astrolabe.cbm.direct-snapshot.semantic-source-schema.v3\0\
+projects{name:text,indexed_at:text,root_path:text,index_mode:text,semantic_state:text,semantic_vector_dimension:i64,semantic_eligible_node_count:optional_i64,node_vector_count:i64,token_vector_count:i64}\0\
 file_hashes{project:text,rel_path:text,sha256:text,mtime_ns:i64,size:i64}\0\
 nodes{id:i64,project:text,label:text,name:text,atom_id:text,qualified_name:text,file_path:text,start_line:i64,end_line:i64,source_present:bool,source_bytes:bytes,source_sha256:text,start_byte:u64,end_byte:u64,properties:json,node_vector:optional<i8x768>}\0\
 edges{id:i64,project:text,source_id:i64,target_id:i64,type:text,properties:json,url_path_gen:text,local_name_gen:text,preprocess_context_id_gen:text}\0\
@@ -2882,6 +2907,32 @@ fn validate_complete_snapshot_project(snapshot: &CbmGraphSnapshot) -> IngestResu
             snapshot.projects.len()
         )));
     }
+    if let Some(project) = snapshot.projects.first() {
+        validate_semantic_capability(
+            &project.index_mode,
+            &project.semantic_state,
+            project.semantic_vector_dimension,
+            project.semantic_eligible_node_count,
+            project.node_vector_count,
+            project.token_vector_count,
+            snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.node_vector.is_some())
+                .count(),
+            snapshot
+                .nodes
+                .iter()
+                .filter_map(|node| node.node_vector.as_ref())
+                .all(|vector| vector.len() == CBM_SEMANTIC_VECTOR_DIMENSION as usize),
+            snapshot.token_vectors.len(),
+            snapshot.token_vectors.iter().all(|row| {
+                !row.token.is_empty()
+                    && row.vector.len() == CBM_SEMANTIC_VECTOR_DIMENSION as usize
+                    && row.idf > 0
+            }),
+        )?;
+    }
     for (family, row_project) in snapshot
         .projects
         .iter()
@@ -2937,11 +2988,20 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
         .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
     connection
         .execute_batch(
-            "PRAGMA user_version = 5;
+            "PRAGMA user_version = 6;
              CREATE TABLE projects (
                name TEXT PRIMARY KEY,
                indexed_at TEXT NOT NULL,
-               root_path TEXT NOT NULL
+               root_path TEXT NOT NULL,
+               index_mode TEXT NOT NULL CHECK(index_mode IN ('full','moderate','fast')),
+               semantic_state TEXT NOT NULL CHECK(semantic_state IN ('available','unavailable_mode','unavailable_corpus')),
+               semantic_vector_dimension INTEGER NOT NULL CHECK(semantic_vector_dimension = 768),
+               semantic_eligible_node_count INTEGER,
+               node_vector_count INTEGER NOT NULL CHECK(node_vector_count >= 0),
+               token_vector_count INTEGER NOT NULL CHECK(token_vector_count >= 0),
+               CHECK((semantic_state = 'available' AND index_mode IN ('full','moderate') AND semantic_eligible_node_count >= 2 AND node_vector_count = semantic_eligible_node_count AND token_vector_count > 0) OR
+                 (semantic_state = 'unavailable_mode' AND index_mode = 'fast' AND semantic_eligible_node_count IS NULL AND node_vector_count = 0 AND token_vector_count = 0) OR
+                 (semantic_state = 'unavailable_corpus' AND index_mode IN ('full','moderate') AND semantic_eligible_node_count >= 0 AND semantic_eligible_node_count < 2 AND node_vector_count = 0 AND token_vector_count = 0))
              );
              CREATE TABLE file_hashes (
                project TEXT NOT NULL,
@@ -3000,16 +3060,16 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
                updated_at TEXT NOT NULL
              );
              CREATE TABLE node_vectors (
-               node_id INTEGER PRIMARY KEY,
-               project TEXT NOT NULL,
-               vector BLOB NOT NULL
+               node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+               project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+               vector BLOB NOT NULL CHECK(length(vector) = 768)
              );
              CREATE TABLE token_vectors (
                id INTEGER PRIMARY KEY,
-               project TEXT NOT NULL,
-               token TEXT NOT NULL,
-               vector BLOB NOT NULL,
-               idf INTEGER NOT NULL
+               project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+               token TEXT NOT NULL CHECK(length(token) > 0),
+               vector BLOB NOT NULL CHECK(length(vector) = 768),
+               idf INTEGER NOT NULL CHECK(idf > 0)
              );",
         )
         .map_err(|error| invalid_sqlite(format!("create row-sink schema: {error}")))?;
@@ -3017,8 +3077,19 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
     for project in &snapshot.projects {
         connection
             .execute(
-                "INSERT INTO projects(name, indexed_at, root_path) VALUES (?1, ?2, ?3)",
-                params![project.project, project.indexed_at, project.root_path],
+                "INSERT INTO projects(name, indexed_at, root_path, index_mode, semantic_state, semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, token_vector_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    project.project,
+                    project.indexed_at,
+                    project.root_path,
+                    project.index_mode,
+                    project.semantic_state,
+                    project.semantic_vector_dimension,
+                    project.semantic_eligible_node_count,
+                    project.node_vector_count,
+                    project.token_vector_count,
+                ],
             )
             .map_err(|error| invalid_sqlite(format!("insert row-sink project: {error}")))?;
     }
@@ -3165,6 +3236,12 @@ fn snapshot_metadata_rows(snapshot: &CbmGraphSnapshot) -> IngestResult<RawMetada
             name: project.project.clone(),
             indexed_at: project.indexed_at.clone(),
             root_path: project.root_path.clone(),
+            index_mode: project.index_mode.clone(),
+            semantic_state: project.semantic_state.clone(),
+            semantic_vector_dimension: project.semantic_vector_dimension,
+            semantic_eligible_node_count: project.semantic_eligible_node_count,
+            node_vector_count: project.node_vector_count,
+            token_vector_count: project.token_vector_count,
         });
     }
 
@@ -4073,6 +4150,7 @@ pub fn read_cbm_sqlite_pipeline_rows(
     let raw_file_hashes = read_file_hashes(&connection, project)?;
     let raw_project_summaries = read_project_summaries(&connection, project)?;
     let raw_token_vectors = read_token_vectors(&connection, project)?;
+    validate_persisted_semantic_state(&raw_projects, &raw_nodes, &raw_token_vectors)?;
     let projects = raw_projects
         .into_iter()
         .map(|row| CbmProjectRow {
@@ -4080,6 +4158,12 @@ pub fn read_cbm_sqlite_pipeline_rows(
             project: row.name,
             indexed_at: row.indexed_at,
             root_path: row.root_path,
+            index_mode: row.index_mode,
+            semantic_state: row.semantic_state,
+            semantic_vector_dimension: row.semantic_vector_dimension,
+            semantic_eligible_node_count: row.semantic_eligible_node_count,
+            node_vector_count: row.node_vector_count,
+            token_vector_count: row.token_vector_count,
             commit: String::new(),
             sqlite_fingerprint_sha256: String::new(),
         })
@@ -4197,7 +4281,11 @@ fn read_projects(connection: &Connection, project: &str) -> IngestResult<Vec<Raw
         ));
     }
     let mut statement = connection
-        .prepare("SELECT name, indexed_at, root_path FROM projects ORDER BY name")
+        .prepare(
+            "SELECT name, indexed_at, root_path, index_mode, semantic_state, \
+             semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, \
+             token_vector_count FROM projects ORDER BY name",
+        )
         .map_err(|error| invalid_sqlite(format!("prepare projects query: {error}")))?;
     let rows = statement
         .query_map([], |row| {
@@ -4205,6 +4293,12 @@ fn read_projects(connection: &Connection, project: &str) -> IngestResult<Vec<Raw
                 name: row.get(0)?,
                 indexed_at: row.get(1)?,
                 root_path: row.get(2)?,
+                index_mode: row.get(3)?,
+                semantic_state: row.get(4)?,
+                semantic_vector_dimension: row.get(5)?,
+                semantic_eligible_node_count: row.get(6)?,
+                node_vector_count: row.get(7)?,
+                token_vector_count: row.get(8)?,
             })
         })
         .map_err(|error| invalid_sqlite(format!("query projects: {error}")))?;
@@ -4222,6 +4316,94 @@ fn read_projects(connection: &Connection, project: &str) -> IngestResult<Vec<Raw
         )));
     }
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_semantic_capability(
+    index_mode: &str,
+    semantic_state: &str,
+    vector_dimension: i64,
+    eligible_node_count: Option<i64>,
+    expected_node_vectors: i64,
+    expected_token_vectors: i64,
+    actual_node_vectors: usize,
+    node_dimensions_valid: bool,
+    actual_token_vectors: usize,
+    token_rows_valid: bool,
+) -> IngestResult<()> {
+    let actual_node_vectors = i64::try_from(actual_node_vectors)
+        .map_err(|_| invalid_sqlite("physical node-vector count exceeds SQLite INTEGER range"))?;
+    let actual_token_vectors = i64::try_from(actual_token_vectors)
+        .map_err(|_| invalid_sqlite("physical token-vector count exceeds SQLite INTEGER range"))?;
+    let relationally_valid = vector_dimension == CBM_SEMANTIC_VECTOR_DIMENSION
+        && expected_node_vectors >= 0
+        && expected_token_vectors >= 0
+        && match semantic_state {
+            "available" => {
+                matches!(index_mode, "full" | "moderate")
+                    && eligible_node_count
+                        .is_some_and(|count| count >= CBM_SEMANTIC_MIN_ELIGIBLE_NODES)
+                    && eligible_node_count == Some(expected_node_vectors)
+                    && expected_token_vectors > 0
+            }
+            "unavailable_mode" => {
+                index_mode == "fast"
+                    && eligible_node_count.is_none()
+                    && expected_node_vectors == 0
+                    && expected_token_vectors == 0
+            }
+            "unavailable_corpus" => {
+                matches!(index_mode, "full" | "moderate")
+                    && eligible_node_count
+                        .is_some_and(|count| (0..CBM_SEMANTIC_MIN_ELIGIBLE_NODES).contains(&count))
+                    && expected_node_vectors == 0
+                    && expected_token_vectors == 0
+            }
+            _ => false,
+        };
+    if !relationally_valid
+        || !node_dimensions_valid
+        || !token_rows_valid
+        || actual_node_vectors != expected_node_vectors
+        || actual_token_vectors != expected_token_vectors
+    {
+        return Err(invalid_sqlite(format!(
+            "CBM_SEMANTIC_STATE_MISMATCH: index_mode={index_mode:?} semantic_state={semantic_state:?} dimension={vector_dimension} eligible={eligible_node_count:?} manifest_node_vectors={expected_node_vectors} physical_node_vectors={actual_node_vectors} manifest_token_vectors={expected_token_vectors} physical_token_vectors={actual_token_vectors} node_dimensions_valid={node_dimensions_valid} token_rows_valid={token_rows_valid}; preserve the source database and rebuild it from exact source only after resolving the mismatch"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_persisted_semantic_state(
+    projects: &[RawProjectRow],
+    nodes: &[RawNodeRow],
+    token_vectors: &[RawTokenVectorRow],
+) -> IngestResult<()> {
+    let Some(project) = projects.first() else {
+        return Ok(());
+    };
+    validate_semantic_capability(
+        &project.index_mode,
+        &project.semantic_state,
+        project.semantic_vector_dimension,
+        project.semantic_eligible_node_count,
+        project.node_vector_count,
+        project.token_vector_count,
+        nodes
+            .iter()
+            .filter(|node| node.node_vector.is_some())
+            .count(),
+        nodes
+            .iter()
+            .filter_map(|node| node.node_vector.as_ref())
+            .all(|vector| vector.len() == CBM_SEMANTIC_VECTOR_DIMENSION as usize),
+        token_vectors.len(),
+        token_vectors.iter().all(|row| {
+            !row.token.is_empty()
+                && row.vector.len() == CBM_SEMANTIC_VECTOR_DIMENSION as usize
+                && row.idf > 0
+        }),
+    )
 }
 
 fn read_file_hashes(connection: &Connection, project: &str) -> IngestResult<Vec<RawFileHashRow>> {
@@ -5153,6 +5335,12 @@ fn metadata_graph_rows(
             project: project.name.clone(),
             indexed_at: project.indexed_at.clone(),
             root_path: project.root_path.clone(),
+            index_mode: project.index_mode.clone(),
+            semantic_state: project.semantic_state.clone(),
+            semantic_vector_dimension: project.semantic_vector_dimension,
+            semantic_eligible_node_count: project.semantic_eligible_node_count,
+            node_vector_count: project.node_vector_count,
+            token_vector_count: project.token_vector_count,
             commit: options.commit.clone(),
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };

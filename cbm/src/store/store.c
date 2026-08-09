@@ -438,7 +438,7 @@ static int validate_edge_identity_index(cbm_store_t *s) {
             "message",
             "edges identity does not enforce the complete local-name and preprocessing-context "
             "tuple",
-            "remediation", "rebuild the incompatible store from exact source with schema v5");
+            "remediation", "rebuild the incompatible store from exact source with schema v6");
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
@@ -447,7 +447,7 @@ static int validate_edge_identity_index(cbm_store_t *s) {
 static int init_schema(cbm_store_t *s) {
     /* user_version == 0 is accepted only for a physically empty, just-created
      * store (SQLITE_OPEN_CREATE stamps 0 by default). It is never an in-place
-     * migration: v5 changes canonical node and edge identity contracts, and old rows cannot
+     * migration: v6 changes canonical identity and index-capability contracts, and old rows cannot
      * be safely restamped without a complete source re-index. Any existing
      * application schema at version 0 is therefore refused below. */
     int initial_user_version = 0;
@@ -502,7 +502,25 @@ static int init_schema(cbm_store_t *s) {
         "CREATE TABLE IF NOT EXISTS projects ("
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
-        "  root_path TEXT NOT NULL"
+        "  root_path TEXT NOT NULL,"
+        "  index_mode TEXT NOT NULL CHECK(index_mode IN ('full','moderate','fast')),"
+        "  semantic_state TEXT NOT NULL CHECK(semantic_state IN "
+        "    ('available','unavailable_mode','unavailable_corpus')),"
+        "  semantic_vector_dimension INTEGER NOT NULL CHECK(semantic_vector_dimension = "
+        CBM_SEMANTIC_VECTOR_DIMENSION_SQL
+        "),"
+        "  semantic_eligible_node_count INTEGER,"
+        "  node_vector_count INTEGER NOT NULL CHECK(node_vector_count >= 0),"
+        "  token_vector_count INTEGER NOT NULL CHECK(token_vector_count >= 0),"
+        "  CHECK((semantic_state = 'available' AND index_mode IN ('full','moderate') AND "
+        "    semantic_eligible_node_count >= " CBM_SEMANTIC_MIN_ELIGIBLE_NODES_SQL
+        " AND node_vector_count = semantic_eligible_node_count AND token_vector_count > 0) OR "
+        "    (semantic_state = 'unavailable_mode' AND index_mode = 'fast' AND "
+        "    semantic_eligible_node_count IS NULL AND node_vector_count = 0 AND "
+        "    token_vector_count = 0) OR (semantic_state = 'unavailable_corpus' AND "
+        "    index_mode IN ('full','moderate') AND semantic_eligible_node_count >= 0 AND "
+        "    semantic_eligible_node_count < " CBM_SEMANTIC_MIN_ELIGIBLE_NODES_SQL
+        " AND node_vector_count = 0 AND token_vector_count = 0))"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -569,6 +587,22 @@ static int init_schema(cbm_store_t *s) {
         "  source_hash TEXT NOT NULL,"
         "  created_at TEXT NOT NULL,"
         "  updated_at TEXT NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS node_vectors ("
+        "  node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,"
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  vector BLOB NOT NULL CHECK(length(vector) = "
+        CBM_SEMANTIC_VECTOR_DIMENSION_SQL
+        ")"
+        ");"
+        "CREATE TABLE IF NOT EXISTS token_vectors ("
+        "  id INTEGER PRIMARY KEY,"
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  token TEXT NOT NULL CHECK(length(token) > 0),"
+        "  vector BLOB NOT NULL CHECK(length(vector) = "
+        CBM_SEMANTIC_VECTOR_DIMENSION_SQL
+        "),"
+        "  idf INTEGER NOT NULL CHECK(idf > 0)"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -967,8 +1001,10 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
     }
     int len_a = sqlite3_value_bytes(argv[0]);
     int len_b = sqlite3_value_bytes(argv[SKIP_ONE]);
-    if (len_a != len_b || len_a == 0) {
-        sqlite3_result_double(ctx, 0.0);
+    if (len_a != CBM_SEMANTIC_VECTOR_DIMENSION ||
+        len_b != CBM_SEMANTIC_VECTOR_DIMENSION) {
+        sqlite3_result_error(ctx, "persisted semantic vector dimension is invalid",
+                             CBM_NOT_FOUND);
         return;
     }
     const int8_t *a = (const int8_t *)sqlite3_value_blob(argv[0]);
@@ -981,8 +1017,12 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
         mag_a += (int32_t)a[i] * (int32_t)a[i];
         mag_b += (int32_t)b[i] * (int32_t)b[i];
     }
+    if (mag_a == 0 || mag_b == 0) {
+        sqlite3_result_error(ctx, "persisted semantic vector magnitude is invalid", CBM_NOT_FOUND);
+        return;
+    }
     double denom = sqrt((double)mag_a) * sqrt((double)mag_b);
-    sqlite3_result_double(ctx, denom > CBM_STORE_DENOM_EPS_D ? (double)dot / denom : 0.0);
+    sqlite3_result_double(ctx, (double)dot / denom);
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -1734,8 +1774,12 @@ static bool store_check_project_provenance(cbm_store_t *s, const char *expected_
         return false;
     }
 
-    rc = sqlite3_prepare_v2(s->db, "SELECT name, indexed_at, root_path FROM projects;",
-                            CBM_NOT_FOUND, &stmt, NULL);
+    rc = sqlite3_prepare_v2(
+        s->db,
+        "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
+        "semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, "
+        "token_vector_count FROM projects;",
+        CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK) {
         store_integrity_set_sqlite_failure(result, "application.project_row.prepare", s->db, rc);
         if (stmt) {
@@ -1752,9 +1796,22 @@ static bool store_check_project_provenance(cbm_store_t *s, const char *expected_
     const unsigned char *name = sqlite3_column_text(stmt, 0);
     const unsigned char *indexed_at = sqlite3_column_text(stmt, 1);
     const unsigned char *root_path = sqlite3_column_text(stmt, 2);
+    const char *index_mode = (const char *)sqlite3_column_text(stmt, 3);
+    const char *semantic_state = (const char *)sqlite3_column_text(stmt, 4);
     int name_bytes = sqlite3_column_bytes(stmt, 0);
     int indexed_at_bytes = sqlite3_column_bytes(stmt, 1);
     int root_path_bytes = sqlite3_column_bytes(stmt, 2);
+    cbm_index_capability_t capability = {
+        .vector_dimension = sqlite3_column_int(stmt, 5),
+        .eligible_node_count = sqlite3_column_type(stmt, 6) == SQLITE_NULL
+                                   ? CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED
+                                   : sqlite3_column_int(stmt, 6),
+        .node_vector_count = sqlite3_column_int(stmt, 7),
+        .token_vector_count = sqlite3_column_int(stmt, 8),
+    };
+    bool index_mode_valid = cbm_index_mode_parse(index_mode, &capability.index_mode);
+    bool semantic_state_valid =
+        cbm_semantic_state_parse(semantic_state, &capability.semantic_state);
     const char *row_violation = NULL;
     if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT || name_bytes <= 0 || !name ||
         !cbm_validate_project_name((const char *)name)) {
@@ -1765,6 +1822,15 @@ static bool store_check_project_provenance(cbm_store_t *s, const char *expected_
     } else if (sqlite3_column_type(stmt, 2) != SQLITE_TEXT ||
                !store_root_path_is_absolute(root_path, root_path_bytes)) {
         row_violation = "root_path must be a non-empty absolute POSIX, drive, or UNC path";
+    } else if (sqlite3_column_type(stmt, 3) != SQLITE_TEXT || !index_mode_valid ||
+               sqlite3_column_type(stmt, 4) != SQLITE_TEXT || !semantic_state_valid ||
+               sqlite3_column_type(stmt, 5) != SQLITE_INTEGER ||
+               (sqlite3_column_type(stmt, 6) != SQLITE_NULL &&
+                sqlite3_column_type(stmt, 6) != SQLITE_INTEGER) ||
+               sqlite3_column_type(stmt, 7) != SQLITE_INTEGER ||
+               sqlite3_column_type(stmt, 8) != SQLITE_INTEGER ||
+               !cbm_index_capability_valid(&capability)) {
+        row_violation = "index capability columns must form one exact valid publication state";
     }
     if (row_violation) {
         store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, "application.project_row",
@@ -2031,7 +2097,9 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
     } SCHEMA_PROBES[] = {
         {STORE_INTEGRITY_CONTRACT_QUERY | STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD,
          "application.schema.projects",
-         "SELECT name, indexed_at, root_path FROM projects LIMIT 0;"},
+         "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
+         "semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, "
+         "token_vector_count FROM projects LIMIT 0;"},
         {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.file_hashes",
          "SELECT project, rel_path, sha256, mtime_ns, size FROM file_hashes LIMIT 0;"},
         {STORE_INTEGRITY_CONTRACT_QUERY | STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD,
@@ -2046,6 +2114,12 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
          "FROM project_summaries LIMIT 0;"},
         {STORE_INTEGRITY_CONTRACT_QUERY, "application.schema.nodes_fts",
          "SELECT rowid, name, qualified_name, label, file_path FROM nodes_fts LIMIT 0;"},
+        {STORE_INTEGRITY_CONTRACT_QUERY | STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD,
+         "application.schema.node_vectors",
+         "SELECT node_id, project, vector FROM node_vectors LIMIT 0;"},
+        {STORE_INTEGRITY_CONTRACT_QUERY | STORE_INTEGRITY_CONTRACT_GRAPH_RELOAD,
+         "application.schema.token_vectors",
+         "SELECT id, project, token, vector, idf FROM token_vectors LIMIT 0;"},
     };
     for (size_t i = 0; i < sizeof(SCHEMA_PROBES) / sizeof(SCHEMA_PROBES[0]); i++) {
         if ((SCHEMA_PROBES[i].contracts & (unsigned int)contract) == 0) {
@@ -4721,11 +4795,24 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
-int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
+int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path,
+                             const cbm_index_capability_t *capability) {
+    if (!s || !name || !root_path || !cbm_index_capability_valid(capability)) {
+        if (s) {
+            store_set_error(s, "project upsert requires one valid index capability");
+        }
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_project,
-                       "INSERT INTO projects (name, indexed_at, root_path) VALUES (?1, ?2, ?3) "
-                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3;");
+                       "INSERT INTO projects (name, indexed_at, root_path, index_mode, "
+                       "semantic_state, semantic_vector_dimension, semantic_eligible_node_count, "
+                       "node_vector_count, token_vector_count) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3, "
+                       "index_mode=?4, semantic_state=?5, semantic_vector_dimension=?6, "
+                       "semantic_eligible_node_count=?7, node_vector_count=?8, "
+                       "token_vector_count=?9;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -4738,6 +4825,16 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     bind_text_utf8(stmt, SKIP_ONE, name);
     bind_text(stmt, ST_COL_2, ts);
     bind_text_utf8(stmt, ST_COL_3, root_path);
+    bind_text(stmt, ST_COL_4, cbm_index_mode_name(capability->index_mode));
+    bind_text(stmt, ST_COL_5, cbm_semantic_state_name(capability->semantic_state));
+    sqlite3_bind_int(stmt, ST_COL_6, capability->vector_dimension);
+    if (capability->eligible_node_count == CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED) {
+        sqlite3_bind_null(stmt, ST_COL_7);
+    } else {
+        sqlite3_bind_int(stmt, ST_COL_7, capability->eligible_node_count);
+    }
+    sqlite3_bind_int(stmt, ST_COL_8, capability->node_vector_count);
+    sqlite3_bind_int(stmt, ST_COL_9, capability->token_vector_count);
 
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -4747,10 +4844,54 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     return CBM_STORE_OK;
 }
 
+static int read_project_row(cbm_store_t *s, sqlite3_stmt *stmt, cbm_project_t *out,
+                            const char *operation) {
+    memset(out, 0, sizeof(*out));
+    out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+    out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+    const char *mode_text = (const char *)sqlite3_column_text(stmt, ST_COL_3);
+    const char *state_text = (const char *)sqlite3_column_text(stmt, ST_COL_4);
+    bool mode_valid = cbm_index_mode_parse(mode_text, &out->capability.index_mode);
+    bool state_valid = cbm_semantic_state_parse(state_text, &out->capability.semantic_state);
+    out->capability.vector_dimension = sqlite3_column_int(stmt, ST_COL_5);
+    out->capability.eligible_node_count =
+        sqlite3_column_type(stmt, ST_COL_6) == SQLITE_NULL
+            ? CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED
+            : sqlite3_column_int(stmt, ST_COL_6);
+    out->capability.node_vector_count = sqlite3_column_int(stmt, ST_COL_7);
+    out->capability.token_vector_count = sqlite3_column_int(stmt, ST_COL_8);
+
+    if (!out->name || !out->indexed_at || !out->root_path) {
+        cbm_project_free_fields(out);
+        store_set_error(s, "project capability row allocation failed");
+        return CBM_STORE_ERR;
+    }
+    if (!mode_valid || !state_valid || !cbm_index_capability_valid(&out->capability)) {
+        char detail[CBM_SZ_512];
+        snprintf(detail, sizeof(detail),
+                 "%s read an invalid index capability: mode=%s semantic_state=%s dimension=%d "
+                 "eligible=%d node_vectors=%d token_vectors=%d",
+                 operation, mode_text ? mode_text : "<null>", state_text ? state_text : "<null>",
+                 out->capability.vector_dimension, out->capability.eligible_node_count,
+                 out->capability.node_vector_count, out->capability.token_vector_count);
+        cbm_project_free_fields(out);
+        store_set_error(s, detail);
+        cbm_log_error("store.index_capability_invalid", "code",
+                      "CBM_INDEX_CAPABILITY_STATE_INVALID", "operation", operation, "detail",
+                      detail, "message", "the persisted index capability is internally inconsistent",
+                      "remediation", "preserve the database and rebuild it from the exact source");
+        return CBM_STORE_SEMANTIC_STATE_INVALID;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_project,
-                       "SELECT name, indexed_at, root_path FROM projects WHERE name = ?1;");
+                        "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
+                        "semantic_vector_dimension, semantic_eligible_node_count, "
+                        "node_vector_count, token_vector_count FROM projects WHERE name = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -4758,10 +4899,7 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
     bind_text(stmt, SKIP_ONE, name);
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
-        return CBM_STORE_OK;
+        return read_project_row(s, stmt, out, "get_project");
     }
     return CBM_STORE_NOT_FOUND;
 }
@@ -4774,7 +4912,9 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     *count = 0;
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_list_projects,
-                       "SELECT name, indexed_at, root_path FROM projects ORDER BY name;");
+                        "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
+                        "semantic_vector_dimension, semantic_eligible_node_count, "
+                        "node_vector_count, token_vector_count FROM projects ORDER BY name;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -4792,14 +4932,10 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
             return CBM_STORE_ERR;
         }
         memset(&arr[n], 0, sizeof(arr[n]));
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
-        if (!arr[n].name || !arr[n].indexed_at || !arr[n].root_path) {
-            cbm_project_free_fields(&arr[n]);
+        int read_rc = read_project_row(s, stmt, &arr[n], "list_projects");
+        if (read_rc != CBM_STORE_OK) {
             cbm_store_free_projects(arr, n);
-            store_set_error(s, "list_projects row allocation failed");
-            return CBM_STORE_ERR;
+            return read_rc;
         }
         n++;
     }
@@ -10889,21 +11025,95 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count) {
 
 /* ── Vector search ────────────────────────��──────────────────────── */
 
-int cbm_store_count_vectors(cbm_store_t *s, const char *project) {
-    if (!s || !project) {
-        return 0;
+static int read_vector_aggregate(cbm_store_t *s, const char *project, const char *sql,
+                                 const char *operation, int *count, int *min_dimension,
+                                 int *max_dimension) {
+    if (!s || !project || !sql || !count || !min_dimension || !max_dimension) {
+        if (s) {
+            store_set_error(s, "vector aggregate arguments are invalid");
+        }
+        return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT count(*) FROM node_vectors WHERE project = ?1";
     if (sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
-        return 0;
+        store_set_error_sqlite(s, operation);
+        return CBM_STORE_ERR;
     }
-    sqlite3_bind_text(stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
+    if (sqlite3_bind_text(stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC) != SQLITE_OK) {
+        store_set_error_sqlite(s, operation);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int step_rc = sqlite3_step(stmt);
+    int64_t exact_count = step_rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    int exact_min =
+        step_rc == SQLITE_ROW && sqlite3_column_type(stmt, SKIP_ONE) != SQLITE_NULL
+            ? sqlite3_column_int(stmt, SKIP_ONE)
+            : -1;
+    int exact_max = step_rc == SQLITE_ROW && sqlite3_column_type(stmt, ST_COL_2) != SQLITE_NULL
+                        ? sqlite3_column_int(stmt, ST_COL_2)
+                        : -1;
+    int done_rc = step_rc == SQLITE_ROW ? sqlite3_step(stmt) : step_rc;
+    int finalize_rc = sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_ROW || done_rc != SQLITE_DONE || finalize_rc != SQLITE_OK ||
+        exact_count < 0 || exact_count > INT_MAX) {
+        if (step_rc != SQLITE_ROW || done_rc != SQLITE_DONE || finalize_rc != SQLITE_OK) {
+            store_set_error_sqlite(s, operation);
+        } else {
+            char detail[CBM_SZ_256];
+            snprintf(detail, sizeof(detail), "%s returned an out-of-range row count: %lld",
+                     operation, (long long)exact_count);
+            store_set_error(s, detail);
+        }
+        return CBM_STORE_ERR;
+    }
+    *count = (int)exact_count;
+    *min_dimension = exact_min;
+    *max_dimension = exact_max;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_read_vector_state(cbm_store_t *s, const char *project,
+                                cbm_vector_state_readback_t *out) {
+    if (!out) {
+        if (s) {
+            store_set_error(s, "vector-state readback output is required");
+        }
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    out->node_vector_min_dimension = -1;
+    out->node_vector_max_dimension = -1;
+    out->token_vector_min_dimension = -1;
+    out->token_vector_max_dimension = -1;
+    if (read_vector_aggregate(
+            s, project,
+            "SELECT count(*), min(length(vector)), max(length(vector)) FROM node_vectors "
+            "WHERE project = ?1",
+            "read_node_vector_state", &out->node_vector_count,
+            &out->node_vector_min_dimension, &out->node_vector_max_dimension) != CBM_STORE_OK ||
+        read_vector_aggregate(
+            s, project,
+            "SELECT count(*), min(length(vector)), max(length(vector)) FROM token_vectors "
+            "WHERE project = ?1",
+            "read_token_vector_state", &out->token_vector_count,
+            &out->token_vector_min_dimension, &out->token_vector_max_dimension) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_count_vectors(cbm_store_t *s, const char *project) {
     int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        count = sqlite3_column_int(stmt, 0);
+    int min_dimension = -1;
+    int max_dimension = -1;
+    if (read_vector_aggregate(
+            s, project,
+            "SELECT count(*), min(length(vector)), max(length(vector)) FROM node_vectors "
+            "WHERE project = ?1",
+            "count_node_vectors", &count, &min_dimension, &max_dimension) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
-    sqlite3_finalize(stmt);
     return count;
 }
 
@@ -10925,7 +11135,7 @@ void cbm_store_free_vector_results(cbm_vector_result_t *results, int count) {
  * vector, then combine using min(cosine_k) across keywords.  This ensures
  * ALL keywords must be relevant, not just the average. */
 enum {
-    VS_VEC_DIM = 768,
+    VS_VEC_DIM = CBM_SEMANTIC_VECTOR_DIMENSION,
     VS_STR_BUF = 16,
 };
 
@@ -10952,7 +11162,8 @@ static int vs_load_enriched_vector(cbm_store_t *s, const char *project, const ch
     if (step_rc == SQLITE_ROW) {
         const int8_t *vec = (const int8_t *)sqlite3_value_blob(sqlite3_column_value(tv_stmt, 0));
         int vec_len = sqlite3_column_bytes(tv_stmt, 0);
-        if (vec && vec_len == VS_VEC_DIM) {
+        int64_t idf_fixed = sqlite3_column_int64(tv_stmt, SKIP_ONE);
+        if (vec && vec_len == VS_VEC_DIM && idf_fixed > 0) {
             for (int d = 0; d < VS_VEC_DIM; d++) {
                 out[d] = (float)vec[d] / CBM_STORE_INT8_MAX;
             }
@@ -10960,8 +11171,8 @@ static int vs_load_enriched_vector(cbm_store_t *s, const char *project, const ch
             return CBM_STORE_OK;
         }
         sqlite3_finalize(tv_stmt);
-        store_set_error(s, "vector keyword row has an invalid dimension");
-        return CBM_STORE_ERR;
+        store_set_error(s, "vector keyword row has an invalid dimension or fixed-point IDF");
+        return CBM_STORE_SEMANTIC_VECTOR_CORRUPT;
     }
     if (step_rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "vector keyword step");
@@ -10969,7 +11180,7 @@ static int vs_load_enriched_vector(cbm_store_t *s, const char *project, const ch
         return CBM_STORE_ERR;
     }
     sqlite3_finalize(tv_stmt);
-    return CBM_STORE_NOT_FOUND;
+    return CBM_STORE_SEMANTIC_KEYWORD_UNAVAILABLE;
 }
 
 /* Clamp one float into the int8 representable range. */
@@ -11023,24 +11234,33 @@ static int vs_build_keyword_vectors(cbm_store_t *s, const char *project, const c
             cbm_log_error("store.vector_search", "code", "CBM_VECTOR_KEYWORD_INVALID", "message",
                           s->errbuf, "remediation",
                           "provide a non-empty keyword with a persisted enriched vector");
-            return CBM_STORE_ERR;
+            return CBM_STORE_SEMANTIC_KEYWORD_INVALID;
         }
         float kw_f[VS_VEC_DIM];
         memset(kw_f, 0, sizeof(kw_f));
         int load_rc = vs_load_enriched_vector(s, project, keywords[k], kw_f);
         if (load_rc != CBM_STORE_OK) {
-            snprintf(s->errbuf, sizeof(s->errbuf),
-                     "vector keyword '%s' has no valid persisted enriched vector", keywords[k]);
-            cbm_log_error("store.vector_search", "code", "CBM_VECTOR_KEYWORD_UNAVAILABLE",
-                          "keyword", keywords[k], "message", s->errbuf, "remediation",
-                          "complete semantic enrichment for this project and retry; no synthetic "
-                          "vector was substituted");
-            return CBM_STORE_ERR;
+            if (load_rc == CBM_STORE_SEMANTIC_KEYWORD_UNAVAILABLE) {
+                snprintf(s->errbuf, sizeof(s->errbuf),
+                         "vector keyword '%s' has no persisted enriched vector", keywords[k]);
+                cbm_log_error("store.vector_search", "code", "CBM_VECTOR_KEYWORD_UNAVAILABLE",
+                              "keyword", keywords[k], "message", s->errbuf, "remediation",
+                              "choose a token present in the committed semantic corpus or re-index "
+                              "the intended source; no synthetic vector was substituted");
+            } else if (load_rc == CBM_STORE_SEMANTIC_VECTOR_CORRUPT) {
+                snprintf(s->errbuf, sizeof(s->errbuf),
+                         "vector keyword '%s' has a corrupt persisted enriched vector",
+                         keywords[k]);
+                cbm_log_error("store.vector_search", "code", "CBM_VECTOR_KEYWORD_CORRUPT",
+                              "keyword", keywords[k], "message", s->errbuf, "remediation",
+                              "preserve the database and rebuild it from the exact source");
+            }
+            return load_rc;
         }
         if (!vs_normalize_and_quantize(kw_f, kw_vecs[actual_kw])) {
             snprintf(s->errbuf, sizeof(s->errbuf),
                      "vector keyword '%s' normalized to zero magnitude", keywords[k]);
-            return CBM_STORE_ERR;
+            return CBM_STORE_SEMANTIC_VECTOR_CORRUPT;
         }
         actual_kw++;
     }
@@ -11145,6 +11365,19 @@ static int vs_append_result(cbm_store_t *s, cbm_vector_result_t **results, int *
     row->end_byte = (uint64_t)end_byte;
     const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, VS_COL_VECTOR);
     int node_vec_len = sqlite3_column_bytes(stmt, VS_COL_VECTOR);
+    if (!node_vec || node_vec_len != VS_VEC_DIM) {
+        free(row->atom_id);
+        free(row->name);
+        free(row->qualified_name);
+        free(row->file_path);
+        free(row->label);
+        memset(row, 0, sizeof(*row));
+        store_set_error(s, "semantic result row has a corrupt persisted node vector");
+        cbm_log_error("store.vector_search", "code", "CBM_NODE_VECTOR_CORRUPT", "message",
+                      s->errbuf, "remediation",
+                      "preserve the database and rebuild it from the exact source");
+        return CBM_STORE_SEMANTIC_VECTOR_CORRUPT;
+    }
     row->score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
     *count = idx + 1;
     return CBM_STORE_OK;
@@ -11152,7 +11385,7 @@ static int vs_append_result(cbm_store_t *s, cbm_vector_result_t **results, int *
 
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
-                            int *out_count) {
+                            int *out_count, cbm_index_capability_t *observed_capability) {
     if (!out || !out_count) {
         return CBM_STORE_ERR;
     }
@@ -11165,10 +11398,37 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
+    cbm_project_t persisted_project = {0};
+    int project_rc = cbm_store_get_project(s, project, &persisted_project);
+    if (project_rc != CBM_STORE_OK) {
+        return project_rc == CBM_STORE_SEMANTIC_STATE_INVALID
+                   ? CBM_STORE_SEMANTIC_STATE_INVALID
+                   : CBM_STORE_ERR;
+    }
+    if (observed_capability) {
+        *observed_capability = persisted_project.capability;
+    }
+    cbm_index_capability_t capability = persisted_project.capability;
+    cbm_project_free_fields(&persisted_project);
+    if (capability.semantic_state != CBM_SEMANTIC_AVAILABLE) {
+        snprintf(s->errbuf, sizeof(s->errbuf),
+                 "semantic search is %s for index mode %s (eligible_nodes=%d)",
+                 cbm_semantic_state_name(capability.semantic_state),
+                 cbm_index_mode_name(capability.index_mode), capability.eligible_node_count);
+        cbm_log_error("store.vector_search", "code", "CBM_SEMANTIC_SEARCH_UNAVAILABLE",
+                      "index_mode", cbm_index_mode_name(capability.index_mode), "semantic_state",
+                      cbm_semantic_state_name(capability.semantic_state), "message", s->errbuf,
+                      "remediation",
+                      capability.semantic_state == CBM_SEMANTIC_UNAVAILABLE_MODE
+                          ? "re-index in moderate or full mode"
+                          : "index a corpus containing at least two functions or methods");
+        return CBM_STORE_SEMANTIC_UNAVAILABLE;
+    }
+
     int8_t kw_vecs[CBM_VECTOR_SEARCH_MAX_KEYWORDS][VS_VEC_DIM];
     int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
     if (actual_kw <= 0) {
-        return CBM_STORE_ERR;
+        return actual_kw;
     }
 
     /* Scan all node vectors, compute per-keyword cosine, take min.
@@ -11221,18 +11481,23 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     int cap = 0;
     int step_rc = 0;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (vs_append_result(s, &results, &count, &cap, stmt, kw_vecs, actual_kw) != CBM_STORE_OK) {
+        int append_rc = vs_append_result(s, &results, &count, &cap, stmt, kw_vecs, actual_kw);
+        if (append_rc != CBM_STORE_OK) {
             sqlite3_finalize(stmt);
             cbm_store_free_vector_results(results, count);
-            return CBM_STORE_ERR;
+            return append_rc;
         }
     }
 
     if (step_rc != SQLITE_DONE) {
+        const char *sqlite_message = sqlite3_errmsg(s->db);
+        bool vector_corrupt =
+            strstr(sqlite_message, "persisted semantic vector dimension is invalid") != NULL ||
+            strstr(sqlite_message, "persisted semantic vector magnitude is invalid") != NULL;
         store_set_error_sqlite(s, "vector search step");
         sqlite3_finalize(stmt);
         cbm_store_free_vector_results(results, count);
-        return CBM_STORE_ERR;
+        return vector_corrupt ? CBM_STORE_SEMANTIC_VECTOR_CORRUPT : CBM_STORE_ERR;
     }
     {
         char cnt_buf[VS_STR_BUF];

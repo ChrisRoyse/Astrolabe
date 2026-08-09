@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "foundation/index_capability.h"
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -145,6 +146,11 @@ typedef struct {
 #define CBM_STORE_OK 0
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
+#define CBM_STORE_SEMANTIC_UNAVAILABLE (-3)
+#define CBM_STORE_SEMANTIC_STATE_INVALID (-4)
+#define CBM_STORE_SEMANTIC_KEYWORD_UNAVAILABLE (-5)
+#define CBM_STORE_SEMANTIC_VECTOR_CORRUPT (-6)
+#define CBM_STORE_SEMANTIC_KEYWORD_INVALID (-7)
 
 /* ── Data structures ────────────────────────────────────────────── */
 
@@ -180,7 +186,17 @@ typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
+    cbm_index_capability_t capability;
 } cbm_project_t;
+
+typedef struct {
+    int node_vector_count;
+    int node_vector_min_dimension;
+    int node_vector_max_dimension;
+    int token_vector_count;
+    int token_vector_min_dimension;
+    int token_vector_max_dimension;
+} cbm_vector_state_readback_t;
 
 typedef struct {
     const char *project;
@@ -521,7 +537,8 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
-int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);
+int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path,
+                             const cbm_index_capability_t *capability);
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);
@@ -954,14 +971,19 @@ typedef struct {
  * the cbm_cosine_i8 SQL function joined with the nodes table.
  * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
-                            int keyword_count, int limit, cbm_vector_result_t **out,
-                            int *out_count);
+                             int keyword_count, int limit, cbm_vector_result_t **out,
+                             int *out_count, cbm_index_capability_t *observed_capability);
 
 /* Free vector search results. */
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);
 
-/* Count vectors for a project. */
+/* Count vectors for a project. Returns -1 on any read failure. */
 int cbm_store_count_vectors(cbm_store_t *s, const char *project);
+
+/* Publication-only physical readback. This scans V+T exactly once after an
+ * index build; discovery and query admission use the O(1) committed manifest. */
+int cbm_store_read_vector_state(cbm_store_t *s, const char *project,
+                                cbm_vector_state_readback_t *out);
 
 /* Execute an arbitrary SQL statement (pragmas, FTS5 maintenance, etc).
  * Returns CBM_STORE_OK on success. */

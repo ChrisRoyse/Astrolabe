@@ -204,7 +204,7 @@ struct cbm_pipeline {
     cbm_index_mode_t mode;
     atomic_int cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
-    cbm_pipeline_row_sink_v1_t row_sink;
+    cbm_pipeline_row_sink_v2_t row_sink;
     bool row_sink_active;
     bool row_sink_completed;
     cbm_pipeline_post_success_fn post_success;
@@ -960,7 +960,7 @@ int cbm_pipeline_set_embedded_compilation_context(cbm_pipeline_t *p, const uint8
     return 0;
 }
 
-int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *sink) {
+int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v2_t *sink) {
     if (!p) {
         cbm_log_error("pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_PIPELINE_NULL",
                       "message", "a row sink cannot be installed on a NULL pipeline", "remediation",
@@ -976,12 +976,12 @@ int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *s
         }
         return 0;
     }
-    if (sink->abi_version != CBM_PIPELINE_ROW_SINK_ABI_V1 ||
-        sink->struct_size != sizeof(cbm_pipeline_row_sink_v1_t)) {
+    if (sink->abi_version != CBM_PIPELINE_ROW_SINK_ABI_V2 ||
+        sink->struct_size != sizeof(cbm_pipeline_row_sink_v2_t)) {
         cbm_log_error("pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_ABI_UNSUPPORTED",
                       "message", "the row-sink ABI version or descriptor size is unsupported",
                       "remediation",
-                      "construct the exact frozen cbm_pipeline_row_sink_v1_t descriptor");
+                      "construct the exact frozen cbm_pipeline_row_sink_v2_t descriptor");
         return CBM_NOT_FOUND;
     }
     if (!sink->node || !sink->edge || !sink->file_hash || !sink->complete || !sink->ctx) {
@@ -989,7 +989,7 @@ int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *s
             "pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_INCOMPLETE", "message",
             "a complete snapshot sink requires node, edge, file-hash, completion, and "
             "context fields",
-            "remediation", "install every v1 callback together or pass NULL to disable the sink");
+            "remediation", "install every v2 callback together or pass NULL to disable the sink");
         return CBM_NOT_FOUND;
     }
     p->row_sink = *sink;
@@ -1753,11 +1753,13 @@ int cbm_pipeline_emit_file_hash(cbm_pipeline_t *p, const char *project, const ch
     return 0;
 }
 
-int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count) {
+int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count,
+                                   const cbm_index_capability_t *capability) {
     if (!p || !p->row_sink_active) {
         return 0;
     }
-    if (p->row_sink_completed || p->committed_nodes < 0 || p->committed_edges < 0) {
+    if (p->row_sink_completed || p->committed_nodes < 0 || p->committed_edges < 0 ||
+        !cbm_index_capability_valid(capability)) {
         cbm_log_error(
             "pipeline.row_sink_refused", "code", "CBM_PIPELINE_ROW_SINK_COMPLETION_INVALID",
             "message", "the snapshot completion manifest is duplicate or lacks committed counts",
@@ -1770,6 +1772,7 @@ int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count) {
         .edge_count = (size_t)p->committed_edges,
         .file_hash_count = file_hash_count,
         .graph_schema_version = CBM_GRAPH_SCHEMA_VERSION,
+        .index_capability = *capability,
     };
     if (p->row_sink.complete(&manifest, p->row_sink.ctx) != 0) {
         cbm_log_error("pipeline.row_sink_refused", "code",
@@ -3128,6 +3131,43 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
+    cbm_project_t persisted_project = {0};
+    if (cbm_store_get_project(identity_store, p->project_name, &persisted_project) != CBM_STORE_OK) {
+        const char *detail = cbm_store_error(identity_store);
+        cbm_log_error("pipeline.route_failed", "code",
+                      "CBM_PIPELINE_INDEX_CAPABILITY_READ_FAILED", "operation",
+                      "read_existing_index_capability", "store_path", db_path, "project",
+                      p->project_name, "message",
+                      detail && detail[0] ? detail
+                                          : "the existing index capability could not be read",
+                      "remediation", "preserve the store and rebuild it from the exact source");
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_INDEX_CAPABILITY_READ_FAILED", "read_existing_index_capability",
+            "route", db_path, 0,
+            detail && detail[0] ? detail : "the existing index capability could not be read",
+            "preserve the store and rebuild it from the exact source");
+        cbm_project_free_fields(&persisted_project);
+        (void)pipeline_close_store(p, &identity_store, "close_capability_read_failed_store",
+                                   "route", db_path);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    bool mode_changed = persisted_project.capability.index_mode != p->mode;
+    const char *persisted_mode = cbm_index_mode_name(persisted_project.capability.index_mode);
+    cbm_project_free_fields(&persisted_project);
+    if (mode_changed) {
+        if (pipeline_close_store(p, &identity_store, "close_mode_change_route_store", "route",
+                                 db_path) != 0) {
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
+        cbm_log_info("pipeline.route", "path", "full", "reason", "index_mode_changed",
+                     "persisted_mode", persisted_mode ? persisted_mode : "invalid",
+                     "requested_mode", cbm_index_mode_name(p->mode), "live_store_mutated",
+                     "false");
+        free(db_path);
+        return PL_ROUTE_FULL;
+    }
     if (p->mode == CBM_MODE_FULL) {
         if (pipeline_close_store(p, &identity_store, "close_explicit_full_route_store", "route",
                                  db_path) != 0) {
@@ -3619,7 +3659,13 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_pipeline_phase_probe_t sink_probe =
             cbm_pipeline_phase_probe_start(p, "persist_row_sink");
         if (final_rc == 0) {
-            final_rc = cbm_pipeline_complete_row_sink(p, (size_t)file_count);
+            cbm_index_capability_t capability = {0};
+            if (cbm_gbuf_get_index_capability(p->gbuf, &capability) != 0) {
+                final_rc = CBM_NOT_FOUND;
+            } else {
+                final_rc =
+                    cbm_pipeline_complete_row_sink(p, (size_t)file_count, &capability);
+            }
         }
         cbm_pipeline_phase_probe_end(p, "persist_row_sink", &sink_probe);
         cbm_pipeline_phase_probe_t close_probe = cbm_pipeline_phase_probe_start(p, "persist_close");
@@ -4186,6 +4232,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
+    if (!p->gbuf || cbm_gbuf_set_index_mode(p->gbuf, p->mode) != 0) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PIPELINE_INDEX_MODE_BIND_FAILED", "bind_graph_buffer_index_mode", "graph",
+            p->repo_path, 0, "the graph buffer could not retain the requested index mode",
+            "inspect the graph-buffer diagnostic and retry the complete index");
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
     cbm_pipeline_attach_row_sink(p, p->gbuf);
     p->registry = cbm_registry_new();
 

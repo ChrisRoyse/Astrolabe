@@ -53,8 +53,10 @@ enum {
     PSE_LSH_BAND_COUNT = 2,
     PSE_FP_PREFIX_LEN = 6, /* strlen("\"fp\":\"") */
     PSE_LSH_ROWS_PER_BAND = 2,
-    PSE_MIN_FUNCS_FOR_PAIR = 2,
 };
+
+_Static_assert((int)CBM_SEM_DIM == (int)CBM_SEMANTIC_VECTOR_DIMENSION,
+               "semantic producer and persisted capability dimensions must match");
 
 /* Scalar weight constants used in score_worker and related helpers. */
 #define PSE_UNIT_POS 1.0F
@@ -1347,14 +1349,18 @@ static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_buf
 
 /* Phase 3c: export co-occurrence-enriched token vectors into the graph buffer
  * so query-time lookups can use them without re-running the finalize step. */
-static void phase3c_export_token_vectors(cbm_gbuf_t *gbuf, cbm_sem_corpus_t *corpus) {
+static bool phase3c_export_token_vectors(cbm_gbuf_t *gbuf, cbm_sem_corpus_t *corpus) {
     int tv_count = cbm_sem_corpus_token_count(corpus);
     for (int t = 0; t < tv_count; t++) {
         const cbm_sem_vec_t *vec = NULL;
         float idf = 0.0F;
         const char *tok = cbm_sem_corpus_token_at(corpus, t, &vec, &idf);
-        if (!tok || !vec || idf <= PSE_FLOW_WEIGHT) {
-            continue;
+        if (!tok || !tok[0] || !vec || idf <= PSE_FLOW_WEIGHT) {
+            cbm_log_error("pass.semantic.token_vector_invalid", "code",
+                          "CBM_SEM_TOKEN_VECTOR_SOURCE_INVALID", "token_ordinal", itoa_log(t),
+                          "message", "the finalized corpus exposed an incomplete enriched token",
+                          "remediation", "repair corpus finalization; no semantic generation was published");
+            return false;
         }
         uint8_t qvec[CBM_SEM_DIM];
         for (int d = 0; d < CBM_SEM_DIM; d++) {
@@ -1367,9 +1373,16 @@ static void phase3c_export_token_vectors(cbm_gbuf_t *gbuf, cbm_sem_corpus_t *cor
             }
             qvec[d] = (uint8_t)(int8_t)(clamped * PSE_INT8_MAX);
         }
-        cbm_gbuf_store_token_vector(gbuf, tok, qvec, CBM_SEM_DIM, idf);
+        if (cbm_gbuf_store_token_vector(gbuf, tok, qvec, CBM_SEM_DIM, idf) != 0) {
+            cbm_log_error("pass.semantic.token_vector_store_failed", "code",
+                          "CBM_SEM_TOKEN_VECTOR_STORE_FAILED", "token", tok, "message",
+                          "the complete enriched-token vector set could not be retained",
+                          "remediation", "inspect the preceding graph-buffer error and retry");
+            return false;
+        }
     }
     cbm_log_info("pass.semantic.token_vectors", "count", itoa_log(tv_count));
+    return true;
 }
 
 /* Phase 5a: generate NUM_HYPERPLANES × CBM_SEM_DIM deterministic random
@@ -1503,8 +1516,16 @@ static bool phase4_build_and_store_vectors(cbm_gbuf_t *gbuf, cbm_sem_func_t *fun
         return false;
     }
     for (int f = 0; f < func_count; f++) {
-        cbm_gbuf_store_vector(gbuf, funcs[f].node_id, &qvecs[(ptrdiff_t)f * CBM_SEM_DIM],
-                              CBM_SEM_DIM);
+        if (cbm_gbuf_store_vector(gbuf, funcs[f].node_id,
+                                  &qvecs[(ptrdiff_t)f * CBM_SEM_DIM], CBM_SEM_DIM) != 0) {
+            free(qvecs);
+            cbm_log_error("pass.semantic.vector_store_failed", "code",
+                          "CBM_SEM_NODE_VECTOR_STORE_FAILED", "node_id",
+                          itoa_log((int)funcs[f].node_id), "message",
+                          "the complete per-function vector set could not be retained",
+                          "remediation", "inspect the preceding graph-buffer error and retry");
+            return false;
+        }
     }
     free(qvecs);
     return true;
@@ -1652,7 +1673,10 @@ static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char **all_tokens, i
                    cbm_sem_corpus_token_count(corpus));
 
     CBM_PROF_START(t_phase3c);
-    phase3c_export_token_vectors(gbuf, corpus);
+    if (!phase3c_export_token_vectors(gbuf, corpus)) {
+        cbm_sem_corpus_free(corpus);
+        return NULL;
+    }
     CBM_PROF_END_N("semantic_edges", "3c_token_vec_export_seq", t_phase3c,
                    cbm_sem_corpus_token_count(corpus));
     return corpus;
@@ -1784,7 +1808,12 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_END_N("semantic_edges", "1b_decode_build_parallel", t_phase1b, func_count);
     cbm_log_info("pass.semantic.collected", "functions", itoa_log(func_count));
 
-    if (func_count < PSE_MIN_FUNCS_FOR_PAIR) {
+    if (func_count < CBM_SEMANTIC_MIN_ELIGIBLE_NODES) {
+        if (cbm_gbuf_finalize_semantic_state(gbuf, func_count) != 0) {
+            free(funcs);
+            free(node_ptrs);
+            return CBM_NOT_FOUND;
+        }
         free(funcs);
         free(node_ptrs);
         cbm_log_info("pass.done", "pass", "semantic_edges", "edges", "0");
@@ -1902,6 +1931,16 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     int total_edges =
         run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
     if (total_edges < 0) {
+        free_lsh_buckets(band_buckets);
+        free(signatures);
+        cbm_sem_corpus_free(corpus);
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return CBM_NOT_FOUND;
+    }
+
+    if (cbm_gbuf_finalize_semantic_state(gbuf, func_count) != 0) {
         free_lsh_buckets(band_buckets);
         free(signatures);
         cbm_sem_corpus_free(corpus);

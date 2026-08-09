@@ -1475,7 +1475,7 @@ struct cbm_mcp_server {
 
     /* Optional row-sink callbacks for embedders that consume index_repository
      * rows directly while preserving the normal MCP result and SQLite output. */
-    cbm_pipeline_row_sink_v1_t row_sink;
+    cbm_pipeline_row_sink_v2_t row_sink;
     bool row_sink_active;
 };
 
@@ -2701,20 +2701,20 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
-int cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, const cbm_pipeline_row_sink_v1_t *sink) {
+int cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, const cbm_pipeline_row_sink_v2_t *sink) {
     if (!srv) {
         cbm_log_error("mcp.row_sink_refused", "code", "CBM_MCP_ROW_SINK_SERVER_NULL", "message",
                       "a row sink cannot be installed on a NULL server", "remediation",
                       "create the MCP server successfully before installing a sink");
         return CBM_NOT_FOUND;
     }
-    if (sink && (sink->abi_version != CBM_PIPELINE_ROW_SINK_ABI_V1 ||
-                 sink->struct_size != sizeof(cbm_pipeline_row_sink_v1_t) || !sink->node ||
+    if (sink && (sink->abi_version != CBM_PIPELINE_ROW_SINK_ABI_V2 ||
+                 sink->struct_size != sizeof(cbm_pipeline_row_sink_v2_t) || !sink->node ||
                  !sink->edge || !sink->file_hash || !sink->complete || !sink->ctx)) {
         cbm_log_error("mcp.row_sink_refused", "code", "CBM_MCP_ROW_SINK_INVALID", "message",
-                      "the MCP server requires one complete frozen v1 sink descriptor",
+                      "the MCP server requires one complete frozen v2 sink descriptor",
                       "remediation",
-                      "provide every v1 callback/context or pass NULL to disable the sink");
+                      "provide every v2 callback/context or pass NULL to disable the sink");
         return CBM_NOT_FOUND;
     }
     if (sink) {
@@ -4050,6 +4050,35 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
     return ok ? DB_PROJECT_INSPECT_OK : DB_PROJECT_INSPECT_FAILED;
 }
 
+static bool add_index_capability_json(yyjson_mut_doc *doc, yyjson_mut_val *parent,
+                                      const cbm_index_capability_t *capability) {
+    if (!doc || !parent || !cbm_index_capability_valid(capability)) {
+        return false;
+    }
+    yyjson_mut_val *semantic = yyjson_mut_obj(doc);
+    if (!semantic ||
+        !yyjson_mut_obj_add_str(doc, parent, "index_mode",
+                                cbm_index_mode_name(capability->index_mode)) ||
+        !yyjson_mut_obj_add_str(doc, semantic, "state",
+                                cbm_semantic_state_name(capability->semantic_state)) ||
+        !yyjson_mut_obj_add_bool(doc, semantic, "available",
+                                 capability->semantic_state == CBM_SEMANTIC_AVAILABLE) ||
+        !yyjson_mut_obj_add_int(doc, semantic, "vector_dimension",
+                                capability->vector_dimension) ||
+        !yyjson_mut_obj_add_int(doc, semantic, "node_vector_count",
+                                capability->node_vector_count) ||
+        !yyjson_mut_obj_add_int(doc, semantic, "token_vector_count",
+                                capability->token_vector_count) ||
+        !yyjson_mut_obj_add_str(doc, semantic, "source", "projects.commit_manifest")) {
+        return false;
+    }
+    bool eligible_added = capability->eligible_node_count == CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED
+                              ? yyjson_mut_obj_add_null(doc, semantic, "eligible_node_count")
+                              : yyjson_mut_obj_add_int(doc, semantic, "eligible_node_count",
+                                                       capability->eligible_node_count);
+    return eligible_added && yyjson_mut_obj_add_val(doc, parent, "semantic_search", semantic);
+}
+
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *srv,
@@ -4092,11 +4121,14 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
         return inspect;
     }
 
+    cbm_project_t persisted_project = {0};
+    int project_rc = cbm_store_get_project(pstore, project_name, &persisted_project);
     int nodes = cbm_store_count_nodes(pstore, project_name);
     int edges = cbm_store_count_edges(pstore, project_name);
-    if (nodes < 0 || edges < 0) {
+    if (project_rc != CBM_STORE_OK || nodes < 0 || edges < 0) {
         record_store_query_failure(srv, "", full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
                                    "source.query_project_details", cbm_store_error(pstore));
+        cbm_project_free_fields(&persisted_project);
         cbm_store_close_result_t close_result;
         (void)close_local_store_exact(&pstore, "list_projects.query_failure", project_name,
                                       &close_result);
@@ -4104,7 +4136,8 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     }
     cbm_store_close_result_t close_result;
     if (!close_local_store_exact(&pstore, "list_projects.finish", project_name,
-                                 &close_result)) {
+                                  &close_result)) {
+        cbm_project_free_fields(&persisted_project);
         record_store_query_failure(
             srv, project_name, full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
             "source.query_close",
@@ -4125,6 +4158,11 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
     yyjson_mut_obj_add_int(doc, p, "size_bytes",
                            verification.db_bytes ? (int64_t)verification.db_bytes : size_bytes);
+    if (!add_index_capability_json(doc, p, &persisted_project.capability)) {
+        cbm_project_free_fields(&persisted_project);
+        return DB_PROJECT_INSPECT_FAILED;
+    }
+    cbm_project_free_fields(&persisted_project);
     yyjson_mut_arr_add_val(arr, p);
     return DB_PROJECT_INSPECT_OK;
 }
@@ -5224,11 +5262,112 @@ typedef struct {
     bool limit_error;
     size_t keyword_count;
     bool store_error;
+    int store_rc;
     int sqlite_error;
     char detail[CBM_SZ_512];
+    bool capability_observed;
+    cbm_index_capability_t capability;
 } semantic_query_outcome_t;
 
 static char *search_graph_semantic_limit_error_result(size_t actual_count);
+
+static char *semantic_query_error_result(const semantic_query_outcome_t *outcome) {
+    const char *code = "CBM_SEARCH_SEMANTIC_STORE_FAILED";
+    const char *operation = "execute_semantic_search";
+    const char *message = "the verified project store could not complete semantic graph search";
+    const char *remediation =
+        "inspect the persisted vector/store diagnostic, repair or re-index the project store, and "
+        "retry the unchanged request";
+    switch (outcome->store_rc) {
+    case CBM_STORE_SEMANTIC_UNAVAILABLE:
+        code = "CBM_SEARCH_SEMANTIC_UNAVAILABLE";
+        operation = "admit_semantic_search";
+        message = "the committed index generation does not advertise semantic search";
+        remediation = outcome->capability_observed &&
+                              outcome->capability.semantic_state ==
+                                  CBM_SEMANTIC_UNAVAILABLE_MODE
+                          ? "re-index the exact repository in moderate or full mode"
+                          : "index a real corpus containing at least two functions or methods";
+        break;
+    case CBM_STORE_SEMANTIC_STATE_INVALID:
+        code = "CBM_SEARCH_SEMANTIC_STATE_INVALID";
+        operation = "validate_semantic_capability";
+        message = "the committed semantic capability is incomplete or internally inconsistent";
+        remediation = "preserve the database and rebuild it from the exact source";
+        break;
+    case CBM_STORE_SEMANTIC_KEYWORD_UNAVAILABLE:
+        code = "CBM_SEARCH_SEMANTIC_KEYWORD_UNAVAILABLE";
+        operation = "load_persisted_keyword_vector";
+        message = "one requested keyword is absent from the committed enriched-token corpus";
+        remediation =
+            "choose a token present in the indexed source or re-index the intended source corpus";
+        break;
+    case CBM_STORE_SEMANTIC_VECTOR_CORRUPT:
+        code = "CBM_SEARCH_SEMANTIC_VECTOR_CORRUPT";
+        operation = "validate_persisted_semantic_vector";
+        message = "a persisted semantic vector is malformed or has zero magnitude";
+        remediation = "preserve the database and rebuild it from the exact source";
+        break;
+    case CBM_STORE_SEMANTIC_KEYWORD_INVALID:
+        code = "CBM_SEARCH_SEMANTIC_KEYWORD_INVALID";
+        operation = "validate_semantic_keyword";
+        message = "semantic_query contains an empty keyword";
+        remediation = "submit only non-empty keyword strings present in the indexed corpus";
+        break;
+    default:
+        break;
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SEMANTIC_DIAGNOSTIC_SERIALIZATION_FAILED\",\"message\":"
+            "\"the semantic failure diagnostic could not be serialized\",\"remediation\":"
+            "\"free memory and retry the unchanged request\"}",
+            true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "operation", operation);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    if (outcome->sqlite_error != SQLITE_OK) {
+        yyjson_mut_obj_add_int(doc, root, "sqlite_error", outcome->sqlite_error);
+    }
+    if (outcome->detail[0]) {
+        yyjson_mut_obj_add_str(doc, root, "detail", outcome->detail);
+    }
+    if (outcome->capability_observed) {
+        yyjson_mut_obj_add_str(doc, root, "index_mode",
+                               cbm_index_mode_name(outcome->capability.index_mode));
+        yyjson_mut_obj_add_str(doc, root, "semantic_state",
+                               cbm_semantic_state_name(outcome->capability.semantic_state));
+        yyjson_mut_obj_add_int(doc, root, "semantic_eligible_node_count",
+                               outcome->capability.eligible_node_count);
+        yyjson_mut_obj_add_int(doc, root, "node_vector_count",
+                               outcome->capability.node_vector_count);
+        yyjson_mut_obj_add_int(doc, root, "token_vector_count",
+                               outcome->capability.token_vector_count);
+    }
+    cbm_log_error("mcp.search_graph_semantic_failed", "code", code, "operation", operation,
+                  "detail", outcome->detail, "message", message, "remediation", remediation);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "{\"code\":\"CBM_SEARCH_SEMANTIC_DIAGNOSTIC_SERIALIZATION_FAILED\",\"message\":"
+            "\"the semantic failure diagnostic could not be serialized\",\"remediation\":"
+            "\"free memory and retry the unchanged request\"}",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
 
 /* Append semantic_query results only after the complete vector search
  * succeeds. A store failure is snapshotted for the caller; the exact-search
@@ -5258,10 +5397,12 @@ static semantic_query_outcome_t run_semantic_query(yyjson_mut_doc *doc, yyjson_m
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
         int sem_limit = limit > 0 ? limit : CBM_SZ_16;
-        int vector_rc =
-            cbm_store_vector_search(store, project, keywords, ki, sem_limit, &vresults, &vcount);
+        int vector_rc = cbm_store_vector_search(store, project, keywords, ki, sem_limit, &vresults,
+                                                &vcount, &outcome.capability);
         if (vector_rc != CBM_STORE_OK) {
             outcome.store_error = true;
+            outcome.store_rc = vector_rc;
+            outcome.capability_observed = cbm_index_capability_valid(&outcome.capability);
             outcome.sqlite_error = cbm_store_error_code(store);
             snprintf(outcome.detail, sizeof(outcome.detail), "%s", cbm_store_error(store));
         } else if (vcount > 0) {
@@ -5596,12 +5737,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern);
         free(relationship);
         if (semantic.store_error) {
-            return search_store_error_result(
-                "CBM_SEARCH_SEMANTIC_STORE_FAILED", "execute_semantic_search",
-                "the verified project store could not complete the semantic graph search",
-                "inspect the persisted vector/store diagnostic, repair or re-index the project "
-                "store if required, and retry the unchanged request",
-                semantic.sqlite_error, semantic.detail);
+            return semantic_query_error_result(&semantic);
         }
         if (semantic.limit_error) {
             return search_graph_semantic_limit_error_result(semantic.keyword_count);
@@ -5748,9 +5884,16 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
             add_git_context_json(doc, root, proj_info.root_path);
-            safe_str_free(&proj_info.name);
-            safe_str_free(&proj_info.indexed_at);
-            safe_str_free(&proj_info.root_path);
+            if (!add_index_capability_json(doc, root, &proj_info.capability)) {
+                cbm_project_free_fields(&proj_info);
+                yyjson_mut_doc_free(doc);
+                free(project);
+                return cbm_mcp_text_result(
+                    "CBM_INDEX_STATUS_CAPABILITY_SERIALIZATION_FAILED: the persisted semantic "
+                    "capability could not be serialized; free memory and retry",
+                    true);
+            }
+            cbm_project_free_fields(&proj_info);
         }
         if (nodes == 0) {
             yyjson_mut_obj_add_str(
@@ -7612,6 +7755,108 @@ static char *build_index_state_mismatch_error(const char *project_name, int expe
     return json ? json : heap_strdup("{\"code\":\"CBM_INDEX_PERSISTED_STATE_MISMATCH\"}");
 }
 
+static bool vector_state_matches_capability(const cbm_index_capability_t *capability,
+                                            const cbm_vector_state_readback_t *readback) {
+    if (!cbm_index_capability_valid(capability) || !readback ||
+        readback->node_vector_count != capability->node_vector_count ||
+        readback->token_vector_count != capability->token_vector_count) {
+        return false;
+    }
+    bool node_dimensions_match =
+        readback->node_vector_count == 0
+            ? readback->node_vector_min_dimension == -1 &&
+                  readback->node_vector_max_dimension == -1
+            : readback->node_vector_min_dimension == capability->vector_dimension &&
+                  readback->node_vector_max_dimension == capability->vector_dimension;
+    bool token_dimensions_match =
+        readback->token_vector_count == 0
+            ? readback->token_vector_min_dimension == -1 &&
+                  readback->token_vector_max_dimension == -1
+            : readback->token_vector_min_dimension == capability->vector_dimension &&
+                  readback->token_vector_max_dimension == capability->vector_dimension;
+    return node_dimensions_match && token_dimensions_match;
+}
+
+static char *build_index_semantic_state_mismatch_error(
+    const char *project_name, cbm_index_mode_t requested_mode,
+    const cbm_index_capability_t *capability, const cbm_vector_state_readback_t *readback) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_INDEX_SEMANTIC_STATE_MISMATCH\","
+            "\"message\":\"the persisted semantic manifest and physical vector rows do not "
+            "match\",\"source_family_preserved\":true}");
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    bool complete =
+        yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+        yyjson_mut_obj_add_str(doc, root, "code", "CBM_INDEX_SEMANTIC_STATE_MISMATCH") &&
+        yyjson_mut_obj_add_str(doc, root, "operation", "read_back_persisted_semantic_state") &&
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            "the published index mode, semantic manifest, and physical vector rows do not form "
+            "one exact generation") &&
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            "preserve the database family and inspect the publication transaction; rebuild only "
+            "from the exact source after resolving the mismatch") &&
+        yyjson_mut_obj_add_strcpy(doc, root, "project", project_name ? project_name : "") &&
+        yyjson_mut_obj_add_str(doc, root, "requested_index_mode",
+                               cbm_index_mode_name(requested_mode)) &&
+        yyjson_mut_obj_add_str(doc, root, "persisted_index_mode",
+                               cbm_index_mode_name(capability->index_mode)) &&
+        yyjson_mut_obj_add_str(doc, root, "persisted_semantic_state",
+                               cbm_semantic_state_name(capability->semantic_state)) &&
+        yyjson_mut_obj_add_int(doc, root, "expected_vector_dimension",
+                               capability->vector_dimension) &&
+        yyjson_mut_obj_add_int(doc, root, "expected_node_vector_count",
+                               capability->node_vector_count) &&
+        yyjson_mut_obj_add_int(doc, root, "expected_token_vector_count",
+                               capability->token_vector_count) &&
+        yyjson_mut_obj_add_int(doc, root, "persisted_node_vector_count",
+                               readback->node_vector_count) &&
+        yyjson_mut_obj_add_int(doc, root, "persisted_node_vector_min_dimension",
+                               readback->node_vector_min_dimension) &&
+        yyjson_mut_obj_add_int(doc, root, "persisted_node_vector_max_dimension",
+                               readback->node_vector_max_dimension) &&
+        yyjson_mut_obj_add_int(doc, root, "persisted_token_vector_count",
+                               readback->token_vector_count) &&
+        yyjson_mut_obj_add_int(doc, root, "persisted_token_vector_min_dimension",
+                               readback->token_vector_min_dimension) &&
+        yyjson_mut_obj_add_int(doc, root, "persisted_token_vector_max_dimension",
+                               readback->token_vector_max_dimension) &&
+        yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
+    char *json = complete ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    yyjson_mut_doc_free(doc);
+    return json ? json
+                : heap_strdup("{\"code\":\"CBM_INDEX_SEMANTIC_STATE_MISMATCH\","
+                              "\"source_family_preserved\":true}");
+}
+
+static bool add_vector_state_readback_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                           const cbm_vector_state_readback_t *readback) {
+    yyjson_mut_val *state = yyjson_mut_obj(doc);
+    return state &&
+           yyjson_mut_obj_add_str(doc, state, "source", "physical_vector_tables") &&
+           yyjson_mut_obj_add_int(doc, state, "node_vector_count",
+                                  readback->node_vector_count) &&
+           yyjson_mut_obj_add_int(doc, state, "node_vector_min_dimension",
+                                  readback->node_vector_min_dimension) &&
+           yyjson_mut_obj_add_int(doc, state, "node_vector_max_dimension",
+                                  readback->node_vector_max_dimension) &&
+           yyjson_mut_obj_add_int(doc, state, "token_vector_count",
+                                  readback->token_vector_count) &&
+           yyjson_mut_obj_add_int(doc, state, "token_vector_min_dimension",
+                                  readback->token_vector_min_dimension) &&
+           yyjson_mut_obj_add_int(doc, state, "token_vector_max_dimension",
+                                  readback->token_vector_max_dimension) &&
+           yyjson_mut_obj_add_val(doc, root, "semantic_vector_readback", state);
+}
+
 static char *build_index_telemetry_error(const char *project_name, size_t metric_count) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
@@ -7795,6 +8040,51 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                       "remediation", "preserve the database family and inspect persistence");
         return build_index_state_mismatch_error(project_name, exp_nodes, exp_edges, nodes, edges);
     }
+
+    cbm_project_t persisted_project = {0};
+    int project_rc = cbm_store_get_project(store, project_name, &persisted_project);
+    if (project_rc != CBM_STORE_OK) {
+        record_store_query_failure(
+            srv, project_name, cbm_store_db_path(store), store,
+            project_rc == CBM_STORE_SEMANTIC_STATE_INVALID
+                ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                : CBM_STORE_VERIFY_IO_FAILED,
+            "source.query_semantic_manifest", cbm_store_error(store));
+        cbm_project_free_fields(&persisted_project);
+        return build_recorded_store_error(srv);
+    }
+    cbm_vector_state_readback_t vector_readback = {0};
+    if (cbm_store_read_vector_state(store, project_name, &vector_readback) != CBM_STORE_OK) {
+        record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
+                                   CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.query_physical_vector_state", cbm_store_error(store));
+        cbm_project_free_fields(&persisted_project);
+        return build_recorded_store_error(srv);
+    }
+    cbm_index_mode_t requested_mode = (cbm_index_mode_t)cbm_pipeline_get_mode(p);
+    if (persisted_project.capability.index_mode != requested_mode ||
+        !vector_state_matches_capability(&persisted_project.capability, &vector_readback)) {
+        cbm_log_error(
+            "dump.semantic_verify_failed", "code", "CBM_INDEX_SEMANTIC_STATE_MISMATCH",
+            "project", project_name, "message",
+            "the persisted semantic manifest and physical vector rows differ from the completed "
+            "index generation",
+            "remediation", "preserve the database family and inspect persistence");
+        char *error = build_index_semantic_state_mismatch_error(
+            project_name, requested_mode, &persisted_project.capability, &vector_readback);
+        cbm_project_free_fields(&persisted_project);
+        return error;
+    }
+    if (!add_index_capability_json(doc, root, &persisted_project.capability) ||
+        !add_vector_state_readback_json(doc, root, &vector_readback)) {
+        cbm_project_free_fields(&persisted_project);
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_INDEX_SEMANTIC_READBACK_SERIALIZATION_FAILED\","
+            "\"message\":\"the verified semantic state could not be serialized\","
+            "\"remediation\":\"preserve the published database, free memory, and inspect its "
+            "projects and vector-table rows\",\"source_family_preserved\":true}");
+    }
+    cbm_project_free_fields(&persisted_project);
 
     browser_runtime_diagnostics_status_t runtime_diagnostics =
         add_browser_runtime_request_diagnostics(srv, doc, root, store, project_name);

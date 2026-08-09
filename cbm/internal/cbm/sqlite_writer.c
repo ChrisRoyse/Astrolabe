@@ -1288,24 +1288,41 @@ static uint8_t *build_token_vec_record(WriterIo *io, const CBMDumpTokenVec *tv, 
     rec_add_text(&r, tv->project);
     rec_add_text(&r, tv->token);
     rec_add_blob(&r, tv->vector, tv->vector_len);
-    /* Store IDF as integer × 1000 for fixed-point (avoid float in record) */
-    enum { IDF_FIXED_POINT_SCALE = 1000 };
-    rec_add_int(&r, (int64_t)(tv->idf * IDF_FIXED_POINT_SCALE));
+    /* Input validation proved this conversion exact for the schema domain. */
+    int64_t idf_fixed = 0;
+    if (!cbm_semantic_idf_to_fixed(tv->idf, &idf_fixed)) {
+        writer_record_input_failure(io, "build_token_vector_record",
+                                    "token-vector IDF is not schema-representable");
+        rec_free(&r);
+        return NULL;
+    }
+    rec_add_int(&r, idf_fixed);
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
     return data;
 }
 
-// Build a projects table record: (name, indexed_at, root_path)
+// Build the one-row project identity + index-generation capability record.
 static uint8_t *build_project_record(WriterIo *io, const char *name, const char *indexed_at,
-                                     const char *root_path, int *out_len) {
+                                     const char *root_path,
+                                     const cbm_index_capability_t *capability, int *out_len) {
     RecordBuilder r;
     rec_init(&r, io, "build_project_record");
 
     rec_add_text(&r, name);
     rec_add_text(&r, indexed_at);
     rec_add_text(&r, root_path);
+    rec_add_text(&r, cbm_index_mode_name(capability->index_mode));
+    rec_add_text(&r, cbm_semantic_state_name(capability->semantic_state));
+    rec_add_int(&r, capability->vector_dimension);
+    if (capability->eligible_node_count == CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED) {
+        rec_add_null(&r);
+    } else {
+        rec_add_int(&r, capability->eligible_node_count);
+    }
+    rec_add_int(&r, capability->node_vector_count);
+    rec_add_int(&r, capability->token_vector_count);
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
@@ -2365,6 +2382,7 @@ typedef struct {
     const char *project;
     const char *root_path;
     const char *indexed_at;
+    const cbm_index_capability_t *capability;
     CBMDumpNode *nodes;
     int node_count;
     CBMDumpEdge *edges;
@@ -2434,8 +2452,8 @@ static int write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
                                  uint32_t *file_hashes_root, uint32_t *summaries_root,
                                  uint32_t *sqlite_seq_root) {
     int proj_rec_len = 0;
-    uint8_t *proj_rec =
-        build_project_record(w->io, w->project, w->indexed_at, w->root_path, &proj_rec_len);
+    uint8_t *proj_rec = build_project_record(w->io, w->project, w->indexed_at, w->root_path,
+                                             w->capability, &proj_rec_len);
     if (!proj_rec) {
         return ERR_WRITE_FAILED;
     }
@@ -2889,7 +2907,23 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     MasterEntry master[] = {
         {"table", "projects", "projects", projects_root,
          "CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT "
-         "NULL,\n\t\troot_path TEXT NOT NULL\n\t)"},
+         "NULL,\n\t\troot_path TEXT NOT NULL,\n\t\tindex_mode TEXT NOT NULL CHECK(index_mode IN "
+         "('full','moderate','fast')),\n\t\tsemantic_state TEXT NOT NULL CHECK(semantic_state IN "
+         "('available','unavailable_mode','unavailable_corpus')),\n\t\tsemantic_vector_dimension "
+         "INTEGER NOT NULL CHECK(semantic_vector_dimension = "
+         CBM_SEMANTIC_VECTOR_DIMENSION_SQL
+         "),\n\t\tsemantic_eligible_node_count INTEGER,\n\t\tnode_vector_count INTEGER NOT NULL "
+         "CHECK(node_vector_count >= 0),\n\t\ttoken_vector_count INTEGER NOT NULL "
+         "CHECK(token_vector_count >= 0),\n\t\tCHECK((semantic_state = 'available' AND index_mode "
+         "IN ('full','moderate') AND semantic_eligible_node_count >= "
+         CBM_SEMANTIC_MIN_ELIGIBLE_NODES_SQL
+         " AND node_vector_count = semantic_eligible_node_count AND token_vector_count > 0) OR "
+         "(semantic_state = 'unavailable_mode' AND index_mode = 'fast' AND "
+         "semantic_eligible_node_count IS NULL AND node_vector_count = 0 AND token_vector_count = "
+         "0) OR (semantic_state = 'unavailable_corpus' AND index_mode IN ('full','moderate') AND "
+         "semantic_eligible_node_count >= 0 AND semantic_eligible_node_count < "
+         CBM_SEMANTIC_MIN_ELIGIBLE_NODES_SQL
+         " AND node_vector_count = 0 AND token_vector_count = 0))\n\t)"},
         {"index", "sqlite_autoindex_projects_1", "projects", autoindex_projects_root, NULL},
         {"table", "file_hashes", "file_hashes", file_hashes_root,
          "CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON "
@@ -2961,12 +2995,17 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
         {"index", "sqlite_autoindex_project_summaries_1", "project_summaries",
          autoindex_summaries_root, NULL},
         {"table", "node_vectors", "node_vectors", vectors_root,
-         "CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT "
-         "NULL,\n\t\tvector BLOB NOT NULL\n\t)"},
+         "CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON "
+         "DELETE CASCADE,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE "
+         "CASCADE,\n\t\tvector BLOB NOT NULL CHECK(length(vector) = "
+         CBM_SEMANTIC_VECTOR_DIMENSION_SQL
+         ")\n\t)"},
         {"table", "token_vectors", "token_vectors", token_vecs_root,
          "CREATE TABLE token_vectors (\n\t\tid INTEGER PRIMARY KEY,\n\t\tproject "
-         "TEXT NOT NULL,\n\t\ttoken TEXT NOT NULL,\n\t\tvector BLOB NOT NULL,\n\t\tidf INTEGER "
-         "NOT NULL\n\t)"},
+         "TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\ttoken TEXT NOT NULL "
+         "CHECK(length(token) > 0),\n\t\tvector BLOB NOT "
+         "NULL CHECK(length(vector) = " CBM_SEMANTIC_VECTOR_DIMENSION_SQL
+         "),\n\t\tidf INTEGER NOT NULL CHECK(idf > 0)\n\t)"},
         {"table", "sqlite_sequence", "sqlite_sequence", sqlite_seq_root,
          "CREATE TABLE sqlite_sequence(name,seq)"},
     };
@@ -3034,16 +3073,60 @@ static bool writer_validate_array(WriterIo *io, const void *array, int count,
     return true;
 }
 
-static bool writer_validate_finalize_inputs(cbm_db_writer_t *w, const CBMDumpNode *nodes,
-                                            int node_count, const CBMDumpEdge *edges,
-                                            int edge_count, const CBMDumpVector *vectors,
-                                            int vector_count, const CBMDumpTokenVec *token_vecs,
-                                            int token_vec_count) {
+static bool writer_validate_finalize_inputs(cbm_db_writer_t *w, const char *project,
+                                             const char *root_path, const char *indexed_at,
+                                             const CBMDumpNode *nodes,
+                                             int node_count, const CBMDumpEdge *edges,
+                                             int edge_count, const CBMDumpVector *vectors,
+                                             int vector_count, const CBMDumpTokenVec *token_vecs,
+                                             int token_vec_count,
+                                             const cbm_index_capability_t *capability) {
+    if (!project || !project[0] || !root_path || !root_path[0] || !indexed_at ||
+        !indexed_at[0]) {
+        writer_record_input_failure(&w->io, "validate_publication_identity",
+                                    "project, root path, and indexed timestamp are required");
+        return false;
+    }
     if (!writer_validate_array(&w->io, nodes, node_count, "validate_nodes_array") ||
         !writer_validate_array(&w->io, edges, edge_count, "validate_edges_array") ||
         !writer_validate_array(&w->io, vectors, vector_count, "validate_vectors_array") ||
         !writer_validate_array(&w->io, token_vecs, token_vec_count,
                                "validate_token_vectors_array")) {
+        return false;
+    }
+    int64_t previous_vector_id = 0;
+    for (int i = 0; i < vector_count; i++) {
+        const CBMDumpVector *vector = &vectors[i];
+        if (vector->node_id <= previous_vector_id || vector->node_id > node_count ||
+            !vector->project || strcmp(vector->project, project) != 0 ||
+            !cbm_semantic_i8_vector_nonzero(vector->vector, vector->vector_len)) {
+            writer_record_input_failure(
+                &w->io, "validate_node_vector_row",
+                "node vectors must be sorted unique nonzero live-node rows for the exact project and dimension");
+            return false;
+        }
+        previous_vector_id = vector->node_id;
+    }
+    for (int i = 0; i < token_vec_count; i++) {
+        const CBMDumpTokenVec *token_vector = &token_vecs[i];
+        int64_t idf_fixed = 0;
+        if (token_vector->id != (int64_t)i + FIRST_ROWID || !token_vector->project ||
+            strcmp(token_vector->project, project) != 0 || !token_vector->token ||
+            !token_vector->token[0] ||
+            !cbm_semantic_i8_vector_nonzero(token_vector->vector, token_vector->vector_len) ||
+            !cbm_semantic_idf_to_fixed(token_vector->idf, &idf_fixed)) {
+            writer_record_input_failure(
+                &w->io, "validate_token_vector_row",
+                "token vectors must be contiguous complete nonzero rows for the exact project, dimension, and fixed-point IDF domain");
+            return false;
+        }
+    }
+    if (!cbm_index_capability_valid(capability) ||
+        capability->node_vector_count != vector_count ||
+        capability->token_vector_count != token_vec_count) {
+        writer_record_input_failure(
+            &w->io, "validate_index_capability",
+            "index capability is absent, invalid, or disagrees with vector rows");
         return false;
     }
     if (w->node_rows_written != node_count) {
@@ -3163,17 +3246,19 @@ int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int co
 }
 
 int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *root_path,
-                        const char *indexed_at, CBMDumpNode *nodes, int node_count,
-                        CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,
-                        int vector_count, CBMDumpTokenVec *token_vecs, int token_vec_count) {
+                        const char *indexed_at, const cbm_index_capability_t *capability,
+                        CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges, int edge_count,
+                        CBMDumpVector *vectors, int vector_count, CBMDumpTokenVec *token_vecs,
+                        int token_vec_count) {
     if (!w) {
         return CBM_NOT_FOUND;
     }
     int err = w->err;
     uint32_t nodes_root = 0;
     if (err == 0 &&
-        !writer_validate_finalize_inputs(w, nodes, node_count, edges, edge_count, vectors,
-                                         vector_count, token_vecs, token_vec_count)) {
+        !writer_validate_finalize_inputs(w, project, root_path, indexed_at, nodes, node_count,
+                                         edges, edge_count, vectors, vector_count, token_vecs,
+                                         token_vec_count, capability)) {
         err = ERR_WRITE_FAILED;
     }
     if (err == 0) {
@@ -3192,6 +3277,7 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     w->wc.project = project;
     w->wc.root_path = root_path;
     w->wc.indexed_at = indexed_at;
+    w->wc.capability = capability;
     w->wc.nodes = nodes;
     w->wc.node_count = node_count;
     w->wc.edges = edges;
@@ -3216,9 +3302,10 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
 }
 
 int cbm_write_db(const char *path, const char *project, const char *root_path,
-                 const char *indexed_at, CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges,
-                 int edge_count, CBMDumpVector *vectors, int vector_count,
-                 CBMDumpTokenVec *token_vecs, int token_vec_count) {
+                 const char *indexed_at, const cbm_index_capability_t *capability,
+                 CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges, int edge_count,
+                 CBMDumpVector *vectors, int vector_count, CBMDumpTokenVec *token_vecs,
+                 int token_vec_count) {
     /* One-shot = open + append all nodes in a single batch + finalize.
      * Produces byte-identical output to the former monolithic writer. */
     cbm_db_writer_t *w = cbm_writer_open(path);
@@ -3227,6 +3314,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     }
     (void)cbm_writer_append_nodes(w, nodes,
                                   node_count); /* error recorded in w, handled by finalize */
-    return cbm_writer_finalize(w, project, root_path, indexed_at, nodes, node_count, edges,
-                               edge_count, vectors, vector_count, token_vecs, token_vec_count);
+    return cbm_writer_finalize(w, project, root_path, indexed_at, capability, nodes, node_count,
+                               edges, edge_count, vectors, vector_count, token_vecs,
+                               token_vec_count);
 }

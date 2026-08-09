@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 const DEFAULT_NODE_COUNT: usize = 400;
 const DEFAULT_SEED: u64 = 20_260_711;
 const PROJECT: &str = "astrolabe-lscale-smoke";
-const VECTOR_DIMS: usize = 64;
+const VECTOR_DIMS: usize = 768;
 
 /// SplitMix64: tiny, dependency-free, deterministic PRNG. Statistical quality
 /// is irrelevant here; only cross-run/cross-platform byte determinism matters.
@@ -106,12 +106,11 @@ fn build_rows(node_count: usize, seed: u64) -> (Vec<NodeRow>, Vec<EdgeRow>) {
                 rng.next_u64() % 13,
             )
         };
-        let vector = if index % 2 == 0 {
-            let mut blob = Vec::with_capacity(VECTOR_DIMS * 4);
+        let vector = if !is_class {
+            let mut blob = Vec::with_capacity(VECTOR_DIMS);
             for _ in 0..VECTOR_DIMS {
-                // Deterministic pseudo-embedding in [-1, 1).
-                let value = ((rng.next_u64() % 2_000_000) as f32 / 1_000_000.0) - 1.0;
-                blob.extend_from_slice(&value.to_le_bytes());
+                let value = (rng.next_u64() % 255) as u8;
+                blob.push(value.wrapping_add(1));
             }
             Some(blob)
         } else {
@@ -186,7 +185,7 @@ fn build_rows(node_count: usize, seed: u64) -> (Vec<NodeRow>, Vec<EdgeRow>) {
 
 fn content_sha256(nodes: &[NodeRow], edges: &[EdgeRow]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-lscale-smoke-corpus-v1\n");
+    hasher.update(b"astrolabe-lscale-smoke-corpus-v2\n");
     for node in nodes {
         hasher.update(node.id.to_le_bytes());
         hasher.update(node.label.as_bytes());
@@ -215,6 +214,14 @@ fn content_sha256(nodes: &[NodeRow], edges: &[EdgeRow]) -> String {
         hasher.update(edge.kind.as_bytes());
         hasher.update([0]);
     }
+    hasher.update(b"symbol\0");
+    hasher.update(
+        nodes
+            .iter()
+            .find_map(|node| node.vector.as_deref())
+            .expect("the admitted corpus has at least two semantic vectors"),
+    );
+    hasher.update(1000_i64.to_le_bytes());
     let digest = hasher.finalize();
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -236,8 +243,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(DEFAULT_SEED);
-    if node_count < 2 {
-        return Err("node-count must be >= 2 (one folder plus one symbol)".into());
+    if node_count < 3 {
+        return Err("node-count must be >= 3 (one folder plus two semantic symbols)".into());
     }
 
     let (nodes, edges) = build_rows(node_count, seed);
@@ -249,11 +256,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::remove_file(&out).ok();
     let mut connection = Connection::open(&out)?;
     connection.execute_batch(
-        "PRAGMA user_version = 5;
+        "PRAGMA user_version = 6;
          CREATE TABLE projects (
              name TEXT PRIMARY KEY,
              indexed_at TEXT NOT NULL,
-             root_path TEXT NOT NULL
+             root_path TEXT NOT NULL,
+             index_mode TEXT NOT NULL CHECK(index_mode IN ('full','moderate','fast')),
+             semantic_state TEXT NOT NULL CHECK(semantic_state IN ('available','unavailable_mode','unavailable_corpus')),
+             semantic_vector_dimension INTEGER NOT NULL CHECK(semantic_vector_dimension = 768),
+             semantic_eligible_node_count INTEGER,
+             node_vector_count INTEGER NOT NULL CHECK(node_vector_count >= 0),
+             token_vector_count INTEGER NOT NULL CHECK(token_vector_count >= 0),
+             CHECK(semantic_state = 'available' AND index_mode IN ('full','moderate') AND semantic_eligible_node_count >= 2 AND node_vector_count = semantic_eligible_node_count AND token_vector_count > 0)
          );
          CREATE TABLE nodes (
              id INTEGER PRIMARY KEY,
@@ -297,15 +311,29 @@ fn main() -> Result<(), Box<dyn Error>> {
              UNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen)
          );
          CREATE TABLE node_vectors (
-             node_id INTEGER PRIMARY KEY,
-             project TEXT NOT NULL,
-             vector BLOB NOT NULL
+             node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+             project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+             vector BLOB NOT NULL CHECK(length(vector) = 768)
+         );
+         CREATE TABLE token_vectors (
+             id INTEGER PRIMARY KEY,
+             project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
+             token TEXT NOT NULL CHECK(length(token) > 0),
+             vector BLOB NOT NULL CHECK(length(vector) = 768),
+             idf INTEGER NOT NULL CHECK(idf > 0)
          );",
     )?;
     let tx = connection.transaction()?;
+    let vector_count = nodes.iter().filter(|node| node.vector.is_some()).count();
     tx.execute(
-        "INSERT INTO projects(name, indexed_at, root_path) VALUES (?1, ?2, ?3)",
-        params![PROJECT, "1970-01-01T00:00:00Z", "/pinned/lscale-smoke"],
+        "INSERT INTO projects(name, indexed_at, root_path, index_mode, semantic_state, semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, token_vector_count)
+         VALUES (?1, ?2, ?3, 'full', 'available', 768, ?4, ?4, 1)",
+        params![
+            PROJECT,
+            "1970-01-01T00:00:00Z",
+            "/pinned/lscale-smoke",
+            vector_count,
+        ],
     )?;
     for node in &nodes {
         tx.execute(
@@ -338,6 +366,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             params![PROJECT, edge.source_id, edge.target_id, edge.kind],
         )?;
     }
+    let token_vector = nodes
+        .iter()
+        .find_map(|node| node.vector.as_deref())
+        .expect("the admitted corpus has at least two semantic vectors");
+    tx.execute(
+        "INSERT INTO token_vectors(id, project, token, vector, idf) VALUES (1, ?1, 'symbol', ?2, 1000)",
+        params![PROJECT, token_vector],
+    )?;
     tx.commit()?;
     drop(connection);
 

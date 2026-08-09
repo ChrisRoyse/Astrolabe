@@ -2,7 +2,7 @@
  * row_sink.h - Borrowed dump-row callback contracts.
  *
  * The graph-buffer callbacks are the low-level node/edge dump hooks. The
- * pipeline v1 descriptor is the complete source-snapshot contract consumed by
+ * pipeline v2 descriptor is the complete source-snapshot contract consumed by
  * embedders: every registered callback is mandatory and the final manifest is
  * emitted exactly once only after all rows have been accepted.
  */
@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "foundation/index_capability.h"
 #include "foundation/schema_version.h"
 
 /* Dump-row sink structs. These rows are borrowed and valid only for the
@@ -60,6 +61,7 @@ typedef struct {
     size_t edge_count;
     size_t file_hash_count;
     uint32_t graph_schema_version;
+    cbm_index_capability_t index_capability;
 } cbm_pipeline_row_manifest_t;
 
 /* Return 0 to continue. Any non-zero return aborts the publication. */
@@ -71,13 +73,13 @@ typedef int (*cbm_pipeline_row_complete_sink_fn)(const cbm_pipeline_row_manifest
                                                  void *ctx);
 
 /*
- * Frozen pipeline snapshot ABI v1. Do not append fields: publish a v2
+ * Frozen pipeline snapshot ABI v2. Do not append fields: publish a v3
  * descriptor for any incompatible extension. A non-NULL descriptor is accepted
  * only when abi_version/struct_size match exactly and every callback/context is
  * non-NULL. The pipeline copies the descriptor; callback rows remain borrowed
  * for the duration of each call.
  */
-#define CBM_PIPELINE_ROW_SINK_ABI_V1 1U
+#define CBM_PIPELINE_ROW_SINK_ABI_V2 2U
 typedef struct {
     uint32_t abi_version;
     size_t struct_size;
@@ -86,6 +88,6 @@ typedef struct {
     cbm_pipeline_row_file_hash_sink_fn file_hash;
     cbm_pipeline_row_complete_sink_fn complete;
     void *ctx;
-} cbm_pipeline_row_sink_v1_t;
+} cbm_pipeline_row_sink_v2_t;
 
 #endif /* CBM_GRAPH_BUFFER_ROW_SINK_H */

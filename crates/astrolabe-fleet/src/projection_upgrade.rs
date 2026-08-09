@@ -42,7 +42,7 @@ use crate::state::RepoState;
 /// Cause-specific refusal for the explicit legacy projection upgrade.
 pub const ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED: &str = "ASTRO_FLEET_PROJECTION_UPGRADE_REFUSED";
 
-const CURRENT_CBM_SCHEMA_VERSION: i64 = 5;
+const CURRENT_CBM_SCHEMA_VERSION: i64 = 6;
 const TRANSACTION_SCHEMA_V1: &str = "astrolabe.projection-upgrade.intent.v1";
 const TRANSACTION_SCHEMA: &str = "astrolabe.projection-upgrade.intent.v2";
 const MEMBER_SCHEMA: &str = "astrolabe.projection-upgrade.member.v1";

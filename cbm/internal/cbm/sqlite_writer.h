@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "foundation/index_capability.h"
 
 // --- Input structs (flat, borrowed strings) ---
 
@@ -47,7 +48,7 @@ typedef struct {
     int64_t node_id; // final sequential ID (matches nodes.id)
     const char *project;
     const uint8_t *vector; // int8-quantized vector blob
-    int vector_len;        // length in bytes (e.g. 256 for d=256)
+    int vector_len;        // length in bytes (exactly 768 in schema v6)
 } CBMDumpVector;
 
 typedef struct {
@@ -55,7 +56,7 @@ typedef struct {
     const char *project;
     const char *token;     // the token string
     const uint8_t *vector; // int8-quantized enriched RI vector blob
-    int vector_len;        // length in bytes (e.g. 256 for d=256)
+    int vector_len;        // length in bytes (exactly 768 in schema v6)
     float idf;             // inverse document frequency weight
 } CBMDumpTokenVec;
 
@@ -71,9 +72,10 @@ typedef struct {
 // every positive count requires a non-NULL array. vectors/vector_count and
 // token_vecs/token_vec_count may be NULL/0.
 int cbm_write_db(const char *path, const char *project, const char *root_path,
-                 const char *indexed_at, CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges,
-                 int edge_count, CBMDumpVector *vectors, int vector_count,
-                 CBMDumpTokenVec *token_vecs, int token_vec_count);
+                 const char *indexed_at, const cbm_index_capability_t *capability,
+                 CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges, int edge_count,
+                 CBMDumpVector *vectors, int vector_count, CBMDumpTokenVec *token_vecs,
+                 int token_vec_count);
 
 // --- Streaming writer: incremental bulk node-table append ---
 //
@@ -107,8 +109,9 @@ int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int co
 // every other count/array pair obeys the same non-negative/non-NULL contract.
 // Frees w and closes the file.
 int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *root_path,
-                        const char *indexed_at, CBMDumpNode *nodes, int node_count,
-                        CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,
-                        int vector_count, CBMDumpTokenVec *token_vecs, int token_vec_count);
+                        const char *indexed_at, const cbm_index_capability_t *capability,
+                        CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges, int edge_count,
+                        CBMDumpVector *vectors, int vector_count, CBMDumpTokenVec *token_vecs,
+                        int token_vec_count);
 
 #endif // CBM_SQLITE_WRITER_H

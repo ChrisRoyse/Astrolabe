@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "foundation/index_capability.h"
 
 #include "graph_buffer/row_sink.h"
 
@@ -107,18 +108,6 @@ enum { CBM_PIPELINE_EMPTY_SOURCE_CORPUS = -2001 };
 
 /* ── Index mode ─────────────────────────────────────────────────── */
 
-#ifndef CBM_INDEX_MODE_T_DEFINED
-#define CBM_INDEX_MODE_T_DEFINED
-typedef enum {
-    /* All modes run the LSP type-aware call/usage resolution (per-file +
-     * cross-file). The mode only controls file discovery breadth and whether
-     * SIMILAR_TO / SEMANTICALLY_RELATED edges are computed. */
-    CBM_MODE_FULL = 0,     /* Full: everything including SIMILAR_TO + SEMANTICALLY_RELATED */
-    CBM_MODE_MODERATE = 1, /* Moderate: fast discovery + SIMILAR_TO + SEMANTICALLY_RELATED */
-    CBM_MODE_FAST = 2,     /* Fast: skip non-essential files, no similarity/semantic edges */
-} cbm_index_mode_t;
-#endif
-
 /* ── Pipeline lifecycle ─────────────────────────────────────────── */
 
 /* Create a new pipeline. Caller owns the result. */
@@ -139,7 +128,7 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
  * no-sink path. A non-NULL descriptor is copied and accepted only when its
  * frozen ABI/version/mandatory callbacks validate exactly. Returns 0 on
  * success, -1 on refusal. */
-int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v1_t *sink);
+int cbm_pipeline_set_sink(cbm_pipeline_t *p, const cbm_pipeline_row_sink_v2_t *sink);
 
 /* Install or clear the optional post-success/pre-cleanup callback. */
 int cbm_pipeline_set_post_success_callback(cbm_pipeline_t *p,

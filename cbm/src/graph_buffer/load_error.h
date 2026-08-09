@@ -32,4 +32,11 @@ typedef struct {
 int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const char *project,
                                   cbm_gbuf_load_error_t *error);
 
+/* Restore vector rows and the persisted semantic capability as well as graph
+ * rows. This is reserved for unchanged generations that will be re-materialized;
+ * changed incremental generations recompute enrichment instead. */
+int cbm_gbuf_load_from_db_checked_with_semantics(cbm_gbuf_t *gb, const char *db_path,
+                                                 const char *project,
+                                                 cbm_gbuf_load_error_t *error);
+
 #endif

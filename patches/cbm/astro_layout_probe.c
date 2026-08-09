@@ -21,8 +21,9 @@ CBM_API int cbm_abi_layout_size(const char *type_name, size_t *size_out, size_t 
     ASTRO_LAYOUT_SIZE_CASE(cbm_gbuf_row_node_t);
     ASTRO_LAYOUT_SIZE_CASE(cbm_gbuf_row_edge_t);
     ASTRO_LAYOUT_SIZE_CASE(cbm_pipeline_row_file_hash_t);
+    ASTRO_LAYOUT_SIZE_CASE(cbm_index_capability_t);
     ASTRO_LAYOUT_SIZE_CASE(cbm_pipeline_row_manifest_t);
-    ASTRO_LAYOUT_SIZE_CASE(cbm_pipeline_row_sink_v1_t);
+    ASTRO_LAYOUT_SIZE_CASE(cbm_pipeline_row_sink_v2_t);
 
 #undef ASTRO_LAYOUT_SIZE_CASE
 
@@ -112,14 +113,22 @@ CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
     ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_manifest_t, edge_count);
     ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_manifest_t, file_hash_count);
     ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_manifest_t, graph_schema_version);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_manifest_t, index_capability);
 
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, abi_version);
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, struct_size);
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, node);
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, edge);
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, file_hash);
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, complete);
-    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v1_t, ctx);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_index_capability_t, index_mode);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_index_capability_t, semantic_state);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_index_capability_t, vector_dimension);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_index_capability_t, eligible_node_count);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_index_capability_t, node_vector_count);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_index_capability_t, token_vector_count);
+
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, abi_version);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, struct_size);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, node);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, edge);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, file_hash);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, complete);
+    ASTRO_LAYOUT_OFFSET_CASE(cbm_pipeline_row_sink_v2_t, ctx);
 
 #undef ASTRO_LAYOUT_OFFSET_CASE
 

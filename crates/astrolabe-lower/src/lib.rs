@@ -43,7 +43,7 @@ pub use team_artifact::{
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const ASTRO_LOWER_ACTOR: &str = "astrolabe-lower";
 pub const ASTRO_LOWERED_SQLITE_MANIFEST_PREFIX: &[u8] = b"astrolabe:lowered-sqlite:v1:";
-pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v4";
+pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v5";
 pub const ASTRO_META_SCHEMA: &str = "astrolabe-astro-meta-v3";
 pub const DEFAULT_LOWERED_AT: &str = "1970-01-01T00:00:00Z";
 
@@ -971,14 +971,14 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 
 fn create_cbm_schema(connection: &Connection) -> LowerResult<()> {
     connection.execute_batch(
-        "PRAGMA user_version = 5;\
-         CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL\n\t);\
+        "PRAGMA user_version = 6;\
+         CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL,\n\t\tindex_mode TEXT NOT NULL CHECK(index_mode IN ('full','moderate','fast')),\n\t\tsemantic_state TEXT NOT NULL CHECK(semantic_state IN ('available','unavailable_mode','unavailable_corpus')),\n\t\tsemantic_vector_dimension INTEGER NOT NULL CHECK(semantic_vector_dimension = 768),\n\t\tsemantic_eligible_node_count INTEGER,\n\t\tnode_vector_count INTEGER NOT NULL CHECK(node_vector_count >= 0),\n\t\ttoken_vector_count INTEGER NOT NULL CHECK(token_vector_count >= 0),\n\t\tCHECK((semantic_state = 'available' AND index_mode IN ('full','moderate') AND semantic_eligible_node_count >= 2 AND node_vector_count = semantic_eligible_node_count AND token_vector_count > 0) OR (semantic_state = 'unavailable_mode' AND index_mode = 'fast' AND semantic_eligible_node_count IS NULL AND node_vector_count = 0 AND token_vector_count = 0) OR (semantic_state = 'unavailable_corpus' AND index_mode IN ('full','moderate') AND semantic_eligible_node_count >= 0 AND semantic_eligible_node_count < 2 AND node_vector_count = 0 AND token_vector_count = 0))\n\t);\
          CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\trel_path TEXT NOT NULL,\n\t\tsha256 TEXT NOT NULL,\n\t\tmtime_ns INTEGER NOT NULL DEFAULT 0,\n\t\tsize INTEGER NOT NULL DEFAULT 0,\n\t\tPRIMARY KEY (project, rel_path)\n\t);\
          CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tatom_id TEXT NOT NULL,\n\t\tsource_present INTEGER NOT NULL CHECK(source_present IN (0,1)),\n\t\tsource_bytes BLOB,\n\t\tsource_sha256 TEXT NOT NULL DEFAULT '',\n\t\tstart_byte INTEGER NOT NULL DEFAULT 0,\n\t\tend_byte INTEGER NOT NULL DEFAULT 0,\n\t\tCHECK((source_present = 0 AND source_bytes IS NULL AND source_sha256 = '' AND start_byte = 0 AND end_byte = 0) OR (source_present = 1 AND source_bytes IS NOT NULL AND length(source_sha256) = 64 AND end_byte >= start_byte AND length(source_bytes) = end_byte - start_byte)),\n\t\tUNIQUE(project, atom_id)\n\t);\
          CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT '{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),\n\t\tpreprocess_context_id_gen TEXT GENERATED ALWAYS AS (coalesce(CAST(json_extract(properties,'$.preprocess_context_id') AS TEXT),'')),\n\t\tCHECK(type != 'IMPORTS' OR json_type(properties,'$.local_name') IS NULL OR json_type(properties,'$.local_name') IN ('null','text')),\n\t\tCHECK(json_type(properties,'$.preprocess_context_id') IS NULL OR json_type(properties,'$.preprocess_context_id') IN ('null','text')),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen, preprocess_context_id_gen)\n\t);\
          CREATE TABLE project_summaries (\n\t\t\tproject TEXT PRIMARY KEY,\n\t\t\tsummary TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL,\n\t\t\tcreated_at TEXT NOT NULL,\n\t\t\tupdated_at TEXT NOT NULL\n\t\t);\
-         CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\tvector BLOB NOT NULL\n\t);\
-         CREATE TABLE token_vectors (\n\t\tid INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\ttoken TEXT NOT NULL,\n\t\tvector BLOB NOT NULL,\n\t\tidf INTEGER NOT NULL\n\t);\
+         CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tvector BLOB NOT NULL CHECK(length(vector) = 768)\n\t);\
+         CREATE TABLE token_vectors (\n\t\tid INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\ttoken TEXT NOT NULL CHECK(length(token) > 0),\n\t\tvector BLOB NOT NULL CHECK(length(vector) = 768),\n\t\tidf INTEGER NOT NULL CHECK(idf > 0)\n\t);\
          CREATE VIRTUAL TABLE nodes_fts USING fts5(  name, qualified_name, label, file_path,  content='',  tokenize='unicode61 remove_diacritics 2');\
          CREATE TABLE astro_meta (\
            schema TEXT NOT NULL,\
@@ -1029,13 +1029,22 @@ fn insert_rows(
 }
 
 fn insert_projects(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult<()> {
-    let mut statement =
-        tx.prepare("INSERT INTO projects(name, indexed_at, root_path) VALUES (?1, ?2, ?3)")?;
+    let mut statement = tx.prepare(
+        "INSERT INTO projects(name, indexed_at, root_path, index_mode, semantic_state, \
+         semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, \
+         token_vector_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
     for project in &rows.projects {
         statement.execute(params![
             project.project,
             project.indexed_at,
-            project.root_path
+            project.root_path,
+            project.index_mode,
+            project.semantic_state,
+            project.semantic_vector_dimension,
+            project.semantic_eligible_node_count,
+            project.node_vector_count,
+            project.token_vector_count,
         ])?;
     }
     Ok(())
@@ -1342,13 +1351,25 @@ fn lowered_manifest_key(project: &str, vault_fingerprint_sha256: &str) -> Vec<u8
 /// later kernel/guard/optimizer-only appends do not change this projection.
 fn lowered_projection_fingerprint(rows: &LoweredRows) -> String {
     let mut hasher = Sha256::new();
-    update_str(&mut hasher, "astrolabe-lowered-projection-v4");
+    update_str(&mut hasher, "astrolabe-lowered-projection-v5");
     update_str(&mut hasher, &rows.project);
     update_opt_u32(&mut hasher, rows.panel_version);
     for project in &rows.projects {
         update_str(&mut hasher, &project.project);
         update_str(&mut hasher, &project.indexed_at);
         update_str(&mut hasher, &project.root_path);
+        update_str(&mut hasher, &project.index_mode);
+        update_str(&mut hasher, &project.semantic_state);
+        update_i64(&mut hasher, project.semantic_vector_dimension);
+        match project.semantic_eligible_node_count {
+            Some(value) => {
+                hasher.update([1]);
+                update_i64(&mut hasher, value);
+            }
+            None => hasher.update([0]),
+        }
+        update_i64(&mut hasher, project.node_vector_count);
+        update_i64(&mut hasher, project.token_vector_count);
     }
     for node in &rows.nodes {
         update_i64(&mut hasher, node.id);

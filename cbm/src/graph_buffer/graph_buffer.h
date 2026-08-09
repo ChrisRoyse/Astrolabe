@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "foundation/index_capability.h"
 #include "graph_buffer/row_sink.h"
 #include "cbm.h"
 
@@ -64,6 +65,18 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path);
  * If id_source is NULL, behaves like cbm_gbuf_new(). */
 cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
                                     _Atomic int64_t *id_source);
+
+/* Bind the graph buffer to the requested index mode before enrichment or
+ * persistence. A buffer without this binding is never publishable. */
+int cbm_gbuf_set_index_mode(cbm_gbuf_t *gb, cbm_index_mode_t mode);
+
+/* Commit the semantic producer's exact eligible-node count after every vector
+ * append succeeds. Full/moderate persistence refuses when this marker is absent
+ * or inconsistent with the retained rows. */
+int cbm_gbuf_finalize_semantic_state(cbm_gbuf_t *gb, int eligible_node_count);
+
+/* Read the complete generation manifest derived from retained rows. */
+int cbm_gbuf_get_index_capability(const cbm_gbuf_t *gb, cbm_index_capability_t *out);
 
 /* Free the graph buffer and all owned data. NULL-safe. */
 void cbm_gbuf_free(cbm_gbuf_t *gb);

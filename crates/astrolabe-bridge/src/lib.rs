@@ -1356,6 +1356,77 @@ impl CbmIndexMode {
             Self::Fast => cbm_sys::cbm_index_mode_t_CBM_MODE_FAST,
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Moderate => "moderate",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CbmSemanticState {
+    Available,
+    UnavailableMode,
+    UnavailableCorpus,
+}
+
+impl CbmSemanticState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::UnavailableMode => "unavailable_mode",
+            Self::UnavailableCorpus => "unavailable_corpus",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CbmIndexCapability {
+    pub index_mode: CbmIndexMode,
+    pub semantic_state: CbmSemanticState,
+    pub vector_dimension: usize,
+    pub eligible_node_count: Option<usize>,
+    pub node_vector_count: usize,
+    pub token_vector_count: usize,
+}
+
+impl CbmIndexCapability {
+    pub const VECTOR_DIMENSION: usize = 768;
+    pub const MIN_ELIGIBLE_NODES: usize = 2;
+    const ELIGIBLE_NOT_EVALUATED: i32 = -1;
+
+    pub fn is_valid(self) -> bool {
+        if self.vector_dimension != Self::VECTOR_DIMENSION {
+            return false;
+        }
+        match self.semantic_state {
+            CbmSemanticState::Available => {
+                self.index_mode != CbmIndexMode::Fast
+                    && self
+                        .eligible_node_count
+                        .is_some_and(|count| count >= Self::MIN_ELIGIBLE_NODES)
+                    && self.eligible_node_count == Some(self.node_vector_count)
+                    && self.token_vector_count > 0
+            }
+            CbmSemanticState::UnavailableMode => {
+                self.index_mode == CbmIndexMode::Fast
+                    && self.eligible_node_count.is_none()
+                    && self.node_vector_count == 0
+                    && self.token_vector_count == 0
+            }
+            CbmSemanticState::UnavailableCorpus => {
+                self.index_mode != CbmIndexMode::Fast
+                    && self
+                        .eligible_node_count
+                        .is_some_and(|count| count < Self::MIN_ELIGIBLE_NODES)
+                    && self.node_vector_count == 0
+                    && self.token_vector_count == 0
+            }
+        }
+    }
 }
 
 /// Exact result of libcbm discovery over a real filesystem tree.
@@ -1490,6 +1561,7 @@ pub struct CbmPipelineRowManifest {
     pub edge_count: usize,
     pub file_hash_count: usize,
     pub graph_schema_version: u32,
+    pub index_capability: CbmIndexCapability,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1546,6 +1618,12 @@ pub fn pipeline_rows_success_response_value(rows: &CbmPipelineRows) -> serde_jso
             "edge_count": m.edge_count,
             "file_hash_count": m.file_hash_count,
             "graph_schema_version": m.graph_schema_version,
+            "index_mode": m.index_capability.index_mode.as_str(),
+            "semantic_state": m.index_capability.semantic_state.as_str(),
+            "semantic_vector_dimension": m.index_capability.vector_dimension,
+            "semantic_eligible_node_count": m.index_capability.eligible_node_count,
+            "node_vector_count": m.index_capability.node_vector_count,
+            "token_vector_count": m.index_capability.token_vector_count,
         })),
     })
 }
@@ -1814,6 +1892,85 @@ impl PipelineRowSinkState {
                 "Repair the producer so every committed source row is emitted exactly once before completion.",
             ));
         }
+        let raw_capability = row.index_capability;
+        let index_mode = match raw_capability.index_mode {
+            cbm_sys::cbm_index_mode_t_CBM_MODE_FULL => CbmIndexMode::Full,
+            cbm_sys::cbm_index_mode_t_CBM_MODE_MODERATE => CbmIndexMode::Moderate,
+            cbm_sys::cbm_index_mode_t_CBM_MODE_FAST => CbmIndexMode::Fast,
+            other => {
+                return Err(envelope(
+                    "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                    format!("CBM row-sink manifest carried unsupported index mode {other}"),
+                    "Rebuild both sides from the exact schema-v6 capability contract.",
+                ));
+            }
+        };
+        let semantic_state = match raw_capability.semantic_state {
+            cbm_sys::cbm_semantic_state_t_CBM_SEMANTIC_AVAILABLE => CbmSemanticState::Available,
+            cbm_sys::cbm_semantic_state_t_CBM_SEMANTIC_UNAVAILABLE_MODE => {
+                CbmSemanticState::UnavailableMode
+            }
+            cbm_sys::cbm_semantic_state_t_CBM_SEMANTIC_UNAVAILABLE_CORPUS => {
+                CbmSemanticState::UnavailableCorpus
+            }
+            other => {
+                return Err(envelope(
+                    "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                    format!("CBM row-sink manifest carried unsupported semantic state {other}"),
+                    "Rebuild both sides from the exact schema-v6 capability contract.",
+                ));
+            }
+        };
+        let vector_dimension = usize::try_from(raw_capability.vector_dimension).map_err(|_| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                "CBM row-sink manifest carried a negative semantic vector dimension",
+                "Repair the native capability producer; no inferred dimension is accepted.",
+            )
+        })?;
+        let node_vector_count =
+            usize::try_from(raw_capability.node_vector_count).map_err(|_| {
+                envelope(
+                    "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                    "CBM row-sink manifest carried a negative node-vector count",
+                    "Repair the native capability producer; no inferred count is accepted.",
+                )
+            })?;
+        let token_vector_count =
+            usize::try_from(raw_capability.token_vector_count).map_err(|_| {
+                envelope(
+                    "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                    "CBM row-sink manifest carried a negative token-vector count",
+                    "Repair the native capability producer; no inferred count is accepted.",
+                )
+            })?;
+        let eligible_node_count = match raw_capability.eligible_node_count {
+            CbmIndexCapability::ELIGIBLE_NOT_EVALUATED => None,
+            value => Some(usize::try_from(value).map_err(|_| {
+                envelope(
+                    "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                    "CBM row-sink manifest carried an invalid eligible-node count",
+                    "Repair the native capability producer; no inferred count is accepted.",
+                )
+            })?),
+        };
+        let index_capability = CbmIndexCapability {
+            index_mode,
+            semantic_state,
+            vector_dimension,
+            eligible_node_count,
+            node_vector_count,
+            token_vector_count,
+        };
+        if !index_capability.is_valid() {
+            return Err(envelope(
+                "ASTRO_CBM_ROW_SINK_CAPABILITY_INVALID",
+                format!(
+                    "CBM row-sink manifest carried an inconsistent capability {index_capability:?}"
+                ),
+                "Repair the native semantic producer and publish one exact capability generation.",
+            ));
+        }
         if self.nodes.iter().any(|node| node.project != project)
             || self.edges.iter().any(|edge| edge.project != project)
             || self
@@ -1846,6 +2003,7 @@ impl PipelineRowSinkState {
             edge_count: row.edge_count,
             file_hash_count: row.file_hash_count,
             graph_schema_version: row.graph_schema_version,
+            index_capability,
         });
         Ok(())
     }
@@ -3591,10 +3749,10 @@ unsafe extern "C" fn pipeline_post_success_sink(ctx: *mut c_void) -> c_int {
 
 fn pipeline_row_sink_descriptor(
     state: &mut PipelineRowSinkState,
-) -> cbm_sys::cbm_pipeline_row_sink_v1_t {
-    cbm_sys::cbm_pipeline_row_sink_v1_t {
-        abi_version: cbm_sys::CBM_PIPELINE_ROW_SINK_ABI_V1,
-        struct_size: std::mem::size_of::<cbm_sys::cbm_pipeline_row_sink_v1_t>(),
+) -> cbm_sys::cbm_pipeline_row_sink_v2_t {
+    cbm_sys::cbm_pipeline_row_sink_v2_t {
+        abi_version: cbm_sys::CBM_PIPELINE_ROW_SINK_ABI_V2,
+        struct_size: std::mem::size_of::<cbm_sys::cbm_pipeline_row_sink_v2_t>(),
         node: Some(pipeline_node_sink),
         edge: Some(pipeline_edge_sink),
         file_hash: Some(pipeline_file_hash_sink),

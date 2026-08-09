@@ -309,6 +309,13 @@ struct cbm_gbuf {
     int dump_token_vec_count;
     int dump_token_vec_cap;
 
+    /* Generation capability is explicit producer state, never inferred by a
+     * reader from whichever tables happen to be non-empty. */
+    bool index_mode_bound;
+    cbm_index_mode_t index_mode;
+    bool semantic_finalized;
+    int semantic_eligible_node_count;
+
     /* Optional dump-row sink. NULL callbacks preserve normal dump behavior. */
     cbm_gbuf_row_node_sink_fn row_node_sink;
     cbm_gbuf_row_edge_sink_fn row_edge_sink;
@@ -514,7 +521,7 @@ static void make_id_key(char *buf, size_t bufsz, int64_t id) {
     snprintf(buf, bufsz, "%lld", (long long)id);
 }
 
-/* Edge identity is the same five-part tuple persisted by schema v5:
+/* Edge identity is the same five-part tuple persisted since schema v5:
  * source, target, type, IMPORTS local name, preprocessing context id. Each
  * discriminator is independent; a context-bearing IMPORTS edge must retain
  * both. Parsing through yyjson matches SQLite json_extract's unescaped text
@@ -995,6 +1002,126 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
     return gb;
 }
 
+int cbm_gbuf_set_index_mode(cbm_gbuf_t *gb, cbm_index_mode_t mode) {
+    if (!gb || !cbm_index_mode_name(mode)) {
+        cbm_log_error("gbuf.index_mode_refused", "code", "CBM_INDEX_MODE_INVALID", "message",
+                      "the graph buffer requires one supported index mode before publication",
+                      "remediation", "repair the pipeline mode binding and retry before indexing");
+        return GB_ERR;
+    }
+    if (gb->index_mode_bound && gb->index_mode != mode) {
+        cbm_log_error("gbuf.index_mode_refused", "code", "CBM_INDEX_MODE_REBIND_REFUSED",
+                      "existing_mode", cbm_index_mode_name(gb->index_mode), "requested_mode",
+                      cbm_index_mode_name(mode), "message",
+                      "one graph buffer cannot represent two index-mode generations",
+                      "remediation", "create a fresh graph buffer for the requested mode");
+        return GB_ERR;
+    }
+    gb->index_mode = mode;
+    gb->index_mode_bound = true;
+    return 0;
+}
+
+int cbm_gbuf_finalize_semantic_state(cbm_gbuf_t *gb, int eligible_node_count) {
+    if (!gb || !gb->index_mode_bound || gb->index_mode == CBM_MODE_FAST ||
+        eligible_node_count < 0) {
+        cbm_log_error("gbuf.semantic_finalize_refused", "code",
+                      "CBM_SEMANTIC_FINALIZE_ARGUMENT_INVALID", "message",
+                      "semantic finalization requires a full or moderate mode binding and an exact "
+                      "non-negative eligible-node count",
+                      "remediation", "repair the semantic producer state before persistence");
+        return GB_ERR;
+    }
+    if (gb->semantic_finalized) {
+        cbm_log_error("gbuf.semantic_finalize_refused", "code",
+                      "CBM_SEMANTIC_FINALIZE_REPLAY_REFUSED", "message",
+                      "semantic capability was already finalized for this graph generation",
+                      "remediation", "create a fresh graph buffer before recomputing enrichment");
+        return GB_ERR;
+    }
+    gb->semantic_eligible_node_count = eligible_node_count;
+    gb->semantic_finalized = true;
+    cbm_index_capability_t capability;
+    if (cbm_gbuf_get_index_capability(gb, &capability) != 0) {
+        gb->semantic_finalized = false;
+        gb->semantic_eligible_node_count = 0;
+        return GB_ERR;
+    }
+    return 0;
+}
+
+int cbm_gbuf_get_index_capability(const cbm_gbuf_t *gb, cbm_index_capability_t *out) {
+    if (!gb || !out || !gb->index_mode_bound) {
+        cbm_log_error("gbuf.capability_refused", "code", "CBM_INDEX_CAPABILITY_UNBOUND",
+                      "message", "the graph generation has no explicit index-mode binding",
+                      "remediation", "bind the requested mode before enrichment and persistence");
+        return GB_ERR;
+    }
+
+    cbm_index_capability_t capability = {
+        .index_mode = gb->index_mode,
+        .semantic_state = CBM_SEMANTIC_UNAVAILABLE_MODE,
+        .vector_dimension = CBM_SEMANTIC_VECTOR_DIMENSION,
+        .eligible_node_count = CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED,
+        .node_vector_count = gb->dump_vector_count,
+        .token_vector_count = gb->dump_token_vec_count,
+    };
+    if (gb->index_mode != CBM_MODE_FAST) {
+        if (!gb->semantic_finalized) {
+            cbm_log_error("gbuf.capability_refused", "code",
+                          "CBM_SEMANTIC_GENERATION_UNFINALIZED", "index_mode",
+                          cbm_index_mode_name(gb->index_mode), "message",
+                          "full/moderate indexing did not finalize semantic producer state",
+                          "remediation", "inspect the semantic pass and retry the complete index");
+            return GB_ERR;
+        }
+        capability.eligible_node_count = gb->semantic_eligible_node_count;
+        capability.semantic_state =
+            gb->semantic_eligible_node_count < CBM_SEMANTIC_MIN_ELIGIBLE_NODES
+                ? CBM_SEMANTIC_UNAVAILABLE_CORPUS
+                : CBM_SEMANTIC_AVAILABLE;
+    }
+
+    for (int i = 0; i < gb->dump_vector_count; i++) {
+        if (!cbm_semantic_i8_vector_nonzero(gb->dump_vectors[i].vector,
+                                             gb->dump_vectors[i].vector_len)) {
+            cbm_log_error("gbuf.capability_refused", "code",
+                          "CBM_SEMANTIC_NODE_VECTOR_INVALID", "message",
+                          "a retained node vector has the wrong dimension or zero magnitude",
+                          "remediation", "repair the vector producer; no database was published");
+            return GB_ERR;
+        }
+    }
+    for (int i = 0; i < gb->dump_token_vec_count; i++) {
+        if (!gb->dump_token_vecs[i].token ||
+            !cbm_semantic_i8_vector_nonzero(gb->dump_token_vecs[i].vector,
+                                             gb->dump_token_vecs[i].vector_len)) {
+            cbm_log_error("gbuf.capability_refused", "code",
+                          "CBM_SEMANTIC_TOKEN_VECTOR_INVALID", "message",
+                          "a retained token vector is incomplete, has the wrong dimension, or has zero magnitude",
+                          "remediation", "repair the enriched-token producer; no database was published");
+            return GB_ERR;
+        }
+    }
+    if (!cbm_index_capability_valid(&capability)) {
+        char eligible[CBM_SZ_32];
+        char node_vectors[CBM_SZ_32];
+        char token_vectors[CBM_SZ_32];
+        snprintf(eligible, sizeof(eligible), "%d", capability.eligible_node_count);
+        snprintf(node_vectors, sizeof(node_vectors), "%d", capability.node_vector_count);
+        snprintf(token_vectors, sizeof(token_vectors), "%d", capability.token_vector_count);
+        cbm_log_error("gbuf.capability_refused", "code", "CBM_INDEX_CAPABILITY_INCONSISTENT",
+                      "index_mode", cbm_index_mode_name(capability.index_mode), "semantic_state",
+                      cbm_semantic_state_name(capability.semantic_state), "eligible_nodes", eligible,
+                      "node_vectors", node_vectors, "token_vectors", token_vectors, "message",
+                      "semantic producer counts do not form one valid index generation",
+                      "remediation", "repair the exact producer failure; no database was published");
+        return GB_ERR;
+    }
+    *out = capability;
+    return 0;
+}
+
 void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -1082,7 +1209,11 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
 /* ── Vector storage ──────────────────────────────────────────────── */
 
 int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector, int vector_len) {
-    if (!gb || !vector || vector_len <= 0) {
+    if (!gb || node_id <= 0 || !vector || vector_len != CBM_SEMANTIC_VECTOR_DIMENSION) {
+        cbm_log_error("gbuf.node_vector_refused", "code", "CBM_NODE_VECTOR_INPUT_INVALID",
+                      "message", "node vectors require a positive node identity and the exact "
+                                 "persisted semantic dimension",
+                      "remediation", "repair the semantic vector producer before retrying");
         return GB_ERR;
     }
     enum { VEC_INIT_CAP = 1024, VEC_GROW = 2 };
@@ -1091,6 +1222,10 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
             gb->dump_vector_cap < VEC_INIT_CAP ? VEC_INIT_CAP : gb->dump_vector_cap * VEC_GROW;
         CBMDumpVector *grown = realloc(gb->dump_vectors, (size_t)new_cap * sizeof(CBMDumpVector));
         if (!grown) {
+            cbm_log_error("gbuf.node_vector_alloc_failed", "code",
+                          "CBM_NODE_VECTOR_ARRAY_ALLOC_FAILED", "message",
+                          "the complete node-vector row array could not be retained",
+                          "remediation", "free memory or reduce repository size, then retry");
             return GB_ERR;
         }
         gb->dump_vectors = grown;
@@ -1099,6 +1234,9 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
     /* Copy vector data */
     uint8_t *vec_copy = malloc((size_t)vector_len);
     if (!vec_copy) {
+        cbm_log_error("gbuf.node_vector_alloc_failed", "code", "CBM_NODE_VECTOR_ALLOC_FAILED",
+                      "message", "one exact node-vector payload could not be retained",
+                      "remediation", "free memory or reduce repository size, then retry");
         return GB_ERR;
     }
     memcpy(vec_copy, vector, (size_t)vector_len);
@@ -1114,11 +1252,14 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
 
 int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
                                 int vector_len, float idf) {
-    if (!gb || !token || !valid_utf8_text(token) || !vector || vector_len <= 0) {
+    int64_t idf_fixed = 0;
+    if (!gb || !token || !token[0] || !valid_utf8_text(token) || !vector ||
+        vector_len != CBM_SEMANTIC_VECTOR_DIMENSION ||
+        !cbm_semantic_idf_to_fixed(idf, &idf_fixed)) {
         cbm_log_error("gbuf.token_vector_refused", "code", "CBM_TOKEN_VECTOR_INPUT_INVALID",
                       "message",
-                      "token vectors require valid UTF-8 text, non-empty vector bytes, and a "
-                      "live graph buffer",
+                      "token vectors require non-empty valid UTF-8 text, a positive IDF, the exact "
+                      "semantic dimension, a schema-representable IDF, and a live graph buffer",
                       NULL);
         return GB_ERR;
     }
@@ -2332,8 +2473,154 @@ static void set_sqlite_load_error(cbm_gbuf_load_error_t *error, sqlite3 *db, con
                    "complete corpus");
 }
 
-int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const char *project,
-                                  cbm_gbuf_load_error_t *error) {
+static int load_persisted_semantic_state(cbm_gbuf_t *gb, cbm_store_t *store, sqlite3 *db,
+                                         const char *db_path, const char *project,
+                                         const int64_t *old_to_new, int64_t max_old_id,
+                                         cbm_gbuf_load_error_t *error) {
+    cbm_project_t persisted = {0};
+    int project_rc = cbm_store_get_project(store, project, &persisted);
+    if (project_rc != CBM_STORE_OK) {
+        set_load_error(error, "CBM_GRAPH_SEMANTIC_MANIFEST_READ_FAILED",
+                       "graph_load_read_semantic_manifest", db_path,
+                       (size_t)(project_rc < 0 ? -project_rc : project_rc),
+                       cbm_store_error(store),
+                       "preserve the database and rebuild it from the exact source only after "
+                       "repairing its capability manifest");
+        cbm_project_free_fields(&persisted);
+        return CBM_NOT_FOUND;
+    }
+
+    const cbm_index_capability_t expected = persisted.capability;
+    cbm_project_free_fields(&persisted);
+    if (!gb->index_mode_bound || expected.index_mode != gb->index_mode) {
+        set_load_error(error, "CBM_GRAPH_INDEX_MODE_MISMATCH",
+                       "graph_load_validate_semantic_mode", db_path, 0,
+                       "the persisted index mode differs from the requested incremental mode",
+                       "perform one complete index in the requested mode; never reuse semantic "
+                       "state from a different generation mode");
+        return CBM_NOT_FOUND;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int step_rc = SQLITE_DONE;
+    if (expected.semantic_state == CBM_SEMANTIC_AVAILABLE) {
+        if (sqlite3_prepare_v2(db,
+                               "SELECT node_id, vector FROM node_vectors "
+                               "WHERE project = ? ORDER BY node_id",
+                               CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            set_sqlite_load_error(error, db, db_path,
+                                  "CBM_GRAPH_NODE_VECTOR_ROWS_PREPARE_FAILED",
+                                  "graph_load_prepare_node_vectors",
+                                  "the committed node-vector query could not be prepared");
+            return CBM_NOT_FOUND;
+        }
+        sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int64_t old_id = sqlite3_column_int64(stmt, 0);
+            const uint8_t *vector = sqlite3_column_blob(stmt, SKIP_ONE);
+            int vector_len = sqlite3_column_bytes(stmt, SKIP_ONE);
+            int64_t new_id =
+                old_id > 0 && old_id <= max_old_id ? old_to_new[old_id] : 0;
+            if (new_id <= 0 || !vector ||
+                vector_len != CBM_SEMANTIC_VECTOR_DIMENSION ||
+                cbm_gbuf_store_vector(gb, new_id, vector, vector_len) != 0) {
+                set_load_error(
+                    error, "CBM_GRAPH_NODE_VECTOR_RESTORE_FAILED",
+                    "graph_load_restore_node_vector", db_path,
+                    old_id < 0 ? 0 : (size_t)old_id,
+                    "a committed node vector could not be mapped and restored exactly",
+                    "preserve the database and rebuild it from the exact source after "
+                    "inspecting the node-vector identity, dimension, and allocation diagnostic");
+                sqlite3_finalize(stmt);
+                return CBM_NOT_FOUND;
+            }
+        }
+        if (step_rc != SQLITE_DONE) {
+            set_sqlite_load_error(error, db, db_path, "CBM_GRAPH_NODE_VECTOR_ROWS_READ_FAILED",
+                                  "graph_load_read_node_vectors",
+                                  "the complete committed node-vector set could not be read");
+            sqlite3_finalize(stmt);
+            return CBM_NOT_FOUND;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+
+        if (sqlite3_prepare_v2(db,
+                               "SELECT token, vector, idf FROM token_vectors "
+                               "WHERE project = ? ORDER BY id",
+                               CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            set_sqlite_load_error(error, db, db_path,
+                                  "CBM_GRAPH_TOKEN_VECTOR_ROWS_PREPARE_FAILED",
+                                  "graph_load_prepare_token_vectors",
+                                  "the committed token-vector query could not be prepared");
+            return CBM_NOT_FOUND;
+        }
+        sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *token = (const char *)sqlite3_column_text(stmt, 0);
+            const uint8_t *vector = sqlite3_column_blob(stmt, SKIP_ONE);
+            int vector_len = sqlite3_column_bytes(stmt, SKIP_ONE);
+            int64_t idf_fixed = sqlite3_column_int64(stmt, GB_COL_2);
+            const float idf =
+                (float)idf_fixed / (float)CBM_SEMANTIC_IDF_FIXED_POINT_SCALE;
+            if (!token || !token[0] || !vector || idf_fixed <= 0 ||
+                vector_len != CBM_SEMANTIC_VECTOR_DIMENSION ||
+                cbm_gbuf_store_token_vector(gb, token, vector, vector_len, idf) != 0) {
+                set_load_error(
+                    error, "CBM_GRAPH_TOKEN_VECTOR_RESTORE_FAILED",
+                    "graph_load_restore_token_vector", token ? token : db_path,
+                    idf_fixed < 0 ? 0 : (size_t)idf_fixed,
+                    "a committed token vector could not be restored exactly",
+                    "preserve the database and rebuild it from the exact source after "
+                    "inspecting the token, dimension, fixed-point IDF, and allocation diagnostic");
+                sqlite3_finalize(stmt);
+                return CBM_NOT_FOUND;
+            }
+        }
+        if (step_rc != SQLITE_DONE) {
+            set_sqlite_load_error(error, db, db_path,
+                                  "CBM_GRAPH_TOKEN_VECTOR_ROWS_READ_FAILED",
+                                  "graph_load_read_token_vectors",
+                                  "the complete committed token-vector set could not be read");
+            sqlite3_finalize(stmt);
+            return CBM_NOT_FOUND;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    if (expected.index_mode != CBM_MODE_FAST &&
+        cbm_gbuf_finalize_semantic_state(gb, expected.eligible_node_count) != 0) {
+        set_load_error(error, "CBM_GRAPH_SEMANTIC_FINALIZE_FAILED",
+                       "graph_load_finalize_semantic_state", db_path,
+                       (size_t)expected.eligible_node_count,
+                       "the restored semantic generation could not be finalized",
+                       "inspect the graph-buffer capability diagnostic and rebuild the exact "
+                       "source generation");
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_index_capability_t actual = {0};
+    if (cbm_gbuf_get_index_capability(gb, &actual) != 0 ||
+        actual.index_mode != expected.index_mode ||
+        actual.semantic_state != expected.semantic_state ||
+        actual.vector_dimension != expected.vector_dimension ||
+        actual.eligible_node_count != expected.eligible_node_count ||
+        actual.node_vector_count != expected.node_vector_count ||
+        actual.token_vector_count != expected.token_vector_count) {
+        set_load_error(error, "CBM_GRAPH_SEMANTIC_RESTORE_MISMATCH",
+                       "graph_load_verify_semantic_state", db_path, 0,
+                       "restored vector rows do not match the committed semantic manifest",
+                       "preserve the database and rebuild it from the exact source after "
+                       "inspecting the manifest and physical vector rows");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+static int cbm_gbuf_load_from_db_checked_internal(cbm_gbuf_t *gb, const char *db_path,
+                                                  const char *project,
+                                                  cbm_gbuf_load_error_t *error,
+                                                  bool load_semantics) {
     if (error) {
         memset(error, 0, sizeof(*error));
     }
@@ -2568,9 +2855,27 @@ int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const cha
     }
     sqlite3_finalize(stmt);
 
+    if (load_semantics && load_persisted_semantic_state(gb, store, db, db_path, project,
+                                                        old_to_new, max_old_id, error) != 0) {
+        free(old_to_new);
+        cbm_store_close_required(&store, "graph_buffer.load.semantic_restore_failed");
+        return CBM_NOT_FOUND;
+    }
+
     free(old_to_new);
     cbm_store_close_required(&store, "graph_buffer.load.complete");
     return 0;
+}
+
+int cbm_gbuf_load_from_db_checked(cbm_gbuf_t *gb, const char *db_path, const char *project,
+                                  cbm_gbuf_load_error_t *error) {
+    return cbm_gbuf_load_from_db_checked_internal(gb, db_path, project, error, false);
+}
+
+int cbm_gbuf_load_from_db_checked_with_semantics(cbm_gbuf_t *gb, const char *db_path,
+                                                 const char *project,
+                                                 cbm_gbuf_load_error_t *error) {
+    return cbm_gbuf_load_from_db_checked_internal(gb, db_path, project, error, true);
 }
 
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
@@ -3341,6 +3646,8 @@ static void remap_sort_dedup_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fina
             gb->dump_vectors[remapped].node_id = new_id;
             remapped++;
         } else {
+            free((void *)gb->dump_vectors[i].vector);
+            gb->dump_vectors[i].vector = NULL;
             dropped++;
         }
     }
@@ -3360,6 +3667,8 @@ static void remap_sort_dedup_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fina
         for (int i = 0; i < gb->dump_vector_count; i++) {
             if (i + GB_DEDUP_LOOKAHEAD < gb->dump_vector_count &&
                 gb->dump_vectors[i].node_id == gb->dump_vectors[i + GB_DEDUP_LOOKAHEAD].node_id) {
+                free((void *)gb->dump_vectors[i].vector);
+                gb->dump_vectors[i].vector = NULL;
                 continue;
             }
             gb->dump_vectors[deduped++] = gb->dump_vectors[i];
@@ -3614,6 +3923,17 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     release_gbuf_indexes(gb);
     CBM_PROF_END("dump", "4_release_gbuf_indexes", t_release_idx);
 
+    /* Remap and validate all vector identities before the writer opens. A
+     * dropped/duplicate vector would otherwise be discovered only after node
+     * pages had been staged. */
+    release_and_remap_vectors(gb, temp_to_final, max_temp_id);
+    cbm_index_capability_t capability;
+    if (cbm_gbuf_get_index_capability(gb, &capability) != 0) {
+        free_dump_resources(NULL, NULL, NULL, 0, NULL, dump_nodes, node_idx, temp_to_final);
+        free(src_nodes);
+        return CBM_NOT_FOUND;
+    }
+
     char indexed_at[CBM_SZ_64];
     generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
@@ -3637,8 +3957,6 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
             free(src_nodes);
             return CBM_NOT_FOUND;
         }
-        release_and_remap_vectors(gb, temp_to_final, max_temp_id);
-
         int sink_rc = emit_row_sink_nodes(gb, dump_nodes, node_idx);
         if (sink_rc == 0) {
             sink_rc = emit_row_sink_edges(gb, dump_edges, edge_idx);
@@ -3703,8 +4021,6 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
              * complete, never torn. release_and_remap_vectors is skipped since the
              * dump is aborting. */
             rc = CBM_NOT_FOUND;
-        } else {
-            release_and_remap_vectors(gb, temp_to_final, max_temp_id);
         }
     }
 
@@ -3713,9 +4029,10 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * called so the writer handle is released and the file descriptor closed even
      * on the edge-build-failed path (the resulting file is unlinked below). */
     CBM_PROF_START(t_finalize);
-    int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
-                                  dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
-                                  gb->dump_token_vecs, gb->dump_token_vec_count);
+    int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, &capability,
+                                  dump_nodes, node_idx, dump_edges, edge_idx, gb->dump_vectors,
+                                  gb->dump_vector_count, gb->dump_token_vecs,
+                                  gb->dump_token_vec_count);
     CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
     if (rc == 0) {
         rc = frc;
@@ -3755,8 +4072,22 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return CBM_NOT_FOUND;
     }
 
+    /* This legacy row-wise path has no vector-row writer. It may publish only a
+     * capability that truthfully requires zero vector rows (currently fast or
+     * an insufficient full/moderate corpus). */
+    cbm_index_capability_t capability;
+    if (cbm_gbuf_get_index_capability(gb, &capability) != 0 ||
+        capability.node_vector_count != 0 || capability.token_vector_count != 0) {
+        cbm_log_error("gbuf.flush_refused", "code", "CBM_GBUF_ROW_STORE_VECTOR_UNSUPPORTED",
+                      "message", "the row-wise store path cannot publish retained semantic vectors",
+                      "remediation", "use the complete atomic direct-writer publication path");
+        return CBM_NOT_FOUND;
+    }
+
     /* Upsert project */
-    cbm_store_upsert_project(store, gb->project, gb->root_path);
+    if (cbm_store_upsert_project(store, gb->project, gb->root_path, &capability) != CBM_STORE_OK) {
+        return CBM_NOT_FOUND;
+    }
 
     /* Begin bulk mode */
     cbm_store_begin_bulk(store);

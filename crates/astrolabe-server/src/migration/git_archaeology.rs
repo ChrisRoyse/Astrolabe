@@ -11,9 +11,9 @@ use astrolabe_anchors::{
     PreparedOutcomeAnchorBatch, prepare_outcome_anchor_batch,
 };
 use astrolabe_bridge::{
-    CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineFileHashRow, CbmPipelineNodeRow,
-    CbmPipelineRowManifest, CbmPipelineRows, ExtractedFile, Import, ImportResolution, Language,
-    discover_pipeline_files,
+    CbmIndexCapability, CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineFileHashRow,
+    CbmPipelineNodeRow, CbmPipelineRowManifest, CbmPipelineRows, CbmSemanticState, ExtractedFile,
+    Import, ImportResolution, Language, discover_pipeline_files,
 };
 // #502: share the clone farm's #480 Windows-invalid-path classifier so the historical
 // checkout and the farm never disagree on what NTFS can hold.
@@ -2840,6 +2840,38 @@ fn parse_extract_manifest(value: &Value) -> Result<CbmPipelineRowManifest, Strin
         .and_then(|raw| {
             u32::try_from(raw).map_err(|_| "manifest graph_schema_version exceeds u32".to_string())
         })?;
+    let index_mode = match value["index_mode"].as_str() {
+        Some("full") => CbmIndexMode::Full,
+        Some("moderate") => CbmIndexMode::Moderate,
+        Some("fast") => CbmIndexMode::Fast,
+        _ => return Err("manifest missing supported string field 'index_mode'".to_string()),
+    };
+    let semantic_state = match value["semantic_state"].as_str() {
+        Some("available") => CbmSemanticState::Available,
+        Some("unavailable_mode") => CbmSemanticState::UnavailableMode,
+        Some("unavailable_corpus") => CbmSemanticState::UnavailableCorpus,
+        _ => return Err("manifest missing supported string field 'semantic_state'".to_string()),
+    };
+    let vector_dimension = usize_field("semantic_vector_dimension")?;
+    let eligible_node_count = match &value["semantic_eligible_node_count"] {
+        Value::Null => None,
+        _ => Some(usize_field("semantic_eligible_node_count")?),
+    };
+    let node_vector_count = usize_field("node_vector_count")?;
+    let token_vector_count = usize_field("token_vector_count")?;
+    let index_capability = CbmIndexCapability {
+        index_mode,
+        semantic_state,
+        vector_dimension,
+        eligible_node_count,
+        node_vector_count,
+        token_vector_count,
+    };
+    if !index_capability.is_valid() {
+        return Err(format!(
+            "manifest semantic capability is internally inconsistent: {index_capability:?}"
+        ));
+    }
     Ok(CbmPipelineRowManifest {
         project: value["project"]
             .as_str()
@@ -2849,6 +2881,7 @@ fn parse_extract_manifest(value: &Value) -> Result<CbmPipelineRowManifest, Strin
         edge_count: usize_field("edge_count")?,
         file_hash_count: usize_field("file_hash_count")?,
         graph_schema_version,
+        index_capability,
     })
 }
 

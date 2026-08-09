@@ -3666,6 +3666,75 @@ pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
             astrolabe_ingest::CBM_SQLITE_SCHEMA_VERSION
         ));
     }
+    let project_capability = &rows.projects[0];
+    let index_mode = match project_capability.index_mode.as_str() {
+        "full" => astrolabe_bridge::CbmIndexMode::Full,
+        "moderate" => astrolabe_bridge::CbmIndexMode::Moderate,
+        "fast" => astrolabe_bridge::CbmIndexMode::Fast,
+        mode => {
+            return RowSinkImportCandidate::Unavailable(format!(
+                "complete SQLite readback carried unsupported index mode {mode:?}"
+            ));
+        }
+    };
+    let semantic_state = match project_capability.semantic_state.as_str() {
+        "available" => astrolabe_bridge::CbmSemanticState::Available,
+        "unavailable_mode" => astrolabe_bridge::CbmSemanticState::UnavailableMode,
+        "unavailable_corpus" => astrolabe_bridge::CbmSemanticState::UnavailableCorpus,
+        state => {
+            return RowSinkImportCandidate::Unavailable(format!(
+                "complete SQLite readback carried unsupported semantic state {state:?}"
+            ));
+        }
+    };
+    let vector_dimension = match usize::try_from(project_capability.semantic_vector_dimension) {
+        Ok(value) => value,
+        Err(_) => {
+            return RowSinkImportCandidate::Unavailable(
+                "complete SQLite readback carried a negative semantic vector dimension".to_string(),
+            );
+        }
+    };
+    let eligible_node_count = match project_capability.semantic_eligible_node_count {
+        Some(value) => match usize::try_from(value) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return RowSinkImportCandidate::Unavailable(
+                    "complete SQLite readback carried a negative eligible-node count".to_string(),
+                );
+            }
+        },
+        None => None,
+    };
+    let node_vector_count = match usize::try_from(project_capability.node_vector_count) {
+        Ok(value) => value,
+        Err(_) => {
+            return RowSinkImportCandidate::Unavailable(
+                "complete SQLite readback carried a negative node-vector count".to_string(),
+            );
+        }
+    };
+    let token_vector_count = match usize::try_from(project_capability.token_vector_count) {
+        Ok(value) => value,
+        Err(_) => {
+            return RowSinkImportCandidate::Unavailable(
+                "complete SQLite readback carried a negative token-vector count".to_string(),
+            );
+        }
+    };
+    let index_capability = astrolabe_bridge::CbmIndexCapability {
+        index_mode,
+        semantic_state,
+        vector_dimension,
+        eligible_node_count,
+        node_vector_count,
+        token_vector_count,
+    };
+    if !index_capability.is_valid() {
+        return RowSinkImportCandidate::Unavailable(format!(
+            "complete SQLite readback carried an inconsistent semantic capability {index_capability:?}"
+        ));
+    }
 
     let source_fingerprint_sha256 = sqlite_pipeline_fingerprint(&rows);
     let CbmSqlitePipelineRows {
@@ -3734,6 +3803,7 @@ pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
         edge_count: edges.len(),
         file_hash_count: file_hashes.len(),
         graph_schema_version,
+        index_capability,
     };
     let bridge_rows = CbmPipelineRows {
         project,
@@ -3845,7 +3915,7 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
 
 fn sqlite_pipeline_fingerprint(rows: &CbmSqlitePipelineRows) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-cbm-complete-sqlite-pipeline-v1\0");
+    hasher.update(b"astrolabe-cbm-complete-sqlite-pipeline-v2\0");
     hash_str(&mut hasher, &rows.project);
     hasher.update(rows.graph_schema_version.to_le_bytes());
 
@@ -3856,6 +3926,18 @@ fn sqlite_pipeline_fingerprint(rows: &CbmSqlitePipelineRows) -> [u8; 32] {
         hash_str(&mut hasher, &row.project);
         hash_str(&mut hasher, &row.indexed_at);
         hash_str(&mut hasher, &row.root_path);
+        hash_str(&mut hasher, &row.index_mode);
+        hash_str(&mut hasher, &row.semantic_state);
+        hasher.update(row.semantic_vector_dimension.to_le_bytes());
+        match row.semantic_eligible_node_count {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update(value.to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update(row.node_vector_count.to_le_bytes());
+        hasher.update(row.token_vector_count.to_le_bytes());
     }
 
     let mut file_hashes = rows.file_hashes.iter().collect::<Vec<_>>();

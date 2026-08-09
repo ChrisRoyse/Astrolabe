@@ -170,7 +170,7 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 /* Install the complete v1 source-snapshot sink for index_repository pipelines.
  * The descriptor is copied. Passing NULL restores the no-sink path. Returns 0
  * on success, -1 when the server or descriptor is invalid. */
-int cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, const cbm_pipeline_row_sink_v1_t *sink);
+int cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, const cbm_pipeline_row_sink_v2_t *sink);
 
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */

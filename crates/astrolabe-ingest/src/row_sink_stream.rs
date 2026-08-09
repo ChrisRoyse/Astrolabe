@@ -62,7 +62,7 @@ const ROW_REMEDIATION: &str = "Fix or drop the malformed CBM row-sink row at its
 
 /// One item of the complete CBM row-sink stream.
 ///
-/// This mirrors the row kinds the CBM pipeline v1 snapshot sink emits. The stream is a
+/// This mirrors the row kinds the CBM pipeline v2 snapshot sink emits. The stream is a
 /// sequence of `IngestResult<RowSinkStreamRow>` so an individual row-sink failure
 /// is carried per the #123 independent-failure contract.
 #[derive(Debug, Clone, PartialEq)]

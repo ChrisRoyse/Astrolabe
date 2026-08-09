@@ -17,6 +17,7 @@
 
 /* Use the existing CBMLanguage enum from extraction layer */
 #include "cbm.h"
+#include "foundation/index_capability.h"
 
 /* ── Language detection ──────────────────────────────────────────── */
 
@@ -67,20 +68,9 @@ bool cbm_gitignore_merge(cbm_gitignore_t *dst, const cbm_gitignore_t *src);
 
 /* ── Directory skip / suffix filters ─────────────────────────────── */
 
-/* Index mode controls filtering aggressiveness.
- * IMPORTANT: these values MUST match pipeline.h exactly.  A previous
- * mismatch (this header had FAST=1, pipeline.h has FAST=2) caused
- * fast-mode filtering to silently no-op depending on include order —
- * the pipeline passed value 2, discover.c compared against 1, and no
- * files got filtered. */
-#ifndef CBM_INDEX_MODE_T_DEFINED
-#define CBM_INDEX_MODE_T_DEFINED
-typedef enum {
-    CBM_MODE_FULL = 0,     /* parse everything supported */
-    CBM_MODE_MODERATE = 1, /* aggressive filtering + similarity/semantic edges */
-    CBM_MODE_FAST = 2,     /* aggressive filtering + no similarity/semantic edges */
-} cbm_index_mode_t;
-#endif
+/* Index mode controls filtering aggressiveness. The persisted capability
+ * contract is the single definition so discovery, pipeline admission, and
+ * publication cannot assign different values to the same requested mode. */
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).
  * Only invariant cache/vendor/build basenames are skipped; mode never adds

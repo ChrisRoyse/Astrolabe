@@ -844,7 +844,8 @@ bool cbm_pipeline_row_sink_active(const cbm_pipeline_t *p);
 void cbm_pipeline_attach_row_sink(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);
 int cbm_pipeline_emit_file_hash(cbm_pipeline_t *p, const char *project, const char *rel_path,
                                 const char *sha256, int64_t mtime_ns, int64_t size);
-int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count);
+int cbm_pipeline_complete_row_sink(cbm_pipeline_t *p, size_t file_hash_count,
+                                   const cbm_index_capability_t *capability);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

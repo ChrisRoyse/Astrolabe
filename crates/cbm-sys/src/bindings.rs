@@ -4,10 +4,17 @@ pub const CBM_ARENA_MAX_BLOCKS: u32 = 256;
 pub const CBM_ARENA_DEFAULT_BLOCK_SIZE: u32 = 65536;
 pub const CBM_MAX_CALL_ARGS: u32 = 8;
 pub const CBM_MAX_STRING_CONSTANTS: u32 = 256;
-pub const CBM_PIPELINE_ROW_SINK_ABI_V1: u32 = 1;
+pub const CBM_SEMANTIC_VECTOR_DIMENSION_SQL: &[u8; 4] = b"768\0";
+pub const CBM_SEMANTIC_MIN_ELIGIBLE_NODES_SQL: &[u8; 2] = b"2\0";
+pub const CBM_PIPELINE_ROW_SINK_ABI_V2: u32 = 2;
 pub const CBM_STORE_OK: u32 = 0;
 pub const CBM_STORE_ERR: i32 = -1;
 pub const CBM_STORE_NOT_FOUND: i32 = -2;
+pub const CBM_STORE_SEMANTIC_UNAVAILABLE: i32 = -3;
+pub const CBM_STORE_SEMANTIC_STATE_INVALID: i32 = -4;
+pub const CBM_STORE_SEMANTIC_KEYWORD_UNAVAILABLE: i32 = -5;
+pub const CBM_STORE_SEMANTIC_VECTOR_CORRUPT: i32 = -6;
+pub const CBM_STORE_SEMANTIC_KEYWORD_INVALID: i32 = -7;
 pub const CBM_ADR_MAX_LENGTH: u32 = 8000;
 pub const CBM_VECTOR_SEARCH_MAX_KEYWORDS: u32 = 32;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
@@ -1574,6 +1581,38 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_label_is_type_like(label: *const ::std::os::raw::c_char) -> bool;
 }
+pub const cbm_index_mode_t_CBM_MODE_FULL: cbm_index_mode_t = 0;
+pub const cbm_index_mode_t_CBM_MODE_MODERATE: cbm_index_mode_t = 1;
+pub const cbm_index_mode_t_CBM_MODE_FAST: cbm_index_mode_t = 2;
+pub type cbm_index_mode_t = ::std::os::raw::c_int;
+pub const cbm_semantic_state_t_CBM_SEMANTIC_AVAILABLE: cbm_semantic_state_t = 0;
+pub const cbm_semantic_state_t_CBM_SEMANTIC_UNAVAILABLE_MODE: cbm_semantic_state_t = 1;
+pub const cbm_semantic_state_t_CBM_SEMANTIC_UNAVAILABLE_CORPUS: cbm_semantic_state_t = 2;
+pub type cbm_semantic_state_t = ::std::os::raw::c_int;
+pub const CBM_SEMANTIC_VECTOR_DIMENSION: _bindgen_ty_1 = 768;
+pub const CBM_SEMANTIC_MIN_ELIGIBLE_NODES: _bindgen_ty_1 = 2;
+pub const CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED: _bindgen_ty_1 = -1;
+pub const CBM_SEMANTIC_IDF_FIXED_POINT_SCALE: _bindgen_ty_1 = 1000;
+pub type _bindgen_ty_1 = ::std::os::raw::c_int;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_index_capability_t {
+    pub index_mode: cbm_index_mode_t,
+    pub semantic_state: cbm_semantic_state_t,
+    pub vector_dimension: ::std::os::raw::c_int,
+    pub eligible_node_count: ::std::os::raw::c_int,
+    pub node_vector_count: ::std::os::raw::c_int,
+    pub token_vector_count: ::std::os::raw::c_int,
+}
+impl Default for cbm_index_capability_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 unsafe extern "C" {
     pub fn cbm_language_for_filename(filename: *const ::std::os::raw::c_char) -> CBMLanguage;
 }
@@ -1618,10 +1657,6 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_gitignore_merge(dst: *mut cbm_gitignore_t, src: *const cbm_gitignore_t) -> bool;
 }
-pub const cbm_index_mode_t_CBM_MODE_FULL: cbm_index_mode_t = 0;
-pub const cbm_index_mode_t_CBM_MODE_MODERATE: cbm_index_mode_t = 1;
-pub const cbm_index_mode_t_CBM_MODE_FAST: cbm_index_mode_t = 2;
-pub type cbm_index_mode_t = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_should_skip_dir(
         dirname: *const ::std::os::raw::c_char,
@@ -1934,8 +1969,8 @@ unsafe extern "C" {
         buf_size: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-pub const CBM_GRAPH_SCHEMA_VERSION: _bindgen_ty_1 = 5;
-pub type _bindgen_ty_1 = ::std::os::raw::c_int;
+pub const CBM_GRAPH_SCHEMA_VERSION: _bindgen_ty_2 = 6;
+pub type _bindgen_ty_2 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_gbuf_row_node_t {
@@ -2012,6 +2047,7 @@ pub struct cbm_pipeline_row_manifest_t {
     pub edge_count: usize,
     pub file_hash_count: usize,
     pub graph_schema_version: u32,
+    pub index_capability: cbm_index_capability_t,
 }
 impl Default for cbm_pipeline_row_manifest_t {
     fn default() -> Self {
@@ -2048,7 +2084,7 @@ pub type cbm_pipeline_row_complete_sink_fn = ::std::option::Option<
 >;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct cbm_pipeline_row_sink_v1_t {
+pub struct cbm_pipeline_row_sink_v2_t {
     pub abi_version: u32,
     pub struct_size: usize,
     pub node: cbm_gbuf_row_node_sink_fn,
@@ -2057,7 +2093,7 @@ pub struct cbm_pipeline_row_sink_v1_t {
     pub complete: cbm_pipeline_row_complete_sink_fn,
     pub ctx: *mut ::std::os::raw::c_void,
 }
-impl Default for cbm_pipeline_row_sink_v1_t {
+impl Default for cbm_pipeline_row_sink_v2_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -2078,22 +2114,22 @@ pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_INTEGRITY_FAILED: cbm_store
     2;
 pub const cbm_store_verify_status_t_CBM_STORE_VERIFY_IO_FAILED: cbm_store_verify_status_t = 3;
 pub type cbm_store_verify_status_t = ::std::os::raw::c_int;
-pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_2 = 64;
-pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_2 = 512;
-pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_2 = 4096;
-pub type _bindgen_ty_2 = ::std::os::raw::c_int;
-pub type cbm_store_close_status_t = i32;
-pub const CBM_STORE_CLOSE_OK: _bindgen_ty_3 = 0;
-pub const CBM_STORE_CLOSE_FINALIZE_FAILED: _bindgen_ty_3 = 1;
-pub const CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS: _bindgen_ty_3 = 2;
-pub const CBM_STORE_CLOSE_FAILED: _bindgen_ty_3 = 3;
-pub const CBM_STORE_CLOSE_INVALID_ARGUMENT: _bindgen_ty_3 = 4;
-pub const CBM_STORE_CLOSE_ABI_VERSION: _bindgen_ty_3 = 1;
-pub const CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT: _bindgen_ty_3 = 34;
-pub const CBM_STORE_CLOSE_STATEMENT_NAME_MAX: _bindgen_ty_3 = 64;
-pub const CBM_STORE_CLOSE_SQL_TEXT_MAX: _bindgen_ty_3 = 512;
-pub const CBM_STORE_CLOSE_SQL_SHA256_MAX: _bindgen_ty_3 = 65;
+pub const CBM_STORE_VERIFY_OPERATION_MAX: _bindgen_ty_3 = 64;
+pub const CBM_STORE_VERIFY_DETAIL_MAX: _bindgen_ty_3 = 512;
+pub const CBM_STORE_VERIFY_PATH_MAX: _bindgen_ty_3 = 4096;
 pub type _bindgen_ty_3 = ::std::os::raw::c_int;
+pub type cbm_store_close_status_t = i32;
+pub const CBM_STORE_CLOSE_OK: _bindgen_ty_4 = 0;
+pub const CBM_STORE_CLOSE_FINALIZE_FAILED: _bindgen_ty_4 = 1;
+pub const CBM_STORE_CLOSE_OUTSTANDING_STATEMENTS: _bindgen_ty_4 = 2;
+pub const CBM_STORE_CLOSE_FAILED: _bindgen_ty_4 = 3;
+pub const CBM_STORE_CLOSE_INVALID_ARGUMENT: _bindgen_ty_4 = 4;
+pub const CBM_STORE_CLOSE_ABI_VERSION: _bindgen_ty_4 = 1;
+pub const CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT: _bindgen_ty_4 = 34;
+pub const CBM_STORE_CLOSE_STATEMENT_NAME_MAX: _bindgen_ty_4 = 64;
+pub const CBM_STORE_CLOSE_SQL_TEXT_MAX: _bindgen_ty_4 = 512;
+pub const CBM_STORE_CLOSE_SQL_SHA256_MAX: _bindgen_ty_4 = 65;
+pub type _bindgen_ty_4 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_store_finalize_error_t {
@@ -2142,18 +2178,18 @@ impl Default for cbm_store_close_result_t {
     }
 }
 pub type cbm_store_normalize_status_t = i32;
-pub const CBM_STORE_NORMALIZE_OK: _bindgen_ty_4 = 0;
-pub const CBM_STORE_NORMALIZE_INVALID_ARGUMENT: _bindgen_ty_4 = 1;
-pub const CBM_STORE_NORMALIZE_READ_ONLY: _bindgen_ty_4 = 2;
-pub const CBM_STORE_NORMALIZE_JOURNAL_READ_FAILED: _bindgen_ty_4 = 3;
-pub const CBM_STORE_NORMALIZE_UNSUPPORTED_JOURNAL_MODE: _bindgen_ty_4 = 4;
-pub const CBM_STORE_NORMALIZE_CHECKPOINT_FAILED: _bindgen_ty_4 = 5;
-pub const CBM_STORE_NORMALIZE_CHECKPOINT_INCOMPLETE: _bindgen_ty_4 = 6;
-pub const CBM_STORE_NORMALIZE_SET_DELETE_FAILED: _bindgen_ty_4 = 7;
-pub const CBM_STORE_NORMALIZE_READBACK_FAILED: _bindgen_ty_4 = 8;
-pub const CBM_STORE_NORMALIZE_ABI_VERSION: _bindgen_ty_4 = 1;
-pub const CBM_STORE_NORMALIZE_MODE_MAX: _bindgen_ty_4 = 16;
-pub type _bindgen_ty_4 = ::std::os::raw::c_int;
+pub const CBM_STORE_NORMALIZE_OK: _bindgen_ty_5 = 0;
+pub const CBM_STORE_NORMALIZE_INVALID_ARGUMENT: _bindgen_ty_5 = 1;
+pub const CBM_STORE_NORMALIZE_READ_ONLY: _bindgen_ty_5 = 2;
+pub const CBM_STORE_NORMALIZE_JOURNAL_READ_FAILED: _bindgen_ty_5 = 3;
+pub const CBM_STORE_NORMALIZE_UNSUPPORTED_JOURNAL_MODE: _bindgen_ty_5 = 4;
+pub const CBM_STORE_NORMALIZE_CHECKPOINT_FAILED: _bindgen_ty_5 = 5;
+pub const CBM_STORE_NORMALIZE_CHECKPOINT_INCOMPLETE: _bindgen_ty_5 = 6;
+pub const CBM_STORE_NORMALIZE_SET_DELETE_FAILED: _bindgen_ty_5 = 7;
+pub const CBM_STORE_NORMALIZE_READBACK_FAILED: _bindgen_ty_5 = 8;
+pub const CBM_STORE_NORMALIZE_ABI_VERSION: _bindgen_ty_5 = 1;
+pub const CBM_STORE_NORMALIZE_MODE_MAX: _bindgen_ty_5 = 16;
+pub type _bindgen_ty_5 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_store_normalize_result_t {
@@ -2265,6 +2301,7 @@ pub struct cbm_project_t {
     pub name: *const ::std::os::raw::c_char,
     pub indexed_at: *const ::std::os::raw::c_char,
     pub root_path: *const ::std::os::raw::c_char,
+    pub capability: cbm_index_capability_t,
 }
 impl Default for cbm_project_t {
     fn default() -> Self {
@@ -2274,6 +2311,16 @@ impl Default for cbm_project_t {
             s.assume_init()
         }
     }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct cbm_vector_state_readback_t {
+    pub node_vector_count: ::std::os::raw::c_int,
+    pub node_vector_min_dimension: ::std::os::raw::c_int,
+    pub node_vector_max_dimension: ::std::os::raw::c_int,
+    pub token_vector_count: ::std::os::raw::c_int,
+    pub token_vector_min_dimension: ::std::os::raw::c_int,
+    pub token_vector_max_dimension: ::std::os::raw::c_int,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2293,8 +2340,8 @@ impl Default for cbm_file_hash_t {
         }
     }
 }
-pub const CBM_FILE_SHA256_CAPACITY: _bindgen_ty_5 = 65;
-pub type _bindgen_ty_5 = ::std::os::raw::c_int;
+pub const CBM_FILE_SHA256_CAPACITY: _bindgen_ty_6 = 65;
+pub type _bindgen_ty_6 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_file_identity_t {
@@ -2694,6 +2741,7 @@ unsafe extern "C" {
         s: *mut cbm_store_t,
         name: *const ::std::os::raw::c_char,
         root_path: *const ::std::os::raw::c_char,
+        capability: *const cbm_index_capability_t,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -3503,6 +3551,7 @@ unsafe extern "C" {
         limit: ::std::os::raw::c_int,
         out: *mut *mut cbm_vector_result_t,
         out_count: *mut ::std::os::raw::c_int,
+        observed_capability: *mut cbm_index_capability_t,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -3515,6 +3564,13 @@ unsafe extern "C" {
     pub fn cbm_store_count_vectors(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_store_read_vector_state(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        out: *mut cbm_vector_state_readback_t,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -3659,20 +3715,20 @@ pub struct cbm_project_transition {
 }
 pub type cbm_project_transition_t = cbm_project_transition;
 pub type cbm_project_holder_probe_status_t = i32;
-pub const CBM_PROJECT_HOLDER_PROBE_NOT_RUN: _bindgen_ty_7 = 0;
-pub const CBM_PROJECT_HOLDER_PROBE_STABLE: _bindgen_ty_7 = 1;
-pub const CBM_PROJECT_HOLDER_PROBE_API_UNAVAILABLE: _bindgen_ty_7 = 2;
-pub const CBM_PROJECT_HOLDER_PROBE_SESSION_FAILED: _bindgen_ty_7 = 3;
-pub const CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED: _bindgen_ty_7 = 4;
-pub const CBM_PROJECT_HOLDER_PROBE_LIST_FAILED: _bindgen_ty_7 = 5;
-pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED: _bindgen_ty_7 = 6;
-pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED: _bindgen_ty_7 = 7;
-pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED: _bindgen_ty_7 = 8;
-pub const CBM_PROJECT_HOLDER_PROBE_UNSTABLE: _bindgen_ty_7 = 9;
-pub const CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED: _bindgen_ty_7 = 10;
-pub const CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX: _bindgen_ty_7 = 64;
-pub const CBM_PROJECT_HOLDER_PATH_MAX: _bindgen_ty_7 = 4096;
-pub type _bindgen_ty_7 = ::std::os::raw::c_int;
+pub const CBM_PROJECT_HOLDER_PROBE_NOT_RUN: _bindgen_ty_8 = 0;
+pub const CBM_PROJECT_HOLDER_PROBE_STABLE: _bindgen_ty_8 = 1;
+pub const CBM_PROJECT_HOLDER_PROBE_API_UNAVAILABLE: _bindgen_ty_8 = 2;
+pub const CBM_PROJECT_HOLDER_PROBE_SESSION_FAILED: _bindgen_ty_8 = 3;
+pub const CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED: _bindgen_ty_8 = 4;
+pub const CBM_PROJECT_HOLDER_PROBE_LIST_FAILED: _bindgen_ty_8 = 5;
+pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED: _bindgen_ty_8 = 6;
+pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED: _bindgen_ty_8 = 7;
+pub const CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED: _bindgen_ty_8 = 8;
+pub const CBM_PROJECT_HOLDER_PROBE_UNSTABLE: _bindgen_ty_8 = 9;
+pub const CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED: _bindgen_ty_8 = 10;
+pub const CBM_PROJECT_HOLDER_PROBE_OPERATION_MAX: _bindgen_ty_8 = 64;
+pub const CBM_PROJECT_HOLDER_PATH_MAX: _bindgen_ty_8 = 4096;
+pub type _bindgen_ty_8 = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_project_quiescence_result_t {
@@ -3713,7 +3769,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_mcp_server_set_row_sink(
         srv: *mut cbm_mcp_server_t,
-        sink: *const cbm_pipeline_row_sink_v1_t,
+        sink: *const cbm_pipeline_row_sink_v2_t,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -3889,8 +3945,8 @@ impl Default for cbm_pipeline_parallel_dispatch_t {
         }
     }
 }
-pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_8 = -2001;
-pub type _bindgen_ty_8 = ::std::os::raw::c_int;
+pub const CBM_PIPELINE_EMPTY_SOURCE_CORPUS: _bindgen_ty_9 = -2001;
+pub type _bindgen_ty_9 = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_pipeline_new(
         repo_path: *const ::std::os::raw::c_char,
@@ -3911,7 +3967,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_pipeline_set_sink(
         p: *mut cbm_pipeline_t,
-        sink: *const cbm_pipeline_row_sink_v1_t,
+        sink: *const cbm_pipeline_row_sink_v2_t,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
