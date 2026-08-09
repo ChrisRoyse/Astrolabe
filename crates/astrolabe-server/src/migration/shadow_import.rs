@@ -3086,6 +3086,38 @@ where
         release_slot!(right);
         release_slot!(left);
     }
+    let xterm_physical_scan = if delta.is_some() {
+        xterm_scalar_bits.fill([None; 6]);
+        Some(stream_eager_cross_term_rows(
+            vault,
+            |kind, cx_id, value| {
+                let Some(node_index) = node_by_cx.get(&cx_id) else {
+                    return Err(calyx_core::CalyxError {
+                        code: "ASTRO_WEAVE_XTERM_CX_UNKNOWN",
+                        message: format!(
+                            "{} physical XTerm row names unknown compact-source CxId {cx_id}",
+                            kind.wire_name()
+                        ),
+                        remediation: "preserve the staged generation and inspect XTerm ownership/tombstone reconciliation against the compact graph identity projection",
+                    });
+                };
+                let scalar = &mut xterm_scalar_bits[*node_index][eager_kind_index(kind)];
+                if scalar.replace(value.to_bits()).is_some() {
+                    return Err(calyx_core::CalyxError {
+                        code: "ASTRO_WEAVE_XTERM_DUPLICATE_PHYSICAL_ROW",
+                        message: format!(
+                            "{} physical XTerm scan returned duplicate CxId {cx_id}",
+                            kind.wire_name()
+                        ),
+                        remediation: "preserve the staged generation and inspect the XTerm key namespace and physical newest-wins scan",
+                    });
+                }
+                Ok(())
+            },
+        )?)
+    } else {
+        None
+    };
     if decoded_slot_bytes_live != 0 || nodes.iter().any(|node| !node.slots.is_empty()) {
         return Err(format!(
             "ASTRO_WEAVE_SLOT_RELEASE_INCOMPLETE: source planning ended with decoded_slot_bytes_live={decoded_slot_bytes_live} and {} nodes still owning slots; remediation: preserve the staged generation and repair the family release schedule",
@@ -3094,7 +3126,17 @@ where
         .into());
     }
     let ms_slot_load = t_slot_load.elapsed().as_millis() as u64;
-    let similarity_edge_dump_hash = hex_lower(similarity_dump_hasher.finalize().as_bytes());
+    let similarity_physical_scan = if delta.is_some() {
+        let scan = scan_similarity_physical_state(vault)?;
+        similarity_edge_count = scan.rows_scanned;
+        Some(scan)
+    } else {
+        None
+    };
+    let similarity_edge_dump_hash = similarity_physical_scan
+        .as_ref()
+        .map(|scan| scan.edge_dump_hash.clone())
+        .unwrap_or_else(|| hex_lower(similarity_dump_hasher.finalize().as_bytes()));
 
     let t_xterm_hash = std::time::Instant::now();
     let mut symbol_order = (0..nodes.len()).collect::<Vec<_>>();
@@ -3255,6 +3297,7 @@ where
             "rows_unchanged": similarity_rows_unchanged,
             "rows_tombstoned": similarity_rows_tombstoned,
             "edge_dump_hash": similarity_edge_dump_hash,
+            "physical_global_scan": similarity_physical_scan,
             "vector_skips": vector_skip_count,
             "family_opt_outs": family_opt_out_count,
             "persisted_region_scan": similarity_region_scan,
@@ -3268,6 +3311,7 @@ where
             "rows_tombstoned": xterm_rows_tombstoned,
             "absent_by_kind": absent_by_kind,
             "xterm_dump_hash": xterm_dump_hash,
+            "physical_global_scan": xterm_physical_scan,
             "kinds": xterm_kind_receipts,
             "fsv": xterm_fsv,
             // #433 neighborhood peer sample-cap disclosure (invariant 3): the

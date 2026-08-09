@@ -89,10 +89,10 @@ pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT,
     ASTRO_SIM_EDGE_RUN_RESOURCE_EXHAUSTED, BoundedSimilarityFamilyPlan, PersistedSimilarityEdgeRow,
     PersistedSimilarityRegionScan, SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA,
-    SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow, SimilarityPersistReport, SimilarityRunTelemetry,
-    expand_persisted_similarity_region_from_vault, persist_similarity_family_run,
-    persist_similarity_family_run_delta, plan_similarity_family_run, read_similarity_edge_rows,
-    sim_edge_graph_key,
+    SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow, SimilarityPersistReport, SimilarityPhysicalScan,
+    SimilarityRunTelemetry, expand_persisted_similarity_region_from_vault,
+    persist_similarity_family_run, persist_similarity_family_run_delta, plan_similarity_family_run,
+    read_similarity_edge_rows, scan_similarity_physical_state, sim_edge_graph_key,
 };
 pub use xterm_cotenant::{
     XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
@@ -102,13 +102,13 @@ pub use xterm_cotenant::{
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
     ASTRO_XTERM_ROW_CORRUPT, ASTRO_XTERM_RUN_SOURCE_INVALID, AgreementGraphAspect,
-    BoundedEagerCrossTermKindPlan, EagerCrossTermPersistReport, EagerCrossTermRunTelemetry,
-    PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
+    BoundedEagerCrossTermKindPlan, EagerCrossTermPersistReport, EagerCrossTermPhysicalScan,
+    EagerCrossTermRunTelemetry, PersistedAgreementEdge, XTERM_EAGER_LEDGER_SCHEMA,
     agreement_graph_aspect, agreement_graph_from_persisted_rows,
     agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots, eager_xterm_key,
     persist_eager_cross_term_kind_run, persist_eager_cross_term_kind_run_delta,
     plan_eager_cross_term_kind_run, plan_eager_cross_term_kind_run_delta,
-    read_eager_cross_term_rows, read_eager_cross_term_rows_with_cotenants,
+    stream_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

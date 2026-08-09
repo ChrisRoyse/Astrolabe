@@ -70,6 +70,7 @@ use astrolabe_weave::{
     persist_similarity_family_run_delta, plan_eager_cross_term_kind_run,
     plan_eager_cross_term_kind_run_delta, plan_similarity_family_run,
     reconcile_complete_associations, recover_reactive_state, run_index_time_drift,
+    scan_similarity_physical_state, stream_eager_cross_term_rows,
 };
 use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range, slot_key};
 use calyx_aster::ledger_view::{LedgerPointReadTrace, parse_aster_ledger_seq};

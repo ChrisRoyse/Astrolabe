@@ -935,6 +935,100 @@ pub struct PersistedSimilarityRegionScan {
     pub page_rows_high_water: usize,
 }
 
+/// Physical receipt for one bounded, generation-stable scan of every SIM_* row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SimilarityPhysicalScan {
+    /// Vault sequence held for the complete scan.
+    pub snapshot_seq: u64,
+    /// Graph-CF generation proved unchanged across the scan.
+    pub graph_generation: u64,
+    /// Number of bounded page callbacks.
+    pub pages: usize,
+    /// Largest number of rows retained by one page callback.
+    pub page_rows_high_water: usize,
+    /// Largest encoded key/value byte total retained by one page callback.
+    pub page_bytes_high_water: u64,
+    /// Total decoded SIM_* rows.
+    pub rows_scanned: usize,
+    /// Total encoded SIM_* key/value bytes.
+    pub bytes_scanned: u64,
+    /// Canonical semantic dump digest of the complete physical SIM_* surface.
+    pub edge_dump_hash: String,
+}
+
+/// Reads and key-verifies the complete persisted SIM_* surface without
+/// materializing it, returning the same canonical dump hash used by planning.
+pub fn scan_similarity_physical_state<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<SimilarityPhysicalScan>
+where
+    C: Clock,
+{
+    refuse_legacy_similarity_rows(vault)?;
+    let storage_before = vault.latest_only_readback_status();
+    ensure_bounded_sim_storage(&storage_before, "global similarity pre-scan")?;
+    let snapshot = vault.snapshot();
+    let graph_generation = vault.cf_content_generation(ColumnFamily::Graph)?;
+    let mut pages = 0usize;
+    let mut page_rows_high_water = 0usize;
+    let mut page_bytes_high_water = 0u64;
+    let mut rows_scanned = 0usize;
+    let mut bytes_scanned = 0u64;
+    let mut dump_hasher = blake3::Hasher::new();
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(SIM_EDGE_ROW_PREFIX),
+        SIM_SCAN_PAGE_ROWS,
+        |page| {
+            pages = pages
+                .checked_add(1)
+                .ok_or_else(|| sim_run_resource_exhausted("global SIM page count overflow"))?;
+            page_rows_high_water = page_rows_high_water.max(page.len());
+            let page_bytes = page.iter().try_fold(0u64, |total, (key, value)| {
+                total
+                    .checked_add(key.len() as u64)
+                    .and_then(|total| total.checked_add(value.len() as u64))
+                    .ok_or_else(|| sim_run_resource_exhausted("global SIM byte count overflow"))
+            })?;
+            page_bytes_high_water = page_bytes_high_water.max(page_bytes);
+            bytes_scanned = bytes_scanned
+                .checked_add(page_bytes)
+                .ok_or_else(|| sim_run_resource_exhausted("global SIM byte count overflow"))?;
+            rows_scanned = rows_scanned
+                .checked_add(page.len())
+                .ok_or_else(|| sim_run_resource_exhausted("global SIM row count overflow"))?;
+            for (key, value) in page {
+                let row = decode_similarity_row(&key, &value, None)?;
+                update_row_dump_hasher(&mut dump_hasher, &row);
+            }
+            Ok(())
+        },
+    )?;
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_sim_storage(&storage_after, "global similarity post-scan")?;
+    let observed_snapshot = vault.snapshot();
+    let observed_generation = vault.cf_content_generation(ColumnFamily::Graph)?;
+    if storage_after != storage_before
+        || observed_snapshot != snapshot
+        || observed_generation != graph_generation
+    {
+        return Err(sim_edge_corrupt(format!(
+            "Graph source changed during global SIM scan: expected_snapshot={snapshot}, observed_snapshot={observed_snapshot}, expected_generation={graph_generation}, observed_generation={observed_generation}, storage_before={storage_before:?}, storage_after={storage_after:?}"
+        )));
+    }
+    Ok(SimilarityPhysicalScan {
+        snapshot_seq: snapshot,
+        graph_generation,
+        pages,
+        page_rows_high_water,
+        page_bytes_high_water,
+        rows_scanned,
+        bytes_scanned,
+        edge_dump_hash: dump_hasher.finalize().to_hex().to_string(),
+    })
+}
+
 /// Expands a changed-symbol set through exactly two persisted SIM hops while
 /// retaining only the evolving identity set and one physical scan page.
 pub fn expand_persisted_similarity_region_from_vault<C>(

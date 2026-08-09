@@ -915,86 +915,141 @@ fn xterm_run_resource_exhausted(message: impl Into<String>) -> CalyxError {
     }
 }
 
-/// One decoded, key-verified designed-pair agreement row from the XTerm CF.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PersistedEagerCrossTermRow {
-    /// Full XTerm CF key the row was stored under.
-    pub key: Vec<u8>,
-    /// Designed pair this row belongs to.
-    pub kind: EagerAgreementKind,
-    /// Decoded loom row.
-    pub row: XtermRow,
+/// Physical receipt for one bounded, generation-stable XTerm CF scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EagerCrossTermPhysicalScan {
+    /// Vault sequence held for the complete scan.
+    pub snapshot_seq: u64,
+    /// XTerm-CF generation proved unchanged across the scan.
+    pub xterm_generation: u64,
+    /// Number of bounded page callbacks.
+    pub pages: usize,
+    /// Largest number of rows retained by one page callback.
+    pub page_rows_high_water: usize,
+    /// Largest encoded key/value byte total retained by one page callback.
+    pub page_bytes_high_water: u64,
+    /// Total rows decoded or classified in the shared XTerm CF.
+    pub rows_scanned: usize,
+    /// Total encoded key/value bytes scanned in the shared XTerm CF.
+    pub bytes_scanned: u64,
+    /// Designed scalar agreement rows delivered to the caller.
+    pub designed_rows: usize,
+    /// Accepted non-XTerm co-tenant rows classified and skipped.
+    pub cotenant_rows_skipped: usize,
 }
 
-/// Reads back every persisted designed-pair agreement row.
-///
-/// Scans the whole XTerm CF, fails closed on undecodable rows or key/field
-/// mismatches (the CF-wide `XtermRow` JSON shape is already the contract the
-/// live anomaly reader enforces), and returns exactly the rows whose slot pair
-/// and kind match one of the six designed agreements.
-///
-/// `ColumnFamily::XTerm` is shared with the layout lane's `placement_truth`
-/// co-tenant rows (#369); those are skipped (co-tenant-aware) exactly as the
-/// live-anomaly reader does. Use [`read_eager_cross_term_rows_with_cotenants`]
-/// when the count of skipped co-tenant rows must be surfaced.
-pub fn read_eager_cross_term_rows<C>(
+/// Streams every key-verified designed scalar agreement from one stable
+/// physical XTerm generation. Accepted co-tenant rows are counted and skipped;
+/// malformed, non-scalar, or drifting designed state refuses.
+pub fn stream_eager_cross_term_rows<C, F>(
     vault: &AsterVault<C>,
-) -> calyx_core::Result<Vec<PersistedEagerCrossTermRow>>
+    mut emit: F,
+) -> calyx_core::Result<EagerCrossTermPhysicalScan>
 where
     C: Clock,
+    F: FnMut(EagerAgreementKind, CxId, f32) -> calyx_core::Result<()>,
 {
-    Ok(read_eager_cross_term_rows_with_cotenants(vault)?.0)
-}
-
-/// [`read_eager_cross_term_rows`] returning the count of shared-CF co-tenant
-/// rows skipped (layout `placement_truth` rows, #369) alongside the designed
-/// rows — a counted, labeled skip, not an error. A genuinely corrupt xterm row
-/// (undecodable, no accepted co-tenant schema marker) still fails closed.
-pub fn read_eager_cross_term_rows_with_cotenants<C>(
-    vault: &AsterVault<C>,
-) -> calyx_core::Result<(Vec<PersistedEagerCrossTermRow>, usize)>
-where
-    C: Clock,
-{
+    let storage_before = vault.latest_only_readback_status();
+    ensure_bounded_xterm_storage(&storage_before, "global XTerm pre-scan")?;
     let snapshot = vault.snapshot();
+    let xterm_generation = vault.cf_content_generation(ColumnFamily::XTerm)?;
     let accepted_cotenants = crate::accepted_xterm_cotenant_schemas();
-    let mut rows = Vec::new();
-    let mut cotenant_skipped = 0usize;
-    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::XTerm)? {
-        let row: XtermRow = match serde_json::from_slice(&value) {
-            Ok(row) => row,
-            Err(error) => {
-                if crate::is_accepted_xterm_cotenant(&value, &accepted_cotenants) {
-                    cotenant_skipped += 1;
+    let mut receipt = EagerCrossTermPhysicalScan {
+        snapshot_seq: snapshot,
+        xterm_generation,
+        pages: 0,
+        page_rows_high_water: 0,
+        page_bytes_high_water: 0,
+        rows_scanned: 0,
+        bytes_scanned: 0,
+        designed_rows: 0,
+        cotenant_rows_skipped: 0,
+    };
+    vault.scan_cf_range_pages_at(
+        snapshot,
+        ColumnFamily::XTerm,
+        &prefix_range(&[]),
+        XTERM_SCAN_PAGE_ROWS,
+        |page| {
+            receipt.pages = receipt
+                .pages
+                .checked_add(1)
+                .ok_or_else(|| xterm_run_resource_exhausted("XTerm scan page count overflow"))?;
+            receipt.page_rows_high_water = receipt.page_rows_high_water.max(page.len());
+            let page_bytes = page.iter().try_fold(0u64, |total, (key, value)| {
+                total
+                    .checked_add(key.len() as u64)
+                    .and_then(|total| total.checked_add(value.len() as u64))
+                    .ok_or_else(|| xterm_run_resource_exhausted("XTerm scan byte overflow"))
+            })?;
+            receipt.page_bytes_high_water = receipt.page_bytes_high_water.max(page_bytes);
+            receipt.bytes_scanned = receipt
+                .bytes_scanned
+                .checked_add(page_bytes)
+                .ok_or_else(|| xterm_run_resource_exhausted("XTerm scan byte overflow"))?;
+            receipt.rows_scanned = receipt
+                .rows_scanned
+                .checked_add(page.len())
+                .ok_or_else(|| xterm_run_resource_exhausted("XTerm scan row overflow"))?;
+            for (key, value) in page {
+                let row: XtermRow = match serde_json::from_slice(&value) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        if crate::is_accepted_xterm_cotenant(&value, &accepted_cotenants) {
+                            receipt.cotenant_rows_skipped = receipt
+                                .cotenant_rows_skipped
+                                .checked_add(1)
+                                .ok_or_else(|| {
+                                    xterm_run_resource_exhausted(
+                                        "XTerm co-tenant row count overflow",
+                                    )
+                                })?;
+                            continue;
+                        }
+                        return Err(xterm_corrupt(format!(
+                            "decode XTerm row {}: {error}",
+                            hex_lower_bytes(&key)
+                        )));
+                    }
+                };
+                validate_xterm_key(&key, &row)?;
+                if row.key.kind != LoomCrossTermKind::Agreement {
                     continue;
                 }
-                return Err(xterm_corrupt(format!(
-                    "decode XTerm row {}: {error}",
-                    hex_lower_bytes(&key)
-                )));
+                let Some(kind) = designed_kind_for_slots(row.key.a, row.key.b) else {
+                    continue;
+                };
+                let LoomCrossTermValue::Scalar(value) = row.value else {
+                    return Err(xterm_corrupt(format!(
+                        "designed agreement row {} contains a vector instead of one scalar",
+                        hex_lower_bytes(&key)
+                    )));
+                };
+                receipt.designed_rows = receipt.designed_rows.checked_add(1).ok_or_else(|| {
+                    xterm_run_resource_exhausted("designed XTerm row count overflow")
+                })?;
+                emit(kind, row.key.cx_id, value)?;
             }
-        };
-        let expected_key = xterm_key(
-            row.key.cx_id,
-            row.key.a,
-            row.key.b,
-            xterm_kind_wire(row.key.kind),
-        );
-        if key != expected_key {
-            return Err(xterm_corrupt(format!(
-                "XTerm row key {} does not match its decoded fields",
-                hex_lower_bytes(&key)
-            )));
-        }
-        if row.key.kind != LoomCrossTermKind::Agreement {
-            continue;
-        }
-        let Some(kind) = designed_kind_for_slots(row.key.a, row.key.b) else {
-            continue;
-        };
-        rows.push(PersistedEagerCrossTermRow { key, kind, row });
+            Ok(())
+        },
+    )?;
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_xterm_storage(&storage_after, "global XTerm post-scan")?;
+    let observed_generation = vault.cf_content_generation(ColumnFamily::XTerm)?;
+    if storage_after != storage_before
+        || observed_generation != xterm_generation
+        || vault.snapshot() != snapshot
+    {
+        return Err(CalyxError {
+            code: ASTRO_XTERM_RUN_SOURCE_INVALID,
+            message: format!(
+                "XTerm source changed during physical scan: expected_snapshot={snapshot}, observed_snapshot={}, expected_generation={xterm_generation}, observed_generation={observed_generation}, storage_before={storage_before:?}, storage_after={storage_after:?}",
+                vault.snapshot(),
+            ),
+            remediation: "preserve the staged generation, identify the unexpected writer, and repeat the scan only from one stable XTerm generation",
+        });
     }
-    Ok((rows, cotenant_skipped))
+    Ok(receipt)
 }
 
 /// Recomputes the designed-pair agreement graph from persisted XTerm CF rows.
@@ -1022,14 +1077,12 @@ where
     C: Clock,
 {
     let mut sums = BTreeMap::<EagerAgreementKind, (f64, usize)>::new();
-    let (rows, cotenant_skipped) = read_eager_cross_term_rows_with_cotenants(vault)?;
-    for persisted in rows {
-        if let LoomCrossTermValue::Scalar(value) = persisted.row.value {
-            let entry = sums.entry(persisted.kind).or_default();
-            entry.0 += f64::from(value);
-            entry.1 += 1;
-        }
-    }
+    let scan = stream_eager_cross_term_rows(vault, |kind, _, value| {
+        let entry = sums.entry(kind).or_default();
+        entry.0 += f64::from(value);
+        entry.1 += 1;
+        Ok(())
+    })?;
     let edges = EagerAgreementKind::ALL
         .into_iter()
         .map(|kind| {
@@ -1045,7 +1098,7 @@ where
             }
         })
         .collect();
-    Ok((edges, cotenant_skipped))
+    Ok((edges, scan.cotenant_rows_skipped))
 }
 
 /// The `get_architecture` agreement-graph aspect payload.
