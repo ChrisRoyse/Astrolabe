@@ -38,9 +38,13 @@ fn project_debouncer(
 }
 
 pub(crate) fn drive_project_lowering(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let (current_raw, current_status) = match read_lowering_status_record(cache_dir, project)? {
+        Some((raw, status)) => (Some(raw), Some(status)),
+        None => (None, None),
+    };
     let debouncer = project_debouncer(cache_dir, project)?;
     let status = match debouncer.run_due(|| regenerate_lowered_under_lock(cache_dir, project)) {
-        Ok(RunOutcome::Idle) => read_lowering_status(cache_dir, project)?.unwrap_or_else(|| {
+        Ok(RunOutcome::Idle) => current_status.unwrap_or_else(|| {
             json!({
                 "schema": "astrolabe-lowering-debounce-v1",
                 "status": "idle",
@@ -87,11 +91,7 @@ pub(crate) fn drive_project_lowering(cache_dir: &Path, project: &str) -> Result<
             "remediation": "repair the writable vault or lowered-artifact path; the persisted debounce debt will retry on a later watcher or index_status tick",
         }),
     };
-    write_config_value(
-        cache_dir,
-        &metadata_key(project, LOWERING_DEBOUNCE_STATUS_KEY),
-        &serde_json::to_string(&status)?,
-    )?;
+    persist_lowering_status_if_changed(cache_dir, project, current_raw.as_deref(), &status)?;
     Ok(status)
 }
 
@@ -128,12 +128,57 @@ pub(crate) fn read_lowering_status(
     cache_dir: &Path,
     project: &str,
 ) -> Result<Option<Value>, DynError> {
-    read_config_value(
-        cache_dir,
-        &metadata_key(project, LOWERING_DEBOUNCE_STATUS_KEY),
-    )?
-    .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
-    .transpose()
+    Ok(read_lowering_status_record(cache_dir, project)?.map(|(_, status)| status))
+}
+
+fn read_lowering_status_record(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<(String, Value)>, DynError> {
+    let key = metadata_key(project, LOWERING_DEBOUNCE_STATUS_KEY);
+    let Some(raw) = read_config_value(cache_dir, &key)? else {
+        return Ok(None);
+    };
+    let status = serde_json::from_str::<Value>(&raw).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_LOWERING_STATUS_MALFORMED: durable lowering status row {key:?} for project {project:?} is not valid JSON: {error}; remediation: preserve the config store and inspect lowering_debounce_json"
+        )
+        .into()
+    })?;
+    Ok(Some((raw, status)))
+}
+
+fn persist_lowering_status_if_changed(
+    cache_dir: &Path,
+    project: &str,
+    current_raw: Option<&str>,
+    status: &Value,
+) -> Result<(), DynError> {
+    let key = metadata_key(project, LOWERING_DEBOUNCE_STATUS_KEY);
+    let serialized = serde_json::to_string(status)?;
+    if current_raw == Some(serialized.as_str()) {
+        return Ok(());
+    }
+
+    write_config_value(cache_dir, &key, &serialized).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_LOWERING_STATUS_WRITE_FAILED: failed to persist durable lowering status row {key:?} for project {project:?}: {error}; remediation: preserve the config store and inspect its writable SQLite state"
+        )
+        .into()
+    })?;
+    let readback = read_config_value(cache_dir, &key).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_LOWERING_STATUS_READBACK_FAILED: persisted durable lowering status row {key:?} for project {project:?}, but its independent read failed: {error}; remediation: preserve the config store and inspect the exact SQLite transaction"
+        )
+        .into()
+    })?;
+    if readback.as_deref() != Some(serialized.as_str()) {
+        return Err(format!(
+            "ASTRO_LOWERING_STATUS_READBACK_MISMATCH: durable lowering status row {key:?} for project {project:?} did not equal its exact write; expected={serialized:?}, actual={readback:?}; remediation: preserve the config store and inspect the exact SQLite transaction"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn persist_regenerated_lowering(
