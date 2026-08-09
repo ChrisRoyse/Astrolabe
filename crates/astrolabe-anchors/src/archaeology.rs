@@ -5,6 +5,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use serde::{Deserialize, Serialize};
+
 /// Stable failure code for invalid archaeology configuration.
 pub const ASTRO_ARCHAEOLOGY_CONFIG_INVALID: &str = "ASTRO_ARCHAEOLOGY_CONFIG_INVALID";
 /// Stable failure code for a failed or malformed Git query.
@@ -15,6 +17,9 @@ pub const ASTRO_ARCHAEOLOGY_OUTPUT_INVALID: &str = "ASTRO_ARCHAEOLOGY_OUTPUT_INV
 /// the immutable parent tree that range was derived from.
 pub const ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT: &str =
     "ASTRO_ARCHAEOLOGY_OBJECT_VIEW_INCONSISTENT";
+/// Stable failure code for a requested history operation that contradicts the
+/// repository's measured history state.
+pub const ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID: &str = "ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID";
 
 const REMEDIATION: &str =
     "verify the repository and Git objects, then rerun archaeology with a validated configuration";
@@ -319,10 +324,86 @@ impl PartialEq for GitDiffTreeBatchTelemetry {
     }
 }
 
+/// Exact state of the repository history named by `HEAD`.
+///
+/// An unborn repository has a real symbolic `HEAD` and real working-tree/index
+/// bytes, but no commit object. Keeping that state distinct from a commit makes
+/// it impossible for history consumers to manufacture an object id for absent
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GitHistoryState {
+    /// `HEAD^{commit}` resolved to this exact immutable commit object.
+    Committed { oid: String },
+    /// Immediate symbolic `HEAD` names this exact absent branch ref.
+    Unborn { symbolic_ref: String },
+}
+
+impl GitHistoryState {
+    /// Validates the persisted representation without consulting repository state.
+    pub fn validate(&self) -> Result<(), ArchaeologyError> {
+        match self {
+            Self::Committed { oid } => validate_oid(oid),
+            Self::Unborn { symbolic_ref } if valid_branch_ref(symbolic_ref) => Ok(()),
+            Self::Unborn { symbolic_ref } => Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("invalid unborn symbolic branch ref {symbolic_ref:?}"),
+            )),
+        }
+    }
+
+    /// Returns the current commit object id only when history exists.
+    pub fn commit_oid(&self) -> Option<&str> {
+        match self {
+            Self::Committed { oid } => Some(oid),
+            Self::Unborn { .. } => None,
+        }
+    }
+
+    /// Returns the exact symbolic branch ref only when history is absent.
+    pub fn unborn_symbolic_ref(&self) -> Option<&str> {
+        match self {
+            Self::Committed { .. } => None,
+            Self::Unborn { symbolic_ref } => Some(symbolic_ref),
+        }
+    }
+}
+
+fn valid_branch_ref(reference: &str) -> bool {
+    let Some(branch) = reference.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    !branch.is_empty()
+        && branch != "@"
+        && !branch.ends_with('.')
+        && !branch.ends_with('/')
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && !branch.contains("//")
+        && !branch
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+        && branch.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+}
+
+/// Exact Git source observation used by publication, preservation, and
+/// freshness consumers. Both fields are measured in one operation so callers
+/// cannot classify history independently from the bytes they fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRepositorySnapshot {
+    /// Exact committed-or-unborn state observed for `HEAD`.
+    pub history: GitHistoryState,
+    /// Versioned digest over the history identity and current source bytes.
+    pub source_fingerprint: String,
+}
+
 /// Deterministic result of one mining pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GitArchaeologyReport {
-    pub head: String,
+    pub history: GitHistoryState,
+    pub head: Option<String>,
     pub szz_findings: Vec<SzzFinding>,
     pub revert_findings: Vec<RevertFinding>,
     /// Commits that became unreachable from the tracked head after a force move.
@@ -421,7 +502,22 @@ pub fn mine_git_archaeology(
     config: &GitArchaeologyConfig,
     mode: &GitMineMode,
 ) -> Result<GitArchaeologyReport, ArchaeologyError> {
+    let history = git_history_state(repo)?;
+    mine_git_archaeology_at_history(repo, config, mode, &history)
+}
+
+/// Mines Git history from an already measured repository-history identity.
+///
+/// Publication paths use this form so source fingerprinting and archaeology
+/// consume one observation rather than independently resolving `HEAD`.
+pub fn mine_git_archaeology_at_history(
+    repo: &Path,
+    config: &GitArchaeologyConfig,
+    mode: &GitMineMode,
+    history: &GitHistoryState,
+) -> Result<GitArchaeologyReport, ArchaeologyError> {
     config.validate()?;
+    history.validate()?;
     // Path-namespace correctness for monorepo-member corpora (e.g. cbm/ inside
     // the Astrolabe repo): `git diff`/`git log` emit TOPLEVEL-relative paths,
     // but a pathspec passed back to `git blame` is resolved relative to the
@@ -436,10 +532,37 @@ pub fn mine_git_archaeology(
             .to_string(),
     );
     let repo: &Path = &toplevel;
-    let head = git_text(repo, &["rev-parse", "--verify", "HEAD"])?
-        .trim()
-        .to_string();
-    validate_oid(&head)?;
+    let history = history.clone();
+    let head = match &history {
+        GitHistoryState::Committed { oid } => oid.clone(),
+        GitHistoryState::Unborn { symbolic_ref } => {
+            if let GitMineMode::Since { previous_head } = mode {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID,
+                    format!(
+                        "incremental archaeology from commit {previous_head} was requested while HEAD names absent branch ref {symbolic_ref:?}"
+                    ),
+                ));
+            }
+            return Ok(GitArchaeologyReport {
+                history,
+                head: None,
+                szz_findings: Vec::new(),
+                revert_findings: Vec::new(),
+                force_removed_commits: Vec::new(),
+                skipped_merge_fixes: 0,
+                skipped_large_commits: 0,
+                skipped_unresolvable_reverts: 0,
+                skipped_gitlink_paths: 0,
+                skipped_unblamable_paths: 0,
+                diff_tree: GitDiffTreeBatchTelemetry {
+                    batch_limit_commits: config.diff_tree_batch_commits,
+                    ..GitDiffTreeBatchTelemetry::default()
+                },
+                blame: GitBlameBatchTelemetry::default(),
+            });
+        }
+    };
 
     // Monorepo-member pathspec (#381): every history walk below is limited to the
     // member subtree so only commits (and, via the scoped diffs, only ranges) that
@@ -699,7 +822,8 @@ pub fn mine_git_archaeology(
         );
     }
     Ok(GitArchaeologyReport {
-        head,
+        history,
+        head: Some(head),
         szz_findings: szz.into_iter().collect(),
         revert_findings: reverts.into_iter().collect(),
         force_removed_commits,
@@ -713,13 +837,51 @@ pub fn mine_git_archaeology(
     })
 }
 
-/// Resolves and validates the repository's current immutable object id.
-pub fn git_head(repo: &Path) -> Result<String, ArchaeologyError> {
-    let head = git_text(repo, &["rev-parse", "--verify", "HEAD"])?
-        .trim()
-        .to_string();
-    validate_oid(&head)?;
-    Ok(head)
+/// Measures the exact committed-or-unborn state named by `HEAD`.
+///
+/// A failed commit lookup is classified as unborn only when `HEAD` is an
+/// immediate symbolic branch ref and Git independently proves that exact ref is
+/// absent. Detached, malformed, present-but-unresolvable, and ref-query fault
+/// states retain the original coded Git failure.
+pub fn git_history_state(repo: &Path) -> Result<GitHistoryState, ArchaeologyError> {
+    let head_args = ["rev-parse", "--verify", "HEAD^{commit}"];
+    let head_output = git_command(repo, &head_args)
+        .output()
+        .map_err(|error| git_spawn_error(&head_args, error))?;
+    if head_output.status.success() {
+        let oid = utf8_trim(&head_output.stdout)?;
+        validate_oid(&oid)?;
+        return Ok(GitHistoryState::Committed { oid });
+    }
+
+    let Some(symbolic_ref) =
+        git_optional_text(repo, &["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])?
+    else {
+        return Err(git_exit_error(
+            &head_args,
+            head_output.status.code(),
+            &head_output.stderr,
+        ));
+    };
+    let symbolic_ref = symbolic_ref.trim().to_string();
+    if !symbolic_ref.starts_with("refs/heads/") || symbolic_ref.len() == "refs/heads/".len() {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "Git HEAD names non-branch symbolic ref {symbolic_ref:?} after HEAD^{{commit}} failed"
+            ),
+        ));
+    }
+    if git_ref_exists(repo, &symbolic_ref)? {
+        return Err(git_exit_error(
+            &head_args,
+            head_output.status.code(),
+            &head_output.stderr,
+        ));
+    }
+    let history = GitHistoryState::Unborn { symbolic_ref };
+    history.validate()?;
+    Ok(history)
 }
 
 /// Reports whether `repo` is inside a real Git work tree.
@@ -756,7 +918,7 @@ pub const GIT_SOURCE_FINGERPRINT_ALGO: &str = "blake3";
 /// binary-file bytes, so two different binary edits could previously produce the
 /// same status + `Binary files differ` payload. Persisted v1 values are therefore
 /// never compared to this stronger domain.
-pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v2";
+pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v3";
 
 /// Content fingerprint of the live git working tree at `repo` — the source-of-truth
 /// freshness signal for shadow imports (#347).
@@ -773,52 +935,37 @@ pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v2";
 /// * the exact current bytes/type of every tracked path changed from HEAD, and
 /// * the exact current bytes/type of every untracked, non-ignored path.
 ///
-/// The returned value is `blake3:v2:<hex>` — self-describing so a persisted watermark
+/// The returned value is `blake3:v3:<hex>` — self-describing so a persisted watermark
 /// can be domain-gated exactly like the CBM-db watermark. Fails closed with a coded
 /// error when `repo` is not a usable git repository (so a missing/renamed source tree
 /// is reported, never silently treated as Fresh).
 pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
-    // HEAD oid, or an explicit unborn-branch marker for a repository whose
-    // symbolic HEAD names a ref that does not exist yet. `rev-parse` also fails
-    // for corrupt/missing objects and broken HEAD state; those are measurement
-    // faults, never evidence of an unborn repository (#831).
-    let head_args = ["rev-parse", "--verify", "HEAD"];
-    let head_output = git_command(repo, &head_args)
-        .output()
-        .map_err(|error| git_spawn_error(&head_args, error))?;
-    let head = if head_output.status.success() {
-        let head = String::from_utf8(head_output.stdout)
-            .map_err(|error| {
-                ArchaeologyError::new(
-                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                    format!("Git HEAD output is not UTF-8: {error}"),
-                )
-            })?
-            .trim()
-            .to_string();
-        validate_oid(&head)?;
-        head
-    } else {
-        let Some(symbolic_head) = git_optional_text(repo, &["symbolic-ref", "--quiet", "HEAD"])?
-        else {
-            return Err(git_exit_error(
-                &head_args,
-                head_output.status.code(),
-                &head_output.stderr,
-            ));
-        };
-        let symbolic_head = symbolic_head.trim();
-        if symbolic_head.is_empty()
-            || git_status(repo, &["show-ref", "--verify", "--quiet", symbolic_head])?
-        {
-            return Err(git_exit_error(
-                &head_args,
-                head_output.status.code(),
-                &head_output.stderr,
-            ));
-        }
-        "unborn-head".to_string()
-    };
+    Ok(git_repository_snapshot(repo)?.source_fingerprint)
+}
+
+/// Measures one coherent repository history/source snapshot.
+pub fn git_repository_snapshot(repo: &Path) -> Result<GitRepositorySnapshot, ArchaeologyError> {
+    let history = git_history_state(repo)?;
+    let source_fingerprint = git_source_fingerprint_at_history(repo, &history)?;
+    let history_after = git_history_state(repo)?;
+    if history_after != history {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID,
+            format!(
+                "Git history changed while its source fingerprint was measured: before={history:?}, after={history_after:?}"
+            ),
+        ));
+    }
+    Ok(GitRepositorySnapshot {
+        history,
+        source_fingerprint,
+    })
+}
+
+fn git_source_fingerprint_at_history(
+    repo: &Path,
+    history: &GitHistoryState,
+) -> Result<String, ArchaeologyError> {
     // NUL-delimited machine status over all untracked files. This is the fail-closed
     // gate: it errors if `repo` is not a git repository, so we never fingerprint a
     // non-source directory as if it were fresh.
@@ -832,22 +979,23 @@ pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
     // current byte streams with the same status. `--no-renames` names both sides of
     // a rename, so the absent old path and exact new bytes are both represented.
     // An explicitly classified unborn repository has no HEAD tree to diff.
-    let changed_tracked = if head == "unborn-head" {
-        // Every index entry is new relative to the absent HEAD tree. Include
-        // staged files as well as the untracked inventory below.
-        git_bytes(repo, &["ls-files", "-z"])?
-    } else {
-        git_bytes(
+    let changed_tracked = match history {
+        GitHistoryState::Unborn { .. } => {
+            // Every index entry is new relative to the absent HEAD tree. Include
+            // staged files as well as the untracked inventory below.
+            git_bytes(repo, &["ls-files", "-z"])?
+        }
+        GitHistoryState::Committed { oid } => git_bytes(
             repo,
             &[
                 "diff",
-                "HEAD",
+                oid,
                 "--name-only",
                 "-z",
                 "--no-ext-diff",
                 "--no-renames",
             ],
-        )?
+        )?,
     };
     // Untracked, non-ignored paths (NUL-delimited). `--others` enumerates the
     // current files and `--exclude-standard` applies the same repository ignore
@@ -860,7 +1008,16 @@ pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
         hasher.update(bytes);
     };
     section(GIT_SOURCE_FINGERPRINT_VERSION.as_bytes());
-    section(head.as_bytes());
+    match history {
+        GitHistoryState::Committed { oid } => {
+            section(b"committed");
+            section(oid.as_bytes());
+        }
+        GitHistoryState::Unborn { symbolic_ref } => {
+            section(b"unborn");
+            section(symbolic_ref.as_bytes());
+        }
+    }
     section(&status);
     let mut changed_paths = BTreeSet::new();
     for raw in changed_tracked
@@ -2493,6 +2650,20 @@ fn git_status(repo: &Path, args: &[&str]) -> Result<bool, ArchaeologyError> {
         // Every other exit is a Git fault, not a false predicate.
         Some(1) => Ok(false),
         _ => Err(git_exit_error(args, output.status.code(), &output.stderr)),
+    }
+}
+
+/// Uses Git's exact ref-existence protocol. Unlike `show-ref --verify`, the
+/// `--exists` form distinguishes an absent ref (2) from a lookup fault (1).
+fn git_ref_exists(repo: &Path, reference: &str) -> Result<bool, ArchaeologyError> {
+    let args = ["show-ref", "--exists", reference];
+    let output = git_command(repo, &args)
+        .output()
+        .map_err(|error| git_spawn_error(&args, error))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => Err(git_exit_error(&args, output.status.code(), &output.stderr)),
     }
 }
 

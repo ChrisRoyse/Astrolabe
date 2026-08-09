@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const PRESERVED_STAGE_DIR: &str = ".astrolabe-shadow-preserved-stage";
 const PRESERVED_STAGE_MANIFEST: &str = "preserved-stage.json";
-const PRESERVED_STAGE_SCHEMA: &str = "astrolabe.shadow-preserved-stage.v1";
-const PRESERVED_STAGE_FINGERPRINT_SCHEMA: &str = "astrolabe.shadow-preserved-stage.fingerprint.v1";
-const PERSISTED_STAGE_ARMING_SCHEMA: &str = "astrolabe.shadow-stage-arming.v1";
+const PRESERVED_STAGE_SCHEMA: &str = "astrolabe.shadow-preserved-stage.v2";
+const PRESERVED_STAGE_FINGERPRINT_SCHEMA: &str = "astrolabe.shadow-preserved-stage.fingerprint.v2";
+const PERSISTED_STAGE_ARMING_SCHEMA: &str = "astrolabe.shadow-stage-arming.v2";
 
 /// Registry-declared retention: at most this many preserved stages per project.
 /// A preserved stage is a full CBM store (multi-GB), so the replacement is a
@@ -113,7 +113,7 @@ pub(crate) struct PreservedStageFingerprint {
     pub(crate) admission_identity_sha256: String,
     pub(crate) producer_executable_sha256: String,
     pub(crate) canonical_repo_path: String,
-    pub(crate) git_head_oid: String,
+    pub(crate) git_history_state: astrolabe_anchors::archaeology::GitHistoryState,
     pub(crate) git_source_fingerprint: String,
     pub(crate) symbol_canonical_schema: String,
     pub(crate) panel_version: u32,
@@ -142,16 +142,16 @@ impl PreservedStageFingerprint {
             )
             .into()
         })?;
+        let git_snapshot =
+            astrolabe_anchors::archaeology::git_repository_snapshot(&canonical_repo)?;
         Ok(Self {
             schema: PRESERVED_STAGE_FINGERPRINT_SCHEMA.to_string(),
             project: project.to_string(),
             admission_identity_sha256: identity.identity_sha256().to_string(),
             producer_executable_sha256: identity.producer_executable_sha256().to_string(),
             canonical_repo_path: canonical_repo.display().to_string(),
-            git_head_oid: astrolabe_anchors::archaeology::git_head(&canonical_repo)?,
-            git_source_fingerprint: astrolabe_anchors::archaeology::git_source_fingerprint(
-                &canonical_repo,
-            )?,
+            git_history_state: git_snapshot.history,
+            git_source_fingerprint: git_snapshot.source_fingerprint,
             symbol_canonical_schema: SYMBOL_CANONICAL_TAG.to_string(),
             panel_version: SHADOW_PANEL_VERSION,
             publication_schema: publication_schema.to_string(),
@@ -162,7 +162,7 @@ impl PreservedStageFingerprint {
     pub(crate) fn token_sha256(&self) -> Result<String, DynError> {
         let bytes = serde_json::to_vec(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"astrolabe.shadow-preserved-stage.fingerprint.v1\0");
+        hasher.update(b"astrolabe.shadow-preserved-stage.fingerprint.v2\0");
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
         Ok(hex_lower(&hasher.finalize()))
@@ -171,6 +171,12 @@ impl PreservedStageFingerprint {
     /// Names every dimension that differs, so a refusal can say exactly what moved.
     fn mismatches(&self, other: &Self) -> Vec<String> {
         let mut differences = Vec::new();
+        if self.git_history_state != other.git_history_state {
+            differences.push(format!(
+                "git_history_state(expected={:?}, preserved={:?})",
+                self.git_history_state, other.git_history_state
+            ));
+        }
         let mut compare = |name: &str, expected: &str, found: &str| {
             if expected != found {
                 differences.push(format!(
@@ -195,7 +201,6 @@ impl PreservedStageFingerprint {
             &self.canonical_repo_path,
             &other.canonical_repo_path,
         );
-        compare("git_head_oid", &self.git_head_oid, &other.git_head_oid);
         compare(
             "git_source_fingerprint",
             &self.git_source_fingerprint,

@@ -482,21 +482,24 @@ const GUARD_COMMIT_OOD_PRODUCER_MAX_EXEMPLARS: usize = 8;
 /// changed symbol is derivable) so a commit is never re-extracted and a diff we
 /// cannot map does not re-fire forever. A symbol whose source or enclosing scope
 /// cannot be derived from the persisted graph is **labeled and counted**
-/// (`underivable`), never silently dropped and never fabricated. The producer never
-/// crashes the tick: git/vault faults return a labeled `skipped`/`degraded` status.
+/// (`underivable`), never silently dropped and never fabricated. Verified unborn
+/// history is an explicit zero-work state; Git query faults remain hard errors.
 pub(crate) fn produce_commit_ood_request(
     cache_dir: &Path,
     project: &str,
     root: &str,
 ) -> Result<Value, DynError> {
     let repo = Path::new(root);
-    let head = match astrolabe_anchors::archaeology::git_head(repo) {
-        Ok(head) => head,
-        Err(err) => {
-            // No git HEAD (not a repo / detached bare): nothing to produce, labeled.
+    let head = match astrolabe_anchors::archaeology::git_history_state(repo)? {
+        astrolabe_anchors::archaeology::GitHistoryState::Committed { oid } => oid,
+        astrolabe_anchors::archaeology::GitHistoryState::Unborn { symbolic_ref } => {
             return Ok(json!({
-                "status": "skipped",
-                "reason": format!("git HEAD unavailable: {err}"),
+                "status": "history_absent",
+                "history_present": false,
+                "symbolic_head": symbolic_ref,
+                "trust": "verified",
+                "freshness": "current",
+                "provenance": "git_worktree",
             }));
         }
     };

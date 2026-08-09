@@ -4,7 +4,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use astrolabe_anchors::archaeology::{
-    GitArchaeologyConfig, GitLineRange, GitMineMode, mine_git_archaeology,
+    GitArchaeologyConfig, GitHistoryState, GitLineRange, GitMineMode,
+    mine_git_archaeology_at_history,
 };
 use astrolabe_anchors::{
     OutcomeAnchorBatchItem, OutcomeAnchorRequest, OutcomeKind, OutcomeSubject,
@@ -184,7 +185,8 @@ struct ArchaeologyPersistenceWindow {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GitArchaeologyImportReport {
-    pub(crate) head: String,
+    pub(crate) history: Option<GitHistoryState>,
+    pub(crate) head: Option<String>,
     pub(crate) mode: &'static str,
     pub(crate) evidence: usize,
     pub(crate) historical_constellations_written: usize,
@@ -460,6 +462,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     cache_dir: &Path,
     vault: &AsterVault<C>,
     mode: GitMineMode,
+    history: &GitHistoryState,
 ) -> Result<GitArchaeologyImportReport, DynError> {
     let mode_name = match &mode {
         GitMineMode::Full => "full",
@@ -479,11 +482,6 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // byte-identical to pre-scoping behavior on every axis.
     let corpus_rel = git_show_prefix(repo)?;
     let git_root = git_toplevel(repo)?;
-    // Resolve, validate, bind, and read back the one explicit scratch namespace
-    // before the history mine or any historical Git mutation. Fleet supplies this
-    // root to every child; direct server launches must configure it themselves.
-    // No alternate path is attempted on any failure.
-    let scratch_scope = archaeology_scratch_scope(&git_root, project)?;
     // #434 phase-internal timing: opt-in via ASTRO_ARCH_TIMING, off by default so
     // production indexing is byte-for-byte unaffected. When set, the mine vs the
     // per-evidence-commit historical-reindex loop are timed separately (with counts)
@@ -496,7 +494,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         diff_tree_batch_commits: diff_tree_batch_limit,
         ..GitArchaeologyConfig::default()
     };
-    let mined = mine_git_archaeology(repo, &config, &mode)?;
+    let mined = mine_git_archaeology_at_history(repo, &config, &mode, history)?;
     if arch_timing {
         eprintln!(
             "astro.arch.timing phase=mine ms={} szz={} reverts={} force_removed={} member_prefix={:?}",
@@ -507,6 +505,66 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             config.member_prefix,
         );
     }
+    // Provenance labeling (#434): a non-empty corpus_rel means the corpus is a
+    // subtree of an enclosing repository whose `.git` we measured. Compute this
+    // before the absent-history return so that state remains fully attributed
+    // without creating a scratch namespace or walking history.
+    let (archaeology_source, pathspec) = if corpus_rel.is_empty() {
+        (ARCHAEOLOGY_SOURCE_OWN_REPO, None)
+    } else {
+        (ARCHAEOLOGY_SOURCE_PARENT_REPO, Some(corpus_rel.clone()))
+    };
+    if matches!(&mined.history, GitHistoryState::Unborn { .. }) {
+        return Ok(GitArchaeologyImportReport {
+            history: Some(mined.history),
+            head: None,
+            mode: "history_absent",
+            evidence: 0,
+            skipped_merge_fixes: mined.skipped_merge_fixes,
+            skipped_large_commits: mined.skipped_large_commits,
+            skipped_unresolvable_reverts: mined.skipped_unresolvable_reverts,
+            skipped_gitlink_paths: mined.skipped_gitlink_paths,
+            skipped_unblamable_paths: mined.skipped_unblamable_paths,
+            diff_tree_count_requested_commits: mined.diff_tree.count_requested_commits,
+            diff_tree_count_processes: mined.diff_tree.count_processes,
+            diff_tree_count_processes_avoided: mined.diff_tree.count_processes_avoided,
+            diff_tree_count_stdout_bytes: mined.diff_tree.count_stdout_bytes,
+            diff_tree_ranges_requested_commits: mined.diff_tree.ranges_requested_commits,
+            diff_tree_ranges_processes: mined.diff_tree.ranges_processes,
+            diff_tree_ranges_processes_avoided: mined.diff_tree.ranges_processes_avoided,
+            diff_tree_ranges_stdout_bytes: mined.diff_tree.ranges_stdout_bytes,
+            diff_tree_batch_limit_commits: mined.diff_tree.batch_limit_commits,
+            blame_requested_ranges: mined.blame.requested_ranges,
+            blame_effective_ranges: mined.blame.effective_ranges,
+            blame_groups: mined.blame.groups,
+            blame_group_cache_hits: mined.blame.group_cache_hits,
+            blame_processes: mined.blame.processes,
+            blame_processes_avoided: mined.blame.processes_avoided,
+            blame_cat_file_processes: mined.blame.cat_file_processes,
+            blame_cat_file_stdout_bytes: mined.blame.cat_file_stdout_bytes,
+            blame_path_absent_groups: mined.blame.path_absent_groups,
+            blame_returned_spans: mined.blame.returned_spans,
+            blame_returned_lines: mined.blame.returned_lines,
+            blame_stdout_bytes: mined.blame.stdout_bytes,
+            archaeology_source,
+            git_root,
+            pathspec,
+            anchor_batch_registry_version:
+                astrolabe_domain::knobs::ARCHAEOLOGY_PERSIST_KNOB_REGISTRY_VERSION,
+            anchor_batch_limit,
+            historical_batch_group_limit,
+            ..GitArchaeologyImportReport::default()
+        });
+    }
+    let mined_head = mined.head.clone().ok_or_else(|| -> DynError {
+        "ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID: committed archaeology report has no head object id; remediation: preserve the staged generation and inspect the typed Git history measurement"
+            .into()
+    })?;
+    // Resolve, validate, bind, and read back the one explicit scratch namespace
+    // only when history exists and historical checkout work can be produced.
+    // Fleet supplies this root to every child; direct server launches must
+    // configure it themselves. No alternate path is attempted on any failure.
+    let scratch_scope = archaeology_scratch_scope(&git_root, project)?;
     let mut evidence = Vec::new();
     for finding in &mined.szz_findings {
         evidence.push(Evidence {
@@ -564,7 +622,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             evidence.push(Evidence {
                 commit: removed.clone(),
                 range,
-                source: format!("git:revert:{}", mined.head),
+                source: format!("git:revert:{mined_head}"),
                 observed_at: force_observed_at,
                 confidence: 1.0,
                 label: "reverted",
@@ -625,20 +683,9 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         }
     }
 
-    // Provenance labeling (#434): a non-empty corpus_rel means the corpus is a
-    // subtree of an enclosing repository whose `.git` we mined — the mined history
-    // is PARENT-derived, and every walk above was pathspec-limited to `corpus_rel`
-    // (#381). An empty corpus_rel means the corpus IS its own git toplevel. Persist
-    // the discovered git root + the subtree pathspec so a consumer sees
-    // `parent_repo(<root>) pathspec=<subtree>` rather than an unlabeled implicit walk
-    // (invariant 1: no unlabeled claim; invariant 3: no silent fallback).
-    let (archaeology_source, pathspec) = if corpus_rel.is_empty() {
-        (ARCHAEOLOGY_SOURCE_OWN_REPO, None)
-    } else {
-        (ARCHAEOLOGY_SOURCE_PARENT_REPO, Some(corpus_rel.clone()))
-    };
     let mut report = GitArchaeologyImportReport {
-        head: mined.head,
+        history: Some(mined.history),
+        head: Some(mined_head),
         mode: mode_name,
         evidence: evidence.len(),
         skipped_merge_fixes: mined.skipped_merge_fixes,
@@ -5925,11 +5972,156 @@ fn historical_subject_id(location: &HistoricalSymbolLocation) -> String {
     )
 }
 
-pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Value {
+pub(crate) fn git_archaeology_summary(
+    report: &GitArchaeologyImportReport,
+) -> Result<Value, DynError> {
+    let history = report.history.as_ref().ok_or_else(|| -> DynError {
+        "ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID: archaeology report omitted its typed Git history state; remediation: preserve the staged generation and inspect the mining result"
+            .into()
+    })?;
+    history.validate()?;
+    let (status, trust, provenance, history_present, symbolic_head) = match history {
+        GitHistoryState::Committed { oid } => {
+            if report.head.as_deref() != Some(oid.as_str()) || report.mode == "history_absent" {
+                return Err(format!(
+                    "ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID: committed history {oid} disagrees with archaeology head={:?} mode={:?}; remediation: preserve the staged generation and inspect the mining result",
+                    report.head, report.mode
+                )
+                .into());
+            }
+            ("imported", "mixed", "git_history", true, None)
+        }
+        GitHistoryState::Unborn { symbolic_ref } => {
+            macro_rules! require_zero {
+                ($($field:ident),+ $(,)?) => {{
+                    let mut nonzero = Vec::new();
+                    $(if report.$field != 0 {
+                        nonzero.push(format!("{}={}", stringify!($field), report.$field));
+                    })+
+                    nonzero
+                }};
+            }
+            let nonzero = require_zero!(
+                evidence,
+                historical_constellations_written,
+                historical_constellations_reused,
+                anchors_written,
+                anchors_deduplicated,
+                evidence_without_symbol,
+                skipped_merge_fixes,
+                skipped_large_commits,
+                skipped_unresolvable_reverts,
+                skipped_gitlink_paths,
+                skipped_unblamable_paths,
+                diff_tree_count_requested_commits,
+                diff_tree_count_processes,
+                diff_tree_count_processes_avoided,
+                diff_tree_count_stdout_bytes,
+                diff_tree_ranges_requested_commits,
+                diff_tree_ranges_processes,
+                diff_tree_ranges_processes_avoided,
+                diff_tree_ranges_stdout_bytes,
+                diff_tree_count_wall_ms,
+                diff_tree_ranges_wall_ms,
+                blame_requested_ranges,
+                blame_effective_ranges,
+                blame_groups,
+                blame_group_cache_hits,
+                blame_processes,
+                blame_processes_avoided,
+                blame_cat_file_processes,
+                blame_cat_file_stdout_bytes,
+                blame_path_absent_groups,
+                blame_returned_spans,
+                blame_returned_lines,
+                blame_stdout_bytes,
+                blame_wall_ms,
+                blame_cat_file_wall_ms,
+                cleanup_remnants,
+                historical_paths_windows_invalid,
+                historical_commits_crashed,
+                historical_post_success_worker_recycles,
+                historical_post_success_cleanup_timeouts,
+                historical_git_inventory_processes,
+                historical_git_checkout_processes,
+                historical_git_cat_file_processes,
+                historical_git_cat_file_stdout_bytes,
+                historical_git_files_materialized,
+                historical_dependency_files_materialized,
+                historical_dependency_candidate_paths_absent,
+                historical_dependency_source_missing,
+                historical_dependency_source_ambiguous,
+                historical_dependency_optional_unresolved,
+                historical_dependency_edges,
+                historical_dependency_revisits,
+                historical_dependency_max_depth,
+                historical_git_paths_absent,
+                historical_git_source_files_materialized,
+                historical_commits_without_materialized_source,
+                historical_git_object_probe_processes_avoided,
+                historical_git_worktree_mutations_avoided,
+                historical_admission_groups,
+                historical_admission_logical_entries,
+                historical_admission_atomic_commits,
+                historical_admission_flushes,
+                historical_admission_max_window_groups,
+                historical_admission_rows_written,
+                historical_admission_ledger_refs_verified,
+                persistence_ledger_files_opened,
+                persistence_ledger_complete_scan_wanted,
+                persistence_atomic_commits,
+                persistence_flushes,
+                persistence_durable_sst_files,
+                persistence_durable_sst_entries,
+                persistence_durable_sst_bytes,
+                anchor_logical_entries,
+                anchor_atomic_commits,
+                anchor_flushes,
+                anchor_max_batch_entries,
+                anchor_rows_written,
+                anchor_ledger_refs_verified,
+                anchor_durable_sst_files,
+                anchor_durable_sst_entries,
+                anchor_durable_sst_bytes,
+                anchor_router_sst_files,
+                anchor_router_sst_entries,
+                anchor_router_sst_bytes,
+                anchor_router_handoff_full_inventories,
+                anchor_router_handoff_memtable_rows_verified,
+                anchor_router_handoff_flush_files_verified,
+                anchor_router_handoff_flush_entries_verified,
+                anchor_router_handoff_flush_files_retired,
+                anchor_router_handoff_flush_bytes_retired,
+                anchor_router_handoff_debt_files_after,
+                anchor_router_handoff_debt_bytes_after,
+                anchor_batch_wall_ms,
+                index_loop_wall_ms,
+            );
+            if report.head.is_some() || report.mode != "history_absent" || !nonzero.is_empty() {
+                return Err(format!(
+                    "ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID: unborn history {symbolic_ref:?} must have head=null, mode=history_absent, and zero historical work, but head={:?} mode={:?} nonzero=[{}]; remediation: preserve the staged generation and inspect the absent-history gate",
+                    report.head,
+                    report.mode,
+                    nonzero.join(", ")
+                )
+                .into());
+            }
+            (
+                "history_absent",
+                "verified",
+                "git_history_absent",
+                false,
+                Some(symbolic_ref.as_str()),
+            )
+        }
+    };
     let mut summary = json!({
-        "status": "imported",
+        "status": status,
         "mode": report.mode,
         "head": report.head,
+        "history_state": serde_json::to_value(history)?,
+        "history_present": history_present,
+        "symbolic_head": symbolic_head,
         "evidence": report.evidence,
         "historical_constellations_written": report.historical_constellations_written,
         "historical_constellations_reused": report.historical_constellations_reused,
@@ -5956,8 +6148,9 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "historical_commits_crashed": report.historical_commits_crashed,
         "historical_post_success_worker_recycles": report.historical_post_success_worker_recycles,
         "historical_post_success_cleanup_timeouts": report.historical_post_success_cleanup_timeouts,
-        "trust": "mixed",
-        "provenance": "git_history",
+        "trust": trust,
+        "freshness": "current",
+        "provenance": provenance,
         // #434 provenance labeling: the discovered git root, whether it is the
         // corpus's OWN repo or an enclosing PARENT repo, and the toplevel-relative
         // subtree pathspec every history walk was limited to. Persisted with the
@@ -6277,5 +6470,5 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         Value::from(report.index_loop_usage.peak_private_bytes_after),
     );
     object.insert("index_loop_usage".to_string(), Value::Object(usage));
-    summary
+    Ok(summary)
 }

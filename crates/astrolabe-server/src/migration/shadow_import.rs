@@ -1,4 +1,5 @@
 use super::*;
+use astrolabe_anchors::archaeology::{GitHistoryState, GitRepositorySnapshot};
 pub(crate) const SHADOW_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 // Shadow-import content-freshness refusal codes (#93). Freshness is derived by
 // recomputing the live CBM SQLite fingerprint and comparing it to the watermark
@@ -25,6 +26,9 @@ pub(crate) const SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION: &str = "the git source t
 pub(crate) const SHADOW_GIT_SOURCE_UNREADABLE_REMEDIATION: &str = "the persisted git source path could not be fingerprinted (the source tree was moved/deleted, or git is unavailable); restore the source tree at its indexed path, or rerun index_repository with calyx=\"shadow\" from the current source location";
 /// Metadata key holding the git working-tree source fingerprint captured at import time.
 pub(crate) const GIT_SOURCE_FINGERPRINT_KEY: &str = "git_source_fingerprint";
+/// Metadata key holding the exact committed-or-unborn Git history state measured
+/// with the working-tree fingerprint.
+pub(crate) const GIT_HISTORY_STATE_KEY: &str = "git_history_state_json";
 /// Metadata key holding the absolute repo path whose git source fingerprint was recorded,
 /// so the read-path freshness gate can recompute it against the live tree (#347).
 pub(crate) const GIT_SOURCE_REPO_PATH_KEY: &str = "git_source_repo_path";
@@ -195,9 +199,124 @@ pub(crate) struct ShadowImportOutcome {
     /// when the import ran against a real repo path. Persisted as the source-of-truth
     /// freshness watermark the read path recomputes against the live tree.
     pub(crate) git_source_fingerprint: Option<String>,
+    /// Typed Git history state captured in the same source observation as the
+    /// fingerprint. `None` only for an explicitly non-Git recovery import.
+    pub(crate) git_history_state: Option<GitHistoryState>,
     /// Absolute repo path whose git source fingerprint was recorded, so the read-path
     /// freshness gate can recompute it (#347). `None` when the import had no repo path.
     pub(crate) git_source_repo_path: Option<String>,
+}
+
+fn parse_git_history_state(
+    project: &str,
+    key: &str,
+    raw: &str,
+) -> Result<GitHistoryState, DynError> {
+    let history: GitHistoryState = serde_json::from_str(raw).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_GIT_HISTORY_STATE_INVALID: project {project:?} config key {key:?} is not a typed Git history state: {error}; remediation: preserve the generation and rebuild it from authoritative source"
+        )
+        .into()
+    })?;
+    history.validate().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_GIT_HISTORY_STATE_INVALID: project {project:?} config key {key:?} has an invalid Git history state: {error}; remediation: preserve the generation and rebuild it from authoritative source"
+        )
+        .into()
+    })?;
+    Ok(history)
+}
+
+fn provenance_with_git_source(
+    mut provenance: Value,
+    snapshot: Option<&GitRepositorySnapshot>,
+    repo_path: Option<&str>,
+) -> Result<Value, DynError> {
+    if let Some(snapshot) = snapshot {
+        let repo_path = repo_path.ok_or_else(|| -> DynError {
+            "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: a measured Git source snapshot has no repository path; remediation: preserve the staged generation and inspect source observation wiring"
+                .into()
+        })?;
+        let source = json!({
+            "entity": "git_worktree",
+            "repo_path": repo_path,
+            "source_fingerprint": snapshot.source_fingerprint,
+            "fingerprint_algorithm": astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_ALGO,
+            "fingerprint_version": astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_VERSION,
+            "history_state": serde_json::to_value(&snapshot.history)?,
+            "history_present": snapshot.history.commit_oid().is_some(),
+            "symbolic_head": snapshot.history.unborn_symbolic_ref(),
+            "source_bytes_measured": true,
+            "trust": "verified",
+            "freshness": "current",
+            "provenance": "git_worktree",
+        });
+        let object = provenance.as_object_mut().ok_or_else(|| -> DynError {
+            "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: provenance surface is not a JSON object; remediation: preserve the staged generation and inspect the row-sink provenance producer"
+                .into()
+        })?;
+        object.insert("git_source".to_string(), source);
+    }
+    Ok(provenance)
+}
+
+fn validate_git_source_provenance(
+    project: &str,
+    provenance: &Value,
+    snapshot: &GitRepositorySnapshot,
+    repo_path: &str,
+) -> Result<(), DynError> {
+    let source = provenance
+        .get("git_source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: project {project:?} provenance omits its git_source object; remediation: preserve the generation and rebuild it from authoritative source"
+            )
+            .into()
+        })?;
+    let history: GitHistoryState = serde_json::from_value(
+        source
+            .get("history_state")
+            .cloned()
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: project {project:?} provenance omits git_source.history_state; remediation: preserve the generation and rebuild it from authoritative source"
+                )
+                .into()
+            })?,
+    )
+    .map_err(|error| -> DynError {
+        format!(
+            "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: project {project:?} provenance has a malformed git_source.history_state: {error}; remediation: preserve the generation and rebuild it from authoritative source"
+        )
+        .into()
+    })?;
+    history.validate()?;
+    let valid = history == snapshot.history
+        && source.get("entity").and_then(Value::as_str) == Some("git_worktree")
+        && source.get("history_present").and_then(Value::as_bool)
+            == Some(snapshot.history.commit_oid().is_some())
+        && source.get("symbolic_head").and_then(Value::as_str)
+            == snapshot.history.unborn_symbolic_ref()
+        && source.get("source_fingerprint").and_then(Value::as_str)
+            == Some(snapshot.source_fingerprint.as_str())
+        && source.get("fingerprint_algorithm").and_then(Value::as_str)
+            == Some(astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_ALGO)
+        && source.get("fingerprint_version").and_then(Value::as_str)
+            == Some(astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_VERSION)
+        && source.get("repo_path").and_then(Value::as_str) == Some(repo_path)
+        && source.get("source_bytes_measured").and_then(Value::as_bool) == Some(true)
+        && source.get("trust").and_then(Value::as_str) == Some("verified")
+        && source.get("freshness").and_then(Value::as_str) == Some("current")
+        && source.get("provenance").and_then(Value::as_str) == Some("git_worktree");
+    if !valid {
+        return Err(format!(
+            "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: project {project:?} provenance git_source does not equal the measured snapshot {snapshot:?} at {repo_path:?}; remediation: preserve the generation and rebuild it from authoritative source"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1231,6 +1350,17 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
     )?
     .filter(|value| !value.trim().is_empty())
     {
+        let history_key = metadata_key(project, GIT_HISTORY_STATE_KEY);
+        let persisted_history_raw = read_config_value(cache_dir, &history_key)?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_GIT_HISTORY_STATE_MISSING: project {project:?} has a Git source fingerprint but no typed history state at {history_key:?}; remediation: preserve the generation and rebuild it from authoritative source"
+                )
+                .into()
+            })?;
+        let persisted_history =
+            parse_git_history_state(project, &history_key, &persisted_history_raw)?;
         // A watermark with no companion repo path cannot be checked; fall through to the
         // db gate rather than guessing a path (labeled by absence, never a false Fresh
         // claim about git-tracked freshness).
@@ -1238,14 +1368,17 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
             read_config_value(cache_dir, &metadata_key(project, GIT_SOURCE_REPO_PATH_KEY))?
                 .filter(|value| !value.trim().is_empty())
         {
-            match astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(&repo_path)) {
-                Ok(live) if live == persisted_source_fp => {
+            match astrolabe_anchors::archaeology::git_repository_snapshot(Path::new(&repo_path)) {
+                Ok(live)
+                    if live.source_fingerprint == persisted_source_fp
+                        && live.history == persisted_history =>
+                {
                     // Source unchanged; the db gate below decides Fresh vs db-Stale.
                 }
                 Ok(live) => {
                     return Ok(ShadowContentVerdict::SourceOutOfBand {
                         expected: persisted_source_fp,
-                        actual: live,
+                        actual: live.source_fingerprint,
                     });
                 }
                 Err(error) => {
@@ -1838,15 +1971,22 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     )?;
     // Gate every git-dependent step on the corpus actually being a git work tree
     // (#406): `dispatch.rs` passes `repo = Some(dir)` for ANY indexed directory, so a
-    // non-git corpus would otherwise hit `git_head`'s `rev-parse --verify HEAD` and
+    // non-git corpus would otherwise hit Git source measurement and
     // abort the whole shadow import with ASTRO_ARCHAEOLOGY_GIT_FAILED. Filtering to a
     // real work tree here routes a non-git corpus through the existing graceful `None`
     // arms (synthetic commit, absent source fingerprint, archaeology unavailable) so it
     // completes rc=0 with archaeology honestly labeled unavailable. A genuine git fault
     // *inside* a real repo still fails closed in the mining queries below.
     let git_repo = repo.filter(|r| astrolabe_anchors::archaeology::is_git_work_tree(r));
-    let commit = match git_repo {
-        Some(repo) => astrolabe_anchors::archaeology::git_head(repo)?,
+    let git_snapshot = git_repo
+        .map(astrolabe_anchors::archaeology::git_repository_snapshot)
+        .transpose()?;
+    let commit = match git_snapshot.as_ref() {
+        Some(snapshot) => snapshot
+            .history
+            .commit_oid()
+            .unwrap_or(&snapshot.source_fingerprint)
+            .to_string(),
         None => format!("shadow-import-v1:{project}"),
     };
     // Source-of-truth watermark (#347): fingerprint the live git working tree of the
@@ -1854,15 +1994,13 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // an out-of-band commit/edit that never touches the derived CBM db. Absent for a
     // recovery import with no repo path — freshness then falls back to the db gate,
     // labeled by the watermark's absence rather than a false git-freshness claim.
-    let (git_source_fingerprint, git_source_repo_path) = match git_repo {
-        Some(repo) => (
-            Some(astrolabe_anchors::archaeology::git_source_fingerprint(
-                repo,
-            )?),
-            Some(repo.to_string_lossy().into_owned()),
-        ),
-        None => (None, None),
-    };
+    let git_source_fingerprint = git_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.source_fingerprint.clone());
+    let git_history_state = git_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.history.clone());
+    let git_source_repo_path = git_repo.map(|repo| repo.to_string_lossy().into_owned());
     // Measured host parallelism, not a constant (#23): the corpus-wide import
     // passes (symbol preparation, row encode/reconcile, readback verification)
     // are worker-count-invariant in results, and one worker left the whole
@@ -1945,6 +2083,17 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         cache_dir,
         &metadata_key(project, GIT_SOURCE_FINGERPRINT_KEY),
     )?;
+    let persisted_git_history_state =
+        read_config_value(cache_dir, &metadata_key(project, GIT_HISTORY_STATE_KEY))?
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| {
+                parse_git_history_state(
+                    project,
+                    &metadata_key(project, GIT_HISTORY_STATE_KEY),
+                    &raw,
+                )
+            })
+            .transpose()?;
     let persisted_git_source_repo_path =
         read_config_value(cache_dir, &metadata_key(project, GIT_SOURCE_REPO_PATH_KEY))?;
     let persisted_content_watermark =
@@ -1968,6 +2117,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     };
     let git_source_identity_unchanged = persisted_git_source_fingerprint.as_deref()
         == git_source_fingerprint.as_deref()
+        && persisted_git_history_state.as_ref() == git_history_state.as_ref()
         && persisted_git_source_repo_path.as_deref() == git_source_repo_path.as_deref();
     // A published empty corpus has no prior graph atoms, so graph cardinality cannot
     // distinguish it from a first import. The persisted, domain-tagged content
@@ -2078,8 +2228,33 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             read_required_shadow_json(cache_dir, project, "skill_tree_json")?
         };
         let provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+        if let (Some(snapshot), Some(repo_path)) =
+            (git_snapshot.as_ref(), git_source_repo_path.as_deref())
+        {
+            validate_git_source_provenance(project, &provenance, snapshot, repo_path)?;
+        }
         let git_archaeology =
             read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
+        if let Some(expected_history) = git_history_state.as_ref() {
+            let actual_history: GitHistoryState = serde_json::from_value(
+                git_archaeology
+                    .get("history_state")
+                    .cloned()
+                    .ok_or_else(|| -> DynError {
+                        format!(
+                            "ASTRO_GIT_HISTORY_STATE_MISSING: project {project:?} persisted archaeology summary omits history_state; remediation: preserve the generation and rebuild it from authoritative source"
+                        )
+                        .into()
+                    })?,
+            )?;
+            actual_history.validate()?;
+            if &actual_history != expected_history {
+                return Err(format!(
+                    "ASTRO_GIT_HISTORY_STATE_INVALID: project {project:?} source history {expected_history:?} disagrees with persisted archaeology history {actual_history:?}; remediation: preserve the generation and rebuild it from authoritative source"
+                )
+                .into());
+            }
+        }
         let kernel_context = read_required_shadow_json(cache_dir, project, "kernel_context_json")?;
         let shadow_ledger_checkpoint =
             capture_shadow_ledger_checkpoint(&vault_dir, &vault, &verify, project)?;
@@ -2134,47 +2309,64 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             git_archaeology,
             weave,
             git_source_fingerprint,
+            git_history_state,
             git_source_repo_path,
         });
     }
     let git_archaeology = match git_repo {
         Some(repo) => {
-            let mode = match read_config_value(
-                cache_dir,
-                &metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY),
-            )? {
-                Some(previous_head) => {
-                    // Convention-migration gate (#418): a prior import may have minted
-                    // archaeology anchors and historical constellations under the OLD
-                    // toplevel-prefixed path convention, whose CxIds are disjoint from the
-                    // live subtree-relative graph. An incremental (`Since`) import would
-                    // only mine NEW commits, silently leaving that off-graph evidence in
-                    // place — a mixed-convention vault. When the persisted convention marker
-                    // is absent (pre-#418 import) or does not match the current convention,
-                    // force a FULL re-mine so every anchor is re-derived under the unified
-                    // subtree-relative convention and attaches on the live graph. This is
-                    // explicit reconciliation, not a silent fallback; the resulting
-                    // `mode: "full"` is visible in the persisted git_archaeology summary.
-                    let persisted_convention = read_config_value(
-                        cache_dir,
-                        &metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
-                    )?;
-                    if persisted_convention.as_deref() == Some(GIT_ARCHAEOLOGY_PATH_CONVENTION) {
-                        astrolabe_anchors::archaeology::GitMineMode::Since { previous_head }
-                    } else {
-                        eprintln!(
-                            "astro.archaeology.migration project={project} \
+            let mode = match git_history_state.as_ref() {
+                Some(GitHistoryState::Unborn { .. }) => {
+                    astrolabe_anchors::archaeology::GitMineMode::Full
+                }
+                Some(GitHistoryState::Committed { .. }) => match read_config_value(
+                    cache_dir,
+                    &metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY),
+                )? {
+                    Some(previous_head) => {
+                        // Convention-migration gate (#418): a prior import may have minted
+                        // archaeology anchors and historical constellations under the OLD
+                        // toplevel-prefixed path convention, whose CxIds are disjoint from the
+                        // live subtree-relative graph. An incremental (`Since`) import would
+                        // only mine NEW commits, silently leaving that off-graph evidence in
+                        // place — a mixed-convention vault. When the persisted convention marker
+                        // is absent (pre-#418 import) or does not match the current convention,
+                        // force a FULL re-mine so every anchor is re-derived under the unified
+                        // subtree-relative convention and attaches on the live graph. This is
+                        // explicit reconciliation, not a silent fallback; the resulting
+                        // `mode: "full"` is visible in the persisted git_archaeology summary.
+                        let persisted_convention = read_config_value(
+                            cache_dir,
+                            &metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
+                        )?;
+                        if persisted_convention.as_deref() == Some(GIT_ARCHAEOLOGY_PATH_CONVENTION)
+                        {
+                            astrolabe_anchors::archaeology::GitMineMode::Since { previous_head }
+                        } else {
+                            eprintln!(
+                                "astro.archaeology.migration project={project} \
                              reason=path_convention_changed action=force_full_remine \
                              persisted={persisted_convention:?} current={GIT_ARCHAEOLOGY_PATH_CONVENTION:?}"
-                        );
-                        astrolabe_anchors::archaeology::GitMineMode::Full
+                            );
+                            astrolabe_anchors::archaeology::GitMineMode::Full
+                        }
                     }
+                    None => astrolabe_anchors::archaeology::GitMineMode::Full,
+                },
+                None => {
+                    return Err(
+                        "ASTRO_GIT_HISTORY_STATE_INVALID: a Git repository reached archaeology without a typed source history state; remediation: preserve the staged generation and inspect source observation wiring"
+                            .into(),
+                    );
                 }
-                None => astrolabe_anchors::archaeology::GitMineMode::Full,
             };
+            let history = git_history_state.as_ref().ok_or_else(|| -> DynError {
+                "ASTRO_GIT_HISTORY_STATE_INVALID: a Git repository reached archaeology without a typed source history state; remediation: preserve the staged generation and inspect source observation wiring"
+                    .into()
+            })?;
             git_archaeology_summary(&run_git_archaeology(
-                repo, project, cache_dir, &vault, mode,
-            )?)
+                repo, project, cache_dir, &vault, mode, history,
+            )?)?
         }
         None => json!({
             "status": "unavailable",
@@ -2319,6 +2511,16 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         &shadow_ledger_head,
         &verify,
     );
+    let provenance = provenance_with_git_source(
+        provenance,
+        git_snapshot.as_ref(),
+        git_source_repo_path.as_deref(),
+    )?;
+    if let (Some(snapshot), Some(repo_path)) =
+        (git_snapshot.as_ref(), git_source_repo_path.as_deref())
+    {
+        validate_git_source_provenance(project, &provenance, snapshot, repo_path)?;
+    }
 
     Ok(ShadowImportOutcome {
         publication_required: true,
@@ -2363,6 +2565,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         git_archaeology,
         weave,
         git_source_fingerprint,
+        git_history_state,
         git_source_repo_path,
     })
 }
@@ -4613,6 +4816,10 @@ pub(crate) fn try_shadow_index_noop_admission(
     }
     let persisted_source_fingerprint =
         required_shadow_config_value(cache_dir, project, GIT_SOURCE_FINGERPRINT_KEY)?;
+    let history_key = metadata_key(project, GIT_HISTORY_STATE_KEY);
+    let persisted_history_raw =
+        required_shadow_config_value(cache_dir, project, GIT_HISTORY_STATE_KEY)?;
+    let persisted_history = parse_git_history_state(project, &history_key, &persisted_history_raw)?;
     let persisted_repo_path =
         required_shadow_config_value(cache_dir, project, GIT_SOURCE_REPO_PATH_KEY)?;
     let canonical_repo = fs::canonicalize(repo_path).map_err(|error| -> DynError {
@@ -4640,9 +4847,11 @@ pub(crate) fn try_shadow_index_noop_admission(
         });
     }
 
-    let source_fingerprint_before =
-        astrolabe_anchors::archaeology::git_source_fingerprint(&canonical_repo)?;
-    if source_fingerprint_before != persisted_source_fingerprint {
+    let source_snapshot_before =
+        astrolabe_anchors::archaeology::git_repository_snapshot(&canonical_repo)?;
+    if source_snapshot_before.source_fingerprint != persisted_source_fingerprint
+        || source_snapshot_before.history != persisted_history
+    {
         return Ok(ShadowIndexNoopAdmission::Miss {
             reason: "git_source_changed".to_string(),
             action_policy: action_policy.clone(),
@@ -4774,6 +4983,24 @@ pub(crate) fn try_shadow_index_noop_admission(
         read_required_shadow_json(cache_dir, project, "git_archaeology_json")?;
     let archaeology_sha256 =
         hex_lower(&Sha256::digest(serde_json::to_vec(&persisted_archaeology)?));
+    let archaeology_history: GitHistoryState = serde_json::from_value(
+        persisted_archaeology
+            .get("history_state")
+            .cloned()
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_GIT_HISTORY_STATE_MISSING: project {project:?} persisted archaeology summary omits history_state; remediation: preserve the generation and rebuild it from authoritative source"
+                )
+                .into()
+            })?,
+    )?;
+    archaeology_history.validate()?;
+    if archaeology_history != persisted_history {
+        return Err(format!(
+            "ASTRO_GIT_HISTORY_STATE_INVALID: project {project:?} config history {persisted_history:?} disagrees with archaeology history {archaeology_history:?}; remediation: preserve the generation and rebuild it from authoritative source"
+        )
+        .into());
+    }
     let archaeology_head = persisted_archaeology
         .get("head")
         .cloned()
@@ -4783,6 +5010,9 @@ pub(crate) fn try_shadow_index_noop_admission(
         "status": "unchanged",
         "mode": "unchanged",
         "head": archaeology_head,
+        "history_state": serde_json::to_value(&persisted_history)?,
+        "history_present": persisted_history.commit_oid().is_some(),
+        "symbolic_head": persisted_history.unborn_symbolic_ref(),
         "persisted_summary_sha256": archaeology_sha256,
         "historical_work_skipped": true,
         "historical_commits_crashed": 0,
@@ -4805,10 +5035,11 @@ pub(crate) fn try_shadow_index_noop_admission(
     // Re-read both independently mutable authorities after the potentially long
     // vault/lowered verification. A source edit or project-config publication that
     // raced this read invalidates the hit instead of returning a torn snapshot.
-    let source_fingerprint_after =
-        astrolabe_anchors::archaeology::git_source_fingerprint(&canonical_repo)?;
-    if source_fingerprint_after != source_fingerprint_before
-        || source_fingerprint_after != persisted_source_fingerprint
+    let source_snapshot_after =
+        astrolabe_anchors::archaeology::git_repository_snapshot(&canonical_repo)?;
+    if source_snapshot_after != source_snapshot_before
+        || source_snapshot_after.source_fingerprint != persisted_source_fingerprint
+        || source_snapshot_after.history != persisted_history
     {
         return Ok(ShadowIndexNoopAdmission::Miss {
             reason: "git_source_changed_during_noop_validation".to_string(),
@@ -4903,8 +5134,19 @@ pub(crate) fn try_shadow_index_noop_admission(
         compact_persisted_surface_ref(cache_dir, project, "kernel_context", "kernel_context_json")?;
     let anomalies =
         compact_persisted_surface_ref(cache_dir, project, "anomalies", "anomaly_report_json")?;
-    let provenance =
-        compact_persisted_surface_ref(cache_dir, project, "provenance", "provenance_json")?;
+    let persisted_provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+    validate_git_source_provenance(
+        project,
+        &persisted_provenance,
+        &source_snapshot_before,
+        &persisted_repo_path,
+    )?;
+    let provenance = compact_surface_ref_from_value(
+        project,
+        "provenance",
+        "provenance_json",
+        &persisted_provenance,
+    )?;
     let weave = compact_persisted_surface_ref_with_overlay(
         cache_dir,
         project,
@@ -4947,11 +5189,19 @@ pub(crate) fn try_shadow_index_noop_admission(
             ),
             (
                 "git_source_fingerprint_before".to_string(),
-                Value::String(source_fingerprint_before.clone()),
+                Value::String(source_snapshot_before.source_fingerprint.clone()),
             ),
             (
                 "git_source_fingerprint_after".to_string(),
-                Value::String(source_fingerprint_after.clone()),
+                Value::String(source_snapshot_after.source_fingerprint.clone()),
+            ),
+            (
+                "git_history_state_before".to_string(),
+                serde_json::to_value(&source_snapshot_before.history)?,
+            ),
+            (
+                "git_history_state_after".to_string(),
+                serde_json::to_value(&source_snapshot_after.history)?,
             ),
             (
                 "source_sqlite_sha256".to_string(),
@@ -5272,6 +5522,27 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, 
     } else {
         "unchanged"
     };
+    let git_source = match outcome.git_history_state.as_ref() {
+        Some(history) => json!({
+            "history_state": history,
+            "history_present": history.commit_oid().is_some(),
+            "symbolic_head": history.unborn_symbolic_ref(),
+            "source_fingerprint": outcome.git_source_fingerprint,
+            "repo_path": outcome.git_source_repo_path,
+            "source_bytes_measured": true,
+            "trust": "verified",
+            "freshness": "current",
+            "provenance": "git_worktree",
+        }),
+        None => json!({
+            "status": "unavailable",
+            "reason": "this recovery import did not carry a Git repository source",
+            "source_bytes_measured": false,
+            "trust": "provisional",
+            "freshness": "unknown",
+            "provenance": "unavailable",
+        }),
+    };
     Ok(json!({
         "status": status,
         "writes_skipped": !outcome.publication_required && !outcome.metadata_publication_required,
@@ -5312,6 +5583,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, 
         "panel_version": SHADOW_PANEL_VERSION,
         "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
         "panel_runtime": "cbm_frozen_v1",
+        "git_source": git_source,
         "vault_import": vault_import_summary(
             &outcome.vault_import_source,
             outcome.vault_import_fallback_reason.as_deref(),
@@ -5675,6 +5947,26 @@ pub(crate) fn persist_shadow_publication_at(
         staged_config_rows,
         publication_generation,
     } = commit;
+    match (
+        outcome.git_history_state.as_ref(),
+        outcome.git_source_fingerprint.as_deref(),
+        outcome.git_source_repo_path.as_deref(),
+    ) {
+        (Some(history), Some(source_fingerprint), Some(repo_path)) => {
+            let snapshot = GitRepositorySnapshot {
+                history: history.clone(),
+                source_fingerprint: source_fingerprint.to_string(),
+            };
+            validate_git_source_provenance(project, &outcome.provenance, &snapshot, repo_path)?;
+        }
+        (None, None, None) => {}
+        state => {
+            return Err(format!(
+                "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: project {project:?} publication has a partial Git source tuple {state:?}; remediation: preserve the staged generation and inspect source observation wiring"
+            )
+            .into());
+        }
+    }
     let mut conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;
@@ -5684,6 +5976,29 @@ pub(crate) fn persist_shadow_publication_at(
     let anomaly_report_json = serde_json::to_string(&outcome.anomalies)?;
     let provenance_json = serde_json::to_string(&outcome.provenance)?;
     let git_archaeology_json = serde_json::to_string(&outcome.git_archaeology)?;
+    let git_history_state_json = outcome
+        .git_history_state
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(expected_history) = outcome.git_history_state.as_ref() {
+        let summary_history = outcome
+            .git_archaeology
+            .get("history_state")
+            .ok_or_else(|| -> DynError {
+                "ASTRO_GIT_HISTORY_STATE_INVALID: Git archaeology summary omitted history_state; remediation: preserve the staged generation and inspect source/archaeology wiring"
+                    .into()
+            })?;
+        let actual_history: GitHistoryState = serde_json::from_value(summary_history.clone())?;
+        actual_history.validate()?;
+        if &actual_history != expected_history {
+            return Err(format!(
+                "ASTRO_GIT_HISTORY_STATE_INVALID: publication source history {expected_history:?} disagrees with archaeology history {actual_history:?}; remediation: preserve the staged generation and inspect source/archaeology wiring"
+            )
+            .into());
+        }
+    }
     let weave_json = serde_json::to_string(&outcome.weave)?;
     let lowering_status_json = serde_json::to_string(&json!({
         "schema": "astrolabe-lowering-debounce-v1",
@@ -5789,6 +6104,7 @@ pub(crate) fn persist_shadow_publication_at(
         ("anomaly_report_json", anomaly_report_json),
         ("provenance_json", provenance_json),
         ("git_archaeology_json", git_archaeology_json),
+        (GIT_HISTORY_STATE_KEY, git_history_state_json),
         ("weave_json", weave_json),
         ("invalidations_json", invalidations_json),
     ] {
@@ -5806,22 +6122,41 @@ pub(crate) fn persist_shadow_publication_at(
             params![metadata_key(project, legacy)],
         )?;
     }
-    if let Some(head) = outcome.git_archaeology.get("head").and_then(Value::as_str) {
-        tx.execute(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-            params![metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY), head],
-        )?;
-        // #418: stamp the identity path convention this archaeology pass was minted under,
-        // atomically with the head it advances, so the next import's mode gate can force a
-        // full re-mine if the convention ever changes again (never a silent mixed-convention
-        // incremental). Written only when archaeology actually ran (a real head exists).
-        tx.execute(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-            params![
-                metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
-                GIT_ARCHAEOLOGY_PATH_CONVENTION
-            ],
-        )?;
+    match outcome.git_history_state.as_ref() {
+        Some(GitHistoryState::Committed { oid }) => {
+            if outcome.git_archaeology.get("head").and_then(Value::as_str) != Some(oid.as_str()) {
+                return Err(format!(
+                    "ASTRO_GIT_HISTORY_STATE_INVALID: committed publication history {oid} disagrees with archaeology head {:?}; remediation: preserve the staged generation and inspect source/archaeology wiring",
+                    outcome.git_archaeology.get("head")
+                )
+                .into());
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                params![metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY), oid],
+            )?;
+            // #418: stamp the identity path convention atomically with the head it
+            // advances so a future convention change forces a full re-mine.
+            tx.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                params![
+                    metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
+                    GIT_ARCHAEOLOGY_PATH_CONVENTION
+                ],
+            )?;
+        }
+        Some(GitHistoryState::Unborn { .. }) => {
+            for key in [
+                GIT_ARCHAEOLOGY_HEAD_KEY,
+                GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY,
+            ] {
+                tx.execute(
+                    "DELETE FROM config WHERE key = ?",
+                    params![metadata_key(project, key)],
+                )?;
+            }
+        }
+        None => {}
     }
     // #347: persist the git-source watermark + repo path (or clear them when this import
     // had no repo, so a stale watermark from a prior repo-aware import can never linger
