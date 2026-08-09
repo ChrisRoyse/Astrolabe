@@ -7887,33 +7887,55 @@ static char *build_index_telemetry_error(const char *project_name, size_t metric
     return json ? json : heap_strdup("{\"code\":\"CBM_INDEX_PHASE_TELEMETRY_INCOMPLETE\"}");
 }
 
+static const char *pipeline_execution_route_name(cbm_pipeline_execution_route_t route) {
+    switch (route) {
+    case CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY:
+        return "unchanged_read_only";
+    case CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED:
+        return "materialized";
+    case CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN:
+    default:
+        return "unknown";
+    }
+}
+
 static char *build_index_parallel_dispatch_error(const char *project_name, size_t dispatch_count,
-                                                 bool complete) {
+                                                 bool complete,
+                                                 cbm_pipeline_execution_route_t route) {
+    bool dispatches_required = route == CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED;
+    const char *reason =
+        !complete                                       ? "retention_incomplete"
+        : route == CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN ? "execution_route_unknown"
+        : route == CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY && dispatch_count != 0
+            ? "unchanged_route_has_dispatches"
+            : "materialized_route_has_no_dispatches";
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return heap_strdup(
             "{\"code\":\"CBM_INDEX_PARALLEL_DISPATCH_TELEMETRY_INCOMPLETE\",\"message\":\"the "
-            "completed index did not retain complete worker-dispatch diagnostics\","
-            "\"sqlite_publication_started\":true}");
+            "completed index reported contradictory execution-route and worker-dispatch "
+            "diagnostics\",\"source_family_preserved\":true}");
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
-    yyjson_mut_obj_add_str(doc, root, "code",
-                           "CBM_INDEX_PARALLEL_DISPATCH_TELEMETRY_INCOMPLETE");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_INDEX_PARALLEL_DISPATCH_TELEMETRY_INCOMPLETE");
     yyjson_mut_obj_add_str(doc, root, "operation", "retain_parallel_dispatches");
+    yyjson_mut_obj_add_str(doc, root, "reason", reason);
+    yyjson_mut_obj_add_str(doc, root, "pipeline_execution_route",
+                           pipeline_execution_route_name(route));
+    yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_required", dispatches_required);
     yyjson_mut_obj_add_str(
         doc, root, "message",
-        "the index published its verified database but did not retain every worker-dispatch "
-        "admission record");
+        "the completed index route and retained worker-dispatch cardinality contradict");
     yyjson_mut_obj_add_str(
         doc, root, "remediation",
-        "preserve the published database and inspect "
+        "preserve the source family; inspect the execution route, retained dispatch count, and "
         "CBM_PIPELINE_PARALLEL_DISPATCH_CAPACITY_EXCEEDED before retrying");
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
     yyjson_mut_obj_add_uint(doc, root, "parallel_dispatch_count", (uint64_t)dispatch_count);
     yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_complete", complete);
-    yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", true);
+    yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", dispatches_required);
     yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
@@ -7963,7 +7985,8 @@ static bool add_pipeline_phase_metrics(yyjson_mut_doc *doc, yyjson_mut_val *root
 
 static bool add_pipeline_parallel_dispatches(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                              const cbm_pipeline_t *p, size_t *dispatch_count_out,
-                                             bool *complete_out) {
+                                             bool *complete_out,
+                                             cbm_pipeline_execution_route_t route) {
     const cbm_pipeline_parallel_dispatch_t *dispatches = NULL;
     size_t dispatch_count = 0;
     bool complete = false;
@@ -7982,12 +8005,10 @@ static bool add_pipeline_parallel_dispatches(yyjson_mut_doc *doc, yyjson_mut_val
         yyjson_mut_obj_add_strcpy(doc, item, "mode", dispatches[i].mode);
         yyjson_mut_obj_add_strcpy(doc, item, "code", dispatches[i].code);
         yyjson_mut_obj_add_int(doc, item, "item_count", dispatches[i].item_count);
-        yyjson_mut_obj_add_int(doc, item, "requested_workers",
-                               dispatches[i].requested_workers);
+        yyjson_mut_obj_add_int(doc, item, "requested_workers", dispatches[i].requested_workers);
         yyjson_mut_obj_add_int(doc, item, "admitted_workers", dispatches[i].admitted_workers);
         yyjson_mut_obj_add_int(doc, item, "created_workers", dispatches[i].created_workers);
-        yyjson_mut_obj_add_int(doc, item, "failed_worker_index",
-                               dispatches[i].failed_worker_index);
+        yyjson_mut_obj_add_int(doc, item, "failed_worker_index", dispatches[i].failed_worker_index);
         yyjson_mut_obj_add_int(doc, item, "error_domain", dispatches[i].error_domain);
         yyjson_mut_obj_add_uint(doc, item, "error_code", (uint64_t)dispatches[i].error_code);
         yyjson_mut_arr_add_val(items, item);
@@ -7995,7 +8016,14 @@ static bool add_pipeline_parallel_dispatches(yyjson_mut_doc *doc, yyjson_mut_val
     yyjson_mut_obj_add_val(doc, root, "parallel_dispatches", items);
     yyjson_mut_obj_add_uint(doc, root, "parallel_dispatch_count", (uint64_t)dispatch_count);
     yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_complete", complete);
-    return complete && dispatches && dispatch_count > 0;
+    bool dispatches_required = route == CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED;
+    yyjson_mut_obj_add_str(doc, root, "pipeline_execution_route",
+                           pipeline_execution_route_name(route));
+    yyjson_mut_obj_add_bool(doc, root, "parallel_dispatches_required", dispatches_required);
+    bool cardinality_matches =
+        (route == CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY && dispatch_count == 0) ||
+        (dispatches_required && dispatch_count > 0);
+    return complete && dispatches && cardinality_matches;
 }
 
 /* Build the success portion only after the persisted source of truth has been
@@ -8102,10 +8130,11 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
 
     size_t parallel_dispatch_count = 0;
     bool parallel_dispatches_complete = false;
+    cbm_pipeline_execution_route_t execution_route = cbm_pipeline_get_execution_route(p);
     if (!add_pipeline_parallel_dispatches(doc, root, p, &parallel_dispatch_count,
-                                          &parallel_dispatches_complete)) {
+                                          &parallel_dispatches_complete, execution_route)) {
         return build_index_parallel_dispatch_error(project_name, parallel_dispatch_count,
-                                                   parallel_dispatches_complete);
+                                                   parallel_dispatches_complete, execution_route);
     }
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);

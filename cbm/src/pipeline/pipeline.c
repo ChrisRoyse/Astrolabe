@@ -314,6 +314,7 @@ struct cbm_pipeline {
     cbm_pipeline_parallel_dispatch_t parallel_dispatches[PL_PARALLEL_DISPATCH_CAPACITY];
     size_t parallel_dispatch_count;
     bool parallel_dispatches_complete;
+    cbm_pipeline_execution_route_t execution_route;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -1220,6 +1221,10 @@ void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
     if (complete) {
         *complete = p && p->parallel_dispatches_complete;
     }
+}
+
+cbm_pipeline_execution_route_t cbm_pipeline_get_execution_route(const cbm_pipeline_t *p) {
+    return p ? p->execution_route : CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN;
 }
 
 void cbm_pipeline_get_compile_context_diagnostics(
@@ -2967,6 +2972,7 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
     (void)snprintf(p->routed_store_sha256, sizeof(p->routed_store_sha256), "%s",
                    verification.db_sha256);
     cbm_pipeline_set_committed_counts(p, committed_nodes, committed_edges);
+    p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY;
     cbm_pipeline_phase_probe_end(p, "unchanged_result_readback", &finish_probe);
     cbm_log_info("pipeline.route", "path", "unchanged_read_only", "source_snapshot_started",
                  "false", "sqlite_publication_started", "false", "nodes", itoa_buf(committed_nodes),
@@ -3994,6 +4000,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->phase_metrics_complete = true;
     p->parallel_dispatch_count = 0;
     p->parallel_dispatches_complete = true;
+    p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN;
     cbm_pipeline_phase_probe_t total_probe = cbm_pipeline_phase_probe_start(p, "total");
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_source_snapshot_t source_snapshot = {0};
@@ -4087,6 +4094,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
+    p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED;
 
     CBM_PROF_START(t_snapshot);
     cbm_pipeline_phase_probe_t snapshot_probe =

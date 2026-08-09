@@ -101,6 +101,16 @@ typedef struct {
     unsigned long error_code;
 } cbm_pipeline_parallel_dispatch_t;
 
+/* Exact successful execution route. The response layer uses this state to
+ * distinguish a verified read-only unchanged result (which must admit zero
+ * worker dispatches) from a materialized index (which must retain at least one
+ * dispatch). UNKNOWN is never a successful response state. */
+typedef enum {
+    CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN = 0,
+    CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY = 1,
+    CBM_PIPELINE_EXECUTION_ROUTE_MATERIALIZED = 2,
+} cbm_pipeline_execution_route_t;
+
 /* Distinct terminal result for a repository with no non-auxiliary source
  * files. Callers must surface this as a structured refusal; it is never a
  * successful structural-only index. */
@@ -183,6 +193,10 @@ void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
 void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
                                           const cbm_pipeline_parallel_dispatch_t **out,
                                           size_t *count, bool *complete);
+
+/* Return the exact successful route selected by the current run. A caller must
+ * reject UNKNOWN and any route/dispatch-cardinality contradiction. */
+cbm_pipeline_execution_route_t cbm_pipeline_get_execution_route(const cbm_pipeline_t *p);
 
 /* Reference edges skipped because their source syntax resolved to several
  * stable atoms in one semantic domain (#727). The corpus still publishes, so
