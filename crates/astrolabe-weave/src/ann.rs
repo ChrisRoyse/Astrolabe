@@ -20,7 +20,11 @@
 //! build (#441) — the per-source exact kNN scans) shard across the declared
 //! worker count over frozen, read-only inputs.
 
-use std::collections::BTreeMap;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap},
+    sync::mpsc,
+};
 
 use calyx_core::{CxId, SlotVector};
 use calyx_sextant::{HnswIndex, QuantConfig, SextantIndex};
@@ -337,52 +341,85 @@ fn dense_candidates(
     });
 
     let quant = QuantConfig::scalar8(scale);
-    let dense_inputs: Vec<Vec<f32>> = group
-        .iter()
-        .map(|&index| {
-            let NormalizedVector::Dense { data, .. } = &vectors[index].vector else {
-                unreachable!("dense group holds only dense vectors");
-            };
-            data.clone()
-        })
-        .collect();
 
     if crate::knobs::weave_dense_ann_use_exact(dim) {
-        // The exact strategy has no persistent index object, so materialize the
-        // same scalar8 representable values it scans. The HNSW path below must
-        // receive raw values: Sextant owns packing and keeps no f32 copy.
-        let approximations: Vec<Vec<f32>> = dense_inputs
-            .iter()
-            .map(|data| {
-                let row = quant.pack(data)?;
-                quant.approx_f32(&row)
-            })
-            .collect::<calyx_core::Result<Vec<_>>>()
+        let mut approximations = Vec::new();
+        approximations
+            .try_reserve_exact(group.len())
             .map_err(|error| SimilarityPlanError::AnnCandidateFailure {
                 family,
                 message: format!(
-                    "exact scalar8 pool packing failed for dim {dim}: {} ({})",
-                    error.message, error.code
+                    "ASTRO_WEAVE_EXACT_KNN_CAPACITY_EXHAUSTED: scalar8 approximation row-table reserve failed for {family} dim {dim}, pool={}, requested_rows={}: {error}; no partial similarity plan was published",
+                    group.len(),
+                    group.len()
                 ),
             })?;
-        return Ok(exact_dense_candidates(
-            &approximations,
-            group,
-            span,
-            per_source,
-        ));
+        for &index in group {
+            let NormalizedVector::Dense { data, .. } = &vectors[index].vector else {
+                unreachable!("dense group holds only dense vectors");
+            };
+            let row =
+                quant
+                    .pack(data)
+                    .map_err(|error| SimilarityPlanError::AnnCandidateFailure {
+                        family,
+                        message: format!(
+                            "exact scalar8 pool packing failed for dim {dim}: {} ({})",
+                            error.message, error.code
+                        ),
+                    })?;
+            let approximation = quant.approx_f32(&row).map_err(|error| {
+                SimilarityPlanError::AnnCandidateFailure {
+                    family,
+                    message: format!(
+                        "exact scalar8 approximation failed for dim {dim}: {} ({})",
+                        error.message, error.code
+                    ),
+                }
+            })?;
+            approximations.push(approximation);
+        }
+        return exact_dense_candidates(family, dim, &approximations, group, span, per_source)
+            .map_err(|message| SimilarityPlanError::AnnCandidateFailure { family, message });
     }
     hnsw_dense_candidates(
         HnswDenseCandidatePlan {
             family,
             dim,
-            dense_inputs: &dense_inputs,
+            vectors,
             quant,
             config,
             span,
             group,
         },
         per_source,
+    )
+}
+
+/// Borrows the raw dense row selected by one dense-group ordinal.
+fn dense_group_row<'a>(vectors: &'a [IndexedVector], group: &[usize], ordinal: usize) -> &'a [f32] {
+    let NormalizedVector::Dense { data, .. } = &vectors[group[ordinal]].vector else {
+        unreachable!("dense group holds only dense vectors");
+    };
+    data
+}
+
+/// Formats the single fail-closed resource-exhaustion code for exact kNN.
+fn exact_knn_capacity_error(
+    family: SimilarityFamily,
+    dim: u32,
+    pool: usize,
+    k: usize,
+    component: &str,
+    requested_items: usize,
+    source: Option<usize>,
+    error: &impl std::fmt::Display,
+) -> String {
+    let source = source
+        .map(|ordinal| ordinal.to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "ASTRO_WEAVE_EXACT_KNN_CAPACITY_EXHAUSTED: {component} reserve failed for {family} dim {dim}, pool={pool}, k={k}, source_ordinal={source}, requested_items={requested_items}: {error}; no partial similarity plan was published"
     )
 }
 
@@ -394,7 +431,7 @@ fn dense_candidates(
 struct HnswDenseCandidatePlan<'a> {
     family: SimilarityFamily,
     dim: u32,
-    dense_inputs: &'a [Vec<f32>],
+    vectors: &'a [IndexedVector],
     quant: QuantConfig,
     config: &'a AnnCandidateConfig,
     span: usize,
@@ -415,7 +452,7 @@ fn hnsw_dense_candidates(
     let HnswDenseCandidatePlan {
         family,
         dim,
-        dense_inputs,
+        vectors,
         quant,
         config,
         span,
@@ -431,13 +468,13 @@ fn hnsw_dense_candidates(
                 error.message, error.code
             ))
         })?;
-    for (ordinal, input) in dense_inputs.iter().enumerate() {
+    for ordinal in 0..group.len() {
         index
             .insert(
                 ordinal_cx_id(ordinal),
                 SlotVector::Dense {
                     dim,
-                    data: input.clone(),
+                    data: dense_group_row(vectors, group, ordinal).to_vec(),
                 },
                 ordinal as u64,
             )
@@ -459,24 +496,29 @@ fn hnsw_dense_candidates(
     // query loop. Measurement drove this: `similarity_plan` was the largest weave
     // sub-stage and its cost is dominated by these queries, previously serial.
     let workers = crate::knobs::weave_similarity_workers()
-        .min(dense_inputs.len())
+        .min(group.len())
         .max(1);
-    let chunk_size = dense_inputs.len().div_ceil(workers);
+    let chunk_size = group.len().div_ceil(workers);
     let hit_lists: Vec<Result<Vec<Vec<usize>>, SimilarityPlanError>> = std::thread::scope(
         |scope| {
             let index = &index;
-            dense_inputs
+            group
                 .chunks(chunk_size.max(1))
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk
                             .iter()
-                            .map(|input| {
+                            .map(|&vector_index| {
+                                let NormalizedVector::Dense { data, .. } =
+                                    &vectors[vector_index].vector
+                                else {
+                                    unreachable!("dense group holds only dense vectors");
+                                };
                                 let hits = index
                                     .search(
                                         &SlotVector::Dense {
                                             dim,
-                                            data: input.clone(),
+                                            data: data.to_vec(),
                                         },
                                         k,
                                         Some(ef),
@@ -528,6 +570,111 @@ fn hnsw_dense_candidates(
     Ok(new_pairs)
 }
 
+/// Heap row for exact kNN selection. A max-heap surfaces the least-preferred
+/// retained candidate: lower score first, then larger ordinal.
+#[derive(Debug)]
+struct ExactCandidate {
+    score: f32,
+    target: usize,
+}
+
+impl PartialEq for ExactCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ExactCandidate {}
+
+impl PartialOrd for ExactCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ExactCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.target.cmp(&other.target))
+    }
+}
+
+/// Computes exact top-k rows for a contiguous source range and streams each row
+/// to the single ordered recorder. The heap allocation is reserved once and reused
+/// for every source owned by this worker.
+fn exact_dense_worker(
+    family: SimilarityFamily,
+    dim: u32,
+    approximations: &[Vec<f32>],
+    sources: std::ops::Range<usize>,
+    k: usize,
+    sender: mpsc::SyncSender<Result<(usize, Vec<usize>), String>>,
+) {
+    let pool = approximations.len();
+    let mut top = BinaryHeap::new();
+    if let Err(error) = top.try_reserve_exact(k) {
+        let _ = sender.send(Err(exact_knn_capacity_error(
+            family,
+            dim,
+            pool,
+            k,
+            "worker top-k heap",
+            k,
+            None,
+            &error,
+        )));
+        return;
+    }
+
+    for source in sources {
+        top.clear();
+        let query = &approximations[source];
+        for target in 0..pool {
+            let candidate = ExactCandidate {
+                score: cosine(query, &approximations[target]),
+                target,
+            };
+            if top.len() < k {
+                top.push(candidate);
+            } else if top
+                .peek()
+                .is_some_and(|worst| candidate.cmp(worst) == Ordering::Less)
+            {
+                top.pop();
+                top.push(candidate);
+            }
+        }
+
+        let mut neighbors = Vec::new();
+        if let Err(error) = neighbors.try_reserve_exact(k) {
+            let _ = sender.send(Err(exact_knn_capacity_error(
+                family,
+                dim,
+                pool,
+                k,
+                "neighbor row",
+                k,
+                Some(source),
+                &error,
+            )));
+            return;
+        }
+        // `pop` yields worst-to-best under `ExactCandidate::cmp`; reversing
+        // restores the historical `(score desc, ordinal asc)` row order.
+        while let Some(candidate) = top.pop() {
+            if candidate.target != source {
+                neighbors.push(candidate.target);
+            }
+        }
+        neighbors.reverse();
+        if sender.send(Ok((source, neighbors))).is_err() {
+            return;
+        }
+    }
+}
+
 /// Deterministic, parallel, **exact** blocked kNN dense candidate build (#441).
 ///
 /// For every source ordinal `s` this computes the exact cosine of its quantized
@@ -537,73 +684,113 @@ fn hnsw_dense_candidates(
 /// (score descending, ordinal ascending) — ordinals are qualified-name order, so it
 /// is fully deterministic with no RNG.
 ///
-/// Determinism / parity: each source's neighbor list is a pure function of the
-/// frozen quantized pool `approximations`, with no graph and no cross-source
-/// mutation, so the per-source scans are sharded across `weave_similarity_workers`
-/// with results concatenated in ordinal order — the proposed candidate set is
-/// byte-identical across runs and worker counts (the pair recording is single
-/// threaded). Because the exact top-k over the quantized pool strictly dominates
-/// HNSW's approximate graph search on the *same* pool (it removes only the
-/// graph-approximation error over the shared quantization error), candidate recall
-/// against the exhaustive planner cannot drop; see the knob declaration.
+/// Production cost measurement (#855, 2026-08-09): `N=191,788`, the failing
+/// low-dimensional pool had `177,738` rows, and default `k=31`. Each worker keeps
+/// one reusable `k`-entry heap and a capacity-one result channel; the ordered
+/// recorder consumes rows immediately. Peak candidate scratch is therefore
+/// O(workers * k), invariant in N, instead of retaining one pool-sized allocation
+/// per source (PC-29/PC-16). Pair scoring remains exact over the entire quantized
+/// pool; selection order and persisted candidate semantics are unchanged (PC-38).
 fn exact_dense_candidates(
+    family: SimilarityFamily,
+    dim: u32,
     approximations: &[Vec<f32>],
     group: &[usize],
     span: usize,
     per_source: &mut [Vec<usize>],
-) -> usize {
+) -> Result<usize, String> {
     let pool = approximations.len();
     // Same candidate breadth as the HNSW query (`span + 1`, self included), clamped
     // to the pool so a tiny group asks for at most `pool` neighbors.
     let k = span.saturating_add(1).min(pool);
-    let indices: Vec<usize> = (0..pool).collect();
     let workers = crate::knobs::weave_similarity_workers().min(pool).max(1);
-    let chunk_size = indices.len().div_ceil(workers).max(1);
-    let neighbor_lists: Vec<Vec<usize>> = std::thread::scope(|scope| {
-        indices
-            .chunks(chunk_size)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&source| {
-                            let query = &approximations[source];
-                            let mut scored: Vec<(usize, f32)> = (0..pool)
-                                .map(|target| (target, cosine(query, &approximations[target])))
-                                .collect();
-                            // Mirrors calyx-sextant `top_k` ordering (score desc)
-                            // with an ordinal tie-break for full determinism.
-                            scored.sort_by(|left, right| {
-                                right
-                                    .1
-                                    .total_cmp(&left.1)
-                                    .then_with(|| left.0.cmp(&right.0))
-                            });
-                            scored.truncate(k);
-                            scored
-                                .into_iter()
-                                .map(|(target, _)| target)
-                                .filter(|&target| target != source)
-                                .collect::<Vec<usize>>()
-                        })
-                        .collect::<Vec<Vec<usize>>>()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("exact knn worker panicked"))
-            .collect()
-    });
+    let chunk_size = pool.div_ceil(workers).max(1);
 
-    let mut new_pairs = 0usize;
-    for (source, neighbors) in neighbor_lists.into_iter().enumerate() {
-        for target in neighbors {
-            if record_pair(per_source, group[source], group[target]) {
-                new_pairs += 1;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        handles.try_reserve_exact(workers).map_err(|error| {
+            exact_knn_capacity_error(
+                family,
+                dim,
+                pool,
+                k,
+                "worker handle table",
+                workers,
+                None,
+                &error,
+            )
+        })?;
+        let mut receivers = Vec::new();
+        receivers.try_reserve_exact(workers).map_err(|error| {
+            exact_knn_capacity_error(
+                family,
+                dim,
+                pool,
+                k,
+                "worker receiver table",
+                workers,
+                None,
+                &error,
+            )
+        })?;
+
+        let mut start = 0usize;
+        while start < pool {
+            let end = start.saturating_add(chunk_size).min(pool);
+            let sources = start..end;
+            let (sender, receiver) = mpsc::sync_channel(1);
+            receivers.push((sources.clone(), receiver));
+            handles.push(scope.spawn(move || {
+                exact_dense_worker(family, dim, approximations, sources, k, sender);
+            }));
+            start = end;
+        }
+
+        let mut new_pairs = 0usize;
+        let mut terminal_error = None;
+        'workers: for (sources, receiver) in &receivers {
+            for expected_source in sources.clone() {
+                match receiver.recv() {
+                    Ok(Ok((source, neighbors))) if source == expected_source => {
+                        for target in neighbors {
+                            if record_pair(per_source, group[source], group[target]) {
+                                new_pairs += 1;
+                            }
+                        }
+                    }
+                    Ok(Ok((source, _))) => {
+                        terminal_error = Some(format!(
+                            "ASTRO_WEAVE_EXACT_KNN_ORDER_DRIFT: {family} dim {dim}, pool={pool}, k={k}, expected_source_ordinal={expected_source}, observed_source_ordinal={source}; no partial similarity plan was published"
+                        ));
+                        break 'workers;
+                    }
+                    Ok(Err(error)) => {
+                        terminal_error = Some(error);
+                        break 'workers;
+                    }
+                    Err(error) => {
+                        terminal_error = Some(format!(
+                            "ASTRO_WEAVE_EXACT_KNN_WORKER_DISCONNECTED: {family} dim {dim}, pool={pool}, k={k}, expected_source_ordinal={expected_source}: {error}; no partial similarity plan was published"
+                        ));
+                        break 'workers;
+                    }
+                }
             }
         }
-    }
-    new_pairs
+        drop(receivers);
+
+        for handle in handles {
+            if handle.join().is_err() && terminal_error.is_none() {
+                terminal_error = Some(format!(
+                    "ASTRO_WEAVE_EXACT_KNN_WORKER_PANICKED: {family} dim {dim}, pool={pool}, k={k}; no partial similarity plan was published"
+                ));
+            }
+        }
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(new_pairs),
+        }
+    })
 }
 
 /// Cosine similarity over two equal-length dense vectors, byte-identical to the
