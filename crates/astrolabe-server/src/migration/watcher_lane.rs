@@ -28,6 +28,12 @@ struct RegistrationRecoveryRefresh<'a> {
     recompute_reason: &'a str,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RegistrationRecoveryDisposition {
+    Proceed,
+    Suppress,
+}
+
 pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<(), DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let runner = Rc::new(CbmToolRunner::new_default()?);
@@ -94,13 +100,13 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             if registered.get(&registration.project) == Some(&registration.root) {
                 continue;
             }
-            match suppress_unchanged_registration_recovery_fault(
+            match registration_recovery_disposition(
                 &cache_dir,
                 &registration,
                 &mut registration_recovery_faults,
             ) {
-                Ok(true) => continue,
-                Ok(false) => {}
+                Ok(RegistrationRecoveryDisposition::Suppress) => continue,
+                Ok(RegistrationRecoveryDisposition::Proceed) => {}
                 Err(error) => {
                     let message =
                         format!("durable registration recovery fault validation failed: {error}");
@@ -131,7 +137,6 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 }
             };
             registration_recovery_faults.remove(&registration.project);
-            delete_registration_recovery_fault(&cache_dir, &registration.project)?;
             if let Some(status) = &catch_up {
                 persist_watcher_status(&cache_dir, &registration.project, status)?;
                 tracing::info!(
@@ -250,15 +255,15 @@ fn registration_catch_up_status(
     })))
 }
 
-fn suppress_unchanged_registration_recovery_fault(
+fn registration_recovery_disposition(
     cache_dir: &Path,
     registration: &WatchRegistration,
     registration_recovery_faults: &mut BTreeMap<String, Value>,
-) -> Result<bool, DynError> {
+) -> Result<RegistrationRecoveryDisposition, DynError> {
     let Some(prior_fault) = read_registration_recovery_fault(cache_dir, &registration.project)?
     else {
         registration_recovery_faults.remove(&registration.project);
-        return Ok(false);
+        return Ok(RegistrationRecoveryDisposition::Proceed);
     };
     registration_recovery_faults.insert(registration.project.clone(), prior_fault.clone());
     let prior_observation =
@@ -277,7 +282,7 @@ fn suppress_unchanged_registration_recovery_fault(
         Ok(None) => {
             registration_recovery_faults.remove(&registration.project);
             delete_registration_recovery_fault(cache_dir, &registration.project)?;
-            return Ok(false);
+            return Ok(RegistrationRecoveryDisposition::Proceed);
         }
         Err(error) => {
             let sentinel_error = error.to_string();
@@ -292,7 +297,9 @@ fn suppress_unchanged_registration_recovery_fault(
         }
     };
     match validated_registration_recovery_sentinel(&prior_fault, registration, fault_code) {
-        Ok(prior_sentinel) if prior_sentinel == current_sentinel => Ok(true),
+        Ok(prior_sentinel) if prior_sentinel == current_sentinel => {
+            Ok(RegistrationRecoveryDisposition::Suppress)
+        }
         Ok(_) => refresh_or_clear_registration_recovery_fault(
             cache_dir,
             registration,
@@ -328,7 +335,7 @@ fn refresh_or_clear_registration_recovery_fault(
     registration: &WatchRegistration,
     refresh: RegistrationRecoveryRefresh<'_>,
     registration_recovery_faults: &mut BTreeMap<String, Value>,
-) -> Result<bool, DynError> {
+) -> Result<RegistrationRecoveryDisposition, DynError> {
     let RegistrationRecoveryRefresh {
         fault_code,
         prior_fault,
@@ -350,13 +357,13 @@ fn refresh_or_clear_registration_recovery_fault(
             None => {
                 registration_recovery_faults.remove(&registration.project);
                 delete_registration_recovery_fault(cache_dir, &registration.project)?;
-                return Ok(false);
+                return Ok(RegistrationRecoveryDisposition::Proceed);
             }
         };
     if current_observation != *prior_observation {
         registration_recovery_faults.remove(&registration.project);
         delete_registration_recovery_fault(cache_dir, &registration.project)?;
-        return Ok(false);
+        return Ok(RegistrationRecoveryDisposition::Proceed);
     }
     let message = prior_fault
         .get("message")
@@ -389,7 +396,7 @@ fn refresh_or_clear_registration_recovery_fault(
         sentinel_sha256 = sentinel_sha256,
         "incremental_watcher.registration_fault_sentinel_revalidated"
     );
-    Ok(true)
+    Ok(RegistrationRecoveryDisposition::Suppress)
 }
 
 fn recompute_after_current_sentinel_error(
@@ -399,7 +406,7 @@ fn recompute_after_current_sentinel_error(
     prior_observation: &Value,
     sentinel_error: &str,
     registration_recovery_faults: &mut BTreeMap<String, Value>,
-) -> Result<bool, DynError> {
+) -> Result<RegistrationRecoveryDisposition, DynError> {
     let fault_class = recovery_fault_log_class(fault_code);
     tracing::warn!(
         project = %registration.project,
@@ -428,12 +435,12 @@ fn recompute_after_current_sentinel_error(
                 observation_sha256 = observation_sha256,
                 "incremental_watcher.registration_fault_current_sentinel_changed_observation"
             );
-            Ok(false)
+            Ok(RegistrationRecoveryDisposition::Proceed)
         }
         Ok(None) => {
             registration_recovery_faults.remove(&registration.project);
             delete_registration_recovery_fault(cache_dir, &registration.project)?;
-            Ok(false)
+            Ok(RegistrationRecoveryDisposition::Proceed)
         }
         Err(observation_error) => Err(format!(
             "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_UNEVALUABLE: current sentinel for project {:?} could not be evaluated ({sentinel_error}); the required one-shot full observation also failed: {observation_error}; remediation: preserve the durable transaction/config bytes and inspect the named transaction before retrying resident suppression",
