@@ -366,6 +366,10 @@ fn registration_recovery_disposition(
         Ok(prior_sentinel) if prior_sentinel == current_sentinel => {
             Ok(RegistrationRecoveryDisposition::Suppress)
         }
+        Ok(_) if shadow_publication_recovery_tracks_owner_state(fault_code) => {
+            delete_registration_recovery_fault(cache_dir, &registration.project)?;
+            Ok(RegistrationRecoveryDisposition::Proceed)
+        }
         Ok(_) => refresh_or_clear_registration_recovery_fault(
             cache_dir,
             registration,
@@ -513,11 +517,41 @@ fn record_registration_reconciliation_refusal(
     error: DynError,
 ) -> Result<(), DynError> {
     let message = error.to_string();
-    if let Some(fault_code) = shadow_publication_recovery_error_code(&message)
-        && let Some(observation) =
+    if let Some(fault_code) = shadow_publication_recovery_error_code(&message) {
+        let Some(sentinel) = registration_recovery_sentinel(cache_dir, registration, fault_code)?
+        else {
+            tracing::info!(
+                project = %registration.project,
+                root = %registration.root,
+                fault_code = fault_code,
+                "incremental_watcher.registration_reconciliation_fault_cleared_before_capture"
+            );
+            return Ok(());
+        };
+        if shadow_publication_recovery_tracks_owner_state(fault_code)
+            && !sentinel.get("shadow_publication").is_some_and(|shadow| {
+                shadow_publication_recovery_sentinel_confirms_owner_fault(shadow, fault_code)
+            })
+        {
+            tracing::info!(
+                project = %registration.project,
+                root = %registration.root,
+                fault_code = fault_code,
+                "incremental_watcher.registration_reconciliation_owner_state_changed_before_capture"
+            );
+            return Ok(());
+        }
+        let Some(observation) =
             registration_recovery_observation(cache_dir, registration, fault_code)?
-        && let Some(sentinel) = registration_recovery_sentinel(cache_dir, registration, fault_code)?
-    {
+        else {
+            tracing::info!(
+                project = %registration.project,
+                root = %registration.root,
+                fault_code = fault_code,
+                "incremental_watcher.registration_reconciliation_fault_cleared_before_observation"
+            );
+            return Ok(());
+        };
         let fault = registration_recovery_fault_record(
             registration,
             fault_code,
@@ -628,6 +662,11 @@ fn registration_recovery_fault_record(
 ) -> Result<Value, DynError> {
     let observation_sha256 = value_sha256(&observation)?;
     let sentinel_sha256 = value_sha256(&sentinel)?;
+    let sentinel_kind = if shadow_publication_recovery_tracks_owner_state(fault_code) {
+        "compact_journal_artifact_metadata_config_generation_plus_exact_owner_generation_state"
+    } else {
+        "compact_journal_artifact_metadata_plus_config_generation"
+    };
     let transaction_inventory_sha256 =
         registration_recovery_observation_field(&observation, "transaction_inventory_sha256");
     let publication_config_sha256 =
@@ -680,7 +719,7 @@ fn registration_recovery_fault_record(
         "message": message,
         "worker_started": false,
         "retry_suppressed_until_observation_changes": true,
-        "sentinel_kind": "compact_journal_artifact_metadata_plus_config_generation",
+        "sentinel_kind": sentinel_kind,
         "full_observation_recompute_reason": recompute_reason,
         "remediation": "preserve the exact shadow-publication transaction, repair the named durable bytes or project publication config, then let the resident watcher re-admit reconciliation",
     }))
@@ -833,6 +872,9 @@ fn shadow_publication_recovery_error_code(message: &str) -> Option<&str> {
                     *token,
                     "ASTRO_SHADOW_PUBLICATION_LEGACY_PRESERVED"
                         | "ASTRO_SHADOW_PUBLICATION_TRANSACTION_NAME_INVALID"
+                        | "ASTRO_SHADOW_PUBLICATION_ACTIVE_GENERATION_CONFLICT"
+                        | "ASTRO_SHADOW_PUBLICATION_OWNER_UNEVALUABLE"
+                        | "ASTRO_SHADOW_PUBLICATION_OWNER_CLASSIFICATION_DRIFT"
                 )
         })
 }

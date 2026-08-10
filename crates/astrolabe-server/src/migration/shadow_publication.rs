@@ -36,6 +36,69 @@ enum PublicationOwnerState {
     Matching,
 }
 
+pub(crate) fn shadow_publication_recovery_tracks_owner_state(fault_code: &str) -> bool {
+    matches!(
+        fault_code,
+        "ASTRO_SHADOW_PUBLICATION_ACTIVE_GENERATION_CONFLICT"
+            | "ASTRO_SHADOW_PUBLICATION_OWNER_UNEVALUABLE"
+            | "ASTRO_SHADOW_PUBLICATION_OWNER_CLASSIFICATION_DRIFT"
+    )
+}
+
+pub(crate) fn shadow_publication_recovery_sentinel_confirms_owner_fault(
+    sentinel: &Value,
+    fault_code: &str,
+) -> bool {
+    if !shadow_publication_recovery_tracks_owner_state(fault_code) {
+        return true;
+    }
+    let Some(metadata) = sentinel.get("transaction_metadata") else {
+        return false;
+    };
+    let Some(transaction_count) = metadata.get("transaction_count").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(journal_count) = metadata.get("journal_count").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(owner_probe_count) = metadata.get("owner_probe_count").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(owner_matching_count) = metadata.get("owner_matching_count").and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(owner_absent_count) = metadata.get("owner_absent_count").and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(owner_reused_count) = metadata.get("owner_reused_count").and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(owner_unevaluable_count) = metadata
+        .get("owner_unevaluable_count")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    if owner_probe_count != transaction_count
+        || owner_probe_count != journal_count
+        || owner_matching_count + owner_absent_count + owner_reused_count + owner_unevaluable_count
+            != owner_probe_count
+    {
+        return false;
+    }
+    match fault_code {
+        "ASTRO_SHADOW_PUBLICATION_ACTIVE_GENERATION_CONFLICT" => {
+            transaction_count > 1 && owner_matching_count > 0
+        }
+        "ASTRO_SHADOW_PUBLICATION_OWNER_UNEVALUABLE" => owner_unevaluable_count > 0,
+        "ASTRO_SHADOW_PUBLICATION_OWNER_CLASSIFICATION_DRIFT" => owner_matching_count > 0,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileEvidence {
@@ -1608,7 +1671,8 @@ pub(crate) fn shadow_publication_recovery_sentinel(
     if !project_root.exists() || fs::read_dir(&project_root)?.next().is_none() {
         return Ok(None);
     }
-    let transaction_metadata = compact_transaction_sentinel(&project_root, live_cache, project)?;
+    let transaction_metadata =
+        compact_transaction_sentinel(&project_root, live_cache, project, fault_code)?;
     let config_rows = publication_recovery_relevant_config_rows(live_cache, project)?;
     let publication_config_sha256 = config_rows_sha256(&config_rows)?;
     Ok(Some(json!({
@@ -1630,14 +1694,20 @@ fn compact_transaction_sentinel(
     project_root: &Path,
     live_cache: &Path,
     project: &str,
+    fault_code: &str,
 ) -> Result<Value, DynError> {
-    let mut sentinel = CompactTransactionSentinel::new();
+    let tracks_owner_state = shadow_publication_recovery_tracks_owner_state(fault_code);
+    let mut sentinel = CompactTransactionSentinel::new(tracks_owner_state);
     collect_compact_transaction_sentinel(project_root, live_cache, project, &mut sentinel)?;
     let entry_digest = sentinel.entries_sha256();
     Ok(json!({
         "schema": "astrolabe.shadow-publication-recovery-compact-sentinel.v1",
         "root": project_root,
-        "strategy": "project-root-direct-entries+journal-sha256+journal-bound-artifact-metadata",
+        "strategy": if tracks_owner_state {
+            "project-root-direct-entries+journal-sha256+journal-bound-artifact-metadata+exact-owner-generation-state"
+        } else {
+            "project-root-direct-entries+journal-sha256+journal-bound-artifact-metadata"
+        },
         "entry_count": sentinel.entry_count,
         "file_count": sentinel.file_count,
         "directory_count": sentinel.directory_count,
@@ -1646,6 +1716,11 @@ fn compact_transaction_sentinel(
         "journal_count": sentinel.journal_count,
         "artifact_probe_count": sentinel.artifact_probe_count,
         "direct_entry_count": sentinel.direct_entry_count,
+        "owner_probe_count": sentinel.owner_probe_count,
+        "owner_matching_count": sentinel.owner_matching_count,
+        "owner_absent_count": sentinel.owner_absent_count,
+        "owner_reused_count": sentinel.owner_reused_count,
+        "owner_unevaluable_count": sentinel.owner_unevaluable_count,
         "entries_sha256": entry_digest,
     }))
 }
@@ -1659,11 +1734,17 @@ struct CompactTransactionSentinel {
     journal_count: u64,
     artifact_probe_count: u64,
     direct_entry_count: u64,
+    tracks_owner_state: bool,
+    owner_probe_count: u64,
+    owner_matching_count: u64,
+    owner_absent_count: u64,
+    owner_reused_count: u64,
+    owner_unevaluable_count: u64,
     hasher: Sha256,
 }
 
 impl CompactTransactionSentinel {
-    fn new() -> Self {
+    fn new(tracks_owner_state: bool) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"astrolabe.shadow-publication.compact-sentinel.v1\0");
         Self {
@@ -1675,6 +1756,12 @@ impl CompactTransactionSentinel {
             journal_count: 0,
             artifact_probe_count: 0,
             direct_entry_count: 0,
+            tracks_owner_state,
+            owner_probe_count: 0,
+            owner_matching_count: 0,
+            owner_absent_count: 0,
+            owner_reused_count: 0,
+            owner_unevaluable_count: 0,
             hasher,
         }
     }
@@ -1719,6 +1806,58 @@ impl CompactTransactionSentinel {
 
     fn entries_sha256(&self) -> String {
         hex_lower(&self.hasher.clone().finalize())
+    }
+
+    fn push_owner_state(
+        &mut self,
+        relative_journal_path: &str,
+        journal: &PublicationJournal,
+    ) -> Result<(), DynError> {
+        if !self.tracks_owner_state {
+            return Ok(());
+        }
+        self.owner_probe_count += 1;
+        let state = match astrolabe_bridge::process_generation_state(
+            journal.owner.pid,
+            journal.owner.process_start_utc_ticks,
+        ) {
+            Ok(astrolabe_bridge::ProcessGenerationState::Absent) => {
+                self.owner_absent_count += 1;
+                json!({"state": "absent"})
+            }
+            Ok(astrolabe_bridge::ProcessGenerationState::Reused {
+                actual_start_utc_ticks,
+            }) => {
+                self.owner_reused_count += 1;
+                json!({
+                    "state": "reused",
+                    "actual_start_utc_ticks": actual_start_utc_ticks,
+                })
+            }
+            Ok(astrolabe_bridge::ProcessGenerationState::Matching) => {
+                self.owner_matching_count += 1;
+                json!({"state": "matching"})
+            }
+            Err(error) => {
+                self.owner_unevaluable_count += 1;
+                json!({
+                    "state": "unevaluable",
+                    "error": error.to_string(),
+                })
+            }
+        };
+        self.push(
+            &format!("{relative_journal_path}#owner"),
+            "transaction_owner_state",
+            "logical",
+            None,
+            json!({
+                "generation": journal.generation,
+                "phase": journal.phase,
+                "owner": journal.owner,
+                "process_generation_state": state,
+            }),
+        )
     }
 }
 
@@ -1827,30 +1966,92 @@ fn push_transaction_journal_sentinel(
     sentinel: &mut CompactTransactionSentinel,
 ) -> Result<(), DynError> {
     let journal_path = transaction.join(PUBLICATION_JOURNAL);
-    let journal_bytes = fs::read(&journal_path).map_err(|error| {
-        format!(
-            "ASTRO_SHADOW_PUBLICATION_SENTINEL_JOURNAL_UNREADABLE: read {}: {error}; remediation: preserve the transaction and inspect the journal before retrying recovery",
-            journal_path.display()
-        )
-    })?;
+    let relative_journal_path = sentinel_display_path(project_root, &journal_path);
+    sentinel.journal_count += 1;
+    let journal_bytes = match fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return sentinel.push(
+                &relative_journal_path,
+                "transaction_journal_unreadable",
+                "logical",
+                None,
+                json!({
+                    "state": "unreadable",
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    };
     let journal_sha256 = hex_lower(&Sha256::digest(&journal_bytes));
-    let metadata = fs::symlink_metadata(&journal_path)?;
+    let metadata = match fs::symlink_metadata(&journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return sentinel.push(
+                &relative_journal_path,
+                "transaction_journal_metadata_unreadable",
+                "logical",
+                Some(journal_bytes.len() as u64),
+                json!({
+                    "state": "metadata_unreadable",
+                    "journal_sha256": journal_sha256,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    };
     if !metadata.file_type().is_file() {
-        return Err(format!(
-            "ASTRO_SHADOW_PUBLICATION_SENTINEL_JOURNAL_NOT_FILE: journal {} is not an ordinary file; remediation: preserve the transaction and inspect the exact path",
-            journal_path.display()
-        )
-        .into());
+        return sentinel.push(
+            &relative_journal_path,
+            "transaction_journal_not_file",
+            "logical",
+            Some(journal_bytes.len() as u64),
+            json!({
+                "state": "not_file",
+                "journal_sha256": journal_sha256,
+            }),
+        );
     }
-    let journal = read_publication_journal(&journal_path)?;
-    validate_publication_journal_identity(
+    let journal = match decode_publication_journal(&journal_bytes, &journal_path) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return sentinel.push(
+                &relative_journal_path,
+                "transaction_journal_invalid",
+                "file",
+                Some(metadata.len()),
+                json!({
+                    "state": "invalid",
+                    "journal_sha256": journal_sha256,
+                    "metadata": cheap_file_metadata(&metadata),
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    };
+    if let Err(error) = validate_publication_journal_identity(
         &journal,
         transaction,
         project_root,
         live_cache,
         project,
-    )?;
-    sentinel.journal_count += 1;
+    ) {
+        return sentinel.push(
+            &relative_journal_path,
+            "transaction_journal_identity_refused",
+            "file",
+            Some(metadata.len()),
+            json!({
+                "state": "identity_refused",
+                "journal_sha256": journal_sha256,
+                "metadata": cheap_file_metadata(&metadata),
+                "generation": journal.generation,
+                "phase": journal.phase,
+                "owner": journal.owner,
+                "error": error.to_string(),
+            }),
+        );
+    }
     let manifest_kind = if journal.recovery_manifest.is_some() {
         "artifact_recovery"
     } else if journal.metadata_acknowledgement.is_some() {
@@ -1859,7 +2060,7 @@ fn push_transaction_journal_sentinel(
         "none"
     };
     sentinel.push(
-        &sentinel_display_path(project_root, &journal_path),
+        &relative_journal_path,
         "transaction_journal",
         "file",
         Some(metadata.len()),
@@ -1872,6 +2073,7 @@ fn push_transaction_journal_sentinel(
             "manifest_kind": manifest_kind,
         }),
     )?;
+    sentinel.push_owner_state(&relative_journal_path, &journal)?;
     if let Some(manifest) = journal.recovery_manifest.as_ref() {
         push_recovery_manifest_sentinel(project_root, &journal, manifest, sentinel)?;
     }
@@ -2556,7 +2758,11 @@ fn read_publication_journal(path: &Path) -> Result<PublicationJournal, DynError>
             path.display()
         )
     })?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+    decode_publication_journal(&bytes, path)
+}
+
+fn decode_publication_journal(bytes: &[u8], path: &Path) -> Result<PublicationJournal, DynError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         format!(
             "ASTRO_SHADOW_PUBLICATION_JOURNAL_MALFORMED: parse {}: {error}; remediation: preserve the transaction and inspect the exact journal bytes",
             path.display()
@@ -2571,7 +2777,7 @@ fn read_publication_journal(path: &Path) -> Result<PublicationJournal, DynError>
     }
     serde_json::from_value(value).map_err(|error| {
         format!(
-            "ASTRO_SHADOW_PUBLICATION_JOURNAL_FIELDS: strict schema-v2 decode of {} failed: {error}; remediation: preserve every byte and repair the named journal field",
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_FIELDS: strict {PUBLICATION_SCHEMA:?} decode of {} failed: {error}; remediation: preserve every byte and repair the named journal field",
             path.display()
         )
         .into()
