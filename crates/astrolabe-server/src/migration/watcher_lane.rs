@@ -15,6 +15,8 @@ use super::dispatch::handle_index_repository;
 pub(crate) const WATCHER_TICK_STATUS_KEY: &str = "watcher_tick_json";
 pub(crate) const WATCHER_FAULT_STATUS_KEY: &str = "watcher_fault_json";
 pub(crate) const WATCHER_REGISTRATION_FAULT_STATUS_KEY: &str = "watcher_registration_fault_json";
+const WATCHER_INDEX_OPERATION: &str = "index_repository";
+const WATCHER_INDEX_PHASE: &str = "watcher_index_worker";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct WatchRegistration {
@@ -62,8 +64,10 @@ struct WatcherErrorEvidence {
     code_observations: Vec<Value>,
     classification_error: Option<String>,
     nested_payload: Option<Value>,
-    operation: Option<Value>,
-    phase: Option<Value>,
+    operation: String,
+    operation_source: &'static str,
+    phase: String,
+    phase_source: &'static str,
 }
 
 #[derive(Debug)]
@@ -1284,8 +1288,10 @@ fn watcher_index_argument_fault(
             code_observations: Vec::new(),
             classification_error: Some(classification_error.to_string()),
             nested_payload: Some(structured.clone()),
-            operation: structured.get("operation").cloned(),
-            phase: structured.get("phase").cloned(),
+            operation: "prepare_watcher_index_args".to_string(),
+            operation_source: "watcher_preflight_context",
+            phase: "watcher_preflight".to_string(),
+            phase_source: "watcher_preflight_context",
         },
     }
 }
@@ -1393,6 +1399,10 @@ fn run_watcher_index_tick(
             "status": "suppressed_terminal_fault",
             "project": project,
             "fault_code": prior_fault.as_ref().and_then(|fault| fault.get("fault_code")),
+            "operation": prior_fault.as_ref().and_then(|fault| fault.get("operation")),
+            "operation_source": prior_fault.as_ref().and_then(|fault| fault.get("operation_source")),
+            "phase": prior_fault.as_ref().and_then(|fault| fault.get("phase")),
+            "phase_source": prior_fault.as_ref().and_then(|fault| fault.get("phase_source")),
             "observation_sha256": observation_sha256,
             "freshness": "stale",
             "trust": "verified",
@@ -1413,11 +1423,17 @@ fn run_watcher_index_tick(
             Ok(response) => response,
             Err(error) => {
                 let message = error.to_string();
+                let unwrapped_error_sha256 = hex_lower(&Sha256::digest(message.as_bytes()));
                 serde_json::to_string(&json!({
                     "content": [{"type": "text", "text": message}],
                     "isError": true,
+                    "structuredContent": {
+                        "operation": WATCHER_INDEX_OPERATION,
+                        "phase": WATCHER_INDEX_PHASE,
+                        "unwrapped_error_sha256": unwrapped_error_sha256,
+                    },
                     "watcher_unwrapped_error": true,
-                    "unwrapped_error_sha256": hex_lower(&Sha256::digest(message.as_bytes())),
+                    "unwrapped_error_sha256": unwrapped_error_sha256,
                 }))?
             }
         },
@@ -1434,8 +1450,10 @@ fn run_watcher_index_tick(
                     "index_repository returned malformed JSON: {error}"
                 )),
                 nested_payload: None,
-                operation: None,
-                phase: None,
+                operation: WATCHER_INDEX_OPERATION.to_string(),
+                operation_source: "watcher_invocation_context",
+                phase: WATCHER_INDEX_PHASE.to_string(),
+                phase_source: "watcher_invocation_context",
             };
             let diagnostic_response = json!({
                 "raw_response": response,
@@ -1470,16 +1488,12 @@ fn run_watcher_index_tick(
     let is_error = match response_value.get("isError").and_then(Value::as_bool) {
         Some(is_error) => is_error,
         None => {
-            let evidence = WatcherErrorEvidence {
-                source_error_code: None,
-                code_observations: Vec::new(),
-                classification_error: Some(
-                    "tool result has no boolean isError disposition".to_string(),
-                ),
-                nested_payload: response_value.get("structuredContent").cloned(),
-                operation: None,
-                phase: None,
-            };
+            let mut evidence = watcher_error_evidence(&response_value);
+            let missing_disposition = "tool result has no boolean isError disposition";
+            evidence.classification_error = Some(match evidence.classification_error.take() {
+                Some(existing) => format!("{existing}; {missing_disposition}"),
+                None => missing_disposition.to_string(),
+            });
             persist_nonretryable_watcher_failure(
                 cache_dir,
                 project,
@@ -1554,6 +1568,10 @@ fn run_watcher_index_tick(
                     "disposition_basis": basis,
                     "source_error_code": source_error_code,
                     "error_evidence": watcher_error_evidence_value(&evidence),
+                    "operation": evidence.operation,
+                    "operation_source": evidence.operation_source,
+                    "phase": evidence.phase,
+                    "phase_source": evidence.phase_source,
                     "transient_attempt": attempt,
                     "transient_max_attempts": WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS,
                     "observation_sha256": observation_sha256,
@@ -1999,15 +2017,20 @@ fn watcher_error_evidence(response: &Value) -> WatcherErrorEvidence {
     if source_error_code.is_none() {
         defects.push("no exact source error code was present".to_string());
     }
-    let operation = nested_payload.as_ref().and_then(|payload| {
-        payload
-            .get("operation")
-            .or_else(|| payload.get("failed_operation"))
-            .cloned()
-    });
-    let phase = nested_payload
-        .as_ref()
-        .and_then(|payload| payload.get("phase").cloned());
+    let (operation, operation_source) = watcher_error_context_field(
+        nested_payload.as_ref(),
+        &["operation", "failed_operation"],
+        WATCHER_INDEX_OPERATION,
+        "operation",
+        &mut defects,
+    );
+    let (phase, phase_source) = watcher_error_context_field(
+        nested_payload.as_ref(),
+        &["phase"],
+        WATCHER_INDEX_PHASE,
+        "phase",
+        &mut defects,
+    );
     WatcherErrorEvidence {
         source_error_code,
         code_observations: candidates
@@ -2017,8 +2040,36 @@ fn watcher_error_evidence(response: &Value) -> WatcherErrorEvidence {
         classification_error: (!defects.is_empty()).then(|| defects.join("; ")),
         nested_payload,
         operation,
+        operation_source,
         phase,
+        phase_source,
     }
+}
+
+fn watcher_error_context_field(
+    nested_payload: Option<&Value>,
+    candidate_keys: &[&'static str],
+    invocation_value: &'static str,
+    field_name: &'static str,
+    defects: &mut Vec<String>,
+) -> (String, &'static str) {
+    let Some(payload) = nested_payload else {
+        return (invocation_value.to_string(), "watcher_invocation_context");
+    };
+    for key in candidate_keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        match value.as_str() {
+            Some(value) if !value.trim().is_empty() => {
+                return (value.to_string(), "response_payload");
+            }
+            _ => defects.push(format!(
+                "nested payload {field_name} field {key:?} is not a non-empty string"
+            )),
+        }
+    }
+    (invocation_value.to_string(), "watcher_invocation_context")
 }
 
 fn push_watcher_error_code_candidate(
@@ -2124,7 +2175,9 @@ fn watcher_error_evidence_value(evidence: &WatcherErrorEvidence) -> Value {
         "code_observations": evidence.code_observations,
         "classification_error": evidence.classification_error,
         "operation": evidence.operation,
+        "operation_source": evidence.operation_source,
         "phase": evidence.phase,
+        "phase_source": evidence.phase_source,
         "nested_payload": evidence.nested_payload,
     })
 }
@@ -2240,7 +2293,9 @@ fn persist_nonretryable_watcher_failure(
         "disposition_basis": basis,
         "error_evidence": watcher_error_evidence_value(evidence),
         "operation": evidence.operation,
+        "operation_source": evidence.operation_source,
         "phase": evidence.phase,
+        "phase_source": evidence.phase_source,
         "observation": observation,
         "observation_sha256": observation_sha256,
         "rearm_signature": watcher_rearm_signature(cache_dir, project, root, index_args_observation)?,
@@ -2268,6 +2323,10 @@ fn persist_nonretryable_watcher_failure(
         "failure_disposition": fault.get("failure_disposition"),
         "disposition_basis": fault.get("disposition_basis"),
         "error_evidence": fault.get("error_evidence"),
+        "operation": fault.get("operation"),
+        "operation_source": fault.get("operation_source"),
+        "phase": fault.get("phase"),
+        "phase_source": fault.get("phase_source"),
         "elapsed_ms": elapsed_ms,
         "observation_sha256": fault.get("observation_sha256"),
         "response_sha256": fault.get("response_sha256"),
