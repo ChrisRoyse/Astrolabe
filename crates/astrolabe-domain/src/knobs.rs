@@ -362,10 +362,15 @@ pub fn lower_debounce_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     LOWER_DEBOUNCE_KNOBS.iter().find(|knob| knob.name == name)
 }
 
-/// Registry version for the shipping incremental watcher cadence (#23).
-pub const WATCHER_KNOB_REGISTRY_VERSION: &str = "astrolabe-watcher-knobs-v1";
+/// Registry version for the shipping incremental watcher cadence and retry budget
+/// (#23, #1083).
+pub const WATCHER_KNOB_REGISTRY_VERSION: &str = "astrolabe-watcher-knobs-v2";
 /// Name of the server-owned Git watcher poll-cadence knob.
 pub const WATCHER_POLL_INTERVAL_MS_KNOB: &str = "watcher_poll_interval_ms";
+/// Name of the maximum number of worker attempts admitted for one unchanged,
+/// explicitly retryable watcher observation.
+pub const WATCHER_TRANSIENT_MAX_ATTEMPTS_KNOB: &str =
+    "watcher_transient_max_attempts_per_observation";
 /// Default watcher cadence. This reserves 95% of the five-second convergence
 /// budget for extraction, ingest, weave, and lowering instead of spending the
 /// entire budget waiting to notice the change.
@@ -375,6 +380,17 @@ pub const WATCHER_MIN_POLL_INTERVAL_MS: u64 = 50;
 /// Largest legal cadence. One second leaves four seconds of the hard five-second
 /// product budget for the actual incremental work.
 pub const WATCHER_MAX_POLL_INTERVAL_MS: u64 = 1_000;
+/// Maximum worker attempts for one unchanged observation whose exact source code
+/// is registered as transient. Twenty observations consume the existing
+/// five-second resident coordination window at the 250 ms shipping cadence; the
+/// final attempt durably parks the observation instead of retrying forever.
+pub const WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS: u64 =
+    PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS / WATCHER_DEFAULT_POLL_INTERVAL_MS;
+/// A transient registration must authorize at least the original worker attempt.
+pub const WATCHER_MIN_TRANSIENT_MAX_ATTEMPTS: u64 = 1;
+/// The hard five-second coordination budget at the fastest legal watcher cadence.
+pub const WATCHER_MAX_TRANSIENT_MAX_ATTEMPTS: u64 =
+    PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS / WATCHER_MIN_POLL_INTERVAL_MS;
 /// Bounded writer-admission window for cooperative resident SQLite closure.
 pub const PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS: u64 = 5_000;
 
@@ -399,6 +415,16 @@ pub const WATCHER_KNOBS: &[U64KnobDeclaration] = &[
         unit: "milliseconds",
         source: "ASTROLABE #753 resident-client cooperative SQLite quiescence contract",
         rationale: "allows twenty resident coordination observations at the 250ms shipping cadence before writer admission fails closed; it is bounded so a foreign or broken handle produces an exact diagnostic instead of an unbounded index request",
+    },
+    U64KnobDeclaration {
+        registry_version: WATCHER_KNOB_REGISTRY_VERSION,
+        name: WATCHER_TRANSIENT_MAX_ATTEMPTS_KNOB,
+        default: WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS,
+        min: WATCHER_MIN_TRANSIENT_MAX_ATTEMPTS,
+        max: WATCHER_MAX_TRANSIENT_MAX_ATTEMPTS,
+        unit: "worker attempts per unchanged observation",
+        source: "ASTROLABE #1083 closed retry authority, bounded by the existing #753 five-second resident coordination window",
+        rationale: "only exact registered transient codes consume this budget; twenty 250ms observations span the complete resident coordination window, after which the exact unchanged failure is durably parked instead of amplifying workers, logs, and config WAL forever; replace with a measured per-code condition signal when one is available",
     },
 ];
 

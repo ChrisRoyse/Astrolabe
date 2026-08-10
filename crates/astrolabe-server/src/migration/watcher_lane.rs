@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use astrolabe_bridge::{BridgeError, CbmWatcher, ErrorEnvelope};
-use astrolabe_domain::knobs::WATCHER_DEFAULT_POLL_INTERVAL_MS;
+use astrolabe_domain::knobs::{
+    WATCHER_DEFAULT_POLL_INTERVAL_MS, WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS,
+};
 
 use super::dispatch::handle_index_repository;
 
@@ -52,6 +54,46 @@ enum RegistrationRecoveryDisposition {
 enum RegistrationCatchUpDisposition {
     PublicationInFlight,
     Ready(Option<Value>),
+}
+
+#[derive(Debug)]
+struct WatcherErrorEvidence {
+    source_error_code: Option<String>,
+    code_observations: Vec<Value>,
+    classification_error: Option<String>,
+    nested_payload: Option<Value>,
+    operation: Option<Value>,
+    phase: Option<Value>,
+}
+
+#[derive(Debug)]
+enum WatcherErrorDisposition {
+    Retryable {
+        source_error_code: String,
+        basis: &'static str,
+    },
+    NonRetryable {
+        fault_code: String,
+        source_error_code: String,
+        basis: &'static str,
+    },
+    ClassificationFault {
+        source_error_code: Option<String>,
+        basis: String,
+    },
+}
+
+#[derive(Debug)]
+enum TransientAttemptDisposition {
+    Attempt(u64),
+    ClassificationFault(String),
+}
+
+#[derive(Debug)]
+struct WatcherIndexArgumentFault {
+    observation: Value,
+    response: Value,
+    evidence: WatcherErrorEvidence,
 }
 
 pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<(), DynError> {
@@ -1126,37 +1168,218 @@ fn delete_registration_recovery_fault(cache_dir: &Path, project: &str) -> Result
     Ok(())
 }
 
+fn prepare_watcher_index_args(
+    cache_dir: &Path,
+    project: &str,
+    root: &str,
+) -> Result<Result<(String, Value), WatcherIndexArgumentFault>, DynError> {
+    let key = metadata_key(project, SHADOW_INDEX_ARGS_KEY);
+    let Some(raw_args) = read_config_value(cache_dir, &key)? else {
+        let observation = json!({
+            "schema": "astrolabe-watcher-index-args-observation-v1",
+            "state": "absent",
+            "config_key": key,
+        });
+        return Ok(Err(watcher_index_argument_fault(
+            project,
+            root,
+            observation,
+            "persisted index_repository arguments are absent",
+            None,
+        )));
+    };
+    let persisted_sha256 = hex_lower(&Sha256::digest(raw_args.as_bytes()));
+    let persisted_bytes = raw_args.len();
+    let mut args: Value = match serde_json::from_str(&raw_args) {
+        Ok(args) => args,
+        Err(error) => {
+            let observation = json!({
+                "schema": "astrolabe-watcher-index-args-observation-v1",
+                "state": "malformed_json",
+                "config_key": key,
+                "persisted_bytes": persisted_bytes,
+                "persisted_sha256": persisted_sha256,
+                "parse_error": error.to_string(),
+            });
+            return Ok(Err(watcher_index_argument_fault(
+                project,
+                root,
+                observation,
+                "persisted index_repository arguments are not valid JSON",
+                Some(error.to_string()),
+            )));
+        }
+    };
+    let json_type = match &args {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    let Some(object) = args.as_object_mut() else {
+        let observation = json!({
+            "schema": "astrolabe-watcher-index-args-observation-v1",
+            "state": "non_object_json",
+            "config_key": key,
+            "persisted_bytes": persisted_bytes,
+            "persisted_sha256": persisted_sha256,
+            "json_type": json_type,
+        });
+        return Ok(Err(watcher_index_argument_fault(
+            project,
+            root,
+            observation,
+            "persisted index_repository arguments are valid JSON but not an object",
+            None,
+        )));
+    };
+    object.insert("repo_path".to_string(), Value::String(root.to_string()));
+    object.insert("calyx".to_string(), Value::String("shadow".to_string()));
+    let normalized_args = serde_json::to_string(&args)?;
+    let observation = json!({
+        "schema": "astrolabe-watcher-index-args-observation-v1",
+        "state": "ready",
+        "config_key": key,
+        "persisted_bytes": persisted_bytes,
+        "persisted_sha256": persisted_sha256,
+        "effective_bytes": normalized_args.len(),
+        "effective_sha256": hex_lower(&Sha256::digest(normalized_args.as_bytes())),
+    });
+    Ok(Ok((normalized_args, observation)))
+}
+
+fn watcher_index_argument_fault(
+    project: &str,
+    root: &str,
+    observation: Value,
+    classification_error: &str,
+    parse_error: Option<String>,
+) -> WatcherIndexArgumentFault {
+    let structured = json!({
+        "operation": "prepare_watcher_index_args",
+        "phase": "watcher_preflight",
+        "project": project,
+        "root": root,
+        "classification_error": classification_error,
+        "parse_error": parse_error,
+        "index_args_observation": observation.clone(),
+        "remediation": "restore the named persisted index_repository argument row as one valid JSON object; no worker or retry is admitted",
+    });
+    let response = json!({
+        "content": [{
+            "type": "text",
+            "text": format!("watcher index-argument classification fault for {project:?}: {classification_error}"),
+        }],
+        "isError": true,
+        "structuredContent": structured.clone(),
+        "watcher_preflight_error": true,
+    });
+    WatcherIndexArgumentFault {
+        observation,
+        response,
+        evidence: WatcherErrorEvidence {
+            source_error_code: None,
+            code_observations: Vec::new(),
+            classification_error: Some(classification_error.to_string()),
+            nested_payload: Some(structured.clone()),
+            operation: structured.get("operation").cloned(),
+            phase: structured.get("phase").cloned(),
+        },
+    }
+}
+
 fn run_watcher_index_tick(
     runner: &CbmToolRunner,
     cache_dir: &Path,
     project: &str,
     root: &str,
 ) -> Result<(), DynError> {
-    let Some(raw_args) =
-        read_config_value(cache_dir, &metadata_key(project, SHADOW_INDEX_ARGS_KEY))?
-    else {
-        return Err(format!("watcher project {project:?} has no persisted index args").into());
-    };
-    let mut args: Value = serde_json::from_str(&raw_args)?;
-    let Some(object) = args.as_object_mut() else {
-        return Err(format!("watcher project {project:?} index args are not an object").into());
-    };
-    object.insert("repo_path".to_string(), Value::String(root.to_string()));
-    object.insert("calyx".to_string(), Value::String("shadow".to_string()));
-    let normalized_args = serde_json::to_string(&args)?;
     let fault_key = metadata_key(project, WATCHER_FAULT_STATUS_KEY);
     let prior_fault = read_config_value(cache_dir, &fault_key)?
         .map(|raw| serde_json::from_str::<Value>(&raw))
         .transpose()?;
-    let observation = watcher_observation(
+    let (normalized_args, index_args_observation) =
+        match prepare_watcher_index_args(cache_dir, project, root)? {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let observation = watcher_observation_resilient(
+                    cache_dir,
+                    project,
+                    root,
+                    &failure.observation,
+                    prior_fault
+                        .as_ref()
+                        .and_then(|fault| fault.get("observation")),
+                );
+                let observation_sha256 = value_sha256(&observation)?;
+                let response_sha256 = value_sha256(&failure.response)?;
+                persist_nonretryable_watcher_failure(
+                    cache_dir,
+                    project,
+                    root,
+                    &fault_key,
+                    &failure.observation,
+                    &observation,
+                    &observation_sha256,
+                    &failure.response,
+                    &response_sha256,
+                    0,
+                    &failure.evidence,
+                    &WatcherErrorDisposition::ClassificationFault {
+                        source_error_code: None,
+                        basis: failure
+                            .evidence
+                            .classification_error
+                            .clone()
+                            .unwrap_or_else(|| {
+                                "watcher index arguments were not usable".to_string()
+                            }),
+                    },
+                    false,
+                    None,
+                )?;
+                return Ok(());
+            }
+        };
+    let prior_observation = prior_fault
+        .as_ref()
+        .and_then(|fault| fault.get("observation"));
+    let (observation, preflight_response) = match watcher_observation(
         cache_dir,
         project,
         root,
-        &normalized_args,
-        prior_fault
-            .as_ref()
-            .and_then(|fault| fault.get("observation")),
-    )?;
+        &index_args_observation,
+        prior_observation,
+    ) {
+        Ok(observation) => (observation, None),
+        Err(error) => {
+            let message = error.to_string();
+            let response = json!({
+                "content": [{"type": "text", "text": format!("ASTRO_WATCHER_OBSERVATION_FAILED: {message}")}],
+                "isError": true,
+                "structuredContent": {
+                    "code": "ASTRO_WATCHER_OBSERVATION_FAILED",
+                    "operation": "observe_watcher_source_of_truth",
+                    "phase": "watcher_preflight",
+                    "message": message,
+                    "remediation": "restore readable source/store/executable state; retries are bounded for this exact observation",
+                },
+                "watcher_preflight_error": true,
+            });
+            (
+                watcher_observation_resilient(
+                    cache_dir,
+                    project,
+                    root,
+                    &index_args_observation,
+                    prior_observation,
+                ),
+                Some(serde_json::to_string(&response)?),
+            )
+        }
+    };
     let observation_sha256 = value_sha256(&observation)?;
     if prior_fault
         .as_ref()
@@ -1182,69 +1405,206 @@ fn run_watcher_index_tick(
         delete_watcher_fault(cache_dir, &fault_key)?;
     }
     let started = Instant::now();
-    let response = handle_index_repository(runner, &normalized_args)?;
+    let worker_started = preflight_response.is_none();
+    let response = match preflight_response {
+        Some(response) => response,
+        None => match handle_index_repository(runner, &normalized_args) {
+            Ok(response) => response,
+            Err(error) => {
+                let message = error.to_string();
+                serde_json::to_string(&json!({
+                    "content": [{"type": "text", "text": message}],
+                    "isError": true,
+                    "watcher_unwrapped_error": true,
+                    "unwrapped_error_sha256": hex_lower(&Sha256::digest(message.as_bytes())),
+                }))?
+            }
+        },
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let response_sha256 = hex_lower(&Sha256::digest(response.as_bytes()));
-    let response_value: Value = serde_json::from_str(&response)?;
-    if tool_result_is_error(&response)? {
-        if let Some(fault_code) = terminal_watcher_fault_code(&response_value) {
-            let fault = json!({
-                "schema": "astrolabe-watcher-fault-v1",
-                "status": "terminal_fault",
-                "project": project,
-                "fault_code": fault_code.clone(),
-                "observation": observation,
-                "observation_sha256": observation_sha256,
-                "rearm_signature": watcher_rearm_signature(cache_dir, project, &normalized_args)?,
-                "response_sha256": response_sha256,
-                "response": response_value,
-                "worker_started": true,
-                "retry_suppressed_until_observation_changes": true,
-                "remediation": "repair or replace the exact source/store/config state; unchanged periodic retries are suppressed",
+    let response_value: Value = match serde_json::from_str(&response) {
+        Ok(response_value) => response_value,
+        Err(error) => {
+            let evidence = WatcherErrorEvidence {
+                source_error_code: None,
+                code_observations: Vec::new(),
+                classification_error: Some(format!(
+                    "index_repository returned malformed JSON: {error}"
+                )),
+                nested_payload: None,
+                operation: None,
+                phase: None,
+            };
+            let diagnostic_response = json!({
+                "raw_response": response,
+                "raw_response_sha256": response_sha256,
+                "parse_error": error.to_string(),
             });
-            write_config_value(cache_dir, &fault_key, &serde_json::to_string(&fault)?)?;
-            let readback = read_config_value(cache_dir, &fault_key)?;
-            if readback.as_deref() != Some(serde_json::to_string(&fault)?.as_str()) {
+            persist_nonretryable_watcher_failure(
+                cache_dir,
+                project,
+                root,
+                &fault_key,
+                &index_args_observation,
+                &observation,
+                &observation_sha256,
+                &diagnostic_response,
+                &response_sha256,
+                elapsed_ms,
+                &evidence,
+                &WatcherErrorDisposition::ClassificationFault {
+                    source_error_code: None,
+                    basis: "malformed_tool_result_envelope".to_string(),
+                },
+                worker_started,
+                None,
+            )?;
+            return Ok(());
+        }
+    };
+    let is_error = match response_value.get("isError").and_then(Value::as_bool) {
+        Some(is_error) => is_error,
+        None => {
+            let evidence = WatcherErrorEvidence {
+                source_error_code: None,
+                code_observations: Vec::new(),
+                classification_error: Some(
+                    "tool result has no boolean isError disposition".to_string(),
+                ),
+                nested_payload: response_value.get("structuredContent").cloned(),
+                operation: None,
+                phase: None,
+            };
+            persist_nonretryable_watcher_failure(
+                cache_dir,
+                project,
+                root,
+                &fault_key,
+                &index_args_observation,
+                &observation,
+                &observation_sha256,
+                &response_value,
+                &response_sha256,
+                elapsed_ms,
+                &evidence,
+                &WatcherErrorDisposition::ClassificationFault {
+                    source_error_code: None,
+                    basis: "missing_tool_result_error_disposition".to_string(),
+                },
+                worker_started,
+                None,
+            )?;
+            return Ok(());
+        }
+    };
+    if is_error {
+        let evidence = watcher_error_evidence(&response_value);
+        let disposition = watcher_error_disposition(&evidence);
+        if let WatcherErrorDisposition::Retryable {
+            source_error_code,
+            basis,
+        } = &disposition
+        {
+            let attempt = match next_transient_watcher_attempt(
+                cache_dir,
+                project,
+                &observation_sha256,
+                source_error_code,
+            )? {
+                TransientAttemptDisposition::Attempt(attempt) => attempt,
+                TransientAttemptDisposition::ClassificationFault(attempt_error) => {
+                    persist_nonretryable_watcher_failure(
+                        cache_dir,
+                        project,
+                        root,
+                        &fault_key,
+                        &index_args_observation,
+                        &observation,
+                        &observation_sha256,
+                        &response_value,
+                        &response_sha256,
+                        elapsed_ms,
+                        &evidence,
+                        &WatcherErrorDisposition::ClassificationFault {
+                            source_error_code: Some(source_error_code.clone()),
+                            basis: attempt_error,
+                        },
+                        worker_started,
+                        None,
+                    )?;
+                    return Ok(());
+                }
+            };
+            if attempt < WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS {
+                let status = json!({
+                    "schema": "astrolabe-watcher-tick-v2",
+                    "status": "transient_error",
+                    "project": project,
+                    "elapsed_ms": elapsed_ms,
+                    "freshness": "stale",
+                    "trust": "provisional",
+                    "failure_disposition": "retryable",
+                    "disposition_basis": basis,
+                    "source_error_code": source_error_code,
+                    "error_evidence": watcher_error_evidence_value(&evidence),
+                    "transient_attempt": attempt,
+                    "transient_max_attempts": WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS,
+                    "observation_sha256": observation_sha256,
+                    "response_sha256": response_sha256,
+                    "response": response_value,
+                    "worker_started": worker_started,
+                    "remediation": "the exact registered transient condition may retry only inside the declared per-observation attempt budget; inspect this status if it does not clear",
+                });
+                persist_watcher_status(cache_dir, project, &status)?;
                 return Err(format!(
-                    "ASTRO_WATCHER_FAULT_READBACK_MISMATCH: persisted fault for {project:?} did not match its exact write"
+                    "ASTRO_WATCHER_EXPLICIT_TRANSIENT: watcher index tick failed for {project:?}; source_error_code={source_error_code}; transient_attempt={attempt}; transient_max_attempts={WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS}; response_sha256={response_sha256}; response={response}"
                 )
                 .into());
             }
-            let status = json!({
-                "schema": "astrolabe-watcher-tick-v2",
-                "status": "terminal_fault_recorded",
-                "project": project,
-                "fault_code": fault_code.clone(),
-                "elapsed_ms": elapsed_ms,
-                "observation_sha256": fault.get("observation_sha256"),
-                "response_sha256": fault.get("response_sha256"),
-                "freshness": "stale",
-                "trust": "verified",
-                "worker_started": true,
-                "retry_suppressed_until_observation_changes": true,
-            });
-            persist_watcher_status(cache_dir, project, &status)?;
-            // The indexing operation failed, but change-detection coordination
-            // converged: advancing the C baseline is what prevents a second
-            // identical worker. The durable fault remains the serving truth.
+            let exhausted = WatcherErrorDisposition::NonRetryable {
+                fault_code: "ASTRO_WATCHER_TRANSIENT_RETRY_EXHAUSTED".to_string(),
+                source_error_code: source_error_code.clone(),
+                basis: "registered_transient_attempt_budget_exhausted",
+            };
+            persist_nonretryable_watcher_failure(
+                cache_dir,
+                project,
+                root,
+                &fault_key,
+                &index_args_observation,
+                &observation,
+                &observation_sha256,
+                &response_value,
+                &response_sha256,
+                elapsed_ms,
+                &evidence,
+                &exhausted,
+                worker_started,
+                Some(attempt),
+            )?;
             return Ok(());
         }
-        let status = json!({
-            "schema": "astrolabe-watcher-tick-v2",
-            "status": "transient_error",
-            "project": project,
-            "elapsed_ms": elapsed_ms,
-            "freshness": "stale",
-            "trust": "provisional",
-            "response_sha256": response_sha256,
-            "response": response_value,
-            "remediation": "inspect the index_repository error and retry the watcher tick",
-        });
-        persist_watcher_status(cache_dir, project, &status)?;
-        return Err(format!(
-            "watcher index tick failed for {project:?}; response_sha256={response_sha256}; response={response}"
-        )
-        .into());
+        persist_nonretryable_watcher_failure(
+            cache_dir,
+            project,
+            root,
+            &fault_key,
+            &index_args_observation,
+            &observation,
+            &observation_sha256,
+            &response_value,
+            &response_sha256,
+            elapsed_ms,
+            &evidence,
+            &disposition,
+            worker_started,
+            None,
+        )?;
+        // The indexing operation failed, but change-detection coordination
+        // converged: advancing the C baseline is what prevents a second
+        // identical worker. The durable fault remains the serving truth.
+        return Ok(());
     }
     delete_watcher_fault(cache_dir, &fault_key)?;
     // P7.4 (#368): after the delta converges, auto-extract this project's newest
@@ -1307,18 +1667,11 @@ fn rearm_changed_faults(
             continue;
         };
         let fault: Value = serde_json::from_str(&raw_fault)?;
-        let raw_args = read_config_value(cache_dir, &metadata_key(project, SHADOW_INDEX_ARGS_KEY))?
-            .ok_or_else(|| -> DynError {
-                format!("watcher project {project:?} lost persisted index args while a terminal fault was active").into()
-            })?;
-        let mut args: Value = serde_json::from_str(&raw_args)?;
-        let args = args.as_object_mut().ok_or_else(|| -> DynError {
-            format!("watcher project {project:?} persisted index args are not an object").into()
-        })?;
-        args.insert("repo_path".to_string(), Value::String(root.clone()));
-        args.insert("calyx".to_string(), Value::String("shadow".to_string()));
-        let normalized_args = serde_json::to_string(&args)?;
-        let current = watcher_rearm_signature(cache_dir, project, &normalized_args)?;
+        let index_args_observation = match prepare_watcher_index_args(cache_dir, project, root)? {
+            Ok((_, observation)) => observation,
+            Err(failure) => failure.observation,
+        };
+        let current = watcher_rearm_signature(cache_dir, project, root, &index_args_observation)?;
         if fault.get("rearm_signature") == Some(&current) {
             continue;
         }
@@ -1344,7 +1697,7 @@ fn watcher_observation(
     cache_dir: &Path,
     project: &str,
     root: &str,
-    args_json: &str,
+    index_args_observation: &Value,
     prior: Option<&Value>,
 ) -> Result<Value, DynError> {
     let source_fingerprint =
@@ -1374,30 +1727,113 @@ fn watcher_observation(
         members.push(json!({"path": path, "metadata": metadata, "sha256": sha256}));
     }
     Ok(json!({
-        "schema": "astrolabe-watcher-observation-v1",
+        "schema": "astrolabe-watcher-observation-v2",
         "project": project,
         "canonical_root": fs::canonicalize(root)?,
         "source_fingerprint": source_fingerprint,
-        "index_args_sha256": hex_lower(&Sha256::digest(args_json.as_bytes())),
+        "index_args": index_args_observation,
         "store_family": members,
         "executable": executable_observation()?,
     }))
 }
 
+fn watcher_observation_resilient(
+    cache_dir: &Path,
+    project: &str,
+    root: &str,
+    index_args_observation: &Value,
+    prior: Option<&Value>,
+) -> Value {
+    let source_fingerprint =
+        match astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(root)) {
+            Ok(value) => json!({"state": "observed", "value": value}),
+            Err(error) => json!({"state": "read_error", "error": error.to_string()}),
+        };
+    let canonical_root = match fs::canonicalize(root) {
+        Ok(path) => json!({"state": "observed", "path": path}),
+        Err(error) => json!({"state": "read_error", "error": error.to_string()}),
+    };
+    let mut members = Vec::new();
+    for path in store_family_paths(cache_dir, project) {
+        let metadata = match file_metadata_observation(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => json!({"read_error": error.to_string()}),
+        };
+        let prior_member = prior
+            .and_then(|value| value.get("store_family"))
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("path") == Some(&json!(path)))
+            });
+        let sha256 = if prior_member.and_then(|item| item.get("metadata")) == Some(&metadata) {
+            prior_member
+                .and_then(|item| item.get("sha256"))
+                .cloned()
+                .unwrap_or_else(|| Value::String("absent".to_string()))
+        } else if metadata.get("present").and_then(Value::as_bool) == Some(true) {
+            match sha256_file(&path) {
+                Ok(sha256) => Value::String(sha256),
+                Err(error) => json!({"read_error": error.to_string()}),
+            }
+        } else if metadata.get("present").and_then(Value::as_bool) == Some(false) {
+            Value::String("absent".to_string())
+        } else {
+            json!({"state": "unavailable"})
+        };
+        members.push(json!({"path": path, "metadata": metadata, "sha256": sha256}));
+    }
+    let executable = match executable_observation() {
+        Ok(value) => json!({"state": "observed", "value": value}),
+        Err(error) => json!({"state": "read_error", "error": error.to_string()}),
+    };
+    json!({
+        "schema": "astrolabe-watcher-observation-v2",
+        "observation_state": "contains_read_fault",
+        "project": project,
+        "canonical_root": canonical_root,
+        "source_fingerprint": source_fingerprint,
+        "index_args": index_args_observation,
+        "store_family": members,
+        "executable": executable,
+    })
+}
+
 fn watcher_rearm_signature(
     cache_dir: &Path,
     project: &str,
-    args_json: &str,
+    root: &str,
+    index_args_observation: &Value,
 ) -> Result<Value, DynError> {
     let store_family = store_family_paths(cache_dir, project)
         .into_iter()
-        .map(|path| Ok(json!({"path": path, "metadata": file_metadata_observation(&path)?})))
-        .collect::<Result<Vec<_>, DynError>>()?;
+        .map(|path| {
+            let metadata = match file_metadata_observation(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => json!({"read_error": error.to_string()}),
+            };
+            json!({"path": path, "metadata": metadata})
+        })
+        .collect::<Vec<_>>();
+    let canonical_root = match fs::canonicalize(root) {
+        Ok(path) => json!({"state": "observed", "path": path}),
+        Err(error) => json!({"state": "read_error", "error": error.to_string()}),
+    };
+    let root_metadata = match file_metadata_observation(Path::new(root)) {
+        Ok(metadata) => metadata,
+        Err(error) => json!({"read_error": error.to_string()}),
+    };
+    let executable = match executable_sentinel() {
+        Ok(value) => value,
+        Err(error) => json!({"state": "read_error", "error": error.to_string()}),
+    };
     Ok(json!({
-        "schema": "astrolabe-watcher-rearm-v1",
-        "index_args_sha256": hex_lower(&Sha256::digest(args_json.as_bytes())),
+        "schema": "astrolabe-watcher-rearm-v2",
+        "root": {"canonical": canonical_root, "metadata": root_metadata},
+        "index_args": index_args_observation,
         "store_family": store_family,
-        "executable": executable_observation()?,
+        "executable": executable,
     }))
 }
 
@@ -1477,47 +1913,378 @@ fn value_sha256(value: &Value) -> Result<String, DynError> {
     Ok(hex_lower(&Sha256::digest(serde_json::to_vec(value)?)))
 }
 
-fn terminal_watcher_fault_code(response: &Value) -> Option<String> {
-    const TERMINAL_CODES: &[&str] = &[
+fn watcher_error_evidence(response: &Value) -> WatcherErrorEvidence {
+    let mut candidates = Vec::<(&'static str, String)>::new();
+    let mut defects = Vec::<String>::new();
+    let mut nested_payload = None;
+
+    if let Some(structured) = response.get("structuredContent") {
+        if structured.is_null() {
+            // Legacy text-only errors intentionally carry no structuredContent.
+        } else if let Some(object) = structured.as_object() {
+            nested_payload = Some(structured.clone());
+            if let Some(code) = object.get("code") {
+                push_watcher_error_code_candidate(
+                    code,
+                    "structuredContent.code",
+                    &mut candidates,
+                    &mut defects,
+                );
+            }
+        } else {
+            defects.push("structuredContent is neither an object nor null".to_string());
+        }
+    }
+    if let Some(code) = response.get("code") {
+        push_watcher_error_code_candidate(code, "result.code", &mut candidates, &mut defects);
+    }
+
+    match response.get("content") {
+        Some(Value::Array(items)) if !items.is_empty() => {
+            for item in items {
+                let Some(text) = item.get("text").and_then(Value::as_str) else {
+                    defects.push("error content item has no string text field".to_string());
+                    continue;
+                };
+                match serde_json::from_str::<Value>(text) {
+                    Ok(inner) => {
+                        if nested_payload.is_none() && inner.is_object() {
+                            nested_payload = Some(inner.clone());
+                        }
+                        if let Some(code) = inner.get("code") {
+                            push_watcher_error_code_candidate(
+                                code,
+                                "content.text.json.code",
+                                &mut candidates,
+                                &mut defects,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(code) = plain_watcher_error_code(text) {
+                            candidates.push(("content.text.prefix", code));
+                        } else if let Some(code) = shadow_publication_recovery_error_code(text) {
+                            candidates.push(("content.text.recovery_code", code.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Some(Value::Array(_)) => defects.push("error content array is empty".to_string()),
+        Some(_) => defects.push("error content is not an array".to_string()),
+        None => defects.push("error result has no content field".to_string()),
+    }
+
+    let mut distinct_codes = candidates
+        .iter()
+        .map(|(_, code)| code.as_str())
+        .collect::<Vec<_>>();
+    distinct_codes.sort_unstable();
+    distinct_codes.dedup();
+    if distinct_codes.len() > 1 {
+        defects.push(format!(
+            "conflicting error codes were present: {}",
+            distinct_codes.join(", ")
+        ));
+    }
+    let source_error_code = distinct_codes.first().map(|code| (*code).to_string());
+    if source_error_code.is_none() {
+        defects.push("no exact source error code was present".to_string());
+    }
+    let operation = nested_payload.as_ref().and_then(|payload| {
+        payload
+            .get("operation")
+            .or_else(|| payload.get("failed_operation"))
+            .cloned()
+    });
+    let phase = nested_payload
+        .as_ref()
+        .and_then(|payload| payload.get("phase").cloned());
+    WatcherErrorEvidence {
+        source_error_code,
+        code_observations: candidates
+            .iter()
+            .map(|(source, code)| json!({"source": source, "code": code}))
+            .collect(),
+        classification_error: (!defects.is_empty()).then(|| defects.join("; ")),
+        nested_payload,
+        operation,
+        phase,
+    }
+}
+
+fn push_watcher_error_code_candidate(
+    value: &Value,
+    source: &'static str,
+    candidates: &mut Vec<(&'static str, String)>,
+    defects: &mut Vec<String>,
+) {
+    let Some(code) = value.as_str() else {
+        defects.push(format!("{source} is not a string"));
+        return;
+    };
+    if !valid_watcher_error_code(code) {
+        defects.push(format!("{source} has invalid code syntax {code:?}"));
+        return;
+    }
+    candidates.push((source, code.to_string()));
+}
+
+fn valid_watcher_error_code(code: &str) -> bool {
+    let mut chars = code.chars();
+    chars.next().is_some_and(|first| first.is_ascii_uppercase())
+        && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && code.contains('_')
+}
+
+fn plain_watcher_error_code(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let prefix = trimmed
+        .split_once(|ch: char| ch == ':' || ch.is_ascii_whitespace())
+        .map_or(trimmed, |(prefix, _)| prefix);
+    if valid_watcher_error_code(prefix) {
+        return Some(prefix.to_string());
+    }
+    trimmed
+        .split_ascii_whitespace()
+        .find_map(|token| token.strip_prefix("code="))
+        .map(|code| code.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+        .filter(|code| valid_watcher_error_code(code))
+        .map(ToOwned::to_owned)
+}
+
+fn watcher_error_disposition(evidence: &WatcherErrorEvidence) -> WatcherErrorDisposition {
+    if let Some(error) = evidence.classification_error.as_ref() {
+        return WatcherErrorDisposition::ClassificationFault {
+            source_error_code: evidence.source_error_code.clone(),
+            basis: error.clone(),
+        };
+    }
+    let Some(code) = evidence.source_error_code.as_deref() else {
+        return WatcherErrorDisposition::ClassificationFault {
+            source_error_code: None,
+            basis: "no exact source error code was present".to_string(),
+        };
+    };
+    const RETRYABLE_CODES: &[&str] = &[
+        "ASTRO_CONFIG_DB_WAL_CONTENDED",
+        "ASTRO_SHADOW_IMPORT_BUSY",
+        "ASTRO_SHADOW_NOOP_CONFIG_CHANGED",
+        "ASTRO_SHADOW_NOOP_GENERATION_CHANGED",
+        "ASTRO_WATCHER_OBSERVATION_FAILED",
+        "CALYX_BACKPRESSURE",
+        "CALYX_DISK_PRESSURE",
+        "CALYX_READER_LEASE_EXPIRED",
+        "CBM_INDEX_HOST_BUSY",
+        "CBM_INDEX_PROJECT_BUSY",
+        "CBM_PROJECT_TRANSITION_ACTIVE",
+        "CBM_STORE_VERIFICATION_FAILED",
+    ];
+    if RETRYABLE_CODES.contains(&code) {
+        return WatcherErrorDisposition::Retryable {
+            source_error_code: code.to_string(),
+            basis: "exact_registered_transient_code",
+        };
+    }
+    const NON_RETRYABLE_CODES: &[&str] = &[
+        "ASTRO_SHADOW_PROJECT_MISMATCH",
+        "CBM_INCREMENTAL_BRANCH_EDGE_INVALID",
+        "CBM_PIPELINE_EMPTY_SOURCE_CORPUS",
+        "CBM_SCHEMA_FRESHNESS_UNREADABLE",
         "CBM_SCHEMA_VERSION_UNSTAMPED",
         "CBM_SCHEMA_VERSION_UNSUPPORTED",
-        "CBM_SCHEMA_FRESHNESS_UNREADABLE",
-        "CBM_PIPELINE_EMPTY_SOURCE_CORPUS",
         "CBM_STORE_INTEGRITY_FAILED",
         "CBM_STORE_PROVENANCE_FAILED",
-        "ASTRO_SHADOW_PROJECT_MISMATCH",
     ];
-    let structured_code = response
-        .get("structuredContent")
-        .and_then(|value| value.get("code"))
-        .and_then(Value::as_str)
-        .or_else(|| response.get("code").and_then(Value::as_str));
-    if let Some(code) = structured_code
-        && (TERMINAL_CODES.contains(&code)
-            || shadow_publication_recovery_error_code(code).is_some())
+    if NON_RETRYABLE_CODES.contains(&code) || shadow_publication_recovery_error_code(code).is_some()
     {
-        return Some(code.to_string());
+        return WatcherErrorDisposition::NonRetryable {
+            fault_code: code.to_string(),
+            source_error_code: code.to_string(),
+            basis: "exact_registered_non_retryable_code",
+        };
     }
-    let text = response
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("text"))
-        .and_then(Value::as_str)?;
-    if let Ok(inner) = serde_json::from_str::<Value>(text)
-        && let Some(code) = inner.get("code").and_then(Value::as_str)
-        && (TERMINAL_CODES.contains(&code)
-            || shadow_publication_recovery_error_code(code).is_some())
+    WatcherErrorDisposition::ClassificationFault {
+        source_error_code: Some(code.to_string()),
+        basis: format!("unregistered source error code {code:?}"),
+    }
+}
+
+fn watcher_error_evidence_value(evidence: &WatcherErrorEvidence) -> Value {
+    json!({
+        "source_error_code": evidence.source_error_code,
+        "code_observations": evidence.code_observations,
+        "classification_error": evidence.classification_error,
+        "operation": evidence.operation,
+        "phase": evidence.phase,
+        "nested_payload": evidence.nested_payload,
+    })
+}
+
+fn next_transient_watcher_attempt(
+    cache_dir: &Path,
+    project: &str,
+    observation_sha256: &str,
+    source_error_code: &str,
+) -> Result<TransientAttemptDisposition, DynError> {
+    let key = metadata_key(project, WATCHER_TICK_STATUS_KEY);
+    let Some(raw_status) = read_config_value(cache_dir, &key)? else {
+        return Ok(TransientAttemptDisposition::Attempt(1));
+    };
+    let status: Value = match serde_json::from_str(&raw_status) {
+        Ok(status) => status,
+        Err(error) => {
+            return Ok(TransientAttemptDisposition::ClassificationFault(format!(
+                "prior watcher_tick_json is malformed JSON (bytes={}, sha256={}, parse_error={error})",
+                raw_status.len(),
+                hex_lower(&Sha256::digest(raw_status.as_bytes()))
+            )));
+        }
+    };
+    if status.get("status").and_then(Value::as_str) != Some("transient_error")
+        || status.get("observation_sha256").and_then(Value::as_str) != Some(observation_sha256)
+        || status.get("source_error_code").and_then(Value::as_str) != Some(source_error_code)
     {
-        return Some(code.to_string());
+        return Ok(TransientAttemptDisposition::Attempt(1));
     }
-    if let Some(code) = TERMINAL_CODES.iter().copied().find(|code| {
-        text.strip_prefix(code)
-            .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with(' '))
-    }) {
-        return Some(code.to_string());
+    let Some(prior) = status.get("transient_attempt").and_then(Value::as_u64) else {
+        return Ok(TransientAttemptDisposition::ClassificationFault(format!(
+            "prior transient watcher_tick_json for {project:?} has no unsigned transient_attempt"
+        )));
+    };
+    Ok(match prior.checked_add(1) {
+        Some(attempt) => TransientAttemptDisposition::Attempt(attempt),
+        None => TransientAttemptDisposition::ClassificationFault(format!(
+            "prior transient watcher_tick_json for {project:?} would overflow its u64 attempt counter"
+        )),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_nonretryable_watcher_failure(
+    cache_dir: &Path,
+    project: &str,
+    root: &str,
+    fault_key: &str,
+    index_args_observation: &Value,
+    observation: &Value,
+    observation_sha256: &str,
+    response: &Value,
+    response_sha256: &str,
+    elapsed_ms: u64,
+    evidence: &WatcherErrorEvidence,
+    disposition: &WatcherErrorDisposition,
+    worker_started: bool,
+    transient_attempt: Option<u64>,
+) -> Result<(), DynError> {
+    let (status_name, fault_status, fault_code, source_error_code, failure_disposition, basis) =
+        match disposition {
+            WatcherErrorDisposition::Retryable { .. } => {
+                return Err(
+                    "ASTRO_WATCHER_DISPOSITION_INTERNAL: retryable failure reached non-retryable persistence"
+                        .into(),
+                );
+            }
+            WatcherErrorDisposition::NonRetryable {
+                fault_code,
+                source_error_code,
+                basis,
+            } if fault_code == "ASTRO_WATCHER_TRANSIENT_RETRY_EXHAUSTED" => (
+                "transient_retry_exhausted",
+                "transient_retry_exhausted",
+                fault_code.clone(),
+                Some(source_error_code.clone()),
+                "non_retryable",
+                (*basis).to_string(),
+            ),
+            WatcherErrorDisposition::NonRetryable {
+                fault_code,
+                source_error_code,
+                basis,
+            } => (
+                "terminal_fault_recorded",
+                "terminal_fault",
+                fault_code.clone(),
+                Some(source_error_code.clone()),
+                "non_retryable",
+                (*basis).to_string(),
+            ),
+            WatcherErrorDisposition::ClassificationFault {
+                source_error_code,
+                basis,
+            } => (
+                "classification_fault_recorded",
+                "classification_fault",
+                "ASTRO_WATCHER_ERROR_DISPOSITION_UNCLASSIFIED".to_string(),
+                source_error_code.clone(),
+                "unclassified_non_retryable",
+                basis.clone(),
+            ),
+        };
+    let fault = json!({
+        "schema": "astrolabe-watcher-fault-v2",
+        "status": fault_status,
+        "project": project,
+        "fault_code": fault_code,
+        "source_error_code": source_error_code,
+        "failure_disposition": failure_disposition,
+        "disposition_basis": basis,
+        "error_evidence": watcher_error_evidence_value(evidence),
+        "operation": evidence.operation,
+        "phase": evidence.phase,
+        "observation": observation,
+        "observation_sha256": observation_sha256,
+        "rearm_signature": watcher_rearm_signature(cache_dir, project, root, index_args_observation)?,
+        "response_sha256": response_sha256,
+        "response": response,
+        "worker_started": worker_started,
+        "transient_attempt": transient_attempt,
+        "transient_max_attempts": if fault_code == "ASTRO_WATCHER_TRANSIENT_RETRY_EXHAUSTED" {
+            Value::from(WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS)
+        } else {
+            Value::Null
+        },
+        "retry_suppressed_until_observation_changes": true,
+        "remediation": "repair the exact source/store/config state or the named error-disposition contract; unchanged periodic retries are suppressed",
+    });
+    persist_watcher_fault(cache_dir, project, fault_key, &fault)?;
+    let status = json!({
+        "schema": "astrolabe-watcher-tick-v2",
+        "status": status_name,
+        "project": project,
+        "fault_code": fault.get("fault_code"),
+        "source_error_code": fault.get("source_error_code"),
+        "failure_disposition": fault.get("failure_disposition"),
+        "disposition_basis": fault.get("disposition_basis"),
+        "error_evidence": fault.get("error_evidence"),
+        "elapsed_ms": elapsed_ms,
+        "observation_sha256": fault.get("observation_sha256"),
+        "response_sha256": fault.get("response_sha256"),
+        "freshness": "stale",
+        "trust": "verified",
+        "worker_started": worker_started,
+        "transient_attempt": fault.get("transient_attempt"),
+        "transient_max_attempts": fault.get("transient_max_attempts"),
+        "retry_suppressed_until_observation_changes": true,
+    });
+    persist_watcher_status(cache_dir, project, &status)
+}
+
+fn persist_watcher_fault(
+    cache_dir: &Path,
+    project: &str,
+    fault_key: &str,
+    fault: &Value,
+) -> Result<(), DynError> {
+    let serialized = serde_json::to_string(fault)?;
+    write_config_value(cache_dir, fault_key, &serialized)?;
+    if read_config_value(cache_dir, fault_key)?.as_deref() != Some(serialized.as_str()) {
+        return Err(format!(
+            "ASTRO_WATCHER_FAULT_READBACK_MISMATCH: persisted fault for {project:?} did not match its exact write"
+        )
+        .into());
     }
-    shadow_publication_recovery_error_code(text).map(ToOwned::to_owned)
+    Ok(())
 }
 
 fn persist_watcher_status(cache_dir: &Path, project: &str, status: &Value) -> Result<(), DynError> {
