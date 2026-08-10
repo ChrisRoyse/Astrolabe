@@ -1,8 +1,22 @@
 use super::*;
 pub(crate) const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
-pub(crate) const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v1";
+pub(crate) const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v2";
 pub(crate) const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str =
-    "astrolabe.periodic_verify_chain_tick.v1";
+    "astrolabe.periodic_verify_chain_tick.v2";
+const VERIFY_CHAIN_STARTUP_READINESS_SCHEMA: &str = "astrolabe.verify_chain_startup_readiness.v1";
+const VERIFY_CHAIN_STARTUP_READINESS_KEY: &str = "astrolabe.verify_chain_startup_readiness_json";
+const STARTUP_VERIFY_OPERATION: &str = "janitor_startup_verify";
+const STARTUP_VERIFY_ADMISSION_ORDER: &str = "completed_before_foreground_admission";
+const PERIODIC_VERIFY_OPERATION: &str = "periodic_verify_scrub_project";
+const PERIODIC_VERIFY_MISSING_OPERATION: &str = "periodic_verify_missing_vault_probe";
+const PERIODIC_VERIFY_ADMISSION_ORDER: &str = "executed_after_foreground_admission";
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JanitorStartupVerifyReport {
+    pub(crate) discovered_projects: u64,
+    pub(crate) checked_projects: u64,
+    pub(crate) damaged_projects: u64,
+}
 
 pub(crate) fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
@@ -367,6 +381,8 @@ pub(crate) fn periodic_verify_project_at(
             None,
             false,
             None,
+            PERIODIC_VERIFY_MISSING_OPERATION,
+            PERIODIC_VERIFY_ADMISSION_ORDER,
         )?;
         return Ok(periodic_verify_result_json(
             project,
@@ -381,13 +397,14 @@ pub(crate) fn periodic_verify_project_at(
             false,
             "scrub",
             None,
+            PERIODIC_VERIFY_MISSING_OPERATION,
         ));
     }
 
-    // #277: bounded janitor scrub step instead of a full verify_chain re-walk on
-    // every tick (the #96 anti-pattern). Cost is O(FSV janitor budget knob),
-    // independent of ledger length. The one-time deep full-chain sweep now lives
-    // in the named startup gate (`janitor_startup_verify_projects_at`).
+    // #277: the logical ledger slice is registry-bounded instead of deliberately
+    // re-walking the chain from genesis. The physical vault-open/materialization
+    // cost is not independent of ledger length and remains tracked by #1064
+    // (PC-03/09/40/41). The deep full-chain sweep lives only in the startup gate.
     match periodic_verify_scrub_project(cache_dir, project, vault_dir)? {
         Some(outcome) => {
             let verified_through = Some(outcome.verified_through);
@@ -404,6 +421,8 @@ pub(crate) fn periodic_verify_project_at(
                 verified_through,
                 outcome.scrubbed,
                 outcome.fsv.as_ref(),
+                PERIODIC_VERIFY_OPERATION,
+                PERIODIC_VERIFY_ADMISSION_ORDER,
             )?;
             Ok(periodic_verify_result_json(
                 project,
@@ -418,6 +437,7 @@ pub(crate) fn periodic_verify_project_at(
                 outcome.scrubbed,
                 "scrub",
                 outcome.fsv.as_ref(),
+                PERIODIC_VERIFY_OPERATION,
             ))
         }
         None => {
@@ -429,6 +449,8 @@ pub(crate) fn periodic_verify_project_at(
                 "status": "skipped_import_in_progress",
                 "vault_dir": vault_dir,
                 "checked_at_unix_ms": checked_at_unix_ms,
+                "operation": PERIODIC_VERIFY_OPERATION,
+                "foreground_admission_order": PERIODIC_VERIFY_ADMISSION_ORDER,
                 "freshness": "fresh",
                 "trust": "provisional",
                 "mode": "skipped_import_in_progress",
@@ -452,6 +474,7 @@ pub(crate) fn periodic_verify_result_json(
     scrubbed: bool,
     mode: &str,
     fsv: Option<&Value>,
+    operation: &str,
 ) -> Value {
     json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
@@ -464,6 +487,8 @@ pub(crate) fn periodic_verify_result_json(
         "checked_range_end": checked_range_end,
         "verified_through": verified_through,
         "scrubbed": scrubbed,
+        "operation": operation,
+        "foreground_admission_order": PERIODIC_VERIFY_ADMISSION_ORDER,
         "mode": mode,
         "fsv": fsv,
         "error": error_text,
@@ -487,6 +512,8 @@ pub(crate) fn persist_periodic_verify_status_at(
     verified_through: Option<u64>,
     scrubbed: bool,
     fsv: Option<&Value>,
+    operation: &str,
+    foreground_admission_order: &str,
 ) -> Result<(), DynError> {
     let mut conn = open_config(cache_dir)?;
     // #178: the last tick's FsvAck envelope, or empty when the tick performed no
@@ -501,6 +528,11 @@ pub(crate) fn persist_periodic_verify_status_at(
     for (key, value) in [
         ("periodic_verify_fsv", fsv_serialized),
         ("periodic_verify_status", status.to_string()),
+        ("periodic_verify_operation", operation.to_string()),
+        (
+            "periodic_verify_foreground_admission_order",
+            foreground_admission_order.to_string(),
+        ),
         (
             "periodic_verify_checked_unix_ms",
             checked_at_unix_ms.to_string(),
@@ -555,42 +587,58 @@ pub(crate) fn periodic_verify_status_at(
     cache_dir: &Path,
     project: &str,
 ) -> Result<Value, DynError> {
-    let Some(status) =
-        read_config_value(cache_dir, &metadata_key(project, "periodic_verify_status"))?
-    else {
-        return Ok(periodic_verify_unobserved_json(project));
+    let keys = [
+        metadata_key(project, "periodic_verify_status"),
+        metadata_key(project, "periodic_verify_checked_unix_ms"),
+        metadata_key(project, "periodic_verify_ledger_rows"),
+        metadata_key(project, "periodic_verify_checked_range_start"),
+        metadata_key(project, "periodic_verify_checked_range_end"),
+        metadata_key(project, "periodic_verify_verified_through"),
+        metadata_key(project, "periodic_verify_scrubbed"),
+        metadata_key(project, "periodic_verify_vault_dir"),
+        metadata_key(project, "periodic_verify_error"),
+        metadata_key(project, "periodic_verify_fsv"),
+        metadata_key(project, "periodic_verify_operation"),
+        metadata_key(project, "periodic_verify_foreground_admission_order"),
+        VERIFY_CHAIN_STARTUP_READINESS_KEY.to_string(),
+    ];
+    let values = read_config_values(cache_dir, &keys)?;
+    let startup_readiness = parse_batched_config_json(&keys[12], values[12].as_deref())?;
+    let Some(status) = values[0].as_deref() else {
+        return Ok(periodic_verify_unobserved_json_with_startup(
+            project,
+            startup_readiness,
+        ));
     };
-    let checked_at_unix_ms =
-        read_config_u64(cache_dir, project, "periodic_verify_checked_unix_ms")?;
-    let ledger_rows = read_config_optional_u64(cache_dir, project, "periodic_verify_ledger_rows")?;
-    let checked_range_start =
-        read_config_optional_u64(cache_dir, project, "periodic_verify_checked_range_start")?;
-    let checked_range_end =
-        read_config_optional_u64(cache_dir, project, "periodic_verify_checked_range_end")?;
-    let verified_through =
-        read_config_optional_u64(cache_dir, project, "periodic_verify_verified_through")?;
-    let scrubbed = read_config_value(
-        cache_dir,
-        &metadata_key(project, "periodic_verify_scrubbed"),
-    )?
-    .map(|value| value.trim() == "1")
-    .unwrap_or(false);
-    let vault_dir = read_config_value(
-        cache_dir,
-        &metadata_key(project, "periodic_verify_vault_dir"),
-    )?
-    .filter(|value| !value.trim().is_empty());
-    let error = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_error"))?
-        .filter(|value| !value.trim().is_empty());
+    let checked_at_unix_ms = parse_batched_config_u64(&keys[1], values[1].as_deref(), false)?;
+    let ledger_rows = parse_batched_config_u64(&keys[2], values[2].as_deref(), true)?;
+    let checked_range_start = parse_batched_config_u64(&keys[3], values[3].as_deref(), true)?;
+    let checked_range_end = parse_batched_config_u64(&keys[4], values[4].as_deref(), true)?;
+    let verified_through = parse_batched_config_u64(&keys[5], values[5].as_deref(), true)?;
+    let scrubbed = match values[6].as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(value) => {
+            return Err(format!(
+                "ASTRO_PERIODIC_VERIFY_SCRUBBED_CORRUPT: persisted config key {:?} is {value:?}, \
+                 expected exactly \"0\" or \"1\". Remediation: repair the exact corrupt row \
+                 before trusting periodic verification status.",
+                keys[6],
+            )
+            .into());
+        }
+    };
+    let vault_dir = values[7].as_deref().filter(|value| !value.is_empty());
+    let error = values[8].as_deref().filter(|value| !value.is_empty());
     // #178: the last tick's FsvAck envelope (labeled absence when the tick made no
     // witnessed mutation). Parsed back from the persisted JSON, never fabricated.
-    let fsv = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_fsv"))?
-        .filter(|value| !value.trim().is_empty())
-        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    let fsv = parse_batched_config_json(&keys[9], values[9].as_deref())?;
+    let operation = values[10].as_deref().filter(|value| !value.is_empty());
+    let foreground_admission_order = values[11].as_deref().filter(|value| !value.is_empty());
     Ok(json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
         "project": project,
-        "status": status.clone(),
+        "status": status,
         "vault_dir": vault_dir,
         "checked_at_unix_ms": checked_at_unix_ms,
         "ledger_rows": ledger_rows,
@@ -598,6 +646,9 @@ pub(crate) fn periodic_verify_status_at(
         "checked_range_end": checked_range_end,
         "verified_through": verified_through,
         "scrubbed": scrubbed,
+        "operation": operation,
+        "foreground_admission_order": foreground_admission_order,
+        "startup_readiness": startup_readiness,
         "fsv": fsv,
         "error": error,
         "freshness": "last_observed",
@@ -606,7 +657,58 @@ pub(crate) fn periodic_verify_status_at(
     }))
 }
 
+fn parse_batched_config_u64(
+    key: &str,
+    value: Option<&str>,
+    empty_is_none: bool,
+) -> Result<Option<u64>, DynError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if empty_is_none && value.is_empty() {
+        return Ok(None);
+    }
+    value.parse::<u64>().map(Some).map_err(|error| {
+        format!(
+            "ASTRO_CONFIG_U64_CORRUPT: persisted config value for key {key:?} is {value:?}, \
+             not an unsigned 64-bit integer{}: {error}. Remediation: repair or remove the \
+             exact corrupt config row before retrying; Astrolabe will not substitute a default \
+             for persisted invalid state.",
+            if empty_is_none {
+                " or the exact empty optional-value sentinel"
+            } else {
+                ""
+            },
+        )
+        .into()
+    })
+}
+
+fn parse_batched_config_json(key: &str, value: Option<&str>) -> Result<Option<Value>, DynError> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<Value>(value)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "ASTRO_VERIFY_STATUS_JSON_CORRUPT: persisted config value for key {key:?} is \
+                 not valid JSON: {error}. Remediation: preserve and inspect the exact corrupt \
+                 row before repairing it; Astrolabe will not report malformed verification \
+                 evidence as absent."
+            )
+            .into()
+        })
+}
+
 pub(crate) fn periodic_verify_unobserved_json(project: &str) -> Value {
+    periodic_verify_unobserved_json_with_startup(project, None)
+}
+
+fn periodic_verify_unobserved_json_with_startup(
+    project: &str,
+    startup_readiness: Option<Value>,
+) -> Value {
     json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
         "project": project,
@@ -618,6 +720,9 @@ pub(crate) fn periodic_verify_unobserved_json(project: &str) -> Value {
         "checked_range_end": Value::Null,
         "verified_through": Value::Null,
         "scrubbed": false,
+        "operation": Value::Null,
+        "foreground_admission_order": Value::Null,
+        "startup_readiness": startup_readiness,
         "fsv": Value::Null,
         "error": Value::Null,
         "freshness": "unknown",
@@ -836,22 +941,120 @@ pub(crate) fn health_trajectory_ndjson(
 ///
 /// Fails **closed** per project: a damaged chain is recorded as
 /// `periodic_verify_status = "error"` with the janitor refusal, never a silent
-/// pass. Returns the number of projects whose boot sweep failed closed.
+/// pass. Returns exact discovered, checked, and damaged project counts.
 /// Resolves the CBM cache dir and runs the one-time [`janitor_startup_verify_projects_at`]
 /// boot gate over every discovered shadow project. Called once at server startup.
-pub(crate) fn janitor_startup_verify_projects() -> Result<u64, DynError> {
+pub(crate) fn janitor_startup_verify_projects(
+    periodic_interval_ms: u64,
+) -> Result<JanitorStartupVerifyReport, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    janitor_startup_verify_projects_at(&cache_dir)
+    janitor_startup_verify_projects_at(&cache_dir, periodic_interval_ms)
 }
 
-pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64, DynError> {
-    let checked_at_unix_ms = unix_epoch_millis();
+pub(crate) fn janitor_startup_verify_projects_at(
+    cache_dir: &Path,
+    periodic_interval_ms: u64,
+) -> Result<JanitorStartupVerifyReport, DynError> {
+    let started_at_unix_ms = unix_epoch_millis();
+    persist_verify_chain_startup_readiness_at(
+        cache_dir,
+        &json!({
+            "schema": VERIFY_CHAIN_STARTUP_READINESS_SCHEMA,
+            "status": "verifying",
+            "operation": "janitor_startup_verify_projects",
+            "foreground_admission": "blocked",
+            "started_at_unix_ms": started_at_unix_ms,
+            "completed_at_unix_ms": Value::Null,
+            "discovered_projects": Value::Null,
+            "checked_projects": Value::Null,
+            "damaged_projects": Value::Null,
+            "periodic_interval_ms": periodic_interval_ms,
+            "first_periodic_tick_not_before_unix_ms": Value::Null,
+            "error": Value::Null,
+        }),
+    )?;
+    let result = janitor_startup_verify_projects_inner(cache_dir, started_at_unix_ms);
+    match result {
+        Ok(report) => {
+            let completed_at_unix_ms = unix_epoch_millis();
+            let ready = report.damaged_projects == 0;
+            persist_verify_chain_startup_readiness_at(
+                cache_dir,
+                &json!({
+                    "schema": VERIFY_CHAIN_STARTUP_READINESS_SCHEMA,
+                    "status": if ready { "ready" } else { "refused_damaged_chain" },
+                    "operation": "janitor_startup_verify_projects",
+                    "foreground_admission": if ready { "released" } else { "refused" },
+                    "started_at_unix_ms": started_at_unix_ms,
+                    "completed_at_unix_ms": completed_at_unix_ms,
+                    "discovered_projects": report.discovered_projects,
+                    "checked_projects": report.checked_projects,
+                    "damaged_projects": report.damaged_projects,
+                    "periodic_interval_ms": periodic_interval_ms,
+                    "first_periodic_tick_not_before_unix_ms": ready.then_some(
+                        completed_at_unix_ms.saturating_add(periodic_interval_ms)
+                    ),
+                    "error": Value::Null,
+                }),
+            )?;
+            Ok(report)
+        }
+        Err(error) => {
+            let error_text = error.to_string();
+            let readiness = json!({
+                "schema": VERIFY_CHAIN_STARTUP_READINESS_SCHEMA,
+                "status": "error",
+                "operation": "janitor_startup_verify_projects",
+                "foreground_admission": "refused",
+                "started_at_unix_ms": started_at_unix_ms,
+                "completed_at_unix_ms": unix_epoch_millis(),
+                "discovered_projects": Value::Null,
+                "checked_projects": Value::Null,
+                "damaged_projects": Value::Null,
+                "periodic_interval_ms": periodic_interval_ms,
+                "first_periodic_tick_not_before_unix_ms": Value::Null,
+                "error": error_text,
+            });
+            persist_verify_chain_startup_readiness_at(cache_dir, &readiness).map_err(
+                |persist_error| -> DynError {
+                    format!(
+                        "ASTRO_VERIFY_CHAIN_STARTUP_TELEMETRY_FAILED: startup verification failed \
+                         with {error}; persisting its terminal readiness state also failed with \
+                         {persist_error}. Remediation: preserve and inspect the config database \
+                         and vault bytes before restarting the server."
+                    )
+                    .into()
+                },
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn janitor_startup_verify_projects_inner(
+    cache_dir: &Path,
+    checked_at_unix_ms: u64,
+) -> Result<JanitorStartupVerifyReport, DynError> {
     let projects = discover_periodic_verify_projects_at(cache_dir)?;
+    let discovered_projects = u64::try_from(projects.len()).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_PROJECT_COUNT_OVERFLOW: discovered project count cannot be \
+             represented as u64: {error}. Remediation: inspect the config project inventory \
+             before restarting the server."
+        )
+        .into()
+    })?;
+    let mut checked_projects = 0u64;
     let mut damaged = 0u64;
     for project in projects {
         if !project.vault_dir.exists() {
             continue;
         }
+        checked_projects = checked_projects.checked_add(1).ok_or_else(|| -> DynError {
+            "ASTRO_VERIFY_CHAIN_PROJECT_COUNT_OVERFLOW: checked project count overflowed u64. \
+             Remediation: inspect the config project inventory before restarting the server."
+                .into()
+        })?;
         let vault_id = read_config_value(cache_dir, &metadata_key(&project.project, "vault_id"))?
             .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
         let salt = read_config_value(cache_dir, &metadata_key(&project.project, "vault_salt"))?
@@ -864,7 +1067,12 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
         ) {
             Ok(vault) => vault,
             Err(error) => {
-                damaged += 1;
+                damaged = damaged.checked_add(1).ok_or_else(|| -> DynError {
+                    "ASTRO_VERIFY_CHAIN_PROJECT_COUNT_OVERFLOW: damaged project count overflowed \
+                     u64. Remediation: inspect the config project inventory before restarting \
+                     the server."
+                        .into()
+                })?;
                 persist_periodic_verify_status_at(
                     cache_dir,
                     &project.project,
@@ -878,6 +1086,8 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
                     None,
                     false,
                     None,
+                    STARTUP_VERIFY_OPERATION,
+                    STARTUP_VERIFY_ADMISSION_ORDER,
                 )?;
                 continue;
             }
@@ -899,11 +1109,18 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
                     verified_through,
                     false,
                     None,
+                    STARTUP_VERIFY_OPERATION,
+                    STARTUP_VERIFY_ADMISSION_ORDER,
                 )?;
             }
             Err(error) => {
                 // Fail closed: a tampered/damaged chain is surfaced, never a pass.
-                damaged += 1;
+                damaged = damaged.checked_add(1).ok_or_else(|| -> DynError {
+                    "ASTRO_VERIFY_CHAIN_PROJECT_COUNT_OVERFLOW: damaged project count overflowed \
+                     u64. Remediation: inspect the config project inventory before restarting \
+                     the server."
+                        .into()
+                })?;
                 persist_periodic_verify_status_at(
                     cache_dir,
                     &project.project,
@@ -917,11 +1134,36 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
                     None,
                     false,
                     None,
+                    STARTUP_VERIFY_OPERATION,
+                    STARTUP_VERIFY_ADMISSION_ORDER,
                 )?;
             }
         }
     }
-    Ok(damaged)
+    Ok(JanitorStartupVerifyReport {
+        discovered_projects,
+        checked_projects,
+        damaged_projects: damaged,
+    })
+}
+
+fn persist_verify_chain_startup_readiness_at(
+    cache_dir: &Path,
+    readiness: &Value,
+) -> Result<(), DynError> {
+    let serialized = serde_json::to_string(readiness)?;
+    write_config_value(cache_dir, VERIFY_CHAIN_STARTUP_READINESS_KEY, &serialized)?;
+    let readback = read_config_value(cache_dir, VERIFY_CHAIN_STARTUP_READINESS_KEY)?;
+    if readback.as_deref() != Some(serialized.as_str()) {
+        return Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_READBACK_MISMATCH: startup readiness config row did not \
+             read back byte-exactly after persistence; expected {serialized:?}, observed \
+             {readback:?}. Remediation: preserve and inspect the config database before \
+             restarting the server."
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn prom_label_value(value: &str) -> String {

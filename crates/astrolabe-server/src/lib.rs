@@ -53,7 +53,6 @@ pub const LEGACY_TOOLS: &[&str] = &[
 pub const LEGACY_ALIASES: &[&str] = &["trace_call_path"];
 const VERIFY_CHAIN_LOOP_DEFAULT_INTERVAL_MS: u64 = 60_000;
 const VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS: u64 = 1_000;
-const VERIFY_CHAIN_LOOP_SLEEP_SLICE_MS: u64 = 100;
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::CodebaseMemoryMcp
@@ -352,7 +351,7 @@ fn print_usage() {
 
 fn run_server() -> Result<i32, DynError> {
     let _watchdog = ParentWatchdog::start();
-    let _verify_chain_loop = VerifyChainLoop::start();
+    let _verify_chain_loop = VerifyChainLoop::start()?;
     let _incremental_watcher_loop = IncrementalWatcherLoop::start();
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
@@ -1276,7 +1275,7 @@ struct ParentWatchdog {
 }
 
 struct VerifyChainLoop {
-    shutdown: Arc<AtomicBool>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -1322,38 +1321,61 @@ impl Drop for IncrementalWatcherLoop {
 }
 
 impl VerifyChainLoop {
-    fn start() -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        if verify_chain_loop_disabled() {
+    fn start() -> Result<Self, DynError> {
+        if verify_chain_loop_disabled()? {
             tracing::info!("verify_chain_loop.disabled source=ASTROLABE_VERIFY_CHAIN_LOOP");
-            return Self {
-                shutdown,
+            return Ok(Self {
+                shutdown: None,
                 handle: None,
-            };
+            });
         }
 
+        let interval = verify_chain_loop_interval()?;
         // #277: one-time deep boot gate before the steady-state bounded scrub lane
         // begins — re-hashes each project's whole persisted ledger from genesis and
-        // fails closed (records status=error) on a tampered/damaged store, so the
-        // per-tick scrub never runs atop already-corrupt state.
-        match migration::janitor_startup_verify_projects() {
-            Ok(0) => {}
-            Ok(damaged) => {
-                tracing::warn!(
-                    "verify_chain_loop.startup_verify_failed_closed damaged_projects={damaged}"
-                );
-            }
-            Err(error) => {
-                tracing::warn!("verify_chain_loop.startup_verify_error error={error}");
-            }
+        // refuses foreground admission on a tampered/damaged store. The readiness
+        // record is durable before the server constructs its request runner.
+        let report = migration::janitor_startup_verify_projects(
+            u64::try_from(interval.as_millis()).map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_VERIFY_CHAIN_INTERVAL_OVERFLOW: periodic interval cannot be \
+                     represented as u64 milliseconds: {error}. Remediation: repair the \
+                     ASTROLABE_VERIFY_CHAIN_INTERVAL_MS setting before restarting the server."
+                )
+                .into()
+            })?,
+        )?;
+        if report.damaged_projects != 0 {
+            return Err(format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_DAMAGED: startup verification found {} damaged \
+                 project vault(s) among {} checked / {} discovered; foreground MCP admission \
+                 is refused. Remediation: inspect each project's persisted \
+                 periodic_verify_error, repair the exact damaged chain, and run a deep verify \
+                 before restarting the server.",
+                report.damaged_projects, report.checked_projects, report.discovered_projects,
+            )
+            .into());
         }
+        tracing::info!(
+            "verify_chain_loop.ready checked_projects={} discovered_projects={} interval_ms={}",
+            report.checked_projects,
+            report.discovered_projects,
+            interval.as_millis(),
+        );
 
-        let interval = verify_chain_loop_interval();
-        let thread_shutdown = Arc::clone(&shutdown);
+        let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
             loop {
-                if thread_shutdown.load(Ordering::Relaxed) {
-                    break;
+                match shutdown_receiver.recv_timeout(interval) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::error!(
+                            "verify_chain_loop.shutdown_channel_disconnected \
+                             code=ASTRO_VERIFY_CHAIN_SHUTDOWN_CHANNEL_DISCONNECTED"
+                        );
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 match migration::periodic_verify_chain_tick() {
                     Ok(report) => {
@@ -1367,40 +1389,58 @@ impl VerifyChainLoop {
                         tracing::warn!("verify_chain_loop.tick_failed error={error}");
                     }
                 }
-                if sleep_until_verify_loop_shutdown(&thread_shutdown, interval) {
-                    break;
-                }
             }
         });
 
-        Self {
-            shutdown,
+        Ok(Self {
+            shutdown: Some(shutdown_sender),
             handle: Some(handle),
-        }
+        })
     }
 }
 
 impl Drop for VerifyChainLoop {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(shutdown) = self.shutdown.take()
+            && shutdown.send(()).is_err()
+        {
+            tracing::error!(
+                "verify_chain_loop.shutdown_send_failed \
+                 code=ASTRO_VERIFY_CHAIN_SHUTDOWN_SEND_FAILED"
+            );
+        }
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                tracing::error!(
+                    "verify_chain_loop.thread_panicked \
+                     code=ASTRO_VERIFY_CHAIN_THREAD_PANICKED"
+                );
+            }
         }
     }
 }
 
-fn verify_chain_loop_disabled() -> bool {
+fn verify_chain_loop_disabled() -> Result<bool, DynError> {
     verify_chain_loop_disabled_from_raw(env::var("ASTROLABE_VERIFY_CHAIN_LOOP").ok().as_deref())
 }
 
-fn verify_chain_loop_disabled_from_raw(raw: Option<&str>) -> bool {
-    raw.is_some_and(|value| {
-        let value = value.trim();
-        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
-    })
+fn verify_chain_loop_disabled_from_raw(raw: Option<&str>) -> Result<bool, DynError> {
+    let Some(value) = raw else {
+        return Ok(false);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(false),
+        "0" | "false" | "off" => Ok(true),
+        other => Err(format!(
+            "ASTRO_VERIFY_CHAIN_LOOP_POLICY_INVALID: ASTROLABE_VERIFY_CHAIN_LOOP is {other:?}, \
+             expected one of 1/true/on or 0/false/off. Remediation: repair or remove the exact \
+             environment value before restarting the server."
+        )
+        .into()),
+    }
 }
 
-fn verify_chain_loop_interval() -> Duration {
+fn verify_chain_loop_interval() -> Result<Duration, DynError> {
     verify_chain_loop_interval_from_raw(
         env::var("ASTROLABE_VERIFY_CHAIN_INTERVAL_MS")
             .ok()
@@ -1408,26 +1448,27 @@ fn verify_chain_loop_interval() -> Duration {
     )
 }
 
-fn verify_chain_loop_interval_from_raw(raw: Option<&str>) -> Duration {
-    let millis = raw
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(VERIFY_CHAIN_LOOP_DEFAULT_INTERVAL_MS)
-        .max(VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS);
-    Duration::from_millis(millis)
-}
-
-fn sleep_until_verify_loop_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
-    let slice = Duration::from_millis(VERIFY_CHAIN_LOOP_SLEEP_SLICE_MS);
-    let mut slept = Duration::ZERO;
-    while slept < duration {
-        if shutdown.load(Ordering::Relaxed) {
-            return true;
-        }
-        let step = duration.saturating_sub(slept).min(slice);
-        thread::sleep(step);
-        slept = slept.saturating_add(step);
+fn verify_chain_loop_interval_from_raw(raw: Option<&str>) -> Result<Duration, DynError> {
+    let millis = match raw {
+        None => VERIFY_CHAIN_LOOP_DEFAULT_INTERVAL_MS,
+        Some(value) => value.trim().parse::<u64>().map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_INTERVAL_INVALID: ASTROLABE_VERIFY_CHAIN_INTERVAL_MS is \
+                 {value:?}, not an unsigned integer: {error}. Remediation: repair or remove the \
+                 exact environment value before restarting the server."
+            )
+            .into()
+        })?,
+    };
+    if millis < VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS {
+        return Err(format!(
+            "ASTRO_VERIFY_CHAIN_INTERVAL_BELOW_MINIMUM: ASTROLABE_VERIFY_CHAIN_INTERVAL_MS is \
+             {millis}, below the declared minimum {VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS}. \
+             Remediation: configure an admitted interval without relying on silent clamping."
+        )
+        .into());
     }
-    shutdown.load(Ordering::Relaxed)
+    Ok(Duration::from_millis(millis))
 }
 
 impl ParentWatchdog {

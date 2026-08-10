@@ -43,58 +43,6 @@ impl MigrationDial {
     }
 }
 
-pub(crate) fn read_config_u64(
-    cache_dir: &Path,
-    project: &str,
-    key: &str,
-) -> Result<Option<u64>, DynError> {
-    let storage_key = metadata_key(project, key);
-    let Some(value) = read_config_value(cache_dir, &storage_key)? else {
-        return Ok(None);
-    };
-    value.parse::<u64>().map(Some).map_err(|error| {
-        format!(
-            "ASTRO_CONFIG_U64_CORRUPT: persisted config value for key {storage_key:?} is \
-             {value:?}, not an unsigned 64-bit integer: {error}. Remediation: repair or remove \
-             the exact corrupt config row before retrying; Astrolabe will not substitute a \
-             default for persisted invalid state."
-        )
-        .into()
-    })
-}
-
-/// Reads a config field whose persisted schema is an optional unsigned integer.
-///
-/// The config table is shared with the C implementation and stores values as
-/// text. Optional periodic-verification numbers use one exact representation:
-/// an empty TEXT value means `None`, while every non-empty value must parse as
-/// a `u64`. This deliberately does not trim or otherwise normalize persisted
-/// bytes, so malformed state remains a fail-closed diagnostic instead of being
-/// silently coerced.
-pub(crate) fn read_config_optional_u64(
-    cache_dir: &Path,
-    project: &str,
-    key: &str,
-) -> Result<Option<u64>, DynError> {
-    let storage_key = metadata_key(project, key);
-    let Some(value) = read_config_value(cache_dir, &storage_key)? else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    value.parse::<u64>().map(Some).map_err(|error| {
-        format!(
-            "ASTRO_CONFIG_U64_CORRUPT: persisted config value for key {storage_key:?} is \
-             {value:?}, not an unsigned 64-bit integer or the exact empty optional-value \
-             sentinel: {error}. Remediation: repair or remove the exact corrupt config row \
-             before retrying; Astrolabe will not substitute a default for persisted invalid \
-             state."
-        )
-        .into()
-    })
-}
-
 pub(crate) fn read_auto_watch_policy_at(cache_dir: &Path) -> Result<bool, AutoWatchPolicyError> {
     let Some(value) = read_config_value(cache_dir, AUTO_WATCH_CONFIG_KEY).map_err(|error| {
         AutoWatchPolicyError {
@@ -177,6 +125,48 @@ pub(crate) fn read_config_value(cache_dir: &Path, key: &str) -> Result<Option<St
         )
         .into()
     })
+}
+
+/// Reads a fixed set of exact config keys through one read-only SQLite handle.
+///
+/// This is the narrow alternative to opening the config database once per field
+/// or scanning an entire project prefix. The returned vector is positionally
+/// aligned with `keys`; an absent row is represented by `None`.
+pub(crate) fn read_config_values(
+    cache_dir: &Path,
+    keys: &[String],
+) -> Result<Vec<Option<String>>, DynError> {
+    let Some(conn) = open_config_read_only_if_present(cache_dir)? else {
+        return Ok(vec![None; keys.len()]);
+    };
+    let mut statement = conn
+        .prepare("SELECT value FROM config WHERE key = ?")
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_CONFIG_DB_READ_FAILED: preparing a read-only exact-key batch in {path} \
+                 failed: {error}. Remediation: inspect the config table and SQLite integrity; \
+                 repair the persisted store before retrying.",
+                path = cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = statement
+            .query_row(params![key], |row| row.get(0))
+            .optional()
+            .map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_CONFIG_DB_READ_FAILED: read-only exact-key batch query for config key \
+                     {key:?} in {path} failed: {error}. Remediation: inspect the config table \
+                     and SQLite integrity; repair the persisted store before retrying.",
+                    path = cache_dir.join("_config.db").display(),
+                )
+                .into()
+            })?;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 /// Reads every `(key, value)` config row whose key starts with `prefix`, ordered
