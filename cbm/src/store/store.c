@@ -1328,11 +1328,15 @@ typedef struct {
     char operation[CBM_STORE_VERIFY_OPERATION_MAX];
     int sqlite_error;
     char detail[CBM_STORE_VERIFY_DETAIL_MAX];
+    uint32_t schema_metadata_read;
+    int32_t observed_schema_version;
+    int32_t reader_schema_version;
 } store_integrity_result_t;
 
 static void store_integrity_result_init(store_integrity_result_t *result) {
     memset(result, 0, sizeof(*result));
     result->status = STORE_INTEGRITY_IO_FAILED;
+    result->reader_schema_version = CBM_GRAPH_SCHEMA_VERSION;
 }
 
 static store_integrity_status_t store_integrity_sqlite_failure_status(int sqlite_error) {
@@ -1368,6 +1372,73 @@ static void store_integrity_set_sqlite_failure(store_integrity_result_t *result,
     store_integrity_set_failure(result, store_integrity_sqlite_failure_status(sqlite_error),
                                 operation, sqlite_error,
                                 message ? message : "SQLite returned no diagnostic");
+}
+
+/* Read the application-owned schema generation before any graph-row or full
+ * integrity work. The caller binds the connection to one stable DB/WAL/SHM
+ * family, so this bounded PRAGMA observes one coherent SQLite generation. A
+ * mismatch is terminal metadata, not an invitation to scan or partially
+ * interpret rows. */
+static bool store_integrity_check_schema_generation(sqlite3 *db, store_integrity_result_t *result) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "PRAGMA main.user_version;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.user_version.prepare", db, rc);
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return false;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        store_integrity_set_sqlite_failure(result, "application.user_version.step", db, rc);
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.user_version.invalid", SQLITE_MISMATCH,
+                                    "PRAGMA user_version did not return an integer");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    sqlite3_int64 observed = sqlite3_column_int64(stmt, 0);
+    if (observed < INT32_MIN || observed > INT32_MAX) {
+        store_integrity_set_failure(
+            result, STORE_INTEGRITY_FAILED, "application.user_version.invalid", SQLITE_RANGE,
+            "PRAGMA user_version exceeded the signed 32-bit application range");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    result->schema_metadata_read = 1;
+    result->observed_schema_version = (int32_t)observed;
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
+                                    "application.user_version.cardinality", SQLITE_OK,
+                                    "PRAGMA user_version did not return exactly one row");
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc != SQLITE_OK) {
+        store_integrity_set_sqlite_failure(result, "application.user_version.finalize", db, rc);
+        return false;
+    }
+    if (observed != CBM_GRAPH_SCHEMA_VERSION) {
+        const char *operation = observed == 0  ? "application.user_version.unstamped"
+                                : observed < 0 ? "application.user_version.invalid"
+                                : observed < CBM_GRAPH_SCHEMA_VERSION
+                                    ? "application.user_version.older"
+                                    : "application.user_version.newer";
+        char detail[ST_BUF_64];
+        snprintf(detail, sizeof(detail), "observed=%lld reader=%d", (long long)observed,
+                 CBM_GRAPH_SCHEMA_VERSION);
+        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED, operation, SQLITE_OK, detail);
+        return false;
+    }
+    return true;
 }
 
 static bool store_root_path_is_absolute(const unsigned char *path, int bytes) {
@@ -1948,6 +2019,9 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
                                     "graph reload requires an expected project name");
         return result->status;
     }
+    if (!store_integrity_check_schema_generation(s->db, result)) {
+        return result->status;
+    }
     if (!store_integrity_map_database(s->db, result)) {
         return result->status;
     }
@@ -2046,50 +2120,6 @@ static store_integrity_status_t store_check_integrity_detailed(cbm_store_t *s,
         return result->status;
     }
 
-    rc = sqlite3_prepare_v2(s->db, "PRAGMA main.user_version;", CBM_NOT_FOUND, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        store_integrity_set_sqlite_failure(result, "application.user_version.prepare", s->db, rc);
-        if (stmt) {
-            sqlite3_finalize(stmt);
-        }
-        return result->status;
-    }
-    rc = sqlite3_step(stmt);
-    int user_version = rc == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
-    if (rc != SQLITE_ROW || user_version != CBM_GRAPH_SCHEMA_VERSION) {
-        if (rc != SQLITE_ROW) {
-            store_integrity_set_sqlite_failure(result, "application.user_version.step", s->db, rc);
-        } else {
-            char detail[ST_BUF_64];
-            snprintf(detail, sizeof(detail), "user_version=%d expected=%d", user_version,
-                     CBM_GRAPH_SCHEMA_VERSION);
-            /* Keep the application-owned schema identity in the structured
-             * operation. Callers must be able to distinguish a durable on-disk
-             * incompatibility from an I/O verification failure without parsing
-             * the human-readable detail string. */
-            store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                        user_version == 0 ? "application.user_version.unstamped"
-                                                          : "application.user_version.unsupported",
-                                        SQLITE_OK, detail);
-        }
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_DONE) {
-        store_integrity_set_failure(result, STORE_INTEGRITY_FAILED,
-                                    "application.user_version.cardinality", SQLITE_OK,
-                                    "PRAGMA user_version did not return exactly one row");
-        sqlite3_finalize(stmt);
-        return result->status;
-    }
-    rc = sqlite3_finalize(stmt);
-    stmt = NULL;
-    if (rc != SQLITE_OK) {
-        store_integrity_set_sqlite_failure(result, "application.user_version.finalize", s->db, rc);
-        return result->status;
-    }
-
     static const struct {
         unsigned int contracts;
         const char *operation;
@@ -2178,6 +2208,7 @@ static void store_verify_result_init(cbm_store_verify_result_t *result) {
     result->family_guard_release_complete = true;
     result->scratch_cleanup_complete = true;
     result->sqlite_error = SQLITE_OK;
+    result->reader_schema_version = CBM_GRAPH_SCHEMA_VERSION;
 }
 
 static void store_verify_set_error(cbm_store_verify_result_t *result,
@@ -3367,6 +3398,79 @@ static bool store_sqlite_corruption_code(int sqlite_error) {
            primary == SQLITE_SCHEMA;
 }
 
+/* The retained family handles deny write/delete access, so this read-only
+ * connection observes one stable DB/WAL/SHM generation. Read only the
+ * application header field here: incompatible generations must stop before a
+ * whole-file hash, scratch copy, mmap, integrity scan, or graph-row probe. */
+static bool store_check_frozen_source_schema(const char *db_path, bool wal_present,
+                                             bool shm_present, cbm_store_verify_result_t *result) {
+    if (wal_present && !shm_present) {
+        store_verify_set_error(
+            result, CBM_STORE_VERIFY_IO_FAILED, "source.schema_wal_without_shm",
+            ERROR_FILE_NOT_FOUND, SQLITE_CANTOPEN,
+            "frozen source has a WAL but no SHM; a read-only metadata connection could create "
+            "source-family state instead of remaining observational");
+        return false;
+    }
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        int sqlite_error = db ? sqlite3_extended_errcode(db) : rc;
+        const char *message = db ? sqlite3_errmsg(db) : sqlite3_errstr(sqlite_error);
+        store_verify_set_error(
+            result,
+            store_sqlite_corruption_code(sqlite_error) ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                                       : CBM_STORE_VERIFY_IO_FAILED,
+            "source.schema_open", ERROR_SUCCESS, sqlite_error,
+            message ? message : "frozen source schema connection returned no diagnostic");
+        if (db) {
+            int close_rc = sqlite3_close(db);
+            if (close_rc != SQLITE_OK) {
+                store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                                       "source.schema_open_close", ERROR_SUCCESS, close_rc,
+                                       "failed frozen-source schema connection did not close");
+            }
+        }
+        return false;
+    }
+
+    store_integrity_result_t schema_result;
+    store_integrity_result_init(&schema_result);
+    bool current = store_integrity_check_schema_generation(db, &schema_result);
+    result->schema_metadata_read = schema_result.schema_metadata_read;
+    result->observed_schema_version = schema_result.observed_schema_version;
+    result->reader_schema_version = schema_result.reader_schema_version;
+
+    int close_rc = sqlite3_close(db);
+    db = NULL;
+    if (close_rc != SQLITE_OK) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.schema_close",
+                               ERROR_SUCCESS, close_rc,
+                               "frozen-source schema connection did not close exactly");
+        return false;
+    }
+    if (current) {
+        return true;
+    }
+
+    char operation[CBM_STORE_VERIFY_OPERATION_MAX];
+    int operation_wrote =
+        snprintf(operation, sizeof(operation), "source.%s", schema_result.operation);
+    if (operation_wrote < 0 || (size_t)operation_wrote >= sizeof(operation)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED,
+                               "source.schema_operation_overflow", ERROR_BUFFER_OVERFLOW,
+                               SQLITE_TOOBIG,
+                               "schema-generation diagnostic exceeds verified capacity");
+        return false;
+    }
+    store_verify_set_error(
+        result,
+        schema_result.status == STORE_INTEGRITY_IO_FAILED ? CBM_STORE_VERIFY_IO_FAILED
+                                                          : CBM_STORE_VERIFY_INTEGRITY_FAILED,
+        operation, ERROR_SUCCESS, schema_result.sqlite_error, schema_result.detail);
+    return false;
+}
+
 #endif /* _WIN32 */
 
 static cbm_store_verify_status_t store_open_path_verified(
@@ -3447,6 +3551,25 @@ static cbm_store_verify_status_t store_open_path_verified(
         goto cleanup;
     }
     result->family_frozen = true;
+
+    LARGE_INTEGER frozen_db_size = {0};
+    if (!GetFileSizeEx(family.db, &frozen_db_size)) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_IO_FAILED, "source.stat_frozen_db",
+                               GetLastError(), SQLITE_OK,
+                               "frozen source database size could not be read");
+        goto cleanup;
+    }
+    if (frozen_db_size.QuadPart < 0) {
+        store_verify_set_error(result, CBM_STORE_VERIFY_INTEGRITY_FAILED, "source.stat_frozen_db",
+                               ERROR_FILE_INVALID, SQLITE_TOOBIG,
+                               "frozen source database size exceeded the signed 64-bit range");
+        goto cleanup;
+    }
+    result->db_bytes = (uint64_t)frozen_db_size.QuadPart;
+    if (!store_check_frozen_source_schema(db_path, result->wal_present, result->shm_present,
+                                          result)) {
+        goto cleanup;
+    }
 
     bool receipt_eligible = expected_project && !result->wal_present && !result->shm_present;
     if (receipt_eligible) {
@@ -3548,6 +3671,9 @@ static cbm_store_verify_status_t store_open_path_verified(
         store_integrity_result_t integrity_result;
         store_integrity_status_t integrity_status = store_check_integrity_detailed(
             snapshot_store, contract, expected_project, &integrity_result);
+        result->schema_metadata_read = integrity_result.schema_metadata_read;
+        result->observed_schema_version = integrity_result.observed_schema_version;
+        result->reader_schema_version = integrity_result.reader_schema_version;
         if (integrity_status == STORE_INTEGRITY_OK && require_delete_journal &&
             !store_check_snapshot_delete_journal(snapshot_store, &integrity_result)) {
             integrity_status = integrity_result.status;
@@ -3606,6 +3732,9 @@ static cbm_store_verify_status_t store_open_path_verified(
             snprintf(result->detail, sizeof(result->detail), "%s", query_detail);
         }
     } else {
+        result->schema_metadata_read = 1;
+        result->observed_schema_version = CBM_GRAPH_SCHEMA_VERSION;
+        result->reader_schema_version = CBM_GRAPH_SCHEMA_VERSION;
         result->status = CBM_STORE_VERIFY_OK;
         result->native_error = ERROR_SUCCESS;
         result->sqlite_error = SQLITE_OK;

@@ -17,10 +17,28 @@ admission, a source-frozen derivative must prove the supported schema, the sole
 internal project name, and an existing canonical `root_path`. The server never
 scans the cache to adopt a differently named database as a fallback.
 
-`list_projects` returns valid projects plus `store_refusals` and
-`refused_store_count`. A legacy, corrupt, drifted, or source-less candidate is
-therefore visible with its exact path/operation/remediation but cannot prevent
-unrelated valid projects from being listed or queried.
+`list_projects` returns valid projects plus `store_refusals`, identity conflicts,
+ghosts, and exact candidate/admitted/excluded counts. `cache_enumeration_complete`
+means the directory walk completed; `discovery_complete` is true only when no
+candidate was excluded. A partial result is labeled `discovery_status=partial`,
+so a legacy, corrupt, drifted, or source-less candidate cannot disappear behind
+otherwise successful project discovery.
+
+Schema compatibility is generation-bound. The frozen SQLite family's
+application-owned `PRAGMA user_version` is read before graph mapping, integrity
+scans, whole-file hashing/copying, or row queries. A generation refusal reports
+the frozen file size but deliberately labels its empty digest
+`db_sha256_status=not_computed_metadata_only`; the explicit archive transaction
+must independently bind the complete family's exact hashes. Known generations
+are reported with their exact schema
+transition commits (`v4` `a5ee3a3b0862ddd0c106b405cd5fef3f4aece994`,
+`v5` `f2a998354f5b7005271eaa3b2d9516dca18a8498`, and `v6`
+`a23c6ba0b5fe9e3225e986d225fec8ee9d537881`). Older, newer, unstamped,
+unknown, or malformed metadata is refused without reading graph rows. An exact
+writer executable was not persisted by these graph schemas, so discovery says
+`writer_artifact_identity_status=not_persisted_by_graph_schema` rather than
+inventing provenance. The Astrolabe host separately adds the exact live reader
+PID/start-ticks/executable hash and installed activation generation.
 
 Canonicalization is not permission to persist build scratch. Roots inside the
 Astrolabe native launcher namespace `.tmp/windows-gnu-toolchain-*` are refused
@@ -160,6 +178,13 @@ Never rename, delete, upgrade, or reindex over an integrity/provenance-refused
 store by hand. From the canonical Astrolabe checkout, use the tracker-bound
 archive transaction with hashes measured from the exact current files and the
 reviewed native binary:
+
+For an older observed schema, preserve the family and use `ArchiveAndReindex`
+with the refusal's exact DB hash and active reader schema. For a newer observed
+schema, preserve every byte and activate a reader generation that explicitly
+supports it; never downgrade, restamp, or partially query the database. An
+unstamped/invalid/unknown schema likewise requires inspection and an explicit
+archive/reindex from authoritative source, never an in-place repair.
 
 ```powershell
 .\scripts\migrate-cbm-store.ps1 `

@@ -15,6 +15,7 @@ fn handle_tool_raw_admitted(
     args_json: &str,
 ) -> Result<String, DynError> {
     match tool_name {
+        "list_projects" => handle_list_projects(runner, args_json),
         "index_repository" => handle_index_repository(runner, args_json),
         "delete_project" => handle_delete_project(runner, args_json),
         "index_status" => handle_index_status(runner, args_json),
@@ -106,7 +107,8 @@ pub fn handle_jsonrpc_raw(
 pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "index_repository"
+        "list_projects"
+            | "index_repository"
             | "delete_project"
             | "index_status"
             | "get_architecture"
@@ -320,6 +322,7 @@ pub(crate) fn should_wrap_tool(
     args: &Map<String, Value>,
 ) -> Result<bool, DynError> {
     match tool_name {
+        "list_projects" => Ok(true),
         // Always wrap delete_project: the Astrolabe host-side sidecar family
         // (lowered mirror, vault, locks, search index, per-project config rows)
         // can outlive a dial-off project, so cleanup must run regardless of the
@@ -366,6 +369,22 @@ pub(crate) fn should_wrap_tool(
         name if is_advertised_astrolabe_tool(name) => Ok(true),
         _ => Ok(false),
     }
+}
+
+pub(crate) fn handle_list_projects(
+    runner: &CbmToolRunner,
+    args_json: &str,
+) -> Result<String, DynError> {
+    let result = runner.handle_tool_raw("list_projects", args_json)?;
+    if tool_result_is_error(&result)? {
+        return Ok(result);
+    }
+    augment_tool_result(
+        &result,
+        json!({
+            "reader_process_generation": crate::activation_epoch::reader_generation_fields()?,
+        }),
+    )
 }
 
 fn shadow_project_requested(args: &Map<String, Value>) -> Result<Option<String>, DynError> {

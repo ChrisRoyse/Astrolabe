@@ -3223,6 +3223,7 @@ static void record_store_query_failure(cbm_mcp_server_t *srv, const char *projec
     memset(&failure, 0, sizeof(failure));
     failure.status = status;
     failure.sqlite_error = store ? cbm_store_error_code(store) : SQLITE_ERROR;
+    failure.reader_schema_version = CBM_GRAPH_SCHEMA_VERSION;
     failure.db_present = db_path && cbm_path_exists(db_path);
     failure.family_guard_release_complete = true;
     failure.scratch_cleanup_complete = true;
@@ -4079,6 +4080,8 @@ static bool add_index_capability_json(yyjson_mut_doc *doc, yyjson_mut_val *paren
     return eligible_added && yyjson_mut_obj_add_val(doc, parent, "semantic_search", semantic);
 }
 
+static yyjson_mut_val *schema_generation_json(yyjson_mut_doc *doc, int32_t version);
+
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *srv,
@@ -4158,6 +4161,11 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
     yyjson_mut_obj_add_int(doc, p, "size_bytes",
                            verification.db_bytes ? (int64_t)verification.db_bytes : size_bytes);
+    yyjson_mut_obj_add_int(doc, p, "schema_version", verification.observed_schema_version);
+    yyjson_mut_obj_add_val(doc, p, "schema_generation",
+                           schema_generation_json(doc, verification.observed_schema_version));
+    yyjson_mut_obj_add_str(doc, p, "writer_artifact_identity_status",
+                           "not_persisted_by_graph_schema");
     if (!add_index_capability_json(doc, p, &persisted_project.capability)) {
         cbm_project_free_fields(&persisted_project);
         return DB_PROJECT_INSPECT_FAILED;
@@ -4167,7 +4175,71 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     return DB_PROJECT_INSPECT_OK;
 }
 
+typedef struct {
+    int32_t version;
+    const char *generation;
+    const char *transition_commit;
+} cbm_schema_generation_t;
+
+static const cbm_schema_generation_t CBM_SCHEMA_GENERATIONS[] = {
+    {4, "cbm.graph-schema.v4", "a5ee3a3b0862ddd0c106b405cd5fef3f4aece994"},
+    {5, "cbm.graph-schema.v5", "f2a998354f5b7005271eaa3b2d9516dca18a8498"},
+    {6, "cbm.graph-schema.v6", "a23c6ba0b5fe9e3225e986d225fec8ee9d537881"},
+};
+
+static const cbm_schema_generation_t *schema_generation_for_version(int32_t version) {
+    for (size_t i = 0; i < sizeof(CBM_SCHEMA_GENERATIONS) / sizeof(CBM_SCHEMA_GENERATIONS[0]);
+         i++) {
+        if (CBM_SCHEMA_GENERATIONS[i].version == version) {
+            return &CBM_SCHEMA_GENERATIONS[i];
+        }
+    }
+    return NULL;
+}
+
+static yyjson_mut_val *schema_generation_json(yyjson_mut_doc *doc, int32_t version) {
+    yyjson_mut_val *generation = yyjson_mut_obj(doc);
+    const cbm_schema_generation_t *known = schema_generation_for_version(version);
+    yyjson_mut_obj_add_int(doc, generation, "version", version);
+    yyjson_mut_obj_add_bool(doc, generation, "known", known != NULL);
+    if (known) {
+        yyjson_mut_obj_add_str(doc, generation, "generation_id", known->generation);
+        yyjson_mut_obj_add_str(doc, generation, "transition_commit", known->transition_commit);
+    } else {
+        yyjson_mut_obj_add_null(doc, generation, "generation_id");
+        yyjson_mut_obj_add_null(doc, generation, "transition_commit");
+    }
+    return generation;
+}
+
+static const char *store_schema_relation(const cbm_store_verify_result_t *verification) {
+    if (!verification->schema_metadata_read) {
+        return "unreadable";
+    }
+    if (verification->observed_schema_version == 0) {
+        return "unstamped";
+    }
+    if (verification->observed_schema_version < 0) {
+        return "invalid";
+    }
+    if (verification->observed_schema_version < verification->reader_schema_version) {
+        return "older";
+    }
+    if (verification->observed_schema_version > verification->reader_schema_version) {
+        return "newer";
+    }
+    return "exact-current";
+}
+
+static bool recorded_store_error_is_schema_generation_mismatch(const cbm_mcp_server_t *srv) {
+    return srv->store_verify.schema_metadata_read &&
+           srv->store_verify.observed_schema_version != srv->store_verify.reader_schema_version;
+}
+
 static const char *recorded_store_error_code(const cbm_mcp_server_t *srv) {
+    if (recorded_store_error_is_schema_generation_mismatch(srv)) {
+        return "CBM_STORE_SCHEMA_GENERATION_MISMATCH";
+    }
     if (store_error_is_provenance(&srv->store_verify)) {
         return "CBM_STORE_PROVENANCE_FAILED";
     }
@@ -4191,12 +4263,36 @@ static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refus
     yyjson_mut_obj_add_strcpy(doc, item, "detail", srv->store_verify.detail);
     yyjson_mut_obj_add_int(doc, item, "native_error", (int64_t)srv->store_verify.native_error);
     yyjson_mut_obj_add_int(doc, item, "sqlite_error", srv->store_verify.sqlite_error);
-    yyjson_mut_obj_add_int(doc, item, "expected_schema_version", CBM_GRAPH_SCHEMA_VERSION);
+    yyjson_mut_obj_add_bool(doc, item, "schema_metadata_read",
+                            srv->store_verify.schema_metadata_read != 0);
+    yyjson_mut_obj_add_int(doc, item, "reader_schema_version",
+                           srv->store_verify.reader_schema_version);
+    yyjson_mut_obj_add_val(doc, item, "reader_schema_generation",
+                           schema_generation_json(doc, srv->store_verify.reader_schema_version));
+    if (srv->store_verify.schema_metadata_read) {
+        yyjson_mut_obj_add_int(doc, item, "observed_schema_version",
+                               srv->store_verify.observed_schema_version);
+        yyjson_mut_obj_add_val(
+            doc, item, "observed_schema_generation",
+            schema_generation_json(doc, srv->store_verify.observed_schema_version));
+    } else {
+        yyjson_mut_obj_add_null(doc, item, "observed_schema_version");
+        yyjson_mut_obj_add_null(doc, item, "observed_schema_generation");
+    }
+    const char *schema_relation = store_schema_relation(&srv->store_verify);
+    yyjson_mut_obj_add_str(doc, item, "schema_relation", schema_relation);
+    yyjson_mut_obj_add_str(doc, item, "writer_artifact_identity_status",
+                           "not_persisted_by_graph_schema");
     yyjson_mut_obj_add_bool(doc, item, "db_present", srv->store_verify.db_present);
     yyjson_mut_obj_add_bool(doc, item, "wal_present", srv->store_verify.wal_present);
     yyjson_mut_obj_add_bool(doc, item, "shm_present", srv->store_verify.shm_present);
     yyjson_mut_obj_add_int(doc, item, "db_bytes", (int64_t)srv->store_verify.db_bytes);
     yyjson_mut_obj_add_strcpy(doc, item, "db_sha256", srv->store_verify.db_sha256);
+    yyjson_mut_obj_add_str(doc, item, "db_sha256_status",
+                           srv->store_verify.db_sha256[0] != '\0' ? "verified"
+                           : recorded_store_error_is_schema_generation_mismatch(srv)
+                               ? "not_computed_metadata_only"
+                               : "unavailable_due_to_prior_failure");
     yyjson_mut_obj_add_bool(doc, item, "family_frozen", srv->store_verify.family_frozen);
     yyjson_mut_obj_add_bool(doc, item, "family_guard_release_complete",
                             srv->store_verify.family_guard_release_complete);
@@ -4209,10 +4305,21 @@ static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refus
     yyjson_mut_obj_add_int(doc, item, "cleanup_native_error",
                            (int64_t)srv->store_verify.cleanup_native_error);
     yyjson_mut_obj_add_bool(doc, item, "source_mutation_attempted", false);
-    yyjson_mut_obj_add_str(
-        doc, item, "remediation",
-        "preserve the complete family; run the explicit hash-bound archive/reindex migration "
-        "for this exact path, or repair the reported canonical project provenance");
+    const char *remediation =
+        strcmp(schema_relation, "older") == 0
+            ? "preserve the complete family; bind its exact hashes, then run "
+              "scripts\\migrate-cbm-store.ps1 -Operation ArchiveAndReindex with this DB path "
+              "and the active reader schema"
+        : strcmp(schema_relation, "newer") == 0
+            ? "preserve the complete family and activate the exact reader generation that "
+              "supports the observed schema; never downgrade or partially read the store"
+        : strcmp(schema_relation, "unstamped") == 0 || strcmp(schema_relation, "invalid") == 0
+            ? "preserve the complete family; inspect the invalid application schema metadata, "
+              "then use the explicit hash-bound archive/reindex transaction from authoritative "
+              "source"
+            : "preserve the complete family; repair the reported integrity or canonical project "
+              "provenance before retrying";
+    yyjson_mut_obj_add_str(doc, item, "remediation", remediation);
     yyjson_mut_arr_add_val(refusals, item);
 }
 
@@ -4312,6 +4419,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *refusals = yyjson_mut_arr(doc);
     yyjson_mut_val *conflicts = yyjson_mut_arr(doc);
     yyjson_mut_val *ghosts = yyjson_mut_arr(doc);
+    int64_t candidate_store_count = 0;
 
     if (!d && cbm_path_exists(dir_path)) {
         record_store_query_failure(srv, "", dir_path, NULL, CBM_STORE_VERIFY_IO_FAILED,
@@ -4331,6 +4439,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         if (!is_project_db_file(name, len)) {
             continue;
         }
+        candidate_store_count++;
         char full_path[CBM_SZ_2K];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
         int64_t size_bytes = cbm_file_size(full_path);
@@ -4362,21 +4471,37 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     cbm_closedir(d);
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
+    int64_t admitted_store_count = (int64_t)yyjson_mut_arr_size(arr);
+    int64_t refused_store_count = (int64_t)yyjson_mut_arr_size(refusals);
+    int64_t conflict_count = (int64_t)yyjson_mut_arr_size(conflicts);
+    int64_t ghost_count = (int64_t)yyjson_mut_arr_size(ghosts);
+    int64_t excluded_store_count = refused_store_count + conflict_count + ghost_count;
+    bool discovery_complete = excluded_store_count == 0;
     yyjson_mut_obj_add_val(doc, root, "store_refusals", refusals);
-    yyjson_mut_obj_add_int(doc, root, "refused_store_count",
-                           (int64_t)yyjson_mut_arr_size(refusals));
+    yyjson_mut_obj_add_int(doc, root, "refused_store_count", refused_store_count);
     yyjson_mut_obj_add_val(doc, root, "project_identity_conflicts", conflicts);
-    yyjson_mut_obj_add_int(doc, root, "project_identity_conflict_count",
-                           (int64_t)yyjson_mut_arr_size(conflicts));
+    yyjson_mut_obj_add_int(doc, root, "project_identity_conflict_count", conflict_count);
     yyjson_mut_obj_add_val(doc, root, "ghost_stores", ghosts);
-    yyjson_mut_obj_add_int(doc, root, "ghost_store_count",
-                           (int64_t)yyjson_mut_arr_size(ghosts));
-    yyjson_mut_obj_add_bool(doc, root, "discovery_complete", true);
+    yyjson_mut_obj_add_int(doc, root, "ghost_store_count", ghost_count);
+    yyjson_mut_obj_add_int(doc, root, "candidate_store_count", candidate_store_count);
+    yyjson_mut_obj_add_int(doc, root, "admitted_store_count", admitted_store_count);
+    yyjson_mut_obj_add_int(doc, root, "excluded_store_count", excluded_store_count);
+    yyjson_mut_obj_add_bool(doc, root, "cache_enumeration_complete", true);
+    yyjson_mut_obj_add_bool(doc, root, "discovery_complete", discovery_complete);
+    yyjson_mut_obj_add_str(doc, root, "discovery_status",
+                           discovery_complete ? "complete" : "partial");
+    yyjson_mut_obj_add_int(doc, root, "reader_schema_version", CBM_GRAPH_SCHEMA_VERSION);
+    yyjson_mut_obj_add_val(doc, root, "reader_schema_generation",
+                           schema_generation_json(doc, CBM_GRAPH_SCHEMA_VERSION));
 
     /* Guide user when no projects are indexed */
-    if (yyjson_mut_arr_size(arr) == 0) {
-        yyjson_mut_obj_add_str(doc, root, "hint",
-                               "No projects indexed. Call index_repository(repo_path=...) first.");
+    if (admitted_store_count == 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "hint",
+            candidate_store_count == 0
+                ? "No project-store candidates exist. Call index_repository(repo_path=...) first."
+                : "Project-store candidates exist but none were admitted; inspect the exact "
+                  "store_refusals, project_identity_conflicts, and ghost_stores diagnostics.");
     }
 
     char *json = yy_doc_to_str(doc);

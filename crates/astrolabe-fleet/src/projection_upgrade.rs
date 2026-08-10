@@ -727,7 +727,7 @@ pub fn complete_projection_upgrade(
     if schema.kind != SchemaKind::Current {
         return Err(refusal(
             &preparation.repo,
-            "ordinary pipeline returned without a current v5 CBM database",
+            "ordinary pipeline returned without a current v6 CBM database",
         ));
     }
     let transaction_dir = store_dir
@@ -886,7 +886,7 @@ fn complete_current_refresh(
     if schema.kind != SchemaKind::Current {
         return Err(refusal(
             repo,
-            "current-refresh completion readback did not find a current v5 database",
+            "current-refresh completion readback did not find a current v6 database",
         ));
     }
     let symbol_canonical_schema =
@@ -1446,7 +1446,7 @@ fn inspect_schema(
         if edge_columns != CURRENT_EDGE_COLUMNS {
             return Err(refusal(
                 repo,
-                &format!("current v5 database has unexpected edge columns: {edge_columns:?}"),
+                &format!("current v6 database has unexpected edge columns: {edge_columns:?}"),
             ));
         }
         let identity_failures: i64 = connection
@@ -1468,7 +1468,7 @@ fn inspect_schema(
             return Err(refusal(
                 repo,
                 &format!(
-                    "current v5 database contains {identity_failures} invalid atom/source rows"
+                    "current v6 database contains {identity_failures} invalid atom/source rows"
                 ),
             ));
         }
@@ -1477,7 +1477,7 @@ fn inspect_schema(
         return Err(refusal(
             repo,
             &format!(
-                "SQLite schema is neither exact populated legacy nor current v5: user_version={user_version}, node_columns={node_columns:?}"
+                "SQLite schema is neither exact populated legacy nor current v6: user_version={user_version}, node_columns={node_columns:?}"
             ),
         ));
     };

@@ -122,6 +122,9 @@ typedef struct {
     cbm_store_verify_status_t status;
     uint32_t native_error;
     int sqlite_error;
+    uint32_t schema_metadata_read;
+    int32_t observed_schema_version;
+    int32_t reader_schema_version;
     bool db_present;
     bool wal_present;
     bool shm_present;

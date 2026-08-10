@@ -70,6 +70,15 @@ pub(crate) enum WorkerActivation {
 }
 
 static INSTALLED_WORKER: OnceLock<InstalledWorkerContext> = OnceLock::new();
+static WORKSPACE_READER_EXECUTABLE: OnceLock<Result<ReaderExecutableIdentity, String>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct ReaderExecutableIdentity {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
 
 pub(crate) fn register_installed_worker(mut context: InstalledWorkerContext) -> Result<(), String> {
     context.generation_path = canonical_context_path(&context.generation_path, "generation root")?;
@@ -311,6 +320,156 @@ pub(crate) fn installed_owner_fields() -> Result<Value, DynError> {
                 "process_start_utc_ticks": process_start_utc_ticks,
             })
         }
+    })
+}
+
+/// Exact reader process/artifact generation served with project discovery.
+/// Installed workers inherit the immutable generation identity verified at
+/// activation. A workspace process hashes its running executable once; that
+/// invariant executable identity is reused for later metadata-only discovery.
+pub(crate) fn reader_generation_fields() -> Result<Value, DynError> {
+    let process_id = std::process::id();
+    let process_start_utc_ticks = astrolabe_bridge::process_start_utc_ticks(process_id)?;
+    Ok(match observe_worker_activation()? {
+        WorkerActivation::Workspace => {
+            let executable = workspace_reader_executable()?;
+            json!({
+                "schema": "astrolabe.reader-process-generation.v1",
+                "generation_scope": "workspace",
+                "process_id": process_id,
+                "process_start_utc_ticks": process_start_utc_ticks,
+                "worker_generation_id": Value::Null,
+                "active_generation_id": Value::Null,
+                "activation_epoch": Value::Null,
+                "activation_record_sha256": Value::Null,
+                "executable_path": executable.path,
+                "executable_bytes": executable.bytes,
+                "executable_sha256": executable.sha256,
+                "publication_path": Value::Null,
+                "publication_sha256": Value::Null,
+            })
+        }
+        WorkerActivation::Active(record) => {
+            let context = INSTALLED_WORKER
+                .get()
+                .expect("installed context exists for an active observation");
+            json!({
+                "schema": "astrolabe.reader-process-generation.v1",
+                "generation_scope": "installed-active",
+                "process_id": process_id,
+                "process_start_utc_ticks": process_start_utc_ticks,
+                "worker_generation_id": context.generation_id,
+                "worker_generation_path": context.generation_path,
+                "active_generation_id": record.generation_id,
+                "active_generation_path": record.generation_path,
+                "activation_epoch": record.epoch,
+                "activation_record_sha256": record.record_sha256,
+                "executable_path": context.executable_path,
+                "executable_bytes": context.executable_path.metadata()?.len(),
+                "executable_sha256": context.executable_sha256,
+                "publication_path": context.publication_path,
+                "publication_sha256": context.publication_sha256,
+            })
+        }
+        WorkerActivation::Retired(record) => {
+            let context = INSTALLED_WORKER
+                .get()
+                .expect("installed context exists for a retired observation");
+            json!({
+                "schema": "astrolabe.reader-process-generation.v1",
+                "generation_scope": "installed-retired",
+                "process_id": process_id,
+                "process_start_utc_ticks": process_start_utc_ticks,
+                "worker_generation_id": context.generation_id,
+                "worker_generation_path": context.generation_path,
+                "active_generation_id": record.generation_id,
+                "active_generation_path": record.generation_path,
+                "activation_epoch": record.epoch,
+                "activation_record_sha256": record.record_sha256,
+                "executable_path": context.executable_path,
+                "executable_bytes": context.executable_path.metadata()?.len(),
+                "executable_sha256": context.executable_sha256,
+                "publication_path": context.publication_path,
+                "publication_sha256": context.publication_sha256,
+            })
+        }
+    })
+}
+
+fn workspace_reader_executable() -> Result<ReaderExecutableIdentity, DynError> {
+    WORKSPACE_READER_EXECUTABLE
+        .get_or_init(capture_workspace_reader_executable)
+        .as_ref()
+        .map(Clone::clone)
+        .map_err(|error| -> DynError { error.clone().into() })
+}
+
+fn capture_workspace_reader_executable() -> Result<ReaderExecutableIdentity, String> {
+    let current = std::env::current_exe().map_err(|error| {
+        format!(
+            "ASTRO_READER_EXECUTABLE_UNRESOLVED: current executable path could not be read: {error}; remediation: preserve the process and repair its executable mapping before project discovery"
+        )
+    })?;
+    let path = fs::canonicalize(&current).map_err(|error| {
+        format!(
+            "ASTRO_READER_EXECUTABLE_UNRESOLVED: current executable {} could not be canonicalized: {error}; remediation: preserve the process and repair its executable mapping before project discovery",
+            current.display()
+        )
+    })?;
+    let mut file = fs::File::open(&path).map_err(|error| {
+        format!(
+            "ASTRO_READER_EXECUTABLE_OPEN_FAILED: current executable {} could not be opened for identity readback: {error}; remediation: preserve the process and restore readable executable bytes before project discovery",
+            path.display()
+        )
+    })?;
+    let before = file.metadata().map_err(|error| {
+        format!(
+            "ASTRO_READER_EXECUTABLE_METADATA_FAILED: current executable {} metadata could not be read before hashing: {error}; remediation: preserve the process and inspect its executable mapping",
+            path.display()
+        )
+    })?;
+    if !before.is_file() || before.len() == 0 {
+        return Err(format!(
+            "ASTRO_READER_EXECUTABLE_INVALID: current executable {} is not one non-empty regular file; remediation: preserve the process and repair its executable mapping",
+            path.display()
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut chunk).map_err(|error| {
+            format!(
+                "ASTRO_READER_EXECUTABLE_READ_FAILED: current executable {} could not be hashed: {error}; remediation: preserve the process and restore readable executable bytes before project discovery",
+                path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
+            "ASTRO_READER_EXECUTABLE_SIZE_OVERFLOW: executable byte count exceeded u64; remediation: preserve the process and inspect the executable mapping".to_string()
+        })?;
+        hasher.update(&chunk[..read]);
+    }
+    let after = file.metadata().map_err(|error| {
+        format!(
+            "ASTRO_READER_EXECUTABLE_METADATA_FAILED: current executable {} metadata could not be read after hashing: {error}; remediation: preserve the process and inspect its executable mapping",
+            path.display()
+        )
+    })?;
+    if before.len() != bytes || after.len() != bytes {
+        return Err(format!(
+            "ASTRO_READER_EXECUTABLE_READBACK_MISMATCH: current executable {} changed or produced a short read; before_bytes={}, hashed_bytes={bytes}, after_bytes={}; remediation: preserve the process and retry only with one stable executable generation",
+            path.display(),
+            before.len(),
+            after.len(),
+        ));
+    }
+    Ok(ReaderExecutableIdentity {
+        path,
+        bytes,
+        sha256: format!("{:x}", hasher.finalize()),
     })
 }
 
