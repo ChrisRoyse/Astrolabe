@@ -5,6 +5,15 @@ pub fn handle_tool_raw(
     tool_name: &str,
     args_json: &str,
 ) -> Result<String, DynError> {
+    let _activation_fence = crate::activation_epoch::admit_tool_call(tool_name, args_json)?;
+    handle_tool_raw_admitted(runner, tool_name, args_json)
+}
+
+fn handle_tool_raw_admitted(
+    runner: &CbmToolRunner,
+    tool_name: &str,
+    args_json: &str,
+) -> Result<String, DynError> {
     match tool_name {
         "index_repository" => handle_index_repository(runner, args_json),
         "delete_project" => handle_delete_project(runner, args_json),
@@ -62,26 +71,27 @@ pub fn handle_jsonrpc_raw(
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
 
-    let Some(id) = request_obj
-        .get("id")
-        .filter(|id| id.is_string() || id.is_number())
-    else {
-        return Ok(runner.handle_jsonrpc_raw(request_json)?);
-    };
     let Some(params) = request_obj.get("params").and_then(Value::as_object) else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
     let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
-    if !should_intercept_tool_call(tool_name) {
-        return Ok(runner.handle_jsonrpc_raw(request_json)?);
-    }
-
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
+    let args_json = serde_json::to_string(&arguments)?;
+    let _activation_fence = crate::activation_epoch::admit_tool_call(tool_name, &args_json)?;
+    let Some(id) = request_obj
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number())
+    else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    if !should_intercept_tool_call(tool_name) {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    }
     let Some(args_obj) = arguments.as_object() else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
@@ -89,8 +99,7 @@ pub fn handle_jsonrpc_raw(
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
 
-    let args_json = serde_json::to_string(&arguments)?;
-    let result_raw = handle_tool_raw(runner, tool_name, &args_json)?;
+    let result_raw = handle_tool_raw_admitted(runner, tool_name, &args_json)?;
     Ok(Some(jsonrpc_result_response(id.clone(), &result_raw)?))
 }
 
@@ -391,6 +400,7 @@ pub(crate) fn handle_index_repository(
             "CBM_PROJECT_NAME_OVERRIDE_REFUSED: project storage identity is derived only from the canonical repository root; remove the name argument and use the project returned by index_repository",
         );
     }
+    let activation_fence = crate::activation_epoch::require_active_generation("index_repository")?;
 
     let search_scale_override = match parse_search_scale_override(args_obj) {
         Ok(value) => value,
@@ -752,6 +762,7 @@ pub(crate) fn handle_index_repository(
                 dial,
                 &sanitized_args,
                 &index_admission_identity,
+                activation_fence.as_ref(),
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => return tool_error_result(error.to_string()),

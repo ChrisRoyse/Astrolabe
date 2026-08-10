@@ -397,6 +397,7 @@ impl ShadowPublication {
         dial: MigrationDial,
         sanitized_index_args: &str,
         index_admission_identity: &ShadowIndexAdmissionIdentity,
+        activation_fence: Option<&crate::activation_epoch::ActivationFence>,
     ) -> Result<ShadowImportOutcome, DynError> {
         let repaired_unchanged_generation =
             self.seed_lower_repair.is_some() && !outcome.publication_required;
@@ -408,6 +409,10 @@ impl ShadowPublication {
             outcome.publication_reason = "seed_lower_repair";
         }
         if !outcome.publication_required {
+            crate::activation_epoch::verify_activation_fence(
+                activation_fence,
+                "shadow_publication_unchanged_commit",
+            )?;
             return self.discard_unchanged(
                 outcome,
                 dial,
@@ -569,6 +574,13 @@ impl ShadowPublication {
             }),
         ) {
             return Err(self.abort_error("validated journal persist", error));
+        }
+
+        if let Err(error) = crate::activation_epoch::verify_activation_fence(
+            activation_fence,
+            "shadow_publication_artifact_commit",
+        ) {
+            return Err(self.abort_error("active generation fence", error));
         }
 
         let live_source = sqlite_path(&self.live_cache, &self.project);

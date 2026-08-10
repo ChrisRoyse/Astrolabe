@@ -100,7 +100,27 @@ struct WatcherIndexArgumentFault {
     evidence: WatcherErrorEvidence,
 }
 
+struct BackgroundLaneReleaseGuard;
+
+impl Drop for BackgroundLaneReleaseGuard {
+    fn drop(&mut self) {
+        match release_background_lane_ownerships() {
+            Ok(released) if released != 0 => tracing::info!(
+                released_background_lane_owners = released,
+                "incremental_watcher.exit_release"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                code = "ASTRO_BACKGROUND_LANE_EXIT_RELEASE_FAILED",
+                error = %error,
+                "incremental_watcher.exit_release_failed"
+            ),
+        }
+    }
+}
+
 pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<(), DynError> {
+    let _lane_release_guard = BackgroundLaneReleaseGuard;
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let runner = Rc::new(CbmToolRunner::new_default()?);
     let callback_runner = Rc::clone(&runner);
@@ -113,8 +133,57 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
     let mut invalid_registration_recovery_observations =
         BTreeMap::<String, InvalidRegistrationRecoveryObservation>::new();
     let mut prior_policy_observation = None::<String>;
+    let mut prior_activation_observation = None::<String>;
 
     while !shutdown.load(Ordering::Relaxed) {
+        // The retained Windows handle behind this fence denies replacement of
+        // active-generation.json for exactly this mutation-capable loop slice.
+        // Activation can therefore commit only between slices, never while an
+        // old generation can still publish watcher state.
+        let activation_fence =
+            crate::activation_epoch::require_active_generation("incremental_watcher_tick");
+        let activation_observation = match &activation_fence {
+            Ok(None) => "workspace".to_string(),
+            Ok(Some(fence)) => format!(
+                "active:{}:{}:{}",
+                fence.epoch, fence.generation_id, fence.record_sha256
+            ),
+            Err(error) => format!("error:{error}"),
+        };
+        let activation_changed =
+            prior_activation_observation.as_deref() != Some(activation_observation.as_str());
+        if activation_changed {
+            let released = release_background_lane_ownerships()?;
+            unwatch_all(&mut watcher, &mut registered)?;
+            invalid_registration_recovery_observations.clear();
+            match &activation_fence {
+                Ok(_) => tracing::info!(
+                    observation = %activation_observation,
+                    released_background_lane_owners = released,
+                    "incremental_watcher.activation_admitted"
+                ),
+                Err(error) => tracing::warn!(
+                    code = "ASTRO_ACTIVE_GENERATION_OBSERVATION_FAILED",
+                    error = %error,
+                    released_background_lane_owners = released,
+                    "incremental_watcher.activation_refused"
+                ),
+            }
+            prior_activation_observation = Some(activation_observation);
+        }
+        let activation_fence = match activation_fence {
+            Ok(fence) => fence,
+            Err(_) => {
+                sleep_watcher_slice(&shutdown);
+                continue;
+            }
+        };
+
+        if shutdown.load(Ordering::Relaxed) {
+            drop(activation_fence);
+            break;
+        }
+
         let policy = read_auto_watch_policy_at(&cache_dir);
         let observation = match &policy {
             Ok(true) => "enabled".to_string(),
@@ -141,8 +210,16 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             prior_policy_observation = Some(observation);
         }
         if !matches!(policy, Ok(true)) {
+            let released = release_background_lane_ownerships()?;
             unwatch_all(&mut watcher, &mut registered)?;
             invalid_registration_recovery_observations.clear();
+            if released != 0 {
+                tracing::info!(
+                    released_background_lane_owners = released,
+                    "incremental_watcher.policy_release"
+                );
+            }
+            drop(activation_fence);
             sleep_watcher_slice(&shutdown);
             continue;
         }
@@ -159,9 +236,13 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             .cloned()
             .collect::<Vec<_>>()
         {
+            let released = release_background_lane_ownership_at(&cache_dir, &stale)?;
             watcher.unwatch(&stale)?;
             registered.remove(&stale);
             invalid_registration_recovery_observations.remove(&stale);
+            if released {
+                tracing::info!(project = %stale, "incremental_watcher.project_lane_released");
+            }
         }
         for registration in discovered {
             if registered.get(&registration.project) == Some(&registration.root) {
@@ -264,6 +345,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 );
             }
         }
+        drop(activation_fence);
         sleep_watcher_slice(&shutdown);
     }
     Ok(())
@@ -962,7 +1044,7 @@ fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistratio
         if root.trim().is_empty() {
             continue;
         }
-        let ownership = match background_lane_status_at(cache_dir, &project) {
+        let ownership = match acquire_background_lane_status_at(cache_dir, &project) {
             Ok(ownership) => ownership,
             Err(error) => {
                 persist_registration_error(

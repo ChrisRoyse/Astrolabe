@@ -17,8 +17,8 @@ use crate::{ResidentJsonrpcFrame, read_jsonrpc_frame};
 
 pub(crate) const INTERNAL_WORKER_ARG: &str = "__astrolabe_mcp_connection_worker_v1";
 
-const PUBLICATION_SCHEMA: &str = "astrolabe.global-mcp-publication.v5";
-const ACTIVATION_SCHEMA: &str = "astrolabe.global-mcp-activation.v3";
+const PUBLICATION_SCHEMA: &str = "astrolabe.global-mcp-publication.v6";
+const ACTIVATION_SCHEMA: &str = "astrolabe.global-mcp-activation.v4";
 const JOURNAL_CONTRACT_SCHEMA: &str = "astrolabe.global-mcp-connection-journal.v1";
 const JOURNAL_RECORD_SCHEMA: &str = "astrolabe.global-mcp-connection-record.v1";
 const MAX_STDERR_TAIL_BYTES: usize = 64 * 1024;
@@ -419,7 +419,25 @@ pub(crate) fn validate_worker_invocation(args: &[String]) -> Result<(), Supervis
             "Preserve the process tree and connection journal; a numeric PID alone never authorizes this worker.",
         ));
     }
-    verify_worker_binding(&generation, &args[4], &args[5])
+    verify_worker_binding(&generation, &args[4], &args[5])?;
+    crate::activation_epoch::register_installed_worker(
+        crate::activation_epoch::InstalledWorkerContext {
+            generation_id: generation.generation_id,
+            generation_path: generation.generation_path,
+            active_generation_path: generation.install_root.join("active-generation.json"),
+            executable_path: generation.executable_path,
+            executable_sha256: args[5].clone(),
+            publication_path: generation.publication_path,
+            publication_sha256: args[4].clone(),
+        },
+    )
+    .map_err(|error| {
+        SupervisorError::new(
+            "ASTRO_MCP_ACTIVE_GENERATION_CONTEXT_FAILED",
+            error,
+            "Preserve the installed generation and connection journal; do not admit mutation or background work without one exact worker activation context.",
+        )
+    })
 }
 
 /// Revalidates the worker's small receipt and physical image metadata without
@@ -454,7 +472,7 @@ fn verify_worker_binding(
         SupervisorError::new(
             "ASTRO_MCP_WORKER_PUBLICATION_JSON_INVALID",
             format!("worker publication receipt is invalid JSON: {error}"),
-            "Preserve the receipt and publish a fresh v5 immutable generation.",
+            "Preserve the receipt and publish a fresh v6 immutable generation.",
         )
     })?;
     require_json_string(&receipt, "/schema", PUBLICATION_SCHEMA)?;
@@ -473,6 +491,16 @@ fn verify_worker_binding(
     )?;
     require_json_string(
         &receipt,
+        "/client_activation/active_generation_schema",
+        crate::activation_epoch::ACTIVE_GENERATION_SCHEMA,
+    )?;
+    require_json_path(
+        &receipt,
+        "/client_activation/active_generation_path",
+        &generation.install_root.join("active-generation.json"),
+    )?;
+    require_json_string(
+        &receipt,
         "/connection_journal/schema",
         JOURNAL_CONTRACT_SCHEMA,
     )?;
@@ -483,7 +511,7 @@ fn verify_worker_binding(
             SupervisorError::new(
                 "ASTRO_MCP_WORKER_ARTIFACT_BYTES_INVALID",
                 "worker publication artifact byte length is absent or invalid",
-                "Preserve the receipt and publish a fresh v5 immutable generation.",
+                "Preserve the receipt and publish a fresh v6 immutable generation.",
             )
         })?;
     let metadata = fs::metadata(&generation.executable_path).map_err(|error| {
@@ -538,7 +566,7 @@ fn verify_publication(
                 "adjacent publication receipt {} could not be read: {error}",
                 generation.publication_path.display()
             ),
-            "Preserve the immutable generation and publish a complete v5 generation before activation.",
+            "Preserve the immutable generation and publish a complete v6 generation before activation.",
         )
     })?;
     let receipt_metadata = fs::metadata(&generation.publication_path).map_err(|error| {
@@ -563,7 +591,7 @@ fn verify_publication(
         SupervisorError::new(
             "ASTRO_MCP_PUBLICATION_JSON_INVALID",
             format!("adjacent publication receipt is not valid JSON: {error}"),
-            "Preserve the invalid receipt and publish a fresh v5 immutable generation.",
+            "Preserve the invalid receipt and publish a fresh v6 immutable generation.",
         )
     })?;
     require_json_string(&receipt, "/schema", PUBLICATION_SCHEMA)?;
@@ -583,6 +611,16 @@ fn verify_publication(
         &receipt,
         "/client_activation/transaction_schema",
         ACTIVATION_SCHEMA,
+    )?;
+    require_json_string(
+        &receipt,
+        "/client_activation/active_generation_schema",
+        crate::activation_epoch::ACTIVE_GENERATION_SCHEMA,
+    )?;
+    require_json_path(
+        &receipt,
+        "/client_activation/active_generation_path",
+        &generation.install_root.join("active-generation.json"),
     )?;
     require_json_string(
         &receipt,
@@ -725,7 +763,7 @@ fn json_string<'a>(document: &'a Value, pointer: &'static str) -> Result<&'a str
             SupervisorError::new(
                 "ASTRO_MCP_PUBLICATION_FIELD_MISSING",
                 format!("publication field {pointer} is absent or not a string"),
-                "Preserve the receipt and publish a complete v5 immutable generation.",
+                "Preserve the receipt and publish a complete v6 immutable generation.",
             )
         })
 }

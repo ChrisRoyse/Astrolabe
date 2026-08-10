@@ -776,8 +776,9 @@ $publishedNomic = @(
 $archaeologyRoot = Join-Path $InstallRoot 'scratch'
 $connectionJournalRoot = Join-Path $InstallRoot 'connections'
 $generationConnectionJournalPath = Join-Path $connectionJournalRoot $generationName
+$activeGenerationPath = Join-Path $InstallRoot 'active-generation.json'
 $publication = [ordered]@{
-    schema = 'astrolabe.global-mcp-publication.v5'
+    schema = 'astrolabe.global-mcp-publication.v6'
     issue = $Issue
     published_at_utc = [DateTime]::UtcNow.ToString('o')
     tree_sha = $ExpectedTreeSha
@@ -844,7 +845,10 @@ $publication = [ordered]@{
     client_activation = [ordered]@{
         status = 'not_attempted'
         required = $true
-        transaction_schema = 'astrolabe.global-mcp-activation.v3'
+        transaction_schema = 'astrolabe.global-mcp-activation.v4'
+        active_generation_schema =
+            'astrolabe.global-mcp-active-generation.v1'
+        active_generation_path = $activeGenerationPath
         activation_script = [IO.Path]::GetFullPath(
             (Join-Path $PSScriptRoot 'activate-global-astrolabe-mcp.ps1')
         )
@@ -901,7 +905,7 @@ $persistedClosureMaterial = @(
         "$([string]$_.name)`t$([uint64]$_.bytes)`t$([string]$_.sha256)"
     }
 ) -join "`n"
-if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v5' -or
+if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v6' -or
     [string]$persistedReceipt.tree_sha -cne $ExpectedTreeSha -or
     [string]$persistedReceipt.artifact.installed_path -cne $finalArtifact -or
     [string]$persistedReceipt.client_activation.status -cne
@@ -913,7 +917,11 @@ if ([string]$persistedReceipt.schema -cne 'astrolabe.global-mcp-publication.v5' 
         'astrolabe' -or
     [bool]$persistedReceipt.client_activation.codex.required -ne $true -or
     [string]$persistedReceipt.client_activation.transaction_schema -cne
-        'astrolabe.global-mcp-activation.v3' -or
+        'astrolabe.global-mcp-activation.v4' -or
+    [string]$persistedReceipt.client_activation.active_generation_schema -cne
+        'astrolabe.global-mcp-active-generation.v1' -or
+    [string]$persistedReceipt.client_activation.active_generation_path -cne
+        $activeGenerationPath -or
     [string]$persistedReceipt.connection_journal.schema -cne
         'astrolabe.global-mcp-connection-journal.v1' -or
     [string]$persistedReceipt.connection_journal.root -cne

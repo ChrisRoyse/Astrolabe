@@ -18,6 +18,8 @@ use tracing::level_filters::LevelFilter;
 
 mod migration;
 
+mod activation_epoch;
+
 mod connection_supervisor;
 
 mod installer_cleanup;
@@ -351,8 +353,21 @@ fn print_usage() {
 
 fn run_server() -> Result<i32, DynError> {
     let _watchdog = ParentWatchdog::start();
-    let _verify_chain_loop = VerifyChainLoop::start()?;
-    let _incremental_watcher_loop = IncrementalWatcherLoop::start();
+    let activation = activation_epoch::observe_worker_activation()?;
+    let background_eligible = matches!(
+        activation,
+        activation_epoch::WorkerActivation::Workspace
+            | activation_epoch::WorkerActivation::Active(_)
+    );
+    tracing::info!(
+        activation = %serde_json::to_string(&activation_epoch::activation_status_json()?)?,
+        background_eligible,
+        "server.activation_epoch"
+    );
+    let _verify_chain_loop = background_eligible
+        .then(VerifyChainLoop::start)
+        .transpose()?;
+    let _incremental_watcher_loop = background_eligible.then(IncrementalWatcherLoop::start);
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
     serve_resident_jsonrpc(&runner)?;
@@ -1376,6 +1391,16 @@ impl VerifyChainLoop {
                         break;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if let Err(error) =
+                    activation_epoch::require_active_generation("periodic_verify_chain_tick")
+                {
+                    tracing::warn!(
+                        code = "ASTRO_INSTALLED_GENERATION_RETIRED",
+                        error = %error,
+                        "verify_chain_loop.retired"
+                    );
+                    break;
                 }
                 match migration::periodic_verify_chain_tick() {
                     Ok(report) => {

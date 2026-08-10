@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Publication and activation are separate durable transactions. This command accepts only an
-    immutable astrolabe.global-mcp-publication.v5 receipt whose artifact and Nomic runtime-data
+    immutable astrolabe.global-mcp-publication.v6 receipt whose artifact and Nomic runtime-data
     bytes still match its receipt and whose frozen tree matches the live issue-owned launcher
     generation.
 
@@ -467,6 +467,8 @@ function Assert-ActivationCompletionReadback {
         [Parameter(Mandatory)][string]$ExpectedNomicDirectoryFileId,
         [Parameter(Mandatory)][string]$ExpectedCodexSha256,
         [Parameter(Mandatory)][string]$ExpectedClaudeSha256,
+        [Parameter(Mandatory)][string]$ExpectedActiveGenerationPath,
+        [Parameter(Mandatory)][string]$ExpectedActiveGenerationSha256,
         [Parameter(Mandatory)][string]$ExpectedConnectionJournalRoot,
         [Parameter(Mandatory)][string]$ExpectedGenerationConnectionJournalPath
     )
@@ -474,16 +476,18 @@ function Assert-ActivationCompletionReadback {
     $runtime = $Completion['runtime']
     $codex = $Completion['codex']
     $claude = $Completion['claude_code']
+    $activeGeneration = $Completion['active_generation']
     if ($runtime -isnot [System.Collections.IDictionary] -or
         $codex -isnot [System.Collections.IDictionary] -or
         $claude -isnot [System.Collections.IDictionary] -or
+        $activeGeneration -isnot [System.Collections.IDictionary] -or
         -not $runtime.Contains('archaeology_root') -or
         $runtime['archaeology_root'] -isnot [System.Collections.IDictionary] -or
         -not $runtime.Contains('nomic_runtime_data_directory') -or
         $runtime['nomic_runtime_data_directory'] -isnot
             [System.Collections.IDictionary] -or
         [string]$Completion['schema'] -cne
-            'astrolabe.global-mcp-activation.v3' -or
+            'astrolabe.global-mcp-activation.v4' -or
         [string]$Completion['verdict'] -cne 'activated' -or
         [string]$runtime['archaeology_root']['path'] -cne
             $ExpectedArchaeologyRoot -or
@@ -492,7 +496,11 @@ function Assert-ActivationCompletionReadback {
         [string]$runtime['nomic_runtime_data_directory']['file_id'] -cne
             $ExpectedNomicDirectoryFileId -or
         [string]$codex['after_sha256'] -cne $ExpectedCodexSha256 -or
-        [string]$claude['after_sha256'] -cne $ExpectedClaudeSha256) {
+        [string]$claude['after_sha256'] -cne $ExpectedClaudeSha256 -or
+        [string]$activeGeneration['path'] -cne
+            $ExpectedActiveGenerationPath -or
+        [string]$activeGeneration['sha256'] -cne
+            $ExpectedActiveGenerationSha256) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
             "$Description differs from physical runtime/config readback" `
             'preserve the transaction and both configs; do not claim global activation'
@@ -510,6 +518,146 @@ function Assert-ActivationCompletionReadback {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_COMPLETION_MISMATCH' `
             "$Description lacks the exact fail-closed connection-journal contract" `
             'preserve the transaction and both configs; do not claim global activation'
+    }
+}
+
+function Get-ValidatedActiveGenerationEpoch {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Record,
+        [Parameter(Mandatory)][string]$ExpectedAuthorityPath,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $epochValue = $Record['activation_epoch']
+    $epoch = [uint64]0
+    $epochConversionError = $null
+    if ($null -eq $epochValue -or $epochValue -is [string] -or
+        $epochValue -is [bool]) {
+        $epochConversionError = 'activation_epoch is absent or is not a JSON number'
+    }
+    else {
+        try {
+            $epoch = [Convert]::ToUInt64(
+                $epochValue,
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+            if ([decimal]$epochValue -ne [decimal]$epoch) {
+                $epochConversionError = 'activation_epoch is not an integral UInt64 value'
+            }
+        }
+        catch {
+            $epochConversionError = $_.Exception.Message
+        }
+    }
+    $generation = $Record['generation']
+    $publication = $Record['publication']
+    $artifact = $Record['artifact']
+    $codex = $Record['codex']
+    $claude = $Record['claude_code']
+    $issueValid = $false
+    $issueValue = $Record['issue']
+    if ($null -ne $issueValue -and $issueValue -isnot [string] -and
+        $issueValue -isnot [bool]) {
+        try {
+            $issueNumber = [Convert]::ToInt32(
+                $issueValue,
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+            $issueValid = $issueNumber -gt 0 -and
+                [decimal]$issueValue -eq [decimal]$issueNumber
+        }
+        catch { $issueValid = $false }
+    }
+    $artifactBytesValid = $false
+    $artifactBytesValue = if ($artifact -is
+            [System.Collections.IDictionary]) {
+        $artifact['bytes']
+    }
+    else { $null }
+    if ($null -ne $artifactBytesValue -and
+        $artifactBytesValue -isnot [string] -and
+        $artifactBytesValue -isnot [bool]) {
+        try {
+            $artifactBytes = [Convert]::ToUInt64(
+                $artifactBytesValue,
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+            $artifactBytesValid = $artifactBytes -gt 0 -and
+                [decimal]$artifactBytesValue -eq [decimal]$artifactBytes
+        }
+        catch { $artifactBytesValid = $false }
+    }
+    if ([string]$Record['schema'] -cne
+            'astrolabe.global-mcp-active-generation.v1' -or
+        [string]$Record['authority_path'] -cne $ExpectedAuthorityPath -or
+        $null -ne $epochConversionError -or
+        $epoch -eq 0 -or
+        [string]::IsNullOrWhiteSpace([string]$Record['transaction_id']) -or
+        -not $issueValid -or
+        [string]$Record['tree_sha'] -cnotmatch '^[0-9a-f]{40}$' -or
+        $generation -isnot [System.Collections.IDictionary] -or
+        [string]::IsNullOrWhiteSpace([string]$generation['id']) -or
+        [string]::IsNullOrWhiteSpace([string]$generation['path']) -or
+        $publication -isnot [System.Collections.IDictionary] -or
+        [string]::IsNullOrWhiteSpace([string]$publication['path']) -or
+        [string]$publication['sha256'] -cnotmatch '^[0-9a-f]{64}$' -or
+        $artifact -isnot [System.Collections.IDictionary] -or
+        [string]::IsNullOrWhiteSpace([string]$artifact['path']) -or
+        -not $artifactBytesValid -or
+        [string]$artifact['sha256'] -cnotmatch '^[0-9a-f]{64}$' -or
+        $codex -isnot [System.Collections.IDictionary] -or
+        [string]::IsNullOrWhiteSpace([string]$codex['config_path']) -or
+        [string]$codex['after_sha256'] -cnotmatch '^[0-9a-f]{64}$' -or
+        $claude -isnot [System.Collections.IDictionary] -or
+        [string]::IsNullOrWhiteSpace([string]$claude['config_path']) -or
+        [string]$claude['after_sha256'] -cnotmatch '^[0-9a-f]{64}$') {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ACTIVE_RECORD_INVALID' `
+            "$Description is not one complete active-generation-v1 authority (epoch_error=$epochConversionError)" `
+            'preserve the exact authority bytes and reconcile the prior activation before continuing'
+    }
+    return $epoch
+}
+
+function Assert-ActiveGenerationReadback {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Record,
+        [Parameter(Mandatory)][string]$ExpectedAuthorityPath,
+        [Parameter(Mandatory)][uint64]$ExpectedEpoch,
+        [Parameter(Mandatory)][string]$ExpectedTransactionId,
+        [Parameter(Mandatory)][string]$ExpectedGenerationId,
+        [Parameter(Mandatory)][string]$ExpectedGenerationPath,
+        [Parameter(Mandatory)][string]$ExpectedPublicationPath,
+        [Parameter(Mandatory)][string]$ExpectedPublicationSha256,
+        [Parameter(Mandatory)][string]$ExpectedArtifactPath,
+        [Parameter(Mandatory)][uint64]$ExpectedArtifactBytes,
+        [Parameter(Mandatory)][string]$ExpectedArtifactSha256,
+        [Parameter(Mandatory)][string]$ExpectedCodexPath,
+        [Parameter(Mandatory)][string]$ExpectedCodexSha256,
+        [Parameter(Mandatory)][string]$ExpectedClaudePath,
+        [Parameter(Mandatory)][string]$ExpectedClaudeSha256,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $epoch = Get-ValidatedActiveGenerationEpoch `
+        $Record $ExpectedAuthorityPath $Description
+    if ($epoch -ne $ExpectedEpoch -or
+        [string]$Record['transaction_id'] -cne $ExpectedTransactionId -or
+        [string]$Record['generation']['id'] -cne $ExpectedGenerationId -or
+        [string]$Record['generation']['path'] -cne $ExpectedGenerationPath -or
+        [string]$Record['publication']['path'] -cne $ExpectedPublicationPath -or
+        [string]$Record['publication']['sha256'] -cne
+            $ExpectedPublicationSha256 -or
+        [string]$Record['artifact']['path'] -cne $ExpectedArtifactPath -or
+        [uint64]$Record['artifact']['bytes'] -ne $ExpectedArtifactBytes -or
+        [string]$Record['artifact']['sha256'] -cne $ExpectedArtifactSha256 -or
+        [string]$Record['codex']['config_path'] -cne $ExpectedCodexPath -or
+        [string]$Record['codex']['after_sha256'] -cne $ExpectedCodexSha256 -or
+        [string]$Record['claude_code']['config_path'] -cne $ExpectedClaudePath -or
+        [string]$Record['claude_code']['after_sha256'] -cne
+            $ExpectedClaudeSha256) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ACTIVE_RECORD_MISMATCH' `
+            "$Description differs from the exact generation/publication/artifact/config authority" `
+            'preserve the active authority and transaction; do not claim activation'
     }
 }
 
@@ -1117,6 +1265,16 @@ $codexReplacementBackupPath = $null
 $claudeReplacementBackupPath = $null
 $codexVerdictLease = $null
 $claudeVerdictLease = $null
+$activeGenerationBefore = $null
+$activeGenerationPath = $null
+$activeGenerationEpoch = [uint64]0
+$activeGenerationCommitAttempted = $false
+$activeGenerationCommitted = $false
+$activeGenerationCommitUnevaluable = $false
+$activeGenerationCommitStage = $null
+$activeGenerationBackup = $null
+$activeGenerationReplacementBackupPath = $null
+$activeGenerationVerdictLease = $null
 $completionPath = $null
 $completionSha256 = $null
 $completionPublished = $false
@@ -1179,14 +1337,14 @@ try {
     }
     $receiptText = Read-AstroUtf8FileLongPath $receiptPath
     $receipt = Get-StrictJsonHashtable $receiptText 'immutable publication receipt'
-    if ([string]$receipt['schema'] -cne 'astrolabe.global-mcp-publication.v5' -or
+    if ([string]$receipt['schema'] -cne 'astrolabe.global-mcp-publication.v6' -or
         [string]$receipt['tree_sha'] -cne $ExpectedTreeSha -or
         [string]$receipt['client_activation']['status'] -cne 'not_attempted' -or
         [bool]$receipt['client_activation']['required'] -ne $true -or
         [string]$receipt['client_activation']['server_name'] -cne 'astrolabe') {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_RECEIPT_INVALID' `
             'publication receipt schema/tree/activation contract does not authorize activation' `
-            'publish one v5 immutable generation from this exact tree before activation'
+            'publish one v6 immutable generation from this exact tree before activation'
     }
     $artifactPath = [IO.Path]::GetFullPath(
         [string]$receipt['artifact']['installed_path']
@@ -1209,18 +1367,33 @@ try {
         -not $environment.Contains('ASTRO_ARCHAEOLOGY_ROOT')) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ENVIRONMENT_INVALID' `
             'publication activation environment is not the exact one-variable archaeology contract' `
-            'publish one v5 generation with exactly ASTRO_ARCHAEOLOGY_ROOT'
+            'publish one v6 generation with exactly ASTRO_ARCHAEOLOGY_ROOT'
     }
     $archaeologyRootRaw = [string]$environment['ASTRO_ARCHAEOLOGY_ROOT']
     $archaeologyRoot = [IO.Path]::GetFullPath($archaeologyRootRaw)
     $installRoot = [IO.Path]::GetFullPath(
         (Split-Path -Parent (Split-Path -Parent $generationPath))
     )
+    $activeGenerationPath = [IO.Path]::GetFullPath(
+        [string]$receipt['client_activation']['active_generation_path']
+    )
+    $expectedActiveGenerationPath = [IO.Path]::GetFullPath(
+        (Join-Path $installRoot 'active-generation.json')
+    )
+    if ([string]$receipt['client_activation']['transaction_schema'] -cne
+            'astrolabe.global-mcp-activation.v4' -or
+        [string]$receipt['client_activation']['active_generation_schema'] -cne
+            'astrolabe.global-mcp-active-generation.v1' -or
+        $activeGenerationPath -cne $expectedActiveGenerationPath) {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_EPOCH_CONTRACT_INVALID' `
+            'publication receipt does not bind the fixed active-generation-v1 authority and activation-v4 transaction' `
+            'publish one v6 generation with the current activation epoch contract'
+    }
     $connectionJournal = $receipt['connection_journal']
     if ($connectionJournal -isnot [System.Collections.IDictionary]) {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CONNECTION_JOURNAL_INVALID' `
             'publication receipt connection_journal is absent or not an object' `
-            'publish one v5 immutable generation with the current connection-supervisor contract'
+            'publish one v6 immutable generation with the current connection-supervisor contract'
     }
     $connectionJournalRoot = [IO.Path]::GetFullPath(
         [string]$connectionJournal['root']
@@ -1247,10 +1420,10 @@ try {
         [bool]$connectionJournal['retry_permitted'] -ne $false -or
         [bool]$connectionJournal['server_substitution_permitted'] -ne $false -or
         [string]$receipt['client_activation']['transaction_schema'] -cne
-            'astrolabe.global-mcp-activation.v3') {
+            'astrolabe.global-mcp-activation.v4') {
         Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_CONNECTION_JOURNAL_INVALID' `
-            'publication receipt does not bind the exact install-owned v1 connection journal and v3 activation contract' `
-            'publish one v5 immutable generation with the current connection-supervisor contract'
+            'publication receipt does not bind the exact install-owned v1 connection journal and v4 activation contract' `
+            'publish one v6 immutable generation with the current connection-supervisor contract'
     }
     $expectedArchaeologyRoot = [IO.Path]::GetFullPath(
         (Join-Path $installRoot 'scratch')
@@ -1392,7 +1565,8 @@ try {
 
     $mutexMaterial = @(
         $CodexConfigPath.ToLowerInvariant(),
-        $ClaudeConfigPath.ToLowerInvariant()
+        $ClaudeConfigPath.ToLowerInvariant(),
+        $activeGenerationPath.ToLowerInvariant()
     ) -join "`n"
     $mutexName = 'Global\Astrolabe.GlobalMcpActivation.' +
         (Get-StringSha256 $mutexMaterial)
@@ -1408,6 +1582,34 @@ try {
 
     $codexBefore = Read-ConfigSnapshot $CodexConfigPath 'Codex user configuration'
     $claudeBefore = Read-ConfigSnapshot $ClaudeConfigPath 'Claude user configuration'
+    $activeGenerationState = Get-AstroPathEntryState $activeGenerationPath
+    if ($activeGenerationState.State -ceq 'absent') {
+        $activeGenerationEpoch = [uint64]1
+    }
+    elseif ($activeGenerationState.State -ceq 'present' -and
+        ($activeGenerationState.Attributes -band
+            [IO.FileAttributes]::Directory) -eq 0 -and
+        ($activeGenerationState.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        $activeGenerationBefore = Read-ConfigSnapshot `
+            $activeGenerationPath 'prior active-generation authority'
+        $priorActiveRecord = Get-StrictJsonHashtable `
+            $activeGenerationBefore.text 'prior active-generation authority'
+        $priorEpoch = Get-ValidatedActiveGenerationEpoch `
+            $priorActiveRecord $activeGenerationPath `
+            'prior active-generation authority'
+        if ($priorEpoch -eq [uint64]::MaxValue) {
+            Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_EPOCH_EXHAUSTED' `
+                'prior active-generation epoch is UInt64.MaxValue' `
+                'preserve the authority and define a new explicit epoch schema before another activation'
+        }
+        $activeGenerationEpoch = [uint64]($priorEpoch + 1)
+    }
+    else {
+        Fail-AstroGlobalActivation 'ASTRO_GLOBAL_ACTIVATION_ACTIVE_RECORD_UNAVAILABLE' `
+            "active-generation authority is neither absent nor one ordinary file: $activeGenerationPath (state=$($activeGenerationState.State); attributes=$($activeGenerationState.Attributes); error=$($activeGenerationState.Error))" `
+            'preserve the entry and repair the exact active-generation authority before activation'
+    }
     $archaeologyBefore = Get-AstroPathEntryState $archaeologyRoot
     if ($archaeologyBefore.State -notin @('absent', 'present') -or
         ($archaeologyBefore.State -ceq 'present' -and
@@ -1430,6 +1632,8 @@ try {
         $transactionPath 'codex.replaced-original.toml'
     $claudeReplacementBackupPath = Join-Path `
         $transactionPath 'claude.replaced-original.json'
+    $activeGenerationReplacementBackupPath = Join-Path `
+        $transactionPath 'active-generation.replaced-original.json'
     Write-NewDurableBytes $codexBeforePath $codexBefore.bytes_value
     Write-NewDurableBytes $claudeBeforePath $claudeBefore.bytes_value
     $intent = [ordered]@{
@@ -1448,6 +1652,22 @@ try {
             receipt_sha256 = $receiptHash
             publication_issue = [int]$receipt['issue']
             generation_path = $generationPath
+        }
+        active_generation = [ordered]@{
+            authority_path = $activeGenerationPath
+            before_state = [string]$activeGenerationState.State
+            before_bytes = $(if ($null -eq $activeGenerationBefore) {
+                    [uint64]0
+                } else { $activeGenerationBefore.bytes })
+            before_sha256 = $(if ($null -eq $activeGenerationBefore) {
+                    $null
+                } else { $activeGenerationBefore.sha256 })
+            before_file_id = $(if ($null -eq $activeGenerationBefore) {
+                    $null
+                } else { $activeGenerationBefore.file_id })
+            candidate_epoch = $activeGenerationEpoch
+            replacement_backup_path =
+                $activeGenerationReplacementBackupPath
         }
         artifact = [ordered]@{
             path = $artifactPath
@@ -1523,8 +1743,65 @@ try {
     Write-NewDurableText $claudeCommitStagePath $claudeCandidate.text
     $claudeCommitStage = Read-ConfigSnapshot `
         $claudeCommitStagePath 'Claude activation commit stage'
+    $activeGenerationCandidatePath = Join-Path `
+        $transactionPath 'active-generation.candidate.json'
+    $activeGenerationCommitStagePath = Join-Path `
+        $transactionPath 'active-generation.commit-stage.json'
+    $activeGenerationRecord = [ordered]@{
+        schema = 'astrolabe.global-mcp-active-generation.v1'
+        authority_path = $activeGenerationPath
+        activation_epoch = $activeGenerationEpoch
+        transaction_id = $transactionId
+        activated_at_utc = [DateTime]::UtcNow.ToString('o')
+        issue = $Issue
+        tree_sha = $ExpectedTreeSha
+        generation = [ordered]@{
+            id = [string]$receipt['generation']['id']
+            path = $generationPath
+        }
+        publication = [ordered]@{
+            path = $receiptPath
+            sha256 = $receiptHash
+        }
+        artifact = [ordered]@{
+            path = $artifactPath
+            bytes = $artifactBytes
+            sha256 = $artifactHash
+        }
+        codex = [ordered]@{
+            config_path = $CodexConfigPath
+            after_sha256 = $codexCommitStage.sha256
+        }
+        claude_code = [ordered]@{
+            config_path = $ClaudeConfigPath
+            after_sha256 = $claudeCommitStage.sha256
+        }
+        commit_protocol =
+            'monotonic epoch; candidate-first; configs committed and read back before fixed authority; authority ReplaceFileW or first-generation MoveFileExW no-replace; exact hash readback and retained no-write/delete verdict lease through completion'
+    }
+    Write-NewDurableJson $activeGenerationCandidatePath `
+        $activeGenerationRecord
+    $activeGenerationCandidate = Read-ConfigSnapshot `
+        $activeGenerationCandidatePath `
+        'active-generation activation candidate'
+    Write-NewDurableBytes $activeGenerationCommitStagePath `
+        $activeGenerationCandidate.bytes_value
+    $activeGenerationCommitStage = Read-ConfigSnapshot `
+        $activeGenerationCommitStagePath `
+        'active-generation activation commit stage'
+    $activeGenerationCandidateReadback = Get-StrictJsonHashtable `
+        $activeGenerationCommitStage.text `
+        'active-generation activation candidate readback'
+    Assert-ActiveGenerationReadback `
+        $activeGenerationCandidateReadback $activeGenerationPath `
+        $activeGenerationEpoch $transactionId `
+        ([string]$receipt['generation']['id']) $generationPath `
+        $receiptPath $receiptHash $artifactPath $artifactBytes $artifactHash `
+        $CodexConfigPath $codexCommitStage.sha256 `
+        $ClaudeConfigPath $claudeCommitStage.sha256 `
+        'active-generation activation candidate readback'
     $candidateRecord = [ordered]@{
-        schema = 'astrolabe.global-mcp-activation-candidates.v2'
+        schema = 'astrolabe.global-mcp-activation-candidates.v3'
         transaction_id = $transactionId
         intent_sha256 = Get-FileSha256 (Join-Path $transactionPath 'intent.json')
         created_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1550,6 +1827,16 @@ try {
             semantic_readback =
                 'user mcpServers.astrolabe stdio/exact-command/empty-args/exact-ASTRO_ARCHAEOLOGY_ROOT'
         }
+        active_generation = [ordered]@{
+            path = $activeGenerationCandidatePath
+            bytes = $activeGenerationCandidate.bytes
+            sha256 = $activeGenerationCandidate.sha256
+            commit_stage_path = $activeGenerationCommitStagePath
+            commit_stage_file_id = $activeGenerationCommitStage.file_id
+            activation_epoch = $activeGenerationEpoch
+            authority_path = $activeGenerationPath
+            prior_state = [string]$activeGenerationState.State
+        }
     }
     Write-NewDurableJson (Join-Path $transactionPath 'candidates.json') $candidateRecord
 
@@ -1565,6 +1852,39 @@ try {
     Assert-SnapshotEquals $claudeCommitStage `
         (Read-ConfigSnapshot $claudeCommitStagePath 'Claude commit-stage readback') `
         'ASTRO_GLOBAL_ACTIVATION_CLAUDE_STAGE_DRIFT' 'Claude commit stage'
+    Assert-SnapshotEquals $activeGenerationCommitStage `
+        (Read-ConfigSnapshot $activeGenerationCommitStagePath `
+            'active-generation commit-stage readback') `
+        'ASTRO_GLOBAL_ACTIVATION_ACTIVE_STAGE_DRIFT' `
+        'active-generation commit stage'
+    $activeGenerationPrecommitState = Get-AstroPathEntryState `
+        $activeGenerationPath
+    if ($null -eq $activeGenerationBefore) {
+        if ($activeGenerationPrecommitState.State -cne 'absent') {
+            Fail-AstroGlobalActivation `
+                'ASTRO_GLOBAL_ACTIVATION_ACTIVE_CONCURRENT_DRIFT' `
+                "active-generation authority changed from absent before commit (state=$($activeGenerationPrecommitState.State); attributes=$($activeGenerationPrecommitState.Attributes); error=$($activeGenerationPrecommitState.Error))" `
+                'preserve the transaction and reconcile the concurrent activation before retrying from fresh snapshots'
+        }
+    }
+    elseif ($activeGenerationPrecommitState.State -cne 'present' -or
+        ($activeGenerationPrecommitState.Attributes -band
+            [IO.FileAttributes]::Directory) -ne 0 -or
+        ($activeGenerationPrecommitState.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail-AstroGlobalActivation `
+            'ASTRO_GLOBAL_ACTIVATION_ACTIVE_CONCURRENT_DRIFT' `
+            "active-generation authority stopped being one ordinary file before commit (state=$($activeGenerationPrecommitState.State); attributes=$($activeGenerationPrecommitState.Attributes); error=$($activeGenerationPrecommitState.Error))" `
+            'preserve the transaction and reconcile the concurrent activation before retrying from fresh snapshots'
+    }
+    else {
+        $activeGenerationPrecommit = Read-ConfigSnapshot `
+            $activeGenerationPath 'active-generation precommit readback'
+        Assert-SnapshotEquals $activeGenerationBefore `
+            $activeGenerationPrecommit `
+            'ASTRO_GLOBAL_ACTIVATION_ACTIVE_CONCURRENT_DRIFT' `
+            'active-generation authority before commit'
+    }
 
     $codexCommitAttempted = $true
     [AstroLauncherLockNative]::ReplaceFilePreserveMetadata(
@@ -1662,8 +1982,56 @@ try {
         'Claude config before terminal verdict'
     $claudeAfter = $claudeVerdictLease.snapshot
 
+    $activeGenerationCommitAttempted = $true
+    if ($null -eq $activeGenerationBefore) {
+        [AstroLauncherLockNative]::MoveFileWriteThroughNoReplace(
+            $activeGenerationCommitStagePath,
+            $activeGenerationPath
+        )
+    }
+    else {
+        [AstroLauncherLockNative]::ReplaceFilePreserveMetadata(
+            $activeGenerationPath,
+            $activeGenerationCommitStagePath,
+            $activeGenerationReplacementBackupPath
+        )
+    }
+    $activeGenerationCommitted = $true
+    Flush-ExistingDurableFile `
+        $activeGenerationPath 'active-generation activation authority'
+    if ($null -ne $activeGenerationBefore) {
+        $activeGenerationBackup = Read-ConfigSnapshot `
+            $activeGenerationReplacementBackupPath `
+            'active-generation replacement backup'
+        Assert-SnapshotEquals $activeGenerationBefore $activeGenerationBackup `
+            'ASTRO_GLOBAL_ACTIVATION_ACTIVE_BACKUP_MISMATCH' `
+            'active-generation replacement backup'
+    }
+    $activeGenerationAfter = Read-ConfigSnapshot `
+        $activeGenerationPath 'active-generation activation readback'
+    Assert-SnapshotEquals $activeGenerationCommitStage $activeGenerationAfter `
+        'ASTRO_GLOBAL_ACTIVATION_ACTIVE_READBACK_MISMATCH' `
+        'active-generation authority after replacement'
+    $activeGenerationFinalReadback = Get-StrictJsonHashtable `
+        $activeGenerationAfter.text 'active-generation activation readback'
+    Assert-ActiveGenerationReadback `
+        $activeGenerationFinalReadback $activeGenerationPath `
+        $activeGenerationEpoch $transactionId `
+        ([string]$receipt['generation']['id']) $generationPath `
+        $receiptPath $receiptHash $artifactPath $artifactBytes $artifactHash `
+        $CodexConfigPath $codexAfter.sha256 `
+        $ClaudeConfigPath $claudeAfter.sha256 `
+        'active-generation activation readback'
+    $activeGenerationVerdictLease = Open-ConfigVerdictLease `
+        $activeGenerationPath 'active-generation activation verdict lease'
+    Assert-SnapshotEquals $activeGenerationAfter `
+        $activeGenerationVerdictLease.snapshot `
+        'ASTRO_GLOBAL_ACTIVATION_ACTIVE_VERDICT_DRIFT' `
+        'active-generation authority before terminal verdict'
+    $activeGenerationAfter = $activeGenerationVerdictLease.snapshot
+
     $completion = [ordered]@{
-        schema = 'astrolabe.global-mcp-activation.v3'
+        schema = 'astrolabe.global-mcp-activation.v4'
         verdict = 'activated'
         transaction_id = $transactionId
         completed_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1676,6 +2044,28 @@ try {
             path = $artifactPath
             bytes = $artifactBytes
             sha256 = $artifactHash
+        }
+        active_generation = [ordered]@{
+            schema = 'astrolabe.global-mcp-active-generation.v1'
+            path = $activeGenerationPath
+            activation_epoch = $activeGenerationEpoch
+            bytes = $activeGenerationAfter.bytes
+            sha256 = $activeGenerationAfter.sha256
+            file_id = $activeGenerationAfter.file_id
+            prior_state = [string]$activeGenerationState.State
+            replacement_backup_path = $(if ($null -eq $activeGenerationBefore) {
+                    $null
+                } else { $activeGenerationReplacementBackupPath })
+            replacement_backup_sha256 = $(if ($null -eq $activeGenerationBefore) {
+                    $null
+                } else { $activeGenerationBackup.sha256 })
+            verdict_lease_acquired_at_utc =
+                $activeGenerationVerdictLease.acquired_at_utc
+            verdict_lease_policy =
+                'read-share-only; write-and-delete-denied-through-completion'
+            commit_stage_absent =
+                -not (Test-AstroPathLongPath `
+                    -LiteralPath $activeGenerationCommitStagePath)
         }
         runtime = [ordered]@{
             archaeology_root = [ordered]@{
@@ -1748,6 +2138,7 @@ try {
             $archaeologyRoot,
             $connectionJournalRoot,
             $generationConnectionJournalPath,
+            $activeGenerationPath,
             $CodexConfigPath,
             $ClaudeConfigPath
         )
@@ -1762,6 +2153,7 @@ try {
         $completionReadback 'durable activation completion stage record' `
         $archaeologyRoot ([string]$runtimeData['sha256']) `
         $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256 `
+        $activeGenerationPath $activeGenerationAfter.sha256 `
         $connectionJournalRoot $generationConnectionJournalPath
     $completionSha256 = Get-FileSha256 $completionStagePath
     [AstroLauncherLockNative]::MoveFileWriteThroughNoReplace(
@@ -1781,6 +2173,7 @@ try {
         $completionFinalReadback 'published activation completion record' `
         $archaeologyRoot ([string]$runtimeData['sha256']) `
         $nomicDirectoryReadback.file_id $codexAfter.sha256 $claudeAfter.sha256 `
+        $activeGenerationPath $activeGenerationAfter.sha256 `
         $connectionJournalRoot $generationConnectionJournalPath
 
     [ordered]@{
@@ -1792,6 +2185,13 @@ try {
         tree_sha = $ExpectedTreeSha
         artifact_path = $artifactPath
         artifact_sha256 = $artifactHash
+        active_generation = [ordered]@{
+            path = $activeGenerationPath
+            activation_epoch = $activeGenerationEpoch
+            bytes = $activeGenerationAfter.bytes
+            sha256 = $activeGenerationAfter.sha256
+            file_id = $activeGenerationAfter.file_id
+        }
         runtime = [ordered]@{
             archaeology_root = $archaeologyRoot
             archaeology_root_file_id = $archaeologyReadback.file_id
@@ -1823,12 +2223,54 @@ try {
 }
 catch {
     $original = $_.Exception
+    Close-ConfigVerdictLease $activeGenerationVerdictLease
+    $activeGenerationVerdictLease = $null
     Close-ConfigVerdictLease $claudeVerdictLease
     $claudeVerdictLease = $null
     Close-ConfigVerdictLease $codexVerdictLease
     $codexVerdictLease = $null
     if ($null -ne $transactionPath) {
-        if (-not $completionPublished) {
+        if ($activeGenerationCommitAttempted -and
+            -not $activeGenerationCommitted) {
+            try {
+                $activeFaultState = Get-AstroPathEntryState `
+                    $activeGenerationPath
+                if ($activeFaultState.State -ceq 'present' -and
+                    ($activeFaultState.Attributes -band
+                        [IO.FileAttributes]::Directory) -eq 0 -and
+                    ($activeFaultState.Attributes -band
+                        [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    $activeFaultSnapshot = Read-ConfigSnapshot `
+                        $activeGenerationPath `
+                        'active-generation ambiguous commit readback'
+                    if (Test-SnapshotEquals `
+                            $activeGenerationCommitStage `
+                            $activeFaultSnapshot) {
+                        $activeGenerationCommitted = $true
+                    }
+                    elseif ($null -eq $activeGenerationBefore -or
+                        -not (Test-SnapshotEquals `
+                            $activeGenerationBefore `
+                            $activeFaultSnapshot)) {
+                        $activeGenerationCommitUnevaluable = $true
+                    }
+                }
+                elseif ($activeFaultState.State -cne 'absent' -or
+                    $null -ne $activeGenerationBefore) {
+                    $activeGenerationCommitUnevaluable = $true
+                }
+            }
+            catch {
+                $activeGenerationCommitUnevaluable = $true
+                $rollback.Add([ordered]@{
+                        role = 'active_generation'
+                        verdict = 'unevaluable'
+                        error = $_.Exception.Message
+                    })
+            }
+        }
+        if (-not $activeGenerationCommitted -and
+            -not $activeGenerationCommitUnevaluable) {
             if ($claudeCommitAttempted -and $null -ne $claudeBefore) {
                 try {
                     $outcome = Restore-ConfigIfOwned `
@@ -1869,15 +2311,30 @@ catch {
         $finalStates = [ordered]@{}
         foreach ($entry in @(
                 [pscustomobject]@{ role = 'codex'; path = $CodexConfigPath },
-                [pscustomobject]@{ role = 'claude_code'; path = $ClaudeConfigPath }
+                [pscustomobject]@{ role = 'claude_code'; path = $ClaudeConfigPath },
+                [pscustomobject]@{
+                    role = 'active_generation'
+                    path = $activeGenerationPath
+                }
             )) {
             try {
-                $snapshot = Read-ConfigSnapshot $entry.path "$($entry.role) fault readback"
-                $finalStates[$entry.role] = [ordered]@{
-                    path = $snapshot.path
-                    bytes = $snapshot.bytes
-                    sha256 = $snapshot.sha256
-                    file_id = $snapshot.file_id
+                $entryState = Get-AstroPathEntryState $entry.path
+                if ($entryState.State -ceq 'absent') {
+                    $finalStates[$entry.role] = [ordered]@{
+                        path = $entry.path
+                        state = 'absent'
+                    }
+                }
+                else {
+                    $snapshot = Read-ConfigSnapshot `
+                        $entry.path "$($entry.role) fault readback"
+                    $finalStates[$entry.role] = [ordered]@{
+                        path = $snapshot.path
+                        state = 'present'
+                        bytes = $snapshot.bytes
+                        sha256 = $snapshot.sha256
+                        file_id = $snapshot.file_id
+                    }
                 }
             }
             catch {
@@ -1889,10 +2346,12 @@ catch {
             }
         }
         $fault = [ordered]@{
-            schema = $(if ($completionPublished) {
+            schema = $(if ($completionPublished -or
+                    $activeGenerationCommitted) {
                     'astrolabe.global-mcp-activation-completion-readback-fault.v1'
                 } else { 'astrolabe.global-mcp-activation-fault.v1' })
-            verdict = $(if ($completionPublished) {
+            verdict = $(if ($completionPublished -or
+                    $activeGenerationCommitted) {
                     'activated_terminal_readback_fault'
                 } else { 'not_activated' })
             recorded_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -1903,6 +2362,17 @@ catch {
                         sha256 = $completionSha256
                     }
                 } else { $null })
+            active_generation = [ordered]@{
+                path = $activeGenerationPath
+                commit_attempted = $activeGenerationCommitAttempted
+                committed = $activeGenerationCommitted
+                commit_unevaluable = $activeGenerationCommitUnevaluable
+                activation_epoch = $activeGenerationEpoch
+                candidate_sha256 = $(if ($null -eq
+                        $activeGenerationCommitStage) {
+                        $null
+                    } else { $activeGenerationCommitStage.sha256 })
+            }
             error = [ordered]@{
                 code = $(if ($original.Data['AstroCode']) {
                         [string]$original.Data['AstroCode']
@@ -1964,6 +2434,7 @@ catch {
     exit 1
 }
 finally {
+    Close-ConfigVerdictLease $activeGenerationVerdictLease
     Close-ConfigVerdictLease $claudeVerdictLease
     Close-ConfigVerdictLease $codexVerdictLease
     if ($mutexHeld -and $null -ne $activationMutex) {

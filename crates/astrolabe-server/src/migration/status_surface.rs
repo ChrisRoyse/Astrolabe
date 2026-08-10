@@ -209,6 +209,8 @@ pub(crate) struct PeriodicVerifyProject {
 }
 
 pub(crate) fn periodic_verify_chain_tick() -> Result<PeriodicVerifyChainTickSummary, DynError> {
+    let _activation_fence =
+        crate::activation_epoch::require_active_generation("periodic_verify_chain_tick")?;
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let report = periodic_verify_chain_tick_at(&cache_dir)?;
     let schema = report
@@ -1246,6 +1248,8 @@ pub(crate) fn health_trajectory_ndjson(
 pub(crate) fn janitor_startup_verify_projects(
     periodic_interval_ms: u64,
 ) -> Result<JanitorStartupVerifyReport, DynError> {
+    let _activation_fence =
+        crate::activation_epoch::require_active_generation("janitor_startup_verify_projects")?;
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     janitor_startup_verify_projects_at(&cache_dir, periodic_interval_ms)
 }

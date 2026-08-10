@@ -21,6 +21,8 @@ pub(crate) struct LoweredSqliteLock {
 pub(crate) struct BackgroundLaneOwner {
     pub(crate) _file: fs::File,
     pub(crate) _path: PathBuf,
+    pub(crate) activation_identity: Option<crate::activation_epoch::ActivationIdentity>,
+    pub(crate) owner_fields: Value,
 }
 
 impl Drop for ShadowImportLock {
@@ -126,14 +128,58 @@ pub(crate) fn background_lane_status_at(
     cache_dir: &Path,
     project: &str,
 ) -> Result<Value, DynError> {
+    let lock_path = background_lane_lock_path(cache_dir, project);
+    let lock_key = lock_path.to_string_lossy().into_owned();
+    let owners = background_lane_owners()
+        .lock()
+        .map_err(|_| "background lane owner registry poisoned")?;
+    if let Some(owner) = owners.get(&lock_key) {
+        return background_lane_owner_summary(&lock_path, &owner.owner_fields);
+    }
+    drop(owners);
+
+    let metadata = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return background_lane_available_summary(&lock_path);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "ASTRO_BACKGROUND_LANE_LOCK_TYPE_INVALID: {} is not one ordinary file; remediation: preserve the entry and repair the exact project lane before background work resumes",
+            lock_path.display()
+        )
+        .into());
+    }
+    let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {
+            lock.unlock()?;
+            background_lane_available_summary(&lock_path)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => background_lane_follower_summary(&lock_path),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn acquire_background_lane_status_at(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
+    let fence = crate::activation_epoch::require_active_generation("background_lane_acquire")?;
     fs::create_dir_all(cache_dir)?;
     let lock_path = background_lane_lock_path(cache_dir, project);
     let lock_key = lock_path.to_string_lossy().into_owned();
     let mut owners = background_lane_owners()
         .lock()
         .map_err(|_| "background lane owner registry poisoned")?;
-    if owners.contains_key(&lock_key) {
-        return Ok(background_lane_owner_summary(&lock_path));
+    let fence_identity = fence.as_ref().map(|value| value.identity());
+    if let Some(owner) = owners.get(&lock_key) {
+        if owner.activation_identity == fence_identity {
+            return background_lane_owner_summary(&lock_path, &owner.owner_fields);
+        }
+        owners.remove(&lock_key);
     }
 
     let mut lock = OpenOptions::new()
@@ -144,30 +190,69 @@ pub(crate) fn background_lane_status_at(
         .open(&lock_path)?;
     match lock.try_lock() {
         Ok(()) => {
+            crate::activation_epoch::verify_activation_fence(
+                fence.as_ref(),
+                "background_lane_owner_publish",
+            )?;
+            let owner_fields = crate::activation_epoch::installed_owner_fields()?;
             lock.set_len(0)?;
-            writeln!(lock, "schema=astrolabe-background-lane-v1")?;
-            writeln!(lock, "project={project}")?;
-            writeln!(lock, "pid={}", std::process::id())?;
+            writeln!(
+                lock,
+                "{}",
+                serde_json::to_string(&json!({
+                    "schema": "astrolabe-background-lane-v2",
+                    "project": project,
+                    "pid": std::process::id(),
+                    "owner": owner_fields,
+                }))?
+            )?;
             lock.sync_all()?;
             owners.insert(
                 lock_key,
                 BackgroundLaneOwner {
                     _file: lock,
                     _path: lock_path.clone(),
+                    activation_identity: fence_identity,
+                    owner_fields: owner_fields.clone(),
                 },
             );
-            Ok(background_lane_owner_summary(&lock_path))
+            background_lane_owner_summary(&lock_path, &owner_fields)
         }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(background_lane_follower_summary(&lock_path)),
+        Err(std::fs::TryLockError::WouldBlock) => background_lane_follower_summary(&lock_path),
         Err(error) => Err(error.into()),
     }
+}
+
+pub(crate) fn release_background_lane_ownerships() -> Result<usize, DynError> {
+    let mut owners = background_lane_owners()
+        .lock()
+        .map_err(|_| "background lane owner registry poisoned")?;
+    let released = owners.len();
+    owners.clear();
+    Ok(released)
+}
+
+pub(crate) fn release_background_lane_ownership_at(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<bool, DynError> {
+    let lock_key = background_lane_lock_path(cache_dir, project)
+        .to_string_lossy()
+        .into_owned();
+    let mut owners = background_lane_owners()
+        .lock()
+        .map_err(|_| "background lane owner registry poisoned")?;
+    Ok(owners.remove(&lock_key).is_some())
 }
 
 pub(crate) fn background_lane_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{BACKGROUND_LANE_LOCK_SUFFIX}"))
 }
 
-pub(crate) fn background_lane_owner_summary(lock_path: &Path) -> Value {
+pub(crate) fn background_lane_owner_summary(
+    lock_path: &Path,
+    owner_fields: &Value,
+) -> Result<Value, DynError> {
     background_lane_summary(
         "owner",
         "this-process",
@@ -175,10 +260,11 @@ pub(crate) fn background_lane_owner_summary(lock_path: &Path) -> Value {
         "verified",
         lock_path,
         true,
+        Some(owner_fields),
     )
 }
 
-pub(crate) fn background_lane_follower_summary(lock_path: &Path) -> Value {
+pub(crate) fn background_lane_follower_summary(lock_path: &Path) -> Result<Value, DynError> {
     background_lane_summary(
         "follower",
         "another-process",
@@ -186,6 +272,19 @@ pub(crate) fn background_lane_follower_summary(lock_path: &Path) -> Value {
         "provisional",
         lock_path,
         false,
+        None,
+    )
+}
+
+pub(crate) fn background_lane_available_summary(lock_path: &Path) -> Result<Value, DynError> {
+    background_lane_summary(
+        "available",
+        "none",
+        "fresh",
+        "verified",
+        lock_path,
+        false,
+        None,
     )
 }
 
@@ -196,9 +295,10 @@ pub(crate) fn background_lane_summary(
     trust: &str,
     lock_path: &Path,
     eligible_owner: bool,
-) -> Value {
-    json!({
-        "schema": "astrolabe-background-lane-v1",
+    owner_fields: Option<&Value>,
+) -> Result<Value, DynError> {
+    Ok(json!({
+        "schema": "astrolabe-background-lane-v2",
         "status": status,
         "owner": owner,
         "pid": if eligible_owner {
@@ -210,6 +310,8 @@ pub(crate) fn background_lane_summary(
         "freshness": freshness,
         "trust": trust,
         "single_owner": eligible_owner,
+        "owner_identity": owner_fields,
+        "activation": crate::activation_epoch::activation_status_json()?,
         "remediation": if eligible_owner {
             Value::Null
         } else {
@@ -219,7 +321,7 @@ pub(crate) fn background_lane_summary(
             "watcher": background_lane_worker_summary(eligible_owner),
             "anneal": background_lane_worker_summary(eligible_owner),
         },
-    })
+    }))
 }
 
 pub(crate) fn background_lane_worker_summary(eligible_owner: bool) -> Value {
