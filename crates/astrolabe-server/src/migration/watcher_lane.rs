@@ -48,6 +48,12 @@ enum RegistrationRecoveryDisposition {
     Refuse(RegistrationRecoveryRefusal),
 }
 
+#[derive(Debug)]
+enum RegistrationCatchUpDisposition {
+    PublicationInFlight,
+    Ready(Option<Value>),
+}
+
 pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<(), DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let runner = Rc::new(CbmToolRunner::new_default()?);
@@ -162,7 +168,8 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 registered.remove(&registration.project);
             }
             let catch_up = match registration_catch_up_status(&cache_dir, &registration) {
-                Ok(status) => status,
+                Ok(RegistrationCatchUpDisposition::PublicationInFlight) => continue,
+                Ok(RegistrationCatchUpDisposition::Ready(status)) => status,
                 Err(error) => {
                     record_registration_reconciliation_refusal(&cache_dir, &registration, error)?;
                     continue;
@@ -179,6 +186,9 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 );
             }
             watcher.watch(&registration.project, &registration.root)?;
+            if catch_up.is_none() {
+                clear_resolved_registration_error(&cache_dir, &registration.project)?;
+            }
             if catch_up.is_some() {
                 catch_up_registrations.push(registration.clone());
             }
@@ -216,13 +226,19 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
 fn registration_catch_up_status(
     cache_dir: &Path,
     registration: &WatchRegistration,
-) -> Result<Option<Value>, DynError> {
-    if reconcile_shadow_publications_for_project(cache_dir, &registration.project)? {
-        tracing::info!(
-            project = %registration.project,
-            root = %registration.root,
-            "incremental_watcher.publication_recovered"
-        );
+) -> Result<RegistrationCatchUpDisposition, DynError> {
+    match reconcile_shadow_publications_for_project(cache_dir, &registration.project)? {
+        ShadowPublicationReconciliation::Absent => {}
+        ShadowPublicationReconciliation::Reconciled => {
+            tracing::info!(
+                project = %registration.project,
+                root = %registration.root,
+                "incremental_watcher.publication_recovered"
+            );
+        }
+        ShadowPublicationReconciliation::Active { .. } => {
+            return Ok(RegistrationCatchUpDisposition::PublicationInFlight);
+        }
     }
     let fingerprint_key = metadata_key(&registration.project, GIT_SOURCE_FINGERPRINT_KEY);
     let root_key = metadata_key(&registration.project, GIT_SOURCE_REPO_PATH_KEY);
@@ -237,7 +253,7 @@ fn registration_catch_up_status(
     if persisted_fingerprint.is_none()
         && !astrolabe_anchors::archaeology::is_git_work_tree(Path::new(&registration.root))
     {
-        return Ok(None);
+        return Ok(RegistrationCatchUpDisposition::Ready(None));
     }
 
     let canonical_root = fs::canonicalize(&registration.root).map_err(|error| {
@@ -257,7 +273,7 @@ fn registration_catch_up_status(
     let live_fingerprint =
         astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(&registration.root))?;
     if root_matches && persisted_fingerprint.as_deref() == Some(live_fingerprint.as_str()) {
-        return Ok(None);
+        return Ok(RegistrationCatchUpDisposition::Ready(None));
     }
 
     let verification = if persisted_fingerprint.is_none() {
@@ -267,7 +283,7 @@ fn registration_catch_up_status(
     } else {
         "source_fingerprint_mismatch"
     };
-    Ok(Some(json!({
+    Ok(RegistrationCatchUpDisposition::Ready(Some(json!({
         "schema": "astrolabe-watcher-tick-v2",
         "status": "catch_up_scheduled",
         "project": registration.project,
@@ -284,7 +300,7 @@ fn registration_catch_up_status(
         "trust": "verified",
         "worker_started": false,
         "remediation": "allow the enabled resident lane to complete its scheduled failure-atomic index generation; inspect watcher_fault_json if it refuses",
-    })))
+    }))))
 }
 
 fn registration_recovery_disposition(
@@ -925,6 +941,25 @@ fn persist_registration_error(
         "remediation": "repair the persisted index_repository arguments and retry registration",
     });
     persist_watcher_status_transition(cache_dir, project, &status)
+}
+
+fn clear_resolved_registration_error(cache_dir: &Path, project: &str) -> Result<bool, DynError> {
+    let key = metadata_key(project, WATCHER_TICK_STATUS_KEY);
+    let Some(raw) = read_config_value(cache_dir, &key)? else {
+        return Ok(false);
+    };
+    let Ok(status) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(false);
+    };
+    if status.get("schema").and_then(Value::as_str) != Some("astrolabe-watcher-tick-v1")
+        || status.get("status").and_then(Value::as_str) != Some("error")
+        || status.get("project").and_then(Value::as_str) != Some(project)
+        || status.get("code").and_then(Value::as_str) != Some("ASTRO_WATCHER_REGISTRATION_INVALID")
+    {
+        return Ok(false);
+    }
+    delete_watcher_fault(cache_dir, &key)?;
+    Ok(true)
 }
 
 fn registration_recovery_refusal(

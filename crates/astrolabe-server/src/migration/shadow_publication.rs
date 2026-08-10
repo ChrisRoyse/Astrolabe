@@ -17,6 +17,25 @@ struct PublicationOwner {
     process_start_utc_ticks: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShadowPublicationReconciliation {
+    Absent,
+    Reconciled,
+    Active {
+        generation: String,
+        phase: String,
+        owner_pid: u32,
+        owner_process_start_utc_ticks: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublicationOwnerState {
+    Absent,
+    Reused { actual_start_utc_ticks: u64 },
+    Matching,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileEvidence {
@@ -146,7 +165,17 @@ impl ShadowPublication {
     pub(crate) fn begin(live_cache: &Path, project: &str) -> Result<Self, DynError> {
         fs::create_dir_all(live_cache)?;
         let project_root = publication_project_root(live_cache, project);
-        reconcile_shadow_publications_for_project(live_cache, project)?;
+        if let ShadowPublicationReconciliation::Active {
+            owner_pid,
+            owner_process_start_utc_ticks,
+            ..
+        } = reconcile_shadow_publications_for_project(live_cache, project)?
+        {
+            return Err(publication_owner_live_error(
+                owner_pid,
+                owner_process_start_utc_ticks,
+            ));
+        }
         if project_root.exists() && fs::read_dir(&project_root)?.next().is_some() {
             return Err(format!(
                 "ASTRO_SHADOW_PUBLICATION_INCOMPLETE: an unfinished shadow publication exists for project {project:?} under {}; live state is not safe to mutate. Remediation: inspect transaction.json and the backup/stage hashes, restore or finalize that exact transaction, then retry",
@@ -2226,11 +2255,9 @@ fn persist_action_metadata_acknowledgement(
 pub(crate) fn reconcile_shadow_publications_for_project(
     live_cache: &Path,
     project: &str,
-) -> Result<bool, DynError> {
+) -> Result<ShadowPublicationReconciliation, DynError> {
     let project_root = publication_project_root(live_cache, project);
-    let had_transactions = project_root.exists() && fs::read_dir(&project_root)?.next().is_some();
-    reconcile_completed_transactions(&project_root, live_cache, project)?;
-    Ok(had_transactions)
+    reconcile_completed_transactions(&project_root, live_cache, project)
 }
 
 fn sqlite_snapshot(source: &Path, destination: &Path) -> Result<(), DynError> {
@@ -2492,7 +2519,7 @@ fn capture_backup_generation(backup: &Path) -> Result<ArtifactGenerationEvidence
     )
 }
 
-fn publication_owner_state(owner: &PublicationOwner) -> Result<String, DynError> {
+fn classify_publication_owner(owner: &PublicationOwner) -> Result<PublicationOwnerState, DynError> {
     match astrolabe_bridge::process_generation_state(
         owner.pid,
         owner.process_start_utc_ticks,
@@ -2503,16 +2530,23 @@ fn publication_owner_state(owner: &PublicationOwner) -> Result<String, DynError>
             owner.pid, owner.process_start_utc_ticks
         )
     })? {
-        astrolabe_bridge::ProcessGenerationState::Absent => Ok("absent".to_string()),
+        astrolabe_bridge::ProcessGenerationState::Absent => Ok(PublicationOwnerState::Absent),
         astrolabe_bridge::ProcessGenerationState::Reused {
             actual_start_utc_ticks,
-        } => Ok(format!("pid_reused:{actual_start_utc_ticks}")),
-        astrolabe_bridge::ProcessGenerationState::Matching => Err(format!(
-            "ASTRO_SHADOW_PUBLICATION_OWNER_LIVE: exact owner ({},{}) is still live; remediation: wait for that exact generation to finish and never recover or remove its transaction",
-            owner.pid, owner.process_start_utc_ticks
-        )
-        .into()),
+        } => Ok(PublicationOwnerState::Reused {
+            actual_start_utc_ticks,
+        }),
+        astrolabe_bridge::ProcessGenerationState::Matching => {
+            Ok(PublicationOwnerState::Matching)
+        }
     }
+}
+
+fn publication_owner_live_error(pid: u32, process_start_utc_ticks: u64) -> DynError {
+    format!(
+        "ASTRO_SHADOW_PUBLICATION_OWNER_LIVE: exact owner ({pid},{process_start_utc_ticks}) is still live; remediation: wait for that exact generation to finish and never recover or remove its transaction"
+    )
+    .into()
 }
 
 fn read_publication_journal(path: &Path) -> Result<PublicationJournal, DynError> {
@@ -2587,6 +2621,7 @@ fn validate_publication_journal_identity(
 fn write_recovery_journal(
     transaction: &Path,
     journal: &PublicationJournal,
+    owner_state: &str,
     phase: &str,
     evidence: Value,
 ) -> Result<(), DynError> {
@@ -2607,7 +2642,7 @@ fn write_recovery_journal(
         evidence: json!({
             "schema": "astrolabe.shadow-publication-recovery.v1",
             "prior_phase": journal.phase,
-            "owner_state": publication_owner_state(&journal.owner)?,
+            "owner_state": owner_state,
             "recovery_actor": {
                 "pid": actor_pid,
                 "process_start_utc_ticks": actor_ticks,
@@ -3008,16 +3043,22 @@ fn reconcile_completed_transactions(
     project_root: &Path,
     live_cache: &Path,
     project: &str,
-) -> Result<(), DynError> {
+) -> Result<ShadowPublicationReconciliation, DynError> {
     if !project_root.exists() {
-        return Ok(());
+        return Ok(ShadowPublicationReconciliation::Absent);
     }
     let mut entries = fs::read_dir(project_root)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.file_name());
+    if entries.is_empty() {
+        remove_empty_dir(project_root)?;
+        return Ok(ShadowPublicationReconciliation::Absent);
+    }
+
+    let mut transactions = Vec::with_capacity(entries.len());
     for entry in entries {
         let transaction = entry.path();
         let journal = transaction.join(PUBLICATION_JOURNAL);
-        let mut value = read_publication_journal(&journal)?;
+        let value = read_publication_journal(&journal)?;
         validate_publication_journal_identity(
             &value,
             &transaction,
@@ -3025,13 +3066,54 @@ fn reconcile_completed_transactions(
             live_cache,
             project,
         )?;
-        let owner_state = publication_owner_state(&value.owner)?;
+        let owner_state = classify_publication_owner(&value.owner)?;
+        transactions.push((transaction, value, owner_state));
+    }
+
+    let active = transactions
+        .iter()
+        .position(|(_, _, owner_state)| matches!(owner_state, PublicationOwnerState::Matching));
+    if let Some(active_index) = active {
+        let (_, value, _) = &transactions[active_index];
+        if transactions.len() != 1 {
+            return Err(format!(
+                "ASTRO_SHADOW_PUBLICATION_ACTIVE_GENERATION_CONFLICT: exact live generation {:?} for project {project:?} exists beside {} additional transaction generation(s); remediation: preserve every transaction byte and inspect all journal owner identities before recovery",
+                value.generation,
+                transactions.len().saturating_sub(1)
+            )
+            .into());
+        }
+        return Ok(ShadowPublicationReconciliation::Active {
+            generation: value.generation.clone(),
+            phase: value.phase.clone(),
+            owner_pid: value.owner.pid,
+            owner_process_start_utc_ticks: value.owner.process_start_utc_ticks,
+        });
+    }
+
+    for (transaction, mut value, owner_state) in transactions {
+        let owner_state = match owner_state {
+            PublicationOwnerState::Absent => "absent".to_string(),
+            PublicationOwnerState::Reused {
+                actual_start_utc_ticks,
+            } => format!("pid_reused:{actual_start_utc_ticks}"),
+            PublicationOwnerState::Matching => {
+                return Err(format!(
+                    "ASTRO_SHADOW_PUBLICATION_OWNER_CLASSIFICATION_DRIFT: exact live owner ({},{}) for generation {:?} reached recovery after the active-generation preflight; remediation: preserve every transaction byte and inspect the reconciliation classifier",
+                    value.owner.pid,
+                    value.owner.process_start_utc_ticks,
+                    value.generation
+                )
+                .into());
+            }
+        };
         if let Some(metadata_acknowledgement) = value.metadata_acknowledgement.as_ref() {
             let (resolved_phase, readback) =
                 reconcile_metadata_acknowledgement(&value, metadata_acknowledgement)?;
             write_recovery_journal(
                 &transaction,
                 &value,
+                &owner_state,
                 resolved_phase,
                 json!({"owner_state": owner_state, "metadata_acknowledgement": readback}),
             )?;
@@ -3046,6 +3128,7 @@ fn reconcile_completed_transactions(
                 write_recovery_journal(
                     &transaction,
                     &value,
+                    &owner_state,
                     "rolled_back",
                     json!({"owner_state": owner_state, "live_generation_mutated": false}),
                 )?;
@@ -3096,6 +3179,7 @@ fn reconcile_completed_transactions(
                 write_recovery_journal(
                     &transaction,
                     &value,
+                    &owner_state,
                     resolved_phase,
                     json!({
                         "owner_state": owner_state,
@@ -3141,11 +3225,23 @@ fn reconcile_completed_transactions(
                 )?;
                 if config_generation == Some(manifest.candidate_config_generation.clone()) {
                     let readback = finalize_interrupted_publication(&value, manifest)?;
-                    write_recovery_journal(&transaction, &value, "complete", readback)?;
+                    write_recovery_journal(
+                        &transaction,
+                        &value,
+                        &owner_state,
+                        "complete",
+                        readback,
+                    )?;
                     value.phase = "complete".to_string();
                 } else if config_generation == manifest.prior_config_generation {
                     let readback = rollback_interrupted_publication(&value, manifest)?;
-                    write_recovery_journal(&transaction, &value, "rolled_back", readback)?;
+                    write_recovery_journal(
+                        &transaction,
+                        &value,
+                        &owner_state,
+                        "rolled_back",
+                        readback,
+                    )?;
                     value.phase = "rolled_back".to_string();
                 } else {
                     return Err(format!(
@@ -3182,7 +3278,8 @@ fn reconcile_completed_transactions(
         }
         remove_transaction_tree(&transaction, project_root)?;
     }
-    remove_empty_dir(project_root)
+    remove_empty_dir(project_root)?;
+    Ok(ShadowPublicationReconciliation::Reconciled)
 }
 
 fn remove_transaction_tree(transaction: &Path, project_root: &Path) -> Result<(), DynError> {
