@@ -1379,11 +1379,21 @@ impl VerifyChainLoop {
                 }
                 match migration::periodic_verify_chain_tick() {
                     Ok(report) => {
-                        let checked = report
-                            .get("checked_projects")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        tracing::debug!("verify_chain_loop.tick checked_projects={checked}");
+                        if report.skipped_import_in_progress_projects == 0 {
+                            tracing::debug!(
+                                "verify_chain_loop.tick checked_projects={}",
+                                report.checked_projects
+                            );
+                        } else {
+                            tracing::info!(
+                                "verify_chain_loop.tick_contention \
+                                 status=skipped_import_in_progress \
+                                 operation=periodic_verify_scrub_project checked_projects={} \
+                                 skipped_projects={}",
+                                report.checked_projects,
+                                report.skipped_import_in_progress_projects,
+                            );
+                        }
                     }
                     Err(error) => {
                         tracing::warn!("verify_chain_loop.tick_failed error={error}");

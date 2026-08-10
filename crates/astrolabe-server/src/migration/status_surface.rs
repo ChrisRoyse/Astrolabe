@@ -2,7 +2,7 @@ use super::*;
 pub(crate) const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 pub(crate) const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v2";
 pub(crate) const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str =
-    "astrolabe.periodic_verify_chain_tick.v2";
+    "astrolabe.periodic_verify_chain_tick.v3";
 const VERIFY_CHAIN_STARTUP_READINESS_SCHEMA: &str = "astrolabe.verify_chain_startup_readiness.v1";
 const VERIFY_CHAIN_STARTUP_READINESS_KEY: &str = "astrolabe.verify_chain_startup_readiness_json";
 const STARTUP_VERIFY_OPERATION: &str = "janitor_startup_verify";
@@ -16,6 +16,12 @@ pub(crate) struct JanitorStartupVerifyReport {
     pub(crate) discovered_projects: u64,
     pub(crate) checked_projects: u64,
     pub(crate) damaged_projects: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PeriodicVerifyChainTickSummary {
+    pub(crate) checked_projects: u64,
+    pub(crate) skipped_import_in_progress_projects: u64,
 }
 
 pub(crate) fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
@@ -200,27 +206,95 @@ pub(crate) struct PeriodicVerifyProject {
     pub(crate) vault_dir: PathBuf,
 }
 
-pub(crate) fn periodic_verify_chain_tick() -> Result<Value, DynError> {
+pub(crate) fn periodic_verify_chain_tick() -> Result<PeriodicVerifyChainTickSummary, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    periodic_verify_chain_tick_at(&cache_dir)
+    let report = periodic_verify_chain_tick_at(&cache_dir)?;
+    let schema = report
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_VERIFY_CHAIN_TICK_REPORT_INVALID: periodic verification report omitted required \
+             string field 'schema'. Remediation: preserve the server log and inspect \
+             periodic_verify_chain_tick_at report construction; do not infer a compatible report."
+                .into()
+        })?;
+    if schema != PERIODIC_VERIFY_CHAIN_TICK_SCHEMA {
+        return Err(format!(
+            "ASTRO_VERIFY_CHAIN_TICK_REPORT_SCHEMA_MISMATCH: periodic verification report schema \
+             '{schema}' does not match expected '{}'. Remediation: preserve the server log and \
+             update the producer and consumer as one protocol generation.",
+            PERIODIC_VERIFY_CHAIN_TICK_SCHEMA
+        )
+        .into());
+    }
+    let required_u64 = |field: &str| -> Result<u64, DynError> {
+        report.get(field).and_then(Value::as_u64).ok_or_else(|| {
+            format!(
+                "ASTRO_VERIFY_CHAIN_TICK_REPORT_INVALID: periodic verification report schema \
+                     '{}' omitted required u64 field '{field}'. Remediation: preserve the server \
+                     log and inspect periodic_verify_chain_tick_at report construction; do not \
+                     infer a zero count.",
+                schema
+            )
+            .into()
+        })
+    };
+    Ok(PeriodicVerifyChainTickSummary {
+        checked_projects: required_u64("checked_projects")?,
+        skipped_import_in_progress_projects: required_u64("skipped_import_in_progress_projects")?,
+    })
 }
 
 pub(crate) fn periodic_verify_chain_tick_at(cache_dir: &Path) -> Result<Value, DynError> {
     let checked_at_unix_ms = unix_epoch_millis();
     let projects = discover_periodic_verify_projects_at(cache_dir)?;
     let mut results = Vec::with_capacity(projects.len());
+    let mut skipped_import_in_progress_projects = 0u64;
     for project in projects {
-        results.push(periodic_verify_project_at(
+        let result = periodic_verify_project_at(
             cache_dir,
             &project.project,
             &project.vault_dir,
             checked_at_unix_ms,
-        )?);
+        )?;
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_VERIFY_CHAIN_PROJECT_REPORT_INVALID: periodic verification for project \
+                     '{}' omitted required string field 'status'. Remediation: preserve the server \
+                     log and inspect periodic_verify_project_at report construction; do not infer \
+                     a completed scrub.",
+                    project.project
+                )
+                .into()
+            })?;
+        if status == "skipped_import_in_progress" {
+            skipped_import_in_progress_projects = skipped_import_in_progress_projects
+                .checked_add(1)
+                .ok_or_else(|| -> DynError {
+                    "ASTRO_VERIFY_CHAIN_SKIP_COUNT_OVERFLOW: skipped-project telemetry exceeded \
+                     u64. Remediation: preserve the server log and inspect project discovery for \
+                     duplicate or unbounded rows."
+                        .into()
+                })?;
+        }
+        results.push(result);
     }
+    let checked_projects = u64::try_from(results.len()).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_PROJECT_COUNT_OVERFLOW: checked project count cannot be \
+             represented as u64: {error}. Remediation: preserve the config database and inspect \
+             project discovery cardinality."
+        )
+        .into()
+    })?;
     Ok(json!({
         "schema": PERIODIC_VERIFY_CHAIN_TICK_SCHEMA,
         "checked_at_unix_ms": checked_at_unix_ms,
-        "checked_projects": results.len(),
+        "checked_projects": checked_projects,
+        "skipped_import_in_progress_projects": skipped_import_in_progress_projects,
         "results": results,
         "freshness": "fresh",
         "trust": "verified",
@@ -261,10 +335,11 @@ pub(crate) fn project_from_metadata_key(key: &str, field: &str) -> Option<String
         .map(ToOwned::to_owned)
 }
 
-/// The bounded per-tick outcome of one FSV janitor scrub step (#277). Carries the
-/// persisted checkpoint watermark and the (bounded) slice this tick re-hashed —
-/// never a whole-ledger count, so the cost is O(budget knob) regardless of ledger
-/// length.
+/// The logical per-tick outcome of one FSV janitor scrub step (#277). Carries the
+/// persisted checkpoint watermark and the requested slice this tick re-hashed.
+/// These fields do not characterize physical cost: vault open/materialization and
+/// ledger-height discovery remain dependent on the real vault and ledger (#1064,
+/// PC-03/PC-09/PC-40/PC-41).
 pub(crate) struct PeriodicScrubOutcome {
     pub(crate) status: String,
     pub(crate) verified_through: u64,
@@ -557,9 +632,10 @@ pub(crate) fn persist_periodic_verify_status_at(
                 .unwrap_or_default(),
         ),
         (
-            // #277: the persisted FSV-janitor checkpoint watermark this tick
-            // resumed from / advanced to. Independent readback across ticks and
-            // restarts proves the janitor never re-walks from genesis.
+            // #277: the persisted logical checkpoint this tick resumed from or
+            // advanced to. Independent readback proves logical continuity only;
+            // physical vault open/materialization and ledger-height discovery may
+            // still revisit earlier bytes (#1064 PC-40/PC-41).
             "periodic_verify_verified_through",
             verified_through
                 .map(|value| value.to_string())
