@@ -38,8 +38,9 @@ watcher-tick, lane-acquisition, and publication boundaries.
   status observation never acquires or creates a lock.
 - Generation classification validates the active record's own immutable
   layout and hashes before comparing active-worker invocation hashes. A
-  different generation is retired, including when its executable bytes are
-  identical.
+  different generation is retired even when its implementation sources are
+  unchanged. The executable embeds the Git tree identity, so each generation's
+  distinct artifact hash remains independently bound and verified.
 - Path equality uses canonical physical Windows identity so `C:\...` and the
   corresponding `\\?\C:\...` spelling cannot produce false skew.
 - Malformed, missing, drifting, or unreadable authority state is a named hard
@@ -69,9 +70,9 @@ and converges through the existing watcher lane.
 Manual full-state verification must read the authority bytes, both client
 configurations, immutable publication/artifact hashes, live process
 generations, lane ownership, and SQLite state. At least one transition should
-use byte-identical reproducible executables under different immutable tree
-identities to prove that epoch identity—not accidental binary difference—is
-the fence.
+use generations whose implementation sources are unchanged while their Git
+tree and embedded-provenance artifact hashes differ. That proves activation
+identity—not a schema or behavioral difference—is the fence.
 
 The design follows the holder/transition identity pattern used by Kubernetes
 Leases and etcd elections, the atomic replacement semantics documented for
