@@ -30,6 +30,10 @@ path and publication receipt. It observes the fixed authority at request,
 watcher-tick, lane-acquisition, and publication boundaries.
 
 - Pure reads remain available on a retired resident.
+- A retired mutation returns `ASTRO_INSTALLED_GENERATION_RETIRED` as the
+  machine-readable tool-fault code, preserves the generation/epoch/hash fields,
+  and directs the caller to reconnect; it is never relabelled as an internal
+  fault or paired with retry advice.
 - Every mutation requires an active-generation fence and retains a read/share
   lease over the authority until the mutation has committed or failed.
 - Activation must acquire incompatible write/delete sharing before replacing

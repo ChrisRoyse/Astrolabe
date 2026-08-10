@@ -9,7 +9,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::DynError;
+use crate::{DynError, migration::ActivationToolFault};
 
 pub(crate) const ACTIVE_GENERATION_SCHEMA: &str = "astrolabe.global-mcp-active-generation.v1";
 const ACTIVE_GENERATION_MAX_BYTES: usize = 64 * 1024;
@@ -129,15 +129,36 @@ pub(crate) fn require_active_generation(
             if record.generation_id != context.generation_id
                 || record.generation_path != context.generation_path
             {
-                return Err(format!(
-                    "ASTRO_INSTALLED_GENERATION_RETIRED: operation {operation:?} raced activation away from worker generation {:?}; observed active epoch={} generation={:?} record_sha256={}, leased active epoch={} generation={:?} record_sha256={}; remediation: preserve staged state and reconnect through the currently activated immutable generation",
-                    context.generation_id,
-                    observed.epoch,
-                    observed.generation_id,
-                    observed.record_sha256,
-                    record.epoch,
-                    record.generation_id,
-                    record.record_sha256,
+                return Err(ActivationToolFault::new(
+                    "ASTRO_INSTALLED_GENERATION_RETIRED",
+                    format!(
+                        "operation {operation:?} raced activation away from worker generation {:?}; observed active epoch={} generation={:?} record_sha256={}, leased active epoch={} generation={:?} record_sha256={}",
+                        context.generation_id,
+                        observed.epoch,
+                        observed.generation_id,
+                        observed.record_sha256,
+                        record.epoch,
+                        record.generation_id,
+                        record.record_sha256,
+                    ),
+                    "preserve staged state and reconnect through the currently activated immutable generation",
+                )
+                .with_detail("operation", operation)
+                .with_detail("worker_generation_id", context.generation_id.clone())
+                .with_detail("observed_active_epoch", observed.epoch)
+                .with_detail(
+                    "observed_active_generation_id",
+                    observed.generation_id.clone(),
+                )
+                .with_detail(
+                    "observed_activation_record_sha256",
+                    observed.record_sha256.clone(),
+                )
+                .with_detail("leased_active_epoch", record.epoch)
+                .with_detail("leased_active_generation_id", record.generation_id.clone())
+                .with_detail(
+                    "leased_activation_record_sha256",
+                    record.record_sha256.clone(),
                 )
                 .into());
             }
@@ -152,12 +173,24 @@ pub(crate) fn require_active_generation(
             let context = INSTALLED_WORKER
                 .get()
                 .expect("installed context exists for a retired observation");
-            Err(format!(
-                "ASTRO_INSTALLED_GENERATION_RETIRED: operation {operation:?} is mutation-capable, but worker generation {:?} is not active; active epoch={} generation={:?} record_sha256={}; remediation: keep this transport for admitted read-only calls and reconnect through the currently activated immutable generation before mutating state",
-                context.generation_id,
-                record.epoch,
-                record.generation_id,
-                record.record_sha256,
+            Err(ActivationToolFault::new(
+                "ASTRO_INSTALLED_GENERATION_RETIRED",
+                format!(
+                    "operation {operation:?} is mutation-capable, but worker generation {:?} is not active; active epoch={} generation={:?} record_sha256={}",
+                    context.generation_id,
+                    record.epoch,
+                    record.generation_id,
+                    record.record_sha256,
+                ),
+                "keep this transport for admitted read-only calls and reconnect through the currently activated immutable generation before mutating state",
+            )
+            .with_detail("operation", operation)
+            .with_detail("worker_generation_id", context.generation_id.clone())
+            .with_detail("active_epoch", record.epoch)
+            .with_detail("active_generation_id", record.generation_id.clone())
+            .with_detail(
+                "activation_record_sha256",
+                record.record_sha256.clone(),
             )
             .into())
         }
@@ -211,12 +244,24 @@ pub(crate) fn admit_tool_call(
             let context = INSTALLED_WORKER
                 .get()
                 .expect("installed context exists for a retired observation");
-            Err(format!(
-                "ASTRO_INSTALLED_GENERATION_RETIRED: tool {tool_name:?} is not admitted as a read-only call on retired worker generation {:?}; active epoch={} generation={:?} record_sha256={}; remediation: reconnect through the currently activated immutable generation before invoking this tool",
-                context.generation_id,
-                record.epoch,
-                record.generation_id,
-                record.record_sha256,
+            Err(ActivationToolFault::new(
+                "ASTRO_INSTALLED_GENERATION_RETIRED",
+                format!(
+                    "tool {tool_name:?} is not admitted as a read-only call on retired worker generation {:?}; active epoch={} generation={:?} record_sha256={}",
+                    context.generation_id,
+                    record.epoch,
+                    record.generation_id,
+                    record.record_sha256,
+                ),
+                "reconnect through the currently activated immutable generation before invoking this tool",
+            )
+            .with_detail("tool", tool_name)
+            .with_detail("worker_generation_id", context.generation_id.clone())
+            .with_detail("active_epoch", record.epoch)
+            .with_detail("active_generation_id", record.generation_id.clone())
+            .with_detail(
+                "activation_record_sha256",
+                record.record_sha256.clone(),
             )
             .into())
         }

@@ -89,7 +89,8 @@ use helpers::*;
 mod tool_fault;
 use tool_fault::*;
 pub(crate) use tool_fault::{
-    TOOL_FAULT_SCHEMA, tool_fault_from_error, tool_fault_result_from_error,
+    TOOL_FAULT_SCHEMA, ToolFault as ActivationToolFault, tool_fault_from_error,
+    tool_fault_result_from_error,
 };
 
 mod config_store;
