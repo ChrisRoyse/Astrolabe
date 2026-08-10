@@ -993,11 +993,26 @@ fn clear_resolved_registration_error(cache_dir: &Path, project: &str) -> Result<
     let Ok(status) = serde_json::from_str::<Value>(&raw) else {
         return Ok(false);
     };
-    if status.get("schema").and_then(Value::as_str) != Some("astrolabe-watcher-tick-v1")
-        || status.get("status").and_then(Value::as_str) != Some("error")
-        || status.get("project").and_then(Value::as_str) != Some(project)
-        || status.get("code").and_then(Value::as_str) != Some("ASTRO_WATCHER_REGISTRATION_INVALID")
-    {
+    let resolved_generic_error = status.get("schema").and_then(Value::as_str)
+        == Some("astrolabe-watcher-tick-v1")
+        && status.get("status").and_then(Value::as_str) == Some("error")
+        && status.get("project").and_then(Value::as_str) == Some(project)
+        && status.get("code").and_then(Value::as_str) == Some("ASTRO_WATCHER_REGISTRATION_INVALID");
+    let resolved_recovery_fault = status.get("schema").and_then(Value::as_str)
+        == Some("astrolabe-watcher-tick-v2")
+        && status.get("status").and_then(Value::as_str)
+            == Some("registration_reconciliation_refused")
+        && status.get("project").and_then(Value::as_str) == Some(project)
+        && status
+            .get("fault_code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| shadow_publication_recovery_error_code(code).is_some())
+        && read_config_value(
+            cache_dir,
+            &metadata_key(project, WATCHER_REGISTRATION_FAULT_STATUS_KEY),
+        )?
+        .is_none();
+    if !resolved_generic_error && !resolved_recovery_fault {
         return Ok(false);
     }
     delete_watcher_fault(cache_dir, &key)?;
