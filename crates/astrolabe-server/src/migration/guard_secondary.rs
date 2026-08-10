@@ -491,7 +491,7 @@ pub(crate) fn produce_commit_ood_request(
 ) -> Result<Value, DynError> {
     let repo = Path::new(root);
     let head = match astrolabe_anchors::archaeology::git_history_state(repo)? {
-        astrolabe_anchors::archaeology::GitHistoryState::Committed { oid } => oid,
+        astrolabe_anchors::archaeology::GitHistoryState::Committed { oid, .. } => oid,
         astrolabe_anchors::archaeology::GitHistoryState::Unborn { symbolic_ref } => {
             return Ok(json!({
                 "status": "history_absent",

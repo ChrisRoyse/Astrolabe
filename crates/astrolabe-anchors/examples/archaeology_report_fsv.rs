@@ -33,7 +33,7 @@ fn main() {
         "head": report.head,
         "history_state": report.history,
         "history_present": report.history.commit_oid().is_some(),
-        "symbolic_head": report.history.unborn_symbolic_ref(),
+        "symbolic_head": report.history.symbolic_ref(),
         "szz_findings": report.szz_findings.iter().map(|finding| {
             json!({
                 "fix_commit": finding.fix_commit,

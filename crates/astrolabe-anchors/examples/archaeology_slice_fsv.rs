@@ -68,7 +68,7 @@ fn main() {
         "head": report.head,
         "history_state": report.history,
         "history_present": report.history.commit_oid().is_some(),
-        "symbolic_head": report.history.unborn_symbolic_ref(),
+        "symbolic_head": report.history.symbolic_ref(),
         "blamed_commit": blamed_commit,
         "matching_findings": findings.len(),
         "paths": paths,

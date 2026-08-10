@@ -5991,7 +5991,7 @@ pub(crate) fn git_archaeology_summary(
     })?;
     history.validate()?;
     let (status, trust, provenance, history_present, symbolic_head) = match history {
-        GitHistoryState::Committed { oid } => {
+        GitHistoryState::Committed { oid, symbolic_ref } => {
             if report.head.as_deref() != Some(oid.as_str()) || report.mode == "history_absent" {
                 return Err(format!(
                     "ASTRO_ARCHAEOLOGY_HISTORY_STATE_INVALID: committed history {oid} disagrees with archaeology head={:?} mode={:?}; remediation: preserve the staged generation and inspect the mining result",
@@ -5999,7 +5999,13 @@ pub(crate) fn git_archaeology_summary(
                 )
                 .into());
             }
-            ("imported", "mixed", "git_history", true, None)
+            (
+                "imported",
+                "mixed",
+                "git_history",
+                true,
+                symbolic_ref.as_deref(),
+            )
         }
         GitHistoryState::Unborn { symbolic_ref } => {
             macro_rules! require_zero {

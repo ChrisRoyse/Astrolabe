@@ -1,12 +1,12 @@
 /*
  * watcher.c — Git-based file change watcher.
  *
- * Strategy: git status + HEAD tracking (the most reliable approach).
+ * Strategy: one branch-aware Git status observation plus exact dirty bytes.
  * For non-git projects, the watcher skips polling (no fsnotify/dirmtime yet).
  *
  *
  * Per-project state tracks:
- *   - Last git HEAD hash (detects commits, checkout, pull)
+ *   - Last coherent Git source fingerprint (branch, HEAD, index, worktree)
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
  *
@@ -39,11 +39,11 @@
 
 /* ── Per-project state ──────────────────────────────────────────── */
 
+#ifdef ASTRO_SPAWN
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64];                    /* git HEAD hash */
-    char worktree_sha256[CBM_SHA256_HEX_LEN + 1]; /* last successfully indexed porcelain state */
+    char source_sha256[CBM_SHA256_HEX_LEN + 1]; /* last successfully indexed Git source state */
     bool is_git;                                  /* false → skip polling */
     bool baseline_done;                           /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
@@ -168,66 +168,90 @@ static bool is_git_repo(const char *root_path) {
     return rc == 0;
 }
 
-static int git_head(const char *root_path, char *out, size_t out_size) {
-#ifdef ASTRO_SPAWN
-    if (!out || out_size == 0) {
-        return CBM_NOT_FOUND;
-    }
-    const char *const argv[] = {"git", "-C", root_path, "rev-parse", "HEAD", NULL};
-    char *data = NULL;
-    size_t len = 0;
-    cbm_spawn_error_t err;
-    if (cbm_spawn_capture(argv, &data, &len, &err) != 0) {
-        watcher_log_spawn_failure("watcher.git_head.spawn_failed", &err);
-        free(data);
-#else
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-#endif
-        return CBM_NOT_FOUND;
-    }
+typedef struct {
+    bool oid_seen;
+    bool head_seen;
+    bool initial;
+    bool detached;
+} git_status_identity_t;
 
-#ifdef ASTRO_SPAWN
-    size_t line = 0;
-    while (line < len && data[line] != '\n' && data[line] != '\r') {
-        line++;
-#else
-    if (fgets(out, (int)out_size, fp)) {
-        size_t len = strlen(out);
-        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
-            out[--len] = '\0';
+static bool status_value_is_hex_oid(const char *value, size_t len) {
+    if (len != 40 && len != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f') ||
+              (value[i] >= 'A' && value[i] <= 'F'))) {
+            return false;
         }
-        cbm_pclose(fp);
-        return 0;
-#endif
     }
-#ifdef ASTRO_SPAWN
-    if (line >= out_size) {
-        line = out_size - SKIP_ONE;
-    }
-    memcpy(out, data, line);
-    out[line] = '\0';
-    bool captured = len > 0;
-    free(data);
-    return captured ? 0 : CBM_NOT_FOUND;
-#else
-    cbm_pclose(fp);
-    return CBM_NOT_FOUND;
-#endif
+    return true;
 }
 
-/* Captures a deterministic fingerprint of the working-tree state. Unlike a
- * boolean "dirty" probe, this distinguishes successive edits while the tree
- * remains dirty and prevents the watcher from reindexing the same dirty bytes
- * forever. The porcelain stream is stable and includes submodule dirtiness. */
-static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_HEX_LEN + 1]) {
+/* Porcelain v2 --branch is Git's stable, machine-readable identity stream. It
+ * binds both the current object and the immediate symbolic/detached HEAD state;
+ * accepting a stream without exactly one of each header would recreate the
+ * same incomplete-input bug this watcher exists to prevent. */
+static bool git_status_identity(const char *data, size_t len, git_status_identity_t *identity) {
+    static const char oid_prefix[] = "# branch.oid ";
+    static const char head_prefix[] = "# branch.head ";
+    if (!data || !identity) {
+        return false;
+    }
+    memset(identity, 0, sizeof(*identity));
+    for (size_t offset = 0; offset < len;) {
+        size_t end = offset;
+        while (end < len && data[end] != '\0' && data[end] != '\n' && data[end] != '\r') {
+            end++;
+        }
+        size_t record_len = end - offset;
+        if (record_len >= sizeof(oid_prefix) - 1 &&
+            memcmp(data + offset, oid_prefix, sizeof(oid_prefix) - 1) == 0) {
+            if (identity->oid_seen) {
+                return false;
+            }
+            const char *value = data + offset + sizeof(oid_prefix) - 1;
+            size_t value_len = record_len - (sizeof(oid_prefix) - 1);
+            identity->oid_seen = true;
+            identity->initial = value_len == sizeof("(initial)") - 1 &&
+                                memcmp(value, "(initial)", sizeof("(initial)") - 1) == 0;
+            if (!identity->initial && !status_value_is_hex_oid(value, value_len)) {
+                return false;
+            }
+        } else if (record_len >= sizeof(head_prefix) - 1 &&
+                   memcmp(data + offset, head_prefix, sizeof(head_prefix) - 1) == 0) {
+            if (identity->head_seen) {
+                return false;
+            }
+            const char *value = data + offset + sizeof(head_prefix) - 1;
+            size_t value_len = record_len - (sizeof(head_prefix) - 1);
+            if (value_len == 0) {
+                return false;
+            }
+            identity->head_seen = true;
+            identity->detached = value_len == sizeof("(detached)") - 1 &&
+                                 memcmp(value, "(detached)", sizeof("(detached)") - 1) == 0;
+        }
+        while (end < len && (data[end] == '\0' || data[end] == '\n' || data[end] == '\r')) {
+            end++;
+        }
+        offset = end;
+    }
+    return identity->oid_seen && identity->head_seen && !(identity->initial && identity->detached);
+}
+#endif
+
+/* Captures every Git input that can affect a watcher publication without an
+ * extra HEAD process: branch/OID identity, index/worktree names and states,
+ * exact untracked bytes, and the complete tracked patch. The first-commit
+ * (initial) form diffs worktree against index because no HEAD tree exists. */
+static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HEX_LEN + 1]) {
     cbm_sha256_ctx hash;
     cbm_sha256_init(&hash);
 #ifdef ASTRO_SPAWN
     const char *const argv[] = {"git",    "--no-optional-locks", "-C", root_path,
-                                "status", "--porcelain=v1",      "-z", "--untracked-files=normal",
+                                "status", "--porcelain=v2",      "--branch", "-z",
+                                "--untracked-files=all",
                                 NULL};
     char *data = NULL;
     size_t len = 0;
@@ -238,8 +262,8 @@ static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_
 #else
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>%s",
+             "git --no-optional-locks -C \"%s\" status --porcelain=v2 --branch "
+             "--untracked-files=all 2>%s",
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
@@ -247,6 +271,13 @@ static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_
         return false;
     }
 #ifdef ASTRO_SPAWN
+    git_status_identity_t identity;
+    if (!git_status_identity(data, len, &identity)) {
+        cbm_log_warn("watcher.git_status.identity_invalid", "remediation",
+                     "inspect git status --porcelain=v2 --branch and repair HEAD before polling");
+        free(data);
+        return false;
+    }
     cbm_sha256_update(&hash, data, len);
     /* Porcelain names untracked files but does not include their contents.
      * Fold those bytes in so repeated edits to a still-untracked file are not
@@ -256,27 +287,47 @@ static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_
         while (end < len && data[end] != '\0') {
             end++;
         }
-        if (end >= offset + 3 && data[offset] == '?' && data[offset + 1] == '?' &&
-            data[offset + 2] == ' ') {
-            size_t path_len = end - (offset + 3);
+        if (end >= offset + 2 && data[offset] == '?' && data[offset + 1] == ' ') {
+            size_t path_len = end - (offset + 2);
             size_t root_len = strlen(root_path);
             char *path = malloc(root_len + path_len + 2);
-            if (path) {
-                memcpy(path, root_path, root_len);
-                path[root_len] = '/';
-                memcpy(path + root_len + 1, data + offset + 3, path_len);
-                path[root_len + path_len + 1] = '\0';
-                FILE *untracked = fopen(path, "rb");
-                if (untracked) {
-                    char chunk[CBM_SZ_1K];
-                    size_t chunk_len;
-                    while ((chunk_len = fread(chunk, 1, sizeof(chunk), untracked)) > 0) {
-                        cbm_sha256_update(&hash, chunk, chunk_len);
-                    }
-                    fclose(untracked);
-                }
-                free(path);
+            if (!path) {
+                cbm_log_warn("watcher.git_status.untracked_alloc_failed", "remediation",
+                             "free memory before polling the complete Git source state");
+                free(data);
+                return false;
             }
+            memcpy(path, root_path, root_len);
+            path[root_len] = '/';
+            memcpy(path + root_len + 1, data + offset + 2, path_len);
+            path[root_len + path_len + 1] = '\0';
+            FILE *untracked = fopen(path, "rb");
+            if (!untracked) {
+                char errno_text[CBM_SZ_64];
+                snprintf(errno_text, sizeof(errno_text), "%d", errno);
+                cbm_log_warn("watcher.git_status.untracked_read_failed", "path", path, "errno",
+                             errno_text);
+                free(path);
+                free(data);
+                return false;
+            }
+            char chunk[CBM_SZ_1K];
+            size_t chunk_len;
+            while ((chunk_len = fread(chunk, 1, sizeof(chunk), untracked)) > 0) {
+                cbm_sha256_update(&hash, chunk, chunk_len);
+            }
+            if (ferror(untracked)) {
+                char errno_text[CBM_SZ_64];
+                snprintf(errno_text, sizeof(errno_text), "%d", errno);
+                cbm_log_warn("watcher.git_status.untracked_read_failed", "path", path, "errno",
+                             errno_text);
+                fclose(untracked);
+                free(path);
+                free(data);
+                return false;
+            }
+            fclose(untracked);
+            free(path);
         }
         offset = end + 1;
     }
@@ -284,8 +335,13 @@ static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_
 
     /* Porcelain status contains names/status only. Fold the complete tracked
      * patch in so successive edits to the same dirty path produce new state. */
-    const char *const diff_argv[] = {
-        "git", "--no-optional-locks", "-C", root_path, "diff", "--binary", "HEAD", NULL};
+    const char *const diff_committed_argv[] = {
+        "git", "--no-optional-locks", "-C", root_path, "diff", "--binary", "--no-ext-diff",
+        "--no-textconv", "--no-renames", "HEAD", "--", NULL};
+    const char *const diff_initial_argv[] = {
+        "git", "--no-optional-locks", "-C", root_path, "diff", "--binary", "--no-ext-diff",
+        "--no-textconv", "--no-renames", "--", NULL};
+    const char *const *diff_argv = identity.initial ? diff_initial_argv : diff_committed_argv;
     data = NULL;
     len = 0;
     if (cbm_spawn_capture(diff_argv, &data, &len, &err) != 0) {
@@ -313,8 +369,9 @@ static bool git_worktree_fingerprint(const char *root_path, char out[CBM_SHA256_
      * once, instead of the watcher going blind after the first edit. */
     char diff_cmd[CBM_SZ_1K];
     snprintf(diff_cmd, sizeof(diff_cmd),
-             "git --no-optional-locks -C \"%s\" diff --binary HEAD 2>%s", root_path,
-             WATCHER_NULDEV);
+             "git --no-optional-locks -C \"%s\" diff --binary --no-ext-diff --no-textconv "
+             "--no-renames HEAD -- 2>%s",
+             root_path, WATCHER_NULDEV);
     FILE *dfp = cbm_popen(diff_cmd, "r");
     if (!dfp) {
         return false;
@@ -635,9 +692,9 @@ void cbm_watcher_invalidate(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
-        /* A SHA-256 worktree fingerprint is exactly 64 lowercase hex bytes;
+        /* A SHA-256 Git source fingerprint is exactly 64 lowercase hex bytes;
          * this non-hex sentinel can never equal a real observation. */
-        snprintf(s->worktree_sha256, sizeof(s->worktree_sha256), "%s", "invalidated");
+        snprintf(s->source_sha256, sizeof(s->source_sha256), "%s", "invalidated");
         s->next_poll_ns = 0;
     }
     cbm_mutex_unlock(&w->projects_lock);
@@ -655,7 +712,7 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
-/* Init baseline for a project: check if git, get HEAD, count files */
+/* Init one coherent Git source baseline for a project. */
 static void init_baseline(project_state_t *s) {
     struct stat st;
     if (stat(s->root_path, &st) != 0) {
@@ -669,8 +726,7 @@ static void init_baseline(project_state_t *s) {
     s->baseline_done = true;
 
     if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
-        (void)git_worktree_fingerprint(s->root_path, s->worktree_sha256);
+        (void)git_source_fingerprint(s->root_path, s->source_sha256);
         s->file_count = git_file_count(s->root_path);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -683,18 +739,16 @@ static void init_baseline(project_state_t *s) {
 }
 
 typedef struct {
-    char head[CBM_SZ_64];
-    bool head_observed;
-    char worktree_sha256[CBM_SHA256_HEX_LEN + 1];
-    bool worktree_observed;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    bool source_observed;
 } project_observation_t;
 
-/* Observe whether a project has changes without advancing either successful
- * baseline. The exact pre-callback observation is committed only after the
+/* Observe whether a project has changes without advancing the successful
+ * baseline. The exact pre-callback source observation is committed only after the
  * index callback succeeds. This is deliberately transactional: acknowledging
- * HEAD before a failed callback makes a committed source change invisible to
- * every later poll, while re-observing after success can swallow bytes that
- * changed during the index generation itself. */
+ * identity before a failed callback makes a source change invisible to every
+ * later poll, while re-observing after success can swallow bytes that changed
+ * during the index generation itself. */
 static bool check_changes(const project_state_t *s, project_observation_t *observation) {
     if (!s->is_git) {
         return false;
@@ -702,26 +756,16 @@ static bool check_changes(const project_state_t *s, project_observation_t *obser
 
     memset(observation, 0, sizeof(*observation));
 
-    /* Check HEAD movement */
-    observation->head_observed =
-        git_head(s->root_path, observation->head, sizeof(observation->head)) == 0;
-
-    /* Check whether the porcelain state changed since the last successful
-     * indexing tick, including successive edits while the tree remains dirty. */
-    observation->worktree_observed =
-        git_worktree_fingerprint(s->root_path, observation->worktree_sha256);
-    return (observation->head_observed && strcmp(observation->head, s->last_head) != 0) ||
-           (observation->worktree_observed &&
-            strcmp(observation->worktree_sha256, s->worktree_sha256) != 0);
+    observation->source_observed =
+        git_source_fingerprint(s->root_path, observation->source_sha256);
+    return observation->source_observed &&
+           strcmp(observation->source_sha256, s->source_sha256) != 0;
 }
 
 static void commit_observation(project_state_t *s, const project_observation_t *observation) {
-    if (observation->head_observed) {
-        snprintf(s->last_head, sizeof(s->last_head), "%s", observation->head);
-    }
-    if (observation->worktree_observed) {
-        snprintf(s->worktree_sha256, sizeof(s->worktree_sha256), "%s",
-                 observation->worktree_sha256);
+    if (observation->source_observed) {
+        snprintf(s->source_sha256, sizeof(s->source_sha256), "%s",
+                 observation->source_sha256);
     }
 }
 

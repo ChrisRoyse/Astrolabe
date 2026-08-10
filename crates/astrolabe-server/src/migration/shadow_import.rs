@@ -245,7 +245,7 @@ fn provenance_with_git_source(
             "fingerprint_version": astrolabe_anchors::archaeology::GIT_SOURCE_FINGERPRINT_VERSION,
             "history_state": serde_json::to_value(&snapshot.history)?,
             "history_present": snapshot.history.commit_oid().is_some(),
-            "symbolic_head": snapshot.history.unborn_symbolic_ref(),
+            "symbolic_head": snapshot.history.symbolic_ref(),
             "source_bytes_measured": true,
             "trust": "verified",
             "freshness": "current",
@@ -297,8 +297,7 @@ fn validate_git_source_provenance(
         && source.get("entity").and_then(Value::as_str) == Some("git_worktree")
         && source.get("history_present").and_then(Value::as_bool)
             == Some(snapshot.history.commit_oid().is_some())
-        && source.get("symbolic_head").and_then(Value::as_str)
-            == snapshot.history.unborn_symbolic_ref()
+        && source.get("symbolic_head").and_then(Value::as_str) == snapshot.history.symbolic_ref()
         && source.get("source_fingerprint").and_then(Value::as_str)
             == Some(snapshot.source_fingerprint.as_str())
         && source.get("fingerprint_algorithm").and_then(Value::as_str)
@@ -5012,7 +5011,7 @@ pub(crate) fn try_shadow_index_noop_admission(
         "head": archaeology_head,
         "history_state": serde_json::to_value(&persisted_history)?,
         "history_present": persisted_history.commit_oid().is_some(),
-        "symbolic_head": persisted_history.unborn_symbolic_ref(),
+        "symbolic_head": persisted_history.symbolic_ref(),
         "persisted_summary_sha256": archaeology_sha256,
         "historical_work_skipped": true,
         "historical_commits_crashed": 0,
@@ -5526,7 +5525,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, 
         Some(history) => json!({
             "history_state": history,
             "history_present": history.commit_oid().is_some(),
-            "symbolic_head": history.unborn_symbolic_ref(),
+            "symbolic_head": history.symbolic_ref(),
             "source_fingerprint": outcome.git_source_fingerprint,
             "repo_path": outcome.git_source_repo_path,
             "source_bytes_measured": true,
@@ -6123,7 +6122,7 @@ pub(crate) fn persist_shadow_publication_at(
         )?;
     }
     match outcome.git_history_state.as_ref() {
-        Some(GitHistoryState::Committed { oid }) => {
+        Some(GitHistoryState::Committed { oid, .. }) => {
             if outcome.git_archaeology.get("head").and_then(Value::as_str) != Some(oid.as_str()) {
                 return Err(format!(
                     "ASTRO_GIT_HISTORY_STATE_INVALID: committed publication history {oid} disagrees with archaeology head {:?}; remediation: preserve the staged generation and inspect source/archaeology wiring",

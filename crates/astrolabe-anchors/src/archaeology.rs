@@ -333,8 +333,13 @@ impl PartialEq for GitDiffTreeBatchTelemetry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum GitHistoryState {
-    /// `HEAD^{commit}` resolved to this exact immutable commit object.
-    Committed { oid: String },
+    /// `HEAD^{commit}` resolved to this exact immutable commit object. The
+    /// optional immediate symbolic ref distinguishes a checked-out branch from
+    /// detached HEAD even when both name the same object.
+    Committed {
+        oid: String,
+        symbolic_ref: Option<String>,
+    },
     /// Immediate symbolic `HEAD` names this exact absent branch ref.
     Unborn { symbolic_ref: String },
 }
@@ -343,7 +348,18 @@ impl GitHistoryState {
     /// Validates the persisted representation without consulting repository state.
     pub fn validate(&self) -> Result<(), ArchaeologyError> {
         match self {
-            Self::Committed { oid } => validate_oid(oid),
+            Self::Committed { oid, symbolic_ref } => {
+                validate_oid(oid)?;
+                if let Some(symbolic_ref) = symbolic_ref {
+                    if !valid_branch_ref(symbolic_ref) {
+                        return Err(ArchaeologyError::new(
+                            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                            format!("invalid committed symbolic branch ref {symbolic_ref:?}"),
+                        ));
+                    }
+                }
+                Ok(())
+            }
             Self::Unborn { symbolic_ref } if valid_branch_ref(symbolic_ref) => Ok(()),
             Self::Unborn { symbolic_ref } => Err(ArchaeologyError::new(
                 ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
@@ -355,7 +371,7 @@ impl GitHistoryState {
     /// Returns the current commit object id only when history exists.
     pub fn commit_oid(&self) -> Option<&str> {
         match self {
-            Self::Committed { oid } => Some(oid),
+            Self::Committed { oid, .. } => Some(oid),
             Self::Unborn { .. } => None,
         }
     }
@@ -364,6 +380,15 @@ impl GitHistoryState {
     pub fn unborn_symbolic_ref(&self) -> Option<&str> {
         match self {
             Self::Committed { .. } => None,
+            Self::Unborn { symbolic_ref } => Some(symbolic_ref),
+        }
+    }
+
+    /// Returns the immediate symbolic branch ref for either committed or
+    /// unborn HEAD. `None` is an explicitly detached committed HEAD.
+    pub fn symbolic_ref(&self) -> Option<&str> {
+        match self {
+            Self::Committed { symbolic_ref, .. } => symbolic_ref.as_deref(),
             Self::Unborn { symbolic_ref } => Some(symbolic_ref),
         }
     }
@@ -534,7 +559,7 @@ pub fn mine_git_archaeology_at_history(
     let repo: &Path = &toplevel;
     let history = history.clone();
     let head = match &history {
-        GitHistoryState::Committed { oid } => oid.clone(),
+        GitHistoryState::Committed { oid, .. } => oid.clone(),
         GitHistoryState::Unborn { symbolic_ref } => {
             if let GitMineMode::Since { previous_head } = mode {
                 return Err(ArchaeologyError::new(
@@ -851,7 +876,12 @@ pub fn git_history_state(repo: &Path) -> Result<GitHistoryState, ArchaeologyErro
     if head_output.status.success() {
         let oid = utf8_trim(&head_output.stdout)?;
         validate_oid(&oid)?;
-        return Ok(GitHistoryState::Committed { oid });
+        let symbolic_ref =
+            git_optional_text(repo, &["symbolic-ref", "--quiet", "--no-recurse", "HEAD"])?
+                .map(|value| value.trim().to_string());
+        let history = GitHistoryState::Committed { oid, symbolic_ref };
+        history.validate()?;
+        return Ok(history);
     }
 
     let Some(symbolic_ref) =
@@ -911,14 +941,16 @@ pub fn is_git_work_tree(repo: &Path) -> bool {
 
 /// Self-describing algorithm tag for the git source fingerprint (#347).
 pub const GIT_SOURCE_FINGERPRINT_ALGO: &str = "blake3";
-/// Self-describing version tag for the git source fingerprint (#347/#858).
+/// Self-describing version tag for the git source fingerprint (#347/#858/#1082).
 ///
 /// v2 replaces textual patch hashing with exact current bytes for every changed
 /// tracked or untracked path. A textual Git diff deliberately does not contain
 /// binary-file bytes, so two different binary edits could previously produce the
-/// same status + `Binary files differ` payload. Persisted v1 values are therefore
-/// never compared to this stronger domain.
-pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v3";
+/// same status + `Binary files differ` payload. v4 additionally binds the
+/// immediate symbolic/detached HEAD identity for committed history; branch
+/// structure is a publication input even when its commit OID is unchanged.
+/// Persisted older values are therefore never compared to this stronger domain.
+pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v4";
 
 /// Content fingerprint of the live git working tree at `repo` — the source-of-truth
 /// freshness signal for shadow imports (#347).
@@ -985,7 +1017,7 @@ fn git_source_fingerprint_at_history(
             // staged files as well as the untracked inventory below.
             git_bytes(repo, &["ls-files", "-z"])?
         }
-        GitHistoryState::Committed { oid } => git_bytes(
+        GitHistoryState::Committed { oid, .. } => git_bytes(
             repo,
             &[
                 "diff",
@@ -1009,9 +1041,16 @@ fn git_source_fingerprint_at_history(
     };
     section(GIT_SOURCE_FINGERPRINT_VERSION.as_bytes());
     match history {
-        GitHistoryState::Committed { oid } => {
+        GitHistoryState::Committed { oid, symbolic_ref } => {
             section(b"committed");
             section(oid.as_bytes());
+            match symbolic_ref {
+                Some(symbolic_ref) => {
+                    section(b"symbolic");
+                    section(symbolic_ref.as_bytes());
+                }
+                None => section(b"detached"),
+            }
         }
         GitHistoryState::Unborn { symbolic_ref } => {
             section(b"unborn");
