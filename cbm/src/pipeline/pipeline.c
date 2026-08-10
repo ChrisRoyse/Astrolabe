@@ -2197,6 +2197,119 @@ static int record_git_structure_error(cbm_pipeline_t *p, const char *code, const
     return CBM_NOT_FOUND;
 }
 
+int cbm_pipeline_git_structure_matches_store(cbm_pipeline_t *p, cbm_store_t *store, bool *matches) {
+    if (matches) {
+        *matches = false;
+    }
+    if (!p || !store || !matches || !p->project_name || !p->project_name[0] || !p->branch_qn ||
+        !p->branch_qn[0] || !p->git_ctx.branch || !p->git_ctx.branch[0]) {
+        return record_git_structure_error(
+            p, "CBM_INCREMENTAL_GIT_STRUCTURE_CONTEXT_INVALID", "probe_incremental_git_structure",
+            "the Git structure admission context is absent",
+            "repair Git context capture so the verified store can be compared with the exact "
+            "current Project and Branch, then retry",
+            "", p ? p->branch_qn : "", "", p && p->git_ctx.branch ? p->git_ctx.branch : "", NULL,
+            NULL);
+    }
+
+    char *expected_properties = pipeline_git_context_props_json_alloc(&p->git_ctx);
+    if (!expected_properties) {
+        return record_git_structure_error(
+            p, "CBM_INCREMENTAL_GIT_PROPERTIES_SERIALIZE_FAILED",
+            "serialize_incremental_git_structure_probe",
+            "the exact current Git properties could not be retained for read-only admission",
+            "preserve the existing SQLite family, repair the Git context or free memory, then "
+            "retry",
+            "", p->branch_qn, "", p->git_ctx.branch, NULL, NULL);
+    }
+
+    cbm_node_t *projects = NULL;
+    cbm_node_t *branches = NULL;
+    cbm_edge_t *has_branch = NULL;
+    int project_count = 0;
+    int branch_count = 0;
+    int has_branch_count = 0;
+    const char *query_operation = "find_incremental_project_identity";
+    int query_status = cbm_store_find_nodes_by_qn(store, p->project_name, p->project_name,
+                                                  &projects, &project_count);
+    if (query_status == CBM_STORE_OK) {
+        query_operation = "find_incremental_branch_identity";
+        query_status = cbm_store_find_nodes_by_label(store, p->project_name, "Branch", &branches,
+                                                     &branch_count);
+    }
+    if (query_status == CBM_STORE_OK && branch_count == 1 && branches) {
+        query_operation = "find_incremental_has_branch_relation";
+        query_status = cbm_store_find_edges_by_target_type(store, branches[0].id, "HAS_BRANCH",
+                                                           &has_branch, &has_branch_count);
+    }
+    if (query_status != CBM_STORE_OK) {
+        const char *store_detail = cbm_store_error(store);
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_GIT_STRUCTURE_PROBE_FAILED", query_operation,
+            store_detail && store_detail[0]
+                ? store_detail
+                : "the indexed Project/Branch/HAS_BRANCH state could not be read exactly",
+            "preserve the existing SQLite family, repair the named store query, then retry",
+            branch_count == 1 && branches && branches[0].qualified_name ? branches[0].qualified_name
+                                                                        : "",
+            p->branch_qn, branch_count == 1 && branches && branches[0].name ? branches[0].name : "",
+            p->git_ctx.branch, "store_operation", query_operation);
+        cbm_store_free_edges(has_branch, has_branch_count);
+        cbm_store_free_nodes(branches, branch_count);
+        cbm_store_free_nodes(projects, project_count);
+        free(expected_properties);
+        return result;
+    }
+
+    const char *mismatch_reason = NULL;
+    if (project_count != 1 || !projects || !projects[0].project || !projects[0].label ||
+        !projects[0].name || !projects[0].qualified_name ||
+        strcmp(projects[0].project, p->project_name) != 0 ||
+        strcmp(projects[0].label, "Project") != 0 ||
+        strcmp(projects[0].name, p->project_name) != 0 ||
+        strcmp(projects[0].qualified_name, p->project_name) != 0) {
+        mismatch_reason = "project_identity";
+    } else if (branch_count != 1 || !branches || !branches[0].project || !branches[0].label ||
+               !branches[0].name || !branches[0].qualified_name || !branches[0].properties_json ||
+               strcmp(branches[0].project, p->project_name) != 0 ||
+               strcmp(branches[0].label, "Branch") != 0 ||
+               strcmp(branches[0].name, p->git_ctx.branch) != 0 ||
+               strcmp(branches[0].qualified_name, p->branch_qn) != 0 ||
+               strcmp(branches[0].properties_json, expected_properties) != 0) {
+        mismatch_reason = "branch_identity_or_properties";
+    } else if (has_branch_count != 1 || !has_branch || !has_branch[0].project ||
+               !has_branch[0].type || strcmp(has_branch[0].project, p->project_name) != 0 ||
+               strcmp(has_branch[0].type, "HAS_BRANCH") != 0 ||
+               has_branch[0].source_id != projects[0].id ||
+               has_branch[0].target_id != branches[0].id || !has_branch[0].properties_json ||
+               strcmp(has_branch[0].properties_json, expected_properties) != 0) {
+        mismatch_reason = "has_branch_identity_or_properties";
+    }
+
+    *matches = mismatch_reason == NULL;
+    if (mismatch_reason) {
+        char project_count_text[32];
+        char branch_count_text[32];
+        char relation_count_text[32];
+        (void)snprintf(project_count_text, sizeof(project_count_text), "%d", project_count);
+        (void)snprintf(branch_count_text, sizeof(branch_count_text), "%d", branch_count);
+        (void)snprintf(relation_count_text, sizeof(relation_count_text), "%d", has_branch_count);
+        cbm_log_info("incremental.git_structure_admission", "route", "reconcile_required", "reason",
+                     mismatch_reason, "old_branch",
+                     branch_count == 1 && branches && branches[0].qualified_name
+                         ? branches[0].qualified_name
+                         : "",
+                     "new_branch", p->branch_qn, "project_count", project_count_text,
+                     "branch_count", branch_count_text, "has_branch_count", relation_count_text);
+    }
+
+    cbm_store_free_edges(has_branch, has_branch_count);
+    cbm_store_free_nodes(branches, branch_count);
+    cbm_store_free_nodes(projects, project_count);
+    free(expected_properties);
+    return 0;
+}
+
 static int validate_has_branch_relation(cbm_pipeline_t *p, const cbm_gbuf_t *gb,
                                         const cbm_gbuf_node_t *project,
                                         const cbm_gbuf_node_t *branch, const char *new_qn,
@@ -3439,6 +3552,23 @@ static int try_unchanged_before_snapshot(cbm_pipeline_t *p, const cbm_discover_o
     if (!unchanged) {
         if (pipeline_close_store(p, &store, "close_changed_source_store",
                                  "unchanged_route", db_path) != 0) {
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
+        free(db_path);
+        return PL_ROUTE_FULL;
+    }
+
+    bool git_structure_matches = false;
+    if (cbm_pipeline_git_structure_matches_store(p, store, &git_structure_matches) != 0) {
+        (void)pipeline_close_store(p, &store, "close_git_structure_probe_failed_store",
+                                   "unchanged_route", db_path);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
+    if (!git_structure_matches) {
+        if (pipeline_close_store(p, &store, "close_git_structure_changed_store", "unchanged_route",
+                                 db_path) != 0) {
             free(db_path);
             return CBM_NOT_FOUND;
         }

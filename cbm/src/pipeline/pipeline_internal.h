@@ -137,6 +137,12 @@ void cbm_pipeline_record_gbuf_refusal(cbm_pipeline_t *p, const cbm_gbuf_t *gb, c
  * existing SQLite family untouched. */
 int cbm_pipeline_reconcile_incremental_git_structure(cbm_pipeline_t *p, cbm_gbuf_t *gb);
 
+/* Decide whether a verified store already carries the exact current Git
+ * Project/Branch/HAS_BRANCH identity. This indexed, read-only admission check
+ * is shared by every no-file-change exit; semantic drift continues to the one
+ * graph reconciliation path, while query failures are terminal diagnostics. */
+int cbm_pipeline_git_structure_matches_store(cbm_pipeline_t *p, cbm_store_t *store, bool *matches);
+
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
 void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
                                            const char *mode, const char *code, int item_count,

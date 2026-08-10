@@ -1249,7 +1249,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * That route loads and atomically re-materializes the existing graph below
      * without re-parsing source files. */
     bool snapshot_noop = n_changed == 0 && deleted_count == 0;
-    if (snapshot_noop && !cbm_pipeline_row_sink_active(p)) {
+    bool git_structure_matches = false;
+    if (snapshot_noop && !cbm_pipeline_row_sink_active(p) &&
+        cbm_pipeline_git_structure_matches_store(p, store, &git_structure_matches) != 0) {
+        free(is_changed);
+        free_deleted_paths(deleted, deleted_count);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close_required(&store, "incremental.git_structure_probe_failed");
+        return CBM_NOT_FOUND;
+    }
+    if (snapshot_noop && !cbm_pipeline_row_sink_active(p) && git_structure_matches) {
         cbm_pipeline_phase_probe_t noop_probe =
             cbm_pipeline_phase_probe_start(p, "incr_noop_finalize");
         int committed_nodes = cbm_store_count_nodes(store, project);
