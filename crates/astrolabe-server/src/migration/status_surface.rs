@@ -10,6 +10,8 @@ const STARTUP_VERIFY_ADMISSION_ORDER: &str = "completed_before_foreground_admiss
 const PERIODIC_VERIFY_OPERATION: &str = "periodic_verify_scrub_project";
 const PERIODIC_VERIFY_MISSING_OPERATION: &str = "periodic_verify_missing_vault_probe";
 const PERIODIC_VERIFY_ADMISSION_ORDER: &str = "executed_after_foreground_admission";
+pub(crate) const POST_PUBLISH_VERIFY_OPERATION: &str = "post_publish_verify_scrub_project";
+const POST_PUBLISH_VERIFY_ADMISSION_ORDER: &str = "completed_before_index_success";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JanitorStartupVerifyReport {
@@ -387,13 +389,44 @@ pub(crate) fn periodic_verify_scrub_project(
     // Serialize against the importer: the scrub commits a checkpoint row + Measure
     // ledger entry, so it must not run concurrently with a shadow import that is
     // itself appending to the same ledger.
-    let Some(_shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
+    let Some(shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
         return Ok(None);
     };
-    let vault_id = read_config_value(cache_dir, &metadata_key(project, "vault_id"))?
+    let identity_keys = [
+        metadata_key(project, "vault_id"),
+        metadata_key(project, "vault_salt"),
+    ];
+    let identity_values = read_config_values(cache_dir, &identity_keys)?;
+    let vault_id = identity_values[0]
+        .clone()
         .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
-    let vault_salt = read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
+    let vault_salt = identity_values[1]
+        .clone()
         .unwrap_or_else(|| vault_salt(project));
+    scrub_project_with_import_owner(
+        cache_dir,
+        project,
+        vault_dir,
+        &vault_id,
+        &vault_salt,
+        &shadow_import_lock,
+    )
+    .map(Some)
+}
+
+/// Executes the mutating janitor slice under an already-acquired exact project
+/// owner. This is shared by the periodic lane and the post-publication readiness
+/// barrier so the latter never reacquires, waits on, or bypasses its own import
+/// lock (#1085).
+fn scrub_project_with_import_owner(
+    cache_dir: &Path,
+    project: &str,
+    vault_dir: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    shadow_import_lock: &ShadowImportLock,
+) -> Result<PeriodicScrubOutcome, DynError> {
+    shadow_import_lock.assert_owns(cache_dir, project)?;
     // Writable handle: the scrub advances the persisted JanitorCheckpoint and
     // appends the witnessed Measure scrub record. selected_cfs=None (all CFs).
     let vault = open_shadow_vault_writable(vault_dir, &vault_id, &vault_salt, Vec::new())?;
@@ -411,7 +444,7 @@ pub(crate) fn periodic_verify_scrub_project(
                 ),
                 astrolabe_ingest::JanitorStepReport::CaughtUp { .. } => (None, None, None),
             };
-            Ok(Some(PeriodicScrubOutcome {
+            Ok(PeriodicScrubOutcome {
                 status: "intact".to_string(),
                 verified_through: checkpoint.verified_through,
                 scrubbed: report.scrubbed(),
@@ -419,9 +452,9 @@ pub(crate) fn periodic_verify_scrub_project(
                 slice_end,
                 error_text: None,
                 fsv,
-            }))
+            })
         }
-        Err(error) => Ok(Some(PeriodicScrubOutcome {
+        Err(error) => Ok(PeriodicScrubOutcome {
             // Fail closed: the janitor detected chain damage (or a corrupt
             // checkpoint) and made no mutation. Surface the exact refusal.
             status: "error".to_string(),
@@ -431,8 +464,183 @@ pub(crate) fn periodic_verify_scrub_project(
             slice_end: None,
             error_text: Some(error.to_string()),
             fsv: None,
-        })),
+        }),
     }
+}
+
+/// Completes and reads back the first bounded scrub for a newly published shadow
+/// generation before `index_repository` may return success (#1085).
+///
+/// Cost contract: exactly one call per artifact publication, while the existing
+/// project import owner is still held. There is no request/poll loop here. Logical
+/// verification is janitor-budget bounded; physical vault-open/materialization
+/// cost remains dependent on the real vault and ledger (#1064 PC-03/09/40/41).
+pub(crate) fn post_publish_verify_project(
+    cache_dir: &Path,
+    project: &str,
+    outcome: &ShadowImportOutcome,
+    shadow_import_lock: &ShadowImportLock,
+) -> Result<Value, DynError> {
+    let checked_at_unix_ms = unix_epoch_millis();
+    let scrub = scrub_project_with_import_owner(
+        cache_dir,
+        project,
+        &outcome.vault_dir,
+        &outcome.vault_id,
+        &outcome.vault_salt,
+        shadow_import_lock,
+    )
+    .map_err(|error| -> DynError {
+        ToolFault::new(
+            "ASTRO_POST_PUBLISH_VERIFY_EXECUTION_FAILED",
+            format!(
+                "project {project:?} published its artifact generation but the first scrub could not execute: {error}"
+            ),
+            "preserve the published source/lowered/vault/config generation and inspect the exact owner, vault-open, or scrub failure before retrying",
+        )
+        .with_detail("project", Value::String(project.to_string()))
+        .with_detail(
+            "vault_dir",
+            Value::String(outcome.vault_dir.display().to_string()),
+        )
+        .with_detail("source_error", Value::String(error.to_string()))
+        .into()
+    })?;
+    let verified_through = Some(scrub.verified_through);
+    persist_periodic_verify_status_at(
+        cache_dir,
+        project,
+        &scrub.status,
+        &outcome.vault_dir,
+        checked_at_unix_ms,
+        verified_through,
+        scrub.slice_start,
+        scrub.slice_end,
+        scrub.error_text.as_deref(),
+        verified_through,
+        scrub.scrubbed,
+        scrub.fsv.as_ref(),
+        POST_PUBLISH_VERIFY_OPERATION,
+        POST_PUBLISH_VERIFY_ADMISSION_ORDER,
+    )
+    .map_err(|error| -> DynError {
+        ToolFault::new(
+            "ASTRO_POST_PUBLISH_VERIFY_STATUS_PERSIST_FAILED",
+            format!(
+                "project {project:?} published its artifact generation but could not persist the first scrub receipt: {error}"
+            ),
+            "preserve the published source/lowered/vault/config generation and inspect the exact config write failure before retrying",
+        )
+        .with_detail("project", Value::String(project.to_string()))
+        .with_detail(
+            "vault_dir",
+            Value::String(outcome.vault_dir.display().to_string()),
+        )
+        .with_detail("source_error", Value::String(error.to_string()))
+        .into()
+    })?;
+
+    // A successful config commit is not accepted as evidence by return value.
+    // Re-open and parse the physical rows through the ordinary status read path,
+    // then compare every readiness-bearing field to the exact write intent.
+    let readback = periodic_verify_status_at(cache_dir, project).map_err(|error| -> DynError {
+        ToolFault::new(
+            "ASTRO_POST_PUBLISH_VERIFY_STATUS_READBACK_FAILED",
+            format!(
+                "project {project:?} published its artifact generation and wrote the first scrub receipt, but independent config readback failed: {error}"
+            ),
+            "preserve the published generation and inspect the exact config rows before retrying",
+        )
+        .with_detail("project", Value::String(project.to_string()))
+        .with_detail(
+            "vault_dir",
+            Value::String(outcome.vault_dir.display().to_string()),
+        )
+        .with_detail("source_error", Value::String(error.to_string()))
+        .into()
+    })?;
+    let expected = json!({
+        "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+        "project": project,
+        "status": scrub.status,
+        "vault_dir": outcome.vault_dir.display().to_string(),
+        "checked_at_unix_ms": checked_at_unix_ms,
+        "ledger_rows": verified_through,
+        "checked_range_start": scrub.slice_start,
+        "checked_range_end": scrub.slice_end,
+        "verified_through": verified_through,
+        "scrubbed": scrub.scrubbed,
+        "operation": POST_PUBLISH_VERIFY_OPERATION,
+        "foreground_admission_order": POST_PUBLISH_VERIFY_ADMISSION_ORDER,
+        "fsv": scrub.fsv,
+        "error": scrub.error_text,
+    });
+    for (field, expected_value) in expected
+        .as_object()
+        .expect("post-publish expected receipt is a JSON object")
+    {
+        if readback.get(field) != Some(expected_value) {
+            return Err(ToolFault::new(
+                "ASTRO_POST_PUBLISH_VERIFY_STATUS_READBACK_MISMATCH",
+                format!(
+                    "project {project:?} field {field:?} expected {expected_value}, observed {}",
+                    readback.get(field).unwrap_or(&Value::Null),
+                ),
+                "preserve the published generation and repair the exact torn or divergent config state before retrying",
+            )
+            .with_detail("project", Value::String(project.to_string()))
+            .with_detail("field", Value::String(field.clone()))
+            .with_detail("expected", expected_value.clone())
+            .with_detail(
+                "observed",
+                readback.get(field).cloned().unwrap_or(Value::Null),
+            )
+            .with_detail("complete_readback", readback.clone())
+            .into());
+        }
+    }
+    if scrub.status != "intact" {
+        let scrub_error = scrub
+            .error_text
+            .as_deref()
+            .unwrap_or("unclassified scrub failure");
+        return Err(ToolFault::new(
+            "ASTRO_POST_PUBLISH_VERIFY_REFUSED",
+            format!(
+                "project {project:?} published its artifact generation but the first bounded scrub failed closed: {scrub_error}"
+            ),
+            "preserve the published generation and repair the exact reported vault/checkpoint damage before retrying",
+        )
+        .with_detail("project", Value::String(project.to_string()))
+        .with_detail("scrub_error", Value::String(scrub_error.to_string()))
+        .with_detail("persisted_readback", readback)
+        .into());
+    }
+    Ok(readback)
+}
+
+fn caught_up_receipt_matches(
+    cache_dir: &Path,
+    project: &str,
+    vault_dir: &Path,
+    verified_through: u64,
+) -> Result<bool, DynError> {
+    let receipt = periodic_verify_status_at(cache_dir, project)?;
+    let expected_vault_dir = vault_dir.display().to_string();
+    Ok(
+        receipt.get("schema").and_then(Value::as_str) == Some(PERIODIC_VERIFY_CHAIN_SCHEMA)
+            && receipt.get("project").and_then(Value::as_str) == Some(project)
+            && receipt.get("status").and_then(Value::as_str) == Some("intact")
+            && receipt.get("vault_dir").and_then(Value::as_str)
+                == Some(expected_vault_dir.as_str())
+            && receipt.get("verified_through").and_then(Value::as_u64) == Some(verified_through)
+            && receipt.get("operation").and_then(Value::as_str).is_some()
+            && receipt
+                .get("foreground_admission_order")
+                .and_then(Value::as_str)
+                .is_some()
+            && receipt.get("error").is_some_and(Value::is_null),
+    )
 }
 
 pub(crate) fn periodic_verify_project_at(
@@ -483,22 +691,37 @@ pub(crate) fn periodic_verify_project_at(
     match periodic_verify_scrub_project(cache_dir, project, vault_dir)? {
         Some(outcome) => {
             let verified_through = Some(outcome.verified_through);
-            persist_periodic_verify_status_at(
-                cache_dir,
-                project,
-                &outcome.status,
-                vault_dir,
-                checked_at_unix_ms,
-                verified_through,
-                outcome.slice_start,
-                outcome.slice_end,
-                outcome.error_text.as_deref(),
-                verified_through,
-                outcome.scrubbed,
-                outcome.fsv.as_ref(),
-                PERIODIC_VERIFY_OPERATION,
-                PERIODIC_VERIFY_ADMISSION_ORDER,
-            )?;
+            // A caught-up slice has verified that the vault checkpoint already
+            // reaches the current tail. When the durable receipt proves that same
+            // fact, rewriting only its timestamp would be a permanent no-op write
+            // tax and would create false state drift (#1085, #1064 PC-03/PC-28).
+            // Any changed/error/absent receipt still persists normally.
+            let persist = outcome.scrubbed
+                || outcome.status != "intact"
+                || !caught_up_receipt_matches(
+                    cache_dir,
+                    project,
+                    vault_dir,
+                    outcome.verified_through,
+                )?;
+            if persist {
+                persist_periodic_verify_status_at(
+                    cache_dir,
+                    project,
+                    &outcome.status,
+                    vault_dir,
+                    checked_at_unix_ms,
+                    verified_through,
+                    outcome.slice_start,
+                    outcome.slice_end,
+                    outcome.error_text.as_deref(),
+                    verified_through,
+                    outcome.scrubbed,
+                    outcome.fsv.as_ref(),
+                    PERIODIC_VERIFY_OPERATION,
+                    PERIODIC_VERIFY_ADMISSION_ORDER,
+                )?;
+            }
             Ok(periodic_verify_result_json(
                 project,
                 &outcome.status,

@@ -526,7 +526,7 @@ pub(crate) fn handle_index_repository(
     // import lock is held through a miss and its full transition, preventing a
     // competing index process from changing the effective settings between the
     // admission read and staged publication.
-    let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
+    let Some(shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
         return tool_error_result(format!(
             "ASTRO_SHADOW_IMPORT_BUSY: a shadow publication for project {project:?} is already active at {}; remediation: retry after that exact owner completes",
             shadow_import_lock_path(&cache_dir, &project).display()
@@ -761,12 +761,48 @@ pub(crate) fn handle_index_repository(
                 publish_started.elapsed().as_millis(),
                 shadow_started.elapsed().as_millis()
             );
+            let post_publish_verification = if outcome.publication_required {
+                let verify_started = std::time::Instant::now();
+                let receipt = match post_publish_verify_project(
+                    &cache_dir,
+                    &project,
+                    &outcome,
+                    &shadow_import_lock,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        if let Some(result) = tool_fault_result_from_error(error.as_ref()) {
+                            return result;
+                        }
+                        return Err(error);
+                    }
+                };
+                eprintln!(
+                    "astro.shadow.index_phase phase=post_publish_verify elapsed_ms={} total_ms={}",
+                    verify_started.elapsed().as_millis(),
+                    shadow_started.elapsed().as_millis()
+                );
+                receipt
+            } else {
+                json!({
+                    "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+                    "project": project,
+                    "status": "not_required",
+                    "operation": POST_PUBLISH_VERIFY_OPERATION,
+                    "publication_required": false,
+                    "durable_state_changed": false,
+                    "reason": "the content-addressed artifact generation was not replaced",
+                    "freshness": "current",
+                    "trust": "verified",
+                })
+            };
             augment_tool_result(
                 &result,
                 json!({
                     "calyx": "shadow",
                     "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
                     "grounding_summary": grounding_summary(&outcome)?,
+                    "post_publish_verification": post_publish_verification,
                     // Never an unlabeled claim: a generation published from an
                     // adopted preserved stage says so, with its resume token (#1037).
                     "preserved_stage_resume": adoption_evidence,

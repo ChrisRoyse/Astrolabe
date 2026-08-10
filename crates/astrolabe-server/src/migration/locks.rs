@@ -7,8 +7,8 @@ pub(crate) const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub(crate) struct ShadowImportLock {
-    pub(crate) _guard: fs::File,
-    pub(crate) path: PathBuf,
+    _guard: fs::File,
+    path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -30,6 +30,42 @@ impl Drop for ShadowImportLock {
     }
 }
 
+impl ShadowImportLock {
+    /// Proves that this live token owns the exact project import lane requested by
+    /// a caller that is about to mutate the shadow vault. The token is constructed
+    /// only after the sidecar lock is acquired; matching the bound marker path and
+    /// its exact owner record prevents a different project's token from being
+    /// reused as ambient authority.
+    pub(crate) fn assert_owns(&self, cache_dir: &Path, project: &str) -> Result<(), DynError> {
+        let expected_path = shadow_import_lock_path(cache_dir, project);
+        if self.path != expected_path {
+            return Err(format!(
+                "ASTRO_SHADOW_IMPORT_OWNER_MISMATCH: retained import ownership is bound to {}, not the required project lock {}; remediation: preserve both project generations and retry only under the exact project's acquired import token",
+                self.path.display(),
+                expected_path.display(),
+            )
+            .into());
+        }
+
+        let expected_marker = format!("pid={}\n", std::process::id());
+        let marker = fs::read_to_string(&expected_path).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_SHADOW_IMPORT_OWNER_MARKER_UNREADABLE: retained ownership for project {project:?} cannot read its marker {}: {error}; remediation: preserve the project generation and inspect the exact marker/guard pair before retrying",
+                expected_path.display(),
+            )
+            .into()
+        })?;
+        if marker != expected_marker {
+            return Err(format!(
+                "ASTRO_SHADOW_IMPORT_OWNER_MARKER_MISMATCH: retained ownership for project {project:?} expected marker {expected_marker:?} at {}, observed {marker:?}; remediation: preserve the project generation and inspect the exact marker/guard pair before retrying",
+                expected_path.display(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 impl Drop for LoweredSqliteLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -39,6 +75,20 @@ impl Drop for LoweredSqliteLock {
 
 pub(crate) fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{SHADOW_IMPORT_LOCK_SUFFIX}"))
+}
+
+pub(crate) fn try_shadow_import_lock(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<ShadowImportLock>, DynError> {
+    fs::create_dir_all(cache_dir)?;
+    let lock_path = shadow_import_lock_path(cache_dir, project);
+    Ok(
+        try_readable_marker_lock(&lock_path)?.map(|guard| ShadowImportLock {
+            _guard: guard,
+            path: lock_path,
+        }),
+    )
 }
 
 pub(crate) fn try_readable_marker_lock(marker_path: &Path) -> Result<Option<fs::File>, DynError> {

@@ -1707,20 +1707,6 @@ fn shadow_index_admission_inputs_sha256(inputs: &Value) -> Result<String, DynErr
     Ok(hex_lower(&hasher.finalize()))
 }
 
-pub(crate) fn try_shadow_import_lock(
-    cache_dir: &Path,
-    project: &str,
-) -> Result<Option<ShadowImportLock>, DynError> {
-    fs::create_dir_all(cache_dir)?;
-    let lock_path = shadow_import_lock_path(cache_dir, project);
-    Ok(
-        try_readable_marker_lock(&lock_path)?.map(|guard| ShadowImportLock {
-            _guard: guard,
-            path: lock_path,
-        }),
-    )
-}
-
 pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> Value {
     // The label is derived from a content verdict (#93): `current/fresh/verified` is
     // emitted only when the live CBM SQLite fingerprint matches the persisted watermark
