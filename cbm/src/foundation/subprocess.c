@@ -43,32 +43,6 @@ static bool cbm_env_truthy(const char *name) {
     const char *value = getenv(name);
     return value && value[0] && strcmp(value, "0") != 0;
 }
-
-static void cbm_log_io_liveness_fault(const char *stage, DWORD native_error,
-                                      const char *message) {
-    char error_text[32];
-    snprintf(error_text, sizeof(error_text), "%lu", (unsigned long)native_error);
-    cbm_log_warn("subprocess.win.io_liveness_unobservable", "code",
-                 "CBM_SUBPROCESS_IO_LIVENESS_UNOBSERVABLE", "operation",
-                 "GetProcessIoCounters", "stage", stage, "native_error_kind", "win32",
-                 "native_error", error_text, "message", message, "remediation",
-                 "preserve the child; restore exact process I/O observability before relying on "
-                 "the quiet-timeout classification");
-}
-
-static bool cbm_io_transfer_regressed(const IO_COUNTERS *previous,
-                                      const IO_COUNTERS *current) {
-    return current->ReadTransferCount < previous->ReadTransferCount ||
-           current->WriteTransferCount < previous->WriteTransferCount ||
-           current->OtherTransferCount < previous->OtherTransferCount;
-}
-
-static bool cbm_io_transfer_advanced(const IO_COUNTERS *previous,
-                                     const IO_COUNTERS *current) {
-    return current->ReadTransferCount > previous->ReadTransferCount ||
-           current->WriteTransferCount > previous->WriteTransferCount ||
-           current->OtherTransferCount > previous->OtherTransferCount;
-}
 #endif
 
 static bool cbm_is_windows_crash_exit(unsigned code) {
@@ -443,63 +417,15 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
-    IO_COUNTERS previous_io = {0};
-    bool io_observable = opts->quiet_timeout_ms <= 0;
-    bool io_fault_reported = false;
-    if (opts->quiet_timeout_ms > 0) {
-        if (GetProcessIoCounters(pi.hProcess, &previous_io)) {
-            io_observable = true;
-        } else {
-            cbm_log_io_liveness_fault(
-                "baseline", GetLastError(),
-                "the exact child process I/O baseline could not be read; a no-progress kill "
-                "would be unevaluable");
-            io_fault_reported = true;
-        }
-    }
     for (;;) {
         DWORD w = WaitForSingleObject(pi.hProcess, 200);
-        bool progressed =
-            cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud);
+        if (cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud)) {
+            last_activity = cbm_now_ms();
+        }
         if (w == WAIT_OBJECT_0) {
             break;
         }
-        if (opts->quiet_timeout_ms > 0) {
-            IO_COUNTERS current_io = {0};
-            if (!GetProcessIoCounters(pi.hProcess, &current_io)) {
-                if (!io_fault_reported) {
-                    cbm_log_io_liveness_fault(
-                        "poll", GetLastError(),
-                        "the exact child process I/O counters became unreadable; a no-progress "
-                        "kill would be unevaluable");
-                    io_fault_reported = true;
-                }
-                io_observable = false;
-            } else if (!io_observable) {
-                /* Activity during an observation gap is unknowable. Start a fresh
-                 * complete quiet window from this exact recovered baseline. */
-                previous_io = current_io;
-                io_observable = true;
-                io_fault_reported = false;
-                progressed = true;
-            } else if (cbm_io_transfer_regressed(&previous_io, &current_io)) {
-                cbm_log_io_liveness_fault(
-                    "monotonicity", ERROR_INVALID_DATA,
-                    "the retained exact child process transfer counters regressed; a "
-                    "no-progress kill would be unevaluable");
-                previous_io = current_io;
-                io_fault_reported = true;
-                progressed = true;
-            } else {
-                progressed = progressed || cbm_io_transfer_advanced(&previous_io, &current_io);
-                previous_io = current_io;
-                io_fault_reported = false;
-            }
-        }
-        if (progressed) {
-            last_activity = cbm_now_ms();
-        }
-        if (opts->quiet_timeout_ms > 0 && io_observable &&
+        if (opts->quiet_timeout_ms > 0 &&
             (cbm_now_ms() - last_activity) >= (uint64_t)opts->quiet_timeout_ms) {
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, INFINITE);

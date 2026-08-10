@@ -10,11 +10,9 @@
  *      POSIX WIFSIGNALED/WTERMSIG, Windows NTSTATUS exception exit codes
  *      (0xC0000005 access-violation, 0xC00000FD stack-overflow, …), and
  *      GCC/MinGW SEH C++ exception markers (0x20474343 / 0x21474343).
- *   2. A quiet-timeout — kill + report HANG when the child makes no measurable
- *      progress for a configurable window. A completed log line is progress. On
- *      Windows, monotonic transfer-byte growth from GetProcessIoCounters on the
- *      retained exact child handle is also progress, independent of log level.
- *      CPU time alone never counts, so a spinning scanner remains killable.
+ *   2. A quiet-timeout — kill + report HANG when the child makes no progress
+ *      (emits no new log line) for a configurable window. This catches external
+ *      tree-sitter scanners that infinite-loop (a hang, not a crash).
  *
  * The reap loop is EINTR-safe. Line tailing keeps a partial final line buffered
  * (an incomplete, un-newline-terminated line is not yet "progress" and is not
@@ -45,9 +43,7 @@ typedef struct {
 } cbm_proc_result_t;
 
 /* Called for each newly-completed (newline-terminated) log line while the child
- * runs. A completed line also resets the quiet-timeout (it is progress). On
- * Windows the retained child's transfer-byte counters provide a second,
- * log-level-independent progress source. */
+ * runs. A completed line also resets the quiet-timeout (it is progress). */
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
 /* Called once, immediately after the child is successfully spawned, with the
@@ -66,7 +62,7 @@ typedef struct {
     cbm_proc_spawn_cb on_spawn;  /* optional: called with the child PID right after spawn */
     void *spawn_ud;              /* user data for on_spawn */
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
-                                  * ms with no measurable progress */
+                                  * ms with no new completed log line */
     bool delete_log_on_exit;     /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 

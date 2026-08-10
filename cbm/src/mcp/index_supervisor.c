@@ -88,12 +88,12 @@ bool cbm_index_supervisor_should_wrap(void) {
     return true;
 }
 
-/* Quiet-timeout (ms) for a supervised worker: killed + reported as a hang only
- * when it has no measurable progress within the window. Completed log lines and,
- * on native Windows, exact monotonic process transfer-byte growth reset the
- * window. CPU time alone does not. The I/O signal is independent of diagnostic
- * log level, so a large compiler expansion remains observable even when INFO
- * events are filtered. This is not a total-time cap. */
+/* Quiet-timeout (ms) for a supervised worker: killed + reported as a hang if it
+ * emits no NEW log line within the window. This is a NO-PROGRESS timeout — every
+ * completed log line the worker tails (per-batch parallel.extract.progress every
+ * 10 files, plus each pass boundary) resets it — NOT a total-time cap, so a large
+ * repo that keeps making progress is never falsely killed. Default: 15 min (a
+ * genuinely stuck file emits nothing, so this fires only on a real hang). */
 static int worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
     return DEFAULT_QUIET_TIMEOUT_MS;
@@ -321,12 +321,14 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     }
     free(worker_args);
 
-    /* No --progress: it installs a REPLACE-mode sink that
+    /* No --progress: the worker's DEFAULT structured logging already provides the
+     * no-progress heartbeat (INFO parallel.extract.progress every 10 files + each
+     * pass boundary — all newline-terminated → tailed → reset the quiet-timeout).
+     * --progress would be strictly worse here: it installs a REPLACE-mode sink that
      * suppresses those default lines and emits per-file extraction as a carriage-
      * return in-place update (no trailing '\n'), which cbm_tail_log does not count
-     * as log progress. The Windows supervisor independently observes exact worker
-     * transfer-byte growth, so liveness does not depend on INFO visibility. (The
-     * response goes to the separate --response-out file, not stdout.) */
+     * as progress. (It would not corrupt the response either — that goes to the
+     * separate --response-out file, not stdout.) */
     const char *argv[10];
     int n = 0;
     argv[n++] = self;
