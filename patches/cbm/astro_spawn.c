@@ -12,6 +12,7 @@
 
 #include "astro_spawn.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -374,83 +375,288 @@ static bool spawn_source_date_epoch_valid(const char *value) {
     return true;
 }
 
-static bool spawn_environment_entry_is_source_date_epoch(const wchar_t *entry) {
-    static const wchar_t name[] = L"SOURCE_DATE_EPOCH";
-    const int name_length = (int)(sizeof(name) / sizeof(name[0]) - 1);
+static bool spawn_environment_entry_has_name(const wchar_t *entry, const wchar_t *name) {
+    if (!entry || !name || entry[0] == L'=') {
+        return false;
+    }
+    size_t name_length = wcslen(name);
     size_t entry_length = wcslen(entry);
-    return entry_length > (size_t)name_length && entry[name_length] == L'=' &&
-           CompareStringOrdinal(entry, name_length, name, name_length, TRUE) == CSTR_EQUAL;
+    return name_length <= INT_MAX && entry_length > name_length &&
+           entry[name_length] == L'=' &&
+           CompareStringOrdinal(entry, (int)name_length, name, (int)name_length, TRUE) ==
+               CSTR_EQUAL;
 }
 
-static wchar_t *spawn_environment_with_source_date_epoch(const char *value,
-                                                          DWORD *error_out) {
-    *error_out = ERROR_SUCCESS;
-    if (!spawn_source_date_epoch_valid(value)) {
-        *error_out = ERROR_INVALID_PARAMETER;
+static int spawn_environment_entry_order(const wchar_t *left, const wchar_t *right) {
+    size_t left_length = left ? wcslen(left) : 0;
+    size_t right_length = right ? wcslen(right) : 0;
+    if (!left || !right || left_length > INT_MAX || right_length > INT_MAX) {
+        return INT_MIN;
+    }
+    int order = CompareStringOrdinal(left, (int)left_length, right, (int)right_length, TRUE);
+    if (order == CSTR_LESS_THAN) {
+        return -1;
+    }
+    if (order == CSTR_GREATER_THAN) {
+        return 1;
+    }
+    return order == CSTR_EQUAL ? 0 : INT_MIN;
+}
+
+static wchar_t *spawn_executable_directory(const wchar_t *executable, DWORD *error_out) {
+    const wchar_t *backslash = executable ? wcsrchr(executable, L'\\') : NULL;
+    const wchar_t *slash = executable ? wcsrchr(executable, L'/') : NULL;
+    const wchar_t *separator = backslash;
+    if (!separator || (slash && slash > separator)) {
+        separator = slash;
+    }
+    if (!separator || separator == executable) {
+        *error_out = ERROR_BAD_PATHNAME;
         return NULL;
     }
-    wchar_t *wide_value = spawn_utf8_to_wide(value);
+    size_t length = (size_t)(separator - executable);
+    if (length == 2 && executable[1] == L':') {
+        length++; /* Preserve the separator for a drive-root directory. */
+    }
+    if (length > SIZE_MAX / sizeof(wchar_t) - 1) {
+        *error_out = ERROR_ARITHMETIC_OVERFLOW;
+        return NULL;
+    }
+    wchar_t *directory = (wchar_t *)malloc((length + 1) * sizeof(*directory));
+    if (!directory) {
+        *error_out = ERROR_NOT_ENOUGH_MEMORY;
+        return NULL;
+    }
+    memcpy(directory, executable, length * sizeof(*directory));
+    directory[length] = L'\0';
+    return directory;
+}
+
+static bool spawn_path_starts_with_directory(const wchar_t *path,
+                                              const wchar_t *directory) {
+    if (!path || !directory) {
+        return false;
+    }
+    const wchar_t *separator = wcschr(path, L';');
+    size_t path_length = separator ? (size_t)(separator - path) : wcslen(path);
+    size_t directory_length = wcslen(directory);
+    while (path_length > 0 &&
+           (path[path_length - 1] == L'\\' || path[path_length - 1] == L'/')) {
+        path_length--;
+    }
+    while (directory_length > 0 &&
+           (directory[directory_length - 1] == L'\\' ||
+            directory[directory_length - 1] == L'/')) {
+        directory_length--;
+    }
+    return path_length == directory_length && path_length <= INT_MAX &&
+           CompareStringOrdinal(path, (int)path_length, directory,
+                                (int)directory_length, TRUE) == CSTR_EQUAL;
+}
+
+static bool spawn_environment_size_add(size_t *required, size_t entry_length) {
+    if (*required == SIZE_MAX || entry_length > SIZE_MAX - *required - 1) {
+        return false;
+    }
+    *required += entry_length + 1;
+    return true;
+}
+
+static wchar_t *spawn_environment_with_source_epoch_and_runtime(
+    const char *value, const wchar_t *executable, DWORD *error_out) {
+    *error_out = ERROR_SUCCESS;
+    LPWCH inherited = NULL;
+    wchar_t *wide_value = NULL;
+    wchar_t *runtime_directory = NULL;
+    wchar_t *path_entry = NULL;
+    wchar_t *epoch_entry = NULL;
+    wchar_t *block = NULL;
+    if (!spawn_source_date_epoch_valid(value)) {
+        *error_out = ERROR_INVALID_PARAMETER;
+        goto done;
+    }
+    wide_value = spawn_utf8_to_wide(value);
     if (!wide_value) {
         *error_out = GetLastError();
         if (*error_out == ERROR_SUCCESS) {
             *error_out = ERROR_NO_UNICODE_TRANSLATION;
         }
-        return NULL;
+        goto done;
     }
-    LPWCH inherited = GetEnvironmentStringsW();
+    inherited = GetEnvironmentStringsW();
     if (!inherited) {
         *error_out = GetLastError();
-        free(wide_value);
-        return NULL;
+        goto done;
     }
 
-    static const wchar_t name[] = L"SOURCE_DATE_EPOCH";
-    size_t name_length = sizeof(name) / sizeof(name[0]) - 1;
-    size_t value_length = wcslen(wide_value);
+    runtime_directory = spawn_executable_directory(executable, error_out);
+    if (!runtime_directory) {
+        goto done;
+    }
+
+    static const wchar_t path_name[] = L"Path";
+    static const wchar_t epoch_name[] = L"SOURCE_DATE_EPOCH";
+    const wchar_t *inherited_path = NULL;
+    size_t path_entries = 0;
+    size_t epoch_entries = 0;
     size_t required = 1;
+    const wchar_t *previous = NULL;
     for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
         size_t entry_length = wcslen(entry);
-        if (!spawn_environment_entry_is_source_date_epoch(entry)) {
-            if (entry_length > SIZE_MAX - required - 1) {
-                *error_out = ERROR_ARITHMETIC_OVERFLOW;
-                FreeEnvironmentStringsW(inherited);
-                free(wide_value);
-                return NULL;
+        if (previous) {
+            int order = spawn_environment_entry_order(previous, entry);
+            if (order == INT_MIN || order > 0) {
+                *error_out = ERROR_INVALID_DATA;
+                goto done;
             }
-            required += entry_length + 1;
+        }
+        previous = entry;
+        if (spawn_environment_entry_has_name(entry, path_name)) {
+            inherited_path = entry + (sizeof(path_name) / sizeof(path_name[0]));
+            path_entries++;
+            continue;
+        }
+        if (spawn_environment_entry_has_name(entry, epoch_name)) {
+            epoch_entries++;
+            continue;
+        }
+        if (!spawn_environment_size_add(&required, entry_length)) {
+            *error_out = ERROR_ARITHMETIC_OVERFLOW;
+            goto done;
         }
     }
-    if (required > SIZE_MAX - name_length - 2 ||
-        value_length > SIZE_MAX - required - name_length - 2) {
-        *error_out = ERROR_ARITHMETIC_OVERFLOW;
-        FreeEnvironmentStringsW(inherited);
-        free(wide_value);
-        return NULL;
+    if (path_entries > 1 || epoch_entries > 1) {
+        *error_out = ERROR_INVALID_DATA;
+        goto done;
     }
-    required += name_length + 1 + value_length + 1;
-    wchar_t *block = (wchar_t *)calloc(required, sizeof(*block));
+
+    static const wchar_t path_prefix[] = L"Path=";
+    static const wchar_t epoch_prefix[] = L"SOURCE_DATE_EPOCH=";
+    size_t path_prefix_length = sizeof(path_prefix) / sizeof(path_prefix[0]) - 1;
+    size_t epoch_prefix_length = sizeof(epoch_prefix) / sizeof(epoch_prefix[0]) - 1;
+    size_t runtime_length = wcslen(runtime_directory);
+    size_t inherited_path_length = inherited_path ? wcslen(inherited_path) : 0;
+    size_t value_length = wcslen(wide_value);
+    bool runtime_already_first =
+        spawn_path_starts_with_directory(inherited_path, runtime_directory);
+    size_t path_value_length = inherited_path_length;
+    if (!runtime_already_first) {
+        size_t separator_length = inherited_path_length > 0 ? 1 : 0;
+        if (inherited_path_length > SIZE_MAX - separator_length ||
+            runtime_length > SIZE_MAX - inherited_path_length - separator_length) {
+            *error_out = ERROR_ARITHMETIC_OVERFLOW;
+            goto done;
+        }
+        path_value_length = runtime_length + separator_length + inherited_path_length;
+    }
+    if (path_value_length > SIZE_MAX - path_prefix_length ||
+        value_length > SIZE_MAX - epoch_prefix_length) {
+        *error_out = ERROR_ARITHMETIC_OVERFLOW;
+        goto done;
+    }
+    size_t path_entry_length = path_prefix_length + path_value_length;
+    size_t epoch_entry_length = epoch_prefix_length + value_length;
+    if (!spawn_environment_size_add(&required, path_entry_length) ||
+        !spawn_environment_size_add(&required, epoch_entry_length) ||
+        path_entry_length > SIZE_MAX / sizeof(wchar_t) - 1 ||
+        epoch_entry_length > SIZE_MAX / sizeof(wchar_t) - 1 ||
+        required > SIZE_MAX / sizeof(wchar_t)) {
+        *error_out = ERROR_ARITHMETIC_OVERFLOW;
+        goto done;
+    }
+
+    path_entry = (wchar_t *)malloc((path_entry_length + 1) * sizeof(*path_entry));
+    epoch_entry = (wchar_t *)malloc((epoch_entry_length + 1) * sizeof(*epoch_entry));
+    if (!path_entry || !epoch_entry) {
+        *error_out = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
+    }
+    wchar_t *path_cursor = path_entry;
+    memcpy(path_cursor, path_prefix, path_prefix_length * sizeof(*path_cursor));
+    path_cursor += path_prefix_length;
+    if (runtime_already_first) {
+        memcpy(path_cursor, inherited_path, inherited_path_length * sizeof(*path_cursor));
+        path_cursor += inherited_path_length;
+    } else {
+        memcpy(path_cursor, runtime_directory, runtime_length * sizeof(*path_cursor));
+        path_cursor += runtime_length;
+        if (inherited_path_length > 0) {
+            *path_cursor++ = L';';
+            memcpy(path_cursor, inherited_path,
+                   inherited_path_length * sizeof(*path_cursor));
+            path_cursor += inherited_path_length;
+        }
+    }
+    *path_cursor = L'\0';
+    memcpy(epoch_entry, epoch_prefix, epoch_prefix_length * sizeof(*epoch_entry));
+    memcpy(epoch_entry + epoch_prefix_length, wide_value,
+           (value_length + 1) * sizeof(*epoch_entry));
+
+    const wchar_t *insertions[2] = {path_entry, epoch_entry};
+    int insertion_order = spawn_environment_entry_order(insertions[0], insertions[1]);
+    if (insertion_order == INT_MIN || insertion_order == 0) {
+        *error_out = ERROR_INVALID_DATA;
+        goto done;
+    }
+    if (insertion_order > 0) {
+        const wchar_t *swap = insertions[0];
+        insertions[0] = insertions[1];
+        insertions[1] = swap;
+    }
+
+    block = (wchar_t *)calloc(required, sizeof(*block));
     if (!block) {
         *error_out = ERROR_NOT_ENOUGH_MEMORY;
-        FreeEnvironmentStringsW(inherited);
-        free(wide_value);
-        return NULL;
+        goto done;
     }
     wchar_t *cursor = block;
+    size_t insertion = 0;
     for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
         size_t entry_length = wcslen(entry);
-        if (!spawn_environment_entry_is_source_date_epoch(entry)) {
-            memcpy(cursor, entry, (entry_length + 1) * sizeof(*cursor));
-            cursor += entry_length + 1;
+        if (spawn_environment_entry_has_name(entry, path_name) ||
+            spawn_environment_entry_has_name(entry, epoch_name)) {
+            continue;
         }
+        while (insertion < 2) {
+            int order = spawn_environment_entry_order(insertions[insertion], entry);
+            if (order == INT_MIN) {
+                *error_out = ERROR_INVALID_DATA;
+                free(block);
+                block = NULL;
+                goto done;
+            }
+            if (order > 0) {
+                break;
+            }
+            size_t insertion_length = wcslen(insertions[insertion]);
+            memcpy(cursor, insertions[insertion],
+                   (insertion_length + 1) * sizeof(*cursor));
+            cursor += insertion_length + 1;
+            insertion++;
+        }
+        memcpy(cursor, entry, (entry_length + 1) * sizeof(*cursor));
+        cursor += entry_length + 1;
     }
-    memcpy(cursor, name, name_length * sizeof(*cursor));
-    cursor += name_length;
-    *cursor++ = L'=';
-    memcpy(cursor, wide_value, value_length * sizeof(*cursor));
-    cursor += value_length;
-    *cursor++ = L'\0';
+    while (insertion < 2) {
+        size_t insertion_length = wcslen(insertions[insertion]);
+        memcpy(cursor, insertions[insertion], (insertion_length + 1) * sizeof(*cursor));
+        cursor += insertion_length + 1;
+        insertion++;
+    }
     *cursor = L'\0';
-    FreeEnvironmentStringsW(inherited);
+    if ((size_t)(cursor - block) != required - 1) {
+        *error_out = ERROR_INVALID_DATA;
+        free(block);
+        block = NULL;
+    }
+
+done:
+    if (inherited) {
+        FreeEnvironmentStringsW(inherited);
+    }
+    free(epoch_entry);
+    free(path_entry);
+    free(runtime_directory);
     free(wide_value);
     return block;
 }
@@ -644,10 +850,11 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     }
 
     DWORD environment_gle = ERROR_SUCCESS;
-    wchar_t *environment = source_date_epoch
-                               ? spawn_environment_with_source_date_epoch(source_date_epoch,
-                                                                          &environment_gle)
-                               : NULL;
+    wchar_t *environment =
+        source_date_epoch
+            ? spawn_environment_with_source_epoch_and_runtime(source_date_epoch, app,
+                                                               &environment_gle)
+            : NULL;
     bool environment_ready = !source_date_epoch || environment != NULL;
 
     PROCESS_INFORMATION pi;
@@ -691,8 +898,9 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         }
         if (!environment_ready) {
             return spawn_fail(err, CBM_SPAWN_E_ENVIRONMENT, "CBM_SPAWN_E_ENVIRONMENT",
-                              "the exact child environment could not be materialized",
-                              "preserve the source epoch and inspect the native environment error",
+                              "the sorted compiler child environment could not be materialized",
+                              "inspect the resolved compiler directory, inherited environment "
+                              "ordering, source epoch, and native environment error",
                               (unsigned long)spawn_gle, -1);
         }
         return spawn_fail(err, CBM_SPAWN_E_SPAWN, "CBM_SPAWN_E_SPAWN",

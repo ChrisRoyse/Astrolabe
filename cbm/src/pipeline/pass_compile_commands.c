@@ -2363,7 +2363,8 @@ static void log_failed_compiler_invocation(const compile_context_owner_t *owner,
         owner && owner->view.context_id ? owner->view.context_id : "", "working_directory",
         working_directory ? working_directory : "", "working_directory_bytes",
         working_bytes_text, "argv_count", argc_text, "argv_encoding",
-        "ordered_utf8_nul_delimited", "argv_sha256", digest_hex);
+        "ordered_utf8_nul_delimited", "argv_sha256", digest_hex,
+        "compiler_runtime_path_policy", "resolved_executable_directory_first");
     for (int i = 0; i < argc; i++) {
         char index_text[32];
         snprintf(index_text, sizeof(index_text), "%d", i);
@@ -2423,6 +2424,7 @@ static int compiler_spawn_fail(cbm_pipeline_ctx_t *ctx,
         "stderr_truncated", stderr_capture && stderr_capture->truncated ? "true" : "false",
         "stderr_sha256", stderr_hash, "message",
         error && error->message ? error->message : "the exact compiler preprocessing step failed",
+        "compiler_runtime_path_policy", "resolved_executable_directory_first",
         "remediation",
         error && error->remediation
             ? error->remediation
@@ -2642,6 +2644,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
                          "canonicalization", "validated_linemarkers_to_empty_lines",
                          "workspace_local_compiler_markers", workspace_local_compiler_markers_text,
                          "working_directory_markers", working_directory_markers_text,
+                         "compiler_runtime_path_policy",
+                         "resolved_executable_directory_first",
                          "source_date_epoch", index->source_date_epoch,
                          "source_date_epoch_provenance", "git_head_commit",
                          "source_date_epoch_revision", index->source_date_epoch_revision,
@@ -2739,6 +2743,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
             peak_text, "peak_compiler_stdout_bytes", peak_stdout_text, "expansion_set_sha256",
             set_hash, "cache", "one_compiler_expansion_per_context", "canonicalization",
             "validated_linemarkers_to_empty_lines", "date_time_macros", "git_source_date_epoch",
+            "compiler_runtime_path_policy", "resolved_executable_directory_first",
             "timestamp_macro_input", "immutable_snapshot_last_write_time", "source_date_epoch",
             index->source_date_epoch, "source_date_epoch_revision",
             index->source_date_epoch_revision, "fallback", "none");

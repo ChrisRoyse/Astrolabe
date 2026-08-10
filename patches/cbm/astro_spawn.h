@@ -114,10 +114,12 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                                       cbm_spawn_bounded_capture_t *out_stderr,
                                       cbm_spawn_error_t *err);
 
-/* Execute the exact cwd/capture contract with one process-local,
- * source-provenance-bound SOURCE_DATE_EPOCH override. The parent process and
- * concurrent compiler children are never mutated. The value must be a
- * canonical unsigned decimal Unix timestamp. */
+/* Execute the exact cwd/capture contract with one private, sorted child
+ * environment. It binds SOURCE_DATE_EPOCH to source provenance and puts the
+ * resolved compiler executable's directory first in the child's Path so that
+ * compiler subprograms inherit the same runtime-DLL closure. The parent process
+ * and concurrent compiler children are never mutated. The epoch value must be
+ * a canonical unsigned decimal Unix timestamp. */
 int cbm_spawn_capture_with_stderr_cwd_source_epoch(
     const char *const *argv, const char *working_directory, const char *source_date_epoch,
     char **out_data, size_t *out_len, size_t stderr_limit,
