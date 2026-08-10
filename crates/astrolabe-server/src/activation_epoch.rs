@@ -71,7 +71,16 @@ pub(crate) enum WorkerActivation {
 
 static INSTALLED_WORKER: OnceLock<InstalledWorkerContext> = OnceLock::new();
 
-pub(crate) fn register_installed_worker(context: InstalledWorkerContext) -> Result<(), String> {
+pub(crate) fn register_installed_worker(mut context: InstalledWorkerContext) -> Result<(), String> {
+    context.generation_path = canonical_context_path(&context.generation_path, "generation root")?;
+    context.active_generation_path = canonical_context_path(
+        &context.active_generation_path,
+        "active-generation authority",
+    )?;
+    context.executable_path =
+        canonical_context_path(&context.executable_path, "worker executable")?;
+    context.publication_path =
+        canonical_context_path(&context.publication_path, "publication receipt")?;
     if let Some(existing) = INSTALLED_WORKER.get() {
         if existing == &context {
             return Ok(());
@@ -369,7 +378,7 @@ fn read_active_generation_with_lease(
         return Err("ASTRO_ACTIVE_GENERATION_TRANSACTION_INVALID: transaction_id is empty; remediation: preserve the authority and complete one valid activation-v4 transaction".into());
     }
     let generation_id = json_string(&value, "/generation/id")?;
-    let generation_path = PathBuf::from(json_string(&value, "/generation/path")?);
+    let generation_path = canonical_record_path(&value, "/generation/path")?;
     for pointer in ["/codex/after_sha256", "/claude_code/after_sha256"] {
         let hash = json_string(&value, pointer)?;
         if !valid_sha256(&hash) {
@@ -467,7 +476,14 @@ fn require_string(value: &Value, pointer: &str, expected: &str) -> Result<(), Dy
 }
 
 fn require_path(value: &Value, pointer: &str, expected: &Path) -> Result<(), DynError> {
-    let actual = PathBuf::from(json_string(value, pointer)?);
+    let actual = canonical_record_path(value, pointer)?;
+    let expected = fs::canonicalize(expected).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ACTIVE_GENERATION_EXPECTED_PATH_UNRESOLVED: expected {pointer} path {} could not be canonicalized: {error}; remediation: preserve the worker and repair its exact immutable generation layout",
+            expected.display(),
+        )
+        .into()
+    })?;
     if actual != expected {
         return Err(format!(
             "ASTRO_ACTIVE_GENERATION_PATH_MISMATCH: {pointer} is {}, expected {}; remediation: preserve the authority and repair the exact activation transaction",
@@ -477,6 +493,26 @@ fn require_path(value: &Value, pointer: &str, expected: &Path) -> Result<(), Dyn
         .into());
     }
     Ok(())
+}
+
+fn canonical_record_path(value: &Value, pointer: &str) -> Result<PathBuf, DynError> {
+    let raw = PathBuf::from(json_string(value, pointer)?);
+    fs::canonicalize(&raw).map_err(|error| {
+        format!(
+            "ASTRO_ACTIVE_GENERATION_PATH_UNRESOLVED: {pointer} path {} could not be canonicalized: {error}; remediation: preserve the authority and restore the exact immutable generation entry",
+            raw.display(),
+        )
+        .into()
+    })
+}
+
+fn canonical_context_path(path: &Path, role: &str) -> Result<PathBuf, String> {
+    fs::canonicalize(path).map_err(|error| {
+        format!(
+            "ASTRO_ACTIVE_GENERATION_CONTEXT_PATH_UNRESOLVED: installed {role} {} could not be canonicalized: {error}; remediation: preserve the worker invocation and repair the exact immutable generation layout",
+            path.display(),
+        )
+    })
 }
 
 fn valid_sha256(value: &str) -> bool {
