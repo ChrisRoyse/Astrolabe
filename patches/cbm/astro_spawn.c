@@ -400,7 +400,30 @@ static int spawn_environment_entry_order(const wchar_t *left, const wchar_t *rig
     if (order == CSTR_GREATER_THAN) {
         return 1;
     }
+    if (order != CSTR_EQUAL) {
+        return INT_MIN;
+    }
+
+    /* Case-insensitive ordering is the Windows environment contract. Use an
+     * ordinal case-sensitive tiebreaker so byte-distinct entries never depend
+     * on qsort's unspecified equal-element order. */
+    order = CompareStringOrdinal(left, (int)left_length, right, (int)right_length, FALSE);
+    if (order == CSTR_LESS_THAN) {
+        return -1;
+    }
+    if (order == CSTR_GREATER_THAN) {
+        return 1;
+    }
     return order == CSTR_EQUAL ? 0 : INT_MIN;
+}
+
+static int spawn_environment_entry_qsort_order(const void *left, const void *right) {
+    const wchar_t *const *left_entry = (const wchar_t *const *)left;
+    const wchar_t *const *right_entry = (const wchar_t *const *)right;
+    int order = spawn_environment_entry_order(*left_entry, *right_entry);
+    /* Every entry is length-checked before qsort. A native comparison fault is
+     * detected again by the adjacent-order readback after sorting. */
+    return order == INT_MIN ? 0 : order;
 }
 
 static wchar_t *spawn_executable_directory(const wchar_t *executable, DWORD *error_out) {
@@ -470,6 +493,7 @@ static wchar_t *spawn_environment_with_source_epoch_and_runtime(
     wchar_t *runtime_directory = NULL;
     wchar_t *path_entry = NULL;
     wchar_t *epoch_entry = NULL;
+    const wchar_t **entries = NULL;
     wchar_t *block = NULL;
     if (!spawn_source_date_epoch_valid(value)) {
         *error_out = ERROR_INVALID_PARAMETER;
@@ -499,18 +523,14 @@ static wchar_t *spawn_environment_with_source_epoch_and_runtime(
     const wchar_t *inherited_path = NULL;
     size_t path_entries = 0;
     size_t epoch_entries = 0;
+    size_t retained_entries = 0;
     size_t required = 1;
-    const wchar_t *previous = NULL;
     for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
         size_t entry_length = wcslen(entry);
-        if (previous) {
-            int order = spawn_environment_entry_order(previous, entry);
-            if (order == INT_MIN || order > 0) {
-                *error_out = ERROR_INVALID_DATA;
-                goto done;
-            }
+        if (entry_length > INT_MAX) {
+            *error_out = ERROR_ARITHMETIC_OVERFLOW;
+            goto done;
         }
-        previous = entry;
         if (spawn_environment_entry_has_name(entry, path_name)) {
             inherited_path = entry + (sizeof(path_name) / sizeof(path_name[0]));
             path_entries++;
@@ -524,6 +544,7 @@ static wchar_t *spawn_environment_with_source_epoch_and_runtime(
             *error_out = ERROR_ARITHMETIC_OVERFLOW;
             goto done;
         }
+        retained_entries++;
     }
     if (path_entries > 1 || epoch_entries > 1) {
         *error_out = ERROR_INVALID_DATA;
@@ -592,16 +613,36 @@ static wchar_t *spawn_environment_with_source_epoch_and_runtime(
     memcpy(epoch_entry + epoch_prefix_length, wide_value,
            (value_length + 1) * sizeof(*epoch_entry));
 
-    const wchar_t *insertions[2] = {path_entry, epoch_entry};
-    int insertion_order = spawn_environment_entry_order(insertions[0], insertions[1]);
-    if (insertion_order == INT_MIN || insertion_order == 0) {
+    if (retained_entries > SIZE_MAX / sizeof(*entries) - 2) {
+        *error_out = ERROR_ARITHMETIC_OVERFLOW;
+        goto done;
+    }
+    size_t entry_count = retained_entries + 2;
+    entries = (const wchar_t **)malloc(entry_count * sizeof(*entries));
+    if (!entries) {
+        *error_out = ERROR_NOT_ENOUGH_MEMORY;
+        goto done;
+    }
+    size_t entry_index = 0;
+    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        if (!spawn_environment_entry_has_name(entry, path_name) &&
+            !spawn_environment_entry_has_name(entry, epoch_name)) {
+            entries[entry_index++] = entry;
+        }
+    }
+    entries[entry_index++] = path_entry;
+    entries[entry_index++] = epoch_entry;
+    if (entry_index != entry_count) {
         *error_out = ERROR_INVALID_DATA;
         goto done;
     }
-    if (insertion_order > 0) {
-        const wchar_t *swap = insertions[0];
-        insertions[0] = insertions[1];
-        insertions[1] = swap;
+    qsort(entries, entry_count, sizeof(*entries), spawn_environment_entry_qsort_order);
+    for (size_t i = 1; i < entry_count; i++) {
+        int order = spawn_environment_entry_order(entries[i - 1], entries[i]);
+        if (order == INT_MIN || order > 0) {
+            *error_out = ERROR_INVALID_DATA;
+            goto done;
+        }
     }
 
     block = (wchar_t *)calloc(required, sizeof(*block));
@@ -610,38 +651,10 @@ static wchar_t *spawn_environment_with_source_epoch_and_runtime(
         goto done;
     }
     wchar_t *cursor = block;
-    size_t insertion = 0;
-    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
-        size_t entry_length = wcslen(entry);
-        if (spawn_environment_entry_has_name(entry, path_name) ||
-            spawn_environment_entry_has_name(entry, epoch_name)) {
-            continue;
-        }
-        while (insertion < 2) {
-            int order = spawn_environment_entry_order(insertions[insertion], entry);
-            if (order == INT_MIN) {
-                *error_out = ERROR_INVALID_DATA;
-                free(block);
-                block = NULL;
-                goto done;
-            }
-            if (order > 0) {
-                break;
-            }
-            size_t insertion_length = wcslen(insertions[insertion]);
-            memcpy(cursor, insertions[insertion],
-                   (insertion_length + 1) * sizeof(*cursor));
-            cursor += insertion_length + 1;
-            insertion++;
-        }
-        memcpy(cursor, entry, (entry_length + 1) * sizeof(*cursor));
+    for (size_t i = 0; i < entry_count; i++) {
+        size_t entry_length = wcslen(entries[i]);
+        memcpy(cursor, entries[i], (entry_length + 1) * sizeof(*cursor));
         cursor += entry_length + 1;
-    }
-    while (insertion < 2) {
-        size_t insertion_length = wcslen(insertions[insertion]);
-        memcpy(cursor, insertions[insertion], (insertion_length + 1) * sizeof(*cursor));
-        cursor += insertion_length + 1;
-        insertion++;
     }
     *cursor = L'\0';
     if ((size_t)(cursor - block) != required - 1) {
@@ -654,6 +667,7 @@ done:
     if (inherited) {
         FreeEnvironmentStringsW(inherited);
     }
+    free(entries);
     free(epoch_entry);
     free(path_entry);
     free(runtime_directory);
