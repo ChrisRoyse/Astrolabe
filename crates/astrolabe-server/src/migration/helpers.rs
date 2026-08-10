@@ -18,6 +18,51 @@ pub(crate) fn value_map(entries: impl IntoIterator<Item = (String, Value)>) -> V
     Value::Object(entries.into_iter().collect())
 }
 
+pub(crate) const PERSISTED_JSON_SHA256_BASIS: &str = "astrolabe.persisted-json-compact.v1";
+
+pub(crate) fn persisted_json_sha256(value: &Value) -> Result<String, DynError> {
+    Ok(hex_lower(&Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+pub(crate) fn verify_embedded_response_sha256(
+    container: &Value,
+    context: &str,
+) -> Result<(), DynError> {
+    let Some(response) = container.get("response") else {
+        return Ok(());
+    };
+    let basis = container
+        .get("response_hash_basis")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "ASTRO_PERSISTED_RESPONSE_HASH_BASIS_MISSING: {context} contains a response without response_hash_basis"
+            )
+        })?;
+    if basis != PERSISTED_JSON_SHA256_BASIS {
+        return Err(format!(
+            "ASTRO_PERSISTED_RESPONSE_HASH_BASIS_INVALID: {context} response_hash_basis={basis:?}; expected={PERSISTED_JSON_SHA256_BASIS:?}"
+        )
+        .into());
+    }
+    let recorded = container
+        .get("response_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "ASTRO_PERSISTED_RESPONSE_SHA256_MISSING: {context} contains a response without response_sha256"
+            )
+        })?;
+    let actual = persisted_json_sha256(response)?;
+    if recorded != actual {
+        return Err(format!(
+            "ASTRO_PERSISTED_RESPONSE_SHA256_MISMATCH: {context} recorded={recorded} actual={actual}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn required_value_field<'a>(
     value: &'a Value,
     field: &str,

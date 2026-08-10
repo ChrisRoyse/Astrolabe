@@ -522,7 +522,7 @@ fn recompute_after_current_sentinel_error(
     );
     match registration_recovery_observation(cache_dir, registration, fault_code) {
         Ok(Some(current_observation)) if current_observation == *prior_observation => {
-            let observation_sha256 = value_sha256(&current_observation)?;
+            let observation_sha256 = persisted_json_sha256(&current_observation)?;
             Err(format!(
                 "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_UNEVALUABLE: current sentinel for project {:?} could not be evaluated ({sentinel_error}); one full observation was recomputed and still matched observation_sha256={observation_sha256}; remediation: preserve the durable transaction/config bytes and repair the sentinel input before resident suppression resumes",
                 registration.project
@@ -530,7 +530,7 @@ fn recompute_after_current_sentinel_error(
             .into())
         }
         Ok(Some(current_observation)) => {
-            let observation_sha256 = value_sha256(&current_observation)?;
+            let observation_sha256 = persisted_json_sha256(&current_observation)?;
             delete_registration_recovery_fault(cache_dir, &registration.project)?;
             tracing::warn!(
                 project = %registration.project,
@@ -702,8 +702,8 @@ fn registration_recovery_fault_record(
     message: &str,
     recompute_reason: Option<&str>,
 ) -> Result<Value, DynError> {
-    let observation_sha256 = value_sha256(&observation)?;
-    let sentinel_sha256 = value_sha256(&sentinel)?;
+    let observation_sha256 = persisted_json_sha256(&observation)?;
+    let sentinel_sha256 = persisted_json_sha256(&sentinel)?;
     let sentinel_kind = if shadow_publication_recovery_tracks_owner_state(fault_code) {
         "compact_journal_artifact_metadata_config_generation_plus_exact_owner_generation_state"
     } else {
@@ -787,7 +787,7 @@ fn validated_registration_recovery_observation(
             )
             .into()
         })?;
-    let actual_observation_sha256 = value_sha256(&observation)?;
+    let actual_observation_sha256 = persisted_json_sha256(&observation)?;
     if stored_observation_sha256 != actual_observation_sha256 {
         return Err(format!(
             "ASTRO_WATCHER_REGISTRATION_FAULT_OBSERVATION_HASH_MISMATCH: durable registration fault for {project:?} stores observation_sha256={stored_observation_sha256}, but readback observation hashes to {actual_observation_sha256}; remediation: preserve the config store and inspect watcher_registration_fault_json"
@@ -862,7 +862,7 @@ fn validated_registration_recovery_sentinel(
                 )
                 .into()
             })?;
-    let actual_sentinel_sha256 = value_sha256(&sentinel)?;
+    let actual_sentinel_sha256 = persisted_json_sha256(&sentinel)?;
     if stored_sentinel_sha256 != actual_sentinel_sha256 {
         return Err(format!(
             "ASTRO_WATCHER_REGISTRATION_FAULT_SENTINEL_HASH_MISMATCH: durable registration fault for {project:?} stores sentinel_sha256={stored_sentinel_sha256}, but readback sentinel hashes to {actual_sentinel_sha256}; remediation: recompute the full observation once and refresh watcher_registration_fault_json"
@@ -1313,8 +1313,8 @@ fn run_watcher_index_tick(
                         .as_ref()
                         .and_then(|fault| fault.get("observation")),
                 );
-                let observation_sha256 = value_sha256(&observation)?;
-                let response_sha256 = value_sha256(&failure.response)?;
+                let observation_sha256 = persisted_json_sha256(&observation)?;
+                let response_sha256 = persisted_json_sha256(&failure.response)?;
                 persist_nonretryable_watcher_failure(
                     cache_dir,
                     project,
@@ -1325,6 +1325,7 @@ fn run_watcher_index_tick(
                     &observation_sha256,
                     &failure.response,
                     &response_sha256,
+                    None,
                     0,
                     &failure.evidence,
                     &WatcherErrorDisposition::ClassificationFault {
@@ -1380,7 +1381,7 @@ fn run_watcher_index_tick(
             )
         }
     };
-    let observation_sha256 = value_sha256(&observation)?;
+    let observation_sha256 = persisted_json_sha256(&observation)?;
     if prior_fault
         .as_ref()
         .and_then(|fault| fault.get("observation_sha256"))
@@ -1422,7 +1423,7 @@ fn run_watcher_index_tick(
         },
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let response_sha256 = hex_lower(&Sha256::digest(response.as_bytes()));
+    let raw_response_sha256 = hex_lower(&Sha256::digest(response.as_bytes()));
     let response_value: Value = match serde_json::from_str(&response) {
         Ok(response_value) => response_value,
         Err(error) => {
@@ -1438,9 +1439,10 @@ fn run_watcher_index_tick(
             };
             let diagnostic_response = json!({
                 "raw_response": response,
-                "raw_response_sha256": response_sha256,
+                "raw_response_sha256": raw_response_sha256,
                 "parse_error": error.to_string(),
             });
+            let response_sha256 = persisted_json_sha256(&diagnostic_response)?;
             persist_nonretryable_watcher_failure(
                 cache_dir,
                 project,
@@ -1451,6 +1453,7 @@ fn run_watcher_index_tick(
                 &observation_sha256,
                 &diagnostic_response,
                 &response_sha256,
+                Some(&raw_response_sha256),
                 elapsed_ms,
                 &evidence,
                 &WatcherErrorDisposition::ClassificationFault {
@@ -1463,6 +1466,7 @@ fn run_watcher_index_tick(
             return Ok(());
         }
     };
+    let response_sha256 = persisted_json_sha256(&response_value)?;
     let is_error = match response_value.get("isError").and_then(Value::as_bool) {
         Some(is_error) => is_error,
         None => {
@@ -1486,6 +1490,7 @@ fn run_watcher_index_tick(
                 &observation_sha256,
                 &response_value,
                 &response_sha256,
+                Some(&raw_response_sha256),
                 elapsed_ms,
                 &evidence,
                 &WatcherErrorDisposition::ClassificationFault {
@@ -1524,6 +1529,7 @@ fn run_watcher_index_tick(
                         &observation_sha256,
                         &response_value,
                         &response_sha256,
+                        Some(&raw_response_sha256),
                         elapsed_ms,
                         &evidence,
                         &WatcherErrorDisposition::ClassificationFault {
@@ -1552,6 +1558,8 @@ fn run_watcher_index_tick(
                     "transient_max_attempts": WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS,
                     "observation_sha256": observation_sha256,
                     "response_sha256": response_sha256,
+                    "response_hash_basis": PERSISTED_JSON_SHA256_BASIS,
+                    "raw_response_sha256": raw_response_sha256,
                     "response": response_value,
                     "worker_started": worker_started,
                     "remediation": "the exact registered transient condition may retry only inside the declared per-observation attempt budget; inspect this status if it does not clear",
@@ -1577,6 +1585,7 @@ fn run_watcher_index_tick(
                 &observation_sha256,
                 &response_value,
                 &response_sha256,
+                Some(&raw_response_sha256),
                 elapsed_ms,
                 &evidence,
                 &exhausted,
@@ -1595,6 +1604,7 @@ fn run_watcher_index_tick(
             &observation_sha256,
             &response_value,
             &response_sha256,
+            Some(&raw_response_sha256),
             elapsed_ms,
             &evidence,
             &disposition,
@@ -1648,7 +1658,9 @@ fn run_watcher_index_tick(
         "elapsed_ms": elapsed_ms,
         "freshness": "fresh",
         "trust": "verified",
-        "response_hash": hex_lower(&Sha256::digest(response.as_bytes())),
+        "response_sha256": response_sha256,
+        "response_hash_basis": PERSISTED_JSON_SHA256_BASIS,
+        "raw_response_sha256": raw_response_sha256,
         "commit_ood_producer": commit_ood_producer,
         "commit_ood": commit_ood,
     });
@@ -1909,10 +1921,6 @@ fn sha256_file(path: &Path) -> Result<String, DynError> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
-fn value_sha256(value: &Value) -> Result<String, DynError> {
-    Ok(hex_lower(&Sha256::digest(serde_json::to_vec(value)?)))
-}
-
 fn watcher_error_evidence(response: &Value) -> WatcherErrorEvidence {
     let mut candidates = Vec::<(&'static str, String)>::new();
     let mut defects = Vec::<String>::new();
@@ -2171,6 +2179,7 @@ fn persist_nonretryable_watcher_failure(
     observation_sha256: &str,
     response: &Value,
     response_sha256: &str,
+    raw_response_sha256: Option<&str>,
     elapsed_ms: u64,
     evidence: &WatcherErrorEvidence,
     disposition: &WatcherErrorDisposition,
@@ -2236,6 +2245,8 @@ fn persist_nonretryable_watcher_failure(
         "observation_sha256": observation_sha256,
         "rearm_signature": watcher_rearm_signature(cache_dir, project, root, index_args_observation)?,
         "response_sha256": response_sha256,
+        "response_hash_basis": PERSISTED_JSON_SHA256_BASIS,
+        "raw_response_sha256": raw_response_sha256,
         "response": response,
         "worker_started": worker_started,
         "transient_attempt": transient_attempt,
@@ -2260,6 +2271,8 @@ fn persist_nonretryable_watcher_failure(
         "elapsed_ms": elapsed_ms,
         "observation_sha256": fault.get("observation_sha256"),
         "response_sha256": fault.get("response_sha256"),
+        "response_hash_basis": fault.get("response_hash_basis"),
+        "raw_response_sha256": fault.get("raw_response_sha256"),
         "freshness": "stale",
         "trust": "verified",
         "worker_started": worker_started,
@@ -2276,27 +2289,39 @@ fn persist_watcher_fault(
     fault_key: &str,
     fault: &Value,
 ) -> Result<(), DynError> {
+    verify_embedded_response_sha256(fault, "watcher_fault.before_write")?;
     let serialized = serde_json::to_string(fault)?;
     write_config_value(cache_dir, fault_key, &serialized)?;
-    if read_config_value(cache_dir, fault_key)?.as_deref() != Some(serialized.as_str()) {
+    let readback = read_config_value(cache_dir, fault_key)?;
+    if readback.as_deref() != Some(serialized.as_str()) {
         return Err(format!(
             "ASTRO_WATCHER_FAULT_READBACK_MISMATCH: persisted fault for {project:?} did not match its exact write"
         )
         .into());
     }
+    let readback_value: Value = serde_json::from_str(readback.as_deref().ok_or_else(|| {
+        format!("ASTRO_WATCHER_FAULT_READBACK_ABSENT: persisted fault for {project:?} disappeared")
+    })?)?;
+    verify_embedded_response_sha256(&readback_value, "watcher_fault.after_readback")?;
     Ok(())
 }
 
 fn persist_watcher_status(cache_dir: &Path, project: &str, status: &Value) -> Result<(), DynError> {
+    verify_embedded_response_sha256(status, "watcher_status.before_write")?;
     let key = metadata_key(project, WATCHER_TICK_STATUS_KEY);
     let serialized = serde_json::to_string(status)?;
     write_config_value(cache_dir, &key, &serialized)?;
-    if read_config_value(cache_dir, &key)?.as_deref() != Some(serialized.as_str()) {
+    let readback = read_config_value(cache_dir, &key)?;
+    if readback.as_deref() != Some(serialized.as_str()) {
         return Err(format!(
             "ASTRO_WATCHER_STATUS_READBACK_MISMATCH: durable status row for {project:?} did not equal its exact write"
         )
         .into());
     }
+    let readback_value: Value = serde_json::from_str(readback.as_deref().ok_or_else(|| {
+        format!("ASTRO_WATCHER_STATUS_READBACK_ABSENT: durable status for {project:?} disappeared")
+    })?)?;
+    verify_embedded_response_sha256(&readback_value, "watcher_status.after_readback")?;
     Ok(())
 }
 

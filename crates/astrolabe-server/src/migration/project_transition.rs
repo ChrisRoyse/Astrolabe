@@ -362,10 +362,15 @@ pub(crate) fn run_project_index_transition(
     let mut invalid_response = None;
     let mut terminal = match outcome.as_ref() {
         Ok(response) => match tool_result_is_error(response) {
-            Ok(is_error) => json!({
-                "status": if is_error { "failed" } else { "completed" },
-                "response_sha256": hex_lower(&Sha256::digest(response.as_bytes())),
-            }),
+            Ok(is_error) => {
+                let response_value: Value = serde_json::from_str(response)?;
+                json!({
+                    "status": if is_error { "failed" } else { "completed" },
+                    "response_sha256": persisted_json_sha256(&response_value)?,
+                    "response_hash_basis": PERSISTED_JSON_SHA256_BASIS,
+                    "raw_response_sha256": hex_lower(&Sha256::digest(response.as_bytes())),
+                })
+            }
             Err(error) => {
                 let message = format!(
                     "ASTRO_PROJECT_TRANSITION_RESPONSE_INVALID: the index generation returned malformed JSON: {error}; remediation: preserve the response and inspect the producing worker"
@@ -374,7 +379,7 @@ pub(crate) fn run_project_index_transition(
                 json!({
                     "status": "failed",
                     "error": message,
-                    "response_sha256": hex_lower(&Sha256::digest(response.as_bytes())),
+                    "raw_response_sha256": hex_lower(&Sha256::digest(response.as_bytes())),
                 })
             }
         },
