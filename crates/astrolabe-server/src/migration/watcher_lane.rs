@@ -944,41 +944,24 @@ fn poll_incremental_watcher(watcher: &mut CbmWatcher) {
 
 fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistration>, DynError> {
     let mut registrations = Vec::new();
-    let index_args_suffix = format!(".{SHADOW_INDEX_ARGS_KEY}");
-    for (key, args_json) in scan_config_prefix(cache_dir, CONFIG_KEY_PREFIX)? {
-        if !key.ends_with(&index_args_suffix) {
+    let source_root_suffix = format!(".{GIT_SOURCE_REPO_PATH_KEY}");
+    for (key, root) in scan_config_prefix(cache_dir, CONFIG_KEY_PREFIX)? {
+        if !key.ends_with(&source_root_suffix) {
             continue;
         }
-        let Some(project) = project_from_metadata_key(&key, SHADOW_INDEX_ARGS_KEY) else {
+        let Some(project) = project_from_metadata_key(&key, GIT_SOURCE_REPO_PATH_KEY) else {
             continue;
         };
-        let args: Value = match serde_json::from_str(&args_json) {
-            Ok(args) => args,
-            Err(error) => {
-                persist_registration_error(
-                    cache_dir,
-                    &project,
-                    &format!("persisted index args are invalid JSON: {error}"),
-                )?;
-                continue;
-            }
-        };
-        let Some(args) = args.as_object() else {
-            persist_registration_error(
-                cache_dir,
-                &project,
-                "persisted index args are not an object",
-            )?;
+        // Registration identity is the atomically published Git source root,
+        // not the mutable arguments used by a later index invocation. If the
+        // argument row is absent or malformed, retaining this registration is
+        // what lets the next source-level reconcile reach the fail-closed
+        // `prepare_watcher_index_args` diagnostic instead of silently
+        // unwatching the project. Non-Git imports deliberately publish an
+        // empty source-root value and have no native Git watch to register.
+        if root.trim().is_empty() {
             continue;
-        };
-        let Some(root) = string_arg(args, "repo_path").or_else(|| string_arg(args, "name")) else {
-            persist_registration_error(
-                cache_dir,
-                &project,
-                "persisted index args have neither repo_path nor name",
-            )?;
-            continue;
-        };
+        }
         let ownership = match background_lane_status_at(cache_dir, &project) {
             Ok(ownership) => ownership,
             Err(error) => {
@@ -993,10 +976,7 @@ fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistratio
         if ownership.get("single_owner").and_then(Value::as_bool) != Some(true) {
             continue;
         }
-        registrations.push(WatchRegistration {
-            project,
-            root: root.to_string(),
-        });
+        registrations.push(WatchRegistration { project, root });
     }
     Ok(registrations)
 }
