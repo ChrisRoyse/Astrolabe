@@ -129,6 +129,14 @@ void cbm_pipeline_record_fatal_error_detail(cbm_pipeline_t *p, const char *code,
 void cbm_pipeline_record_gbuf_refusal(cbm_pipeline_t *p, const cbm_gbuf_t *gb, const char *phase,
                                       const char *path);
 
+/* Reconcile the graph's persisted Project/Branch structure with the exact Git
+ * context captured by the current pipeline. Incremental classification is
+ * file-content based, but Branch identity/properties are independent graph
+ * inputs and therefore must be reconciled after every existing-graph load.
+ * The operation mutates only the in-memory buffer; any refusal leaves the
+ * existing SQLite family untouched. */
+int cbm_pipeline_reconcile_incremental_git_structure(cbm_pipeline_t *p, cbm_gbuf_t *gb);
+
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
 void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
                                            const char *mode, const char *code, int item_count,

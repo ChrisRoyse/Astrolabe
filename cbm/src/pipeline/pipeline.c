@@ -65,6 +65,7 @@ enum {
 #include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1985,6 +1986,474 @@ uint8_t *cbm_pipeline_read_file_identity_bytes(const cbm_file_info_t *file, size
     return bytes;
 }
 
+typedef enum {
+    CBM_BRANCH_REPLAY_FILE = 1,
+    CBM_BRANCH_REPLAY_FOLDER = 2,
+} cbm_branch_replay_kind_t;
+
+typedef struct {
+    cbm_branch_replay_kind_t kind;
+    int64_t target_id;
+    char *target_atom_id;
+    char *properties_json;
+} cbm_branch_replay_edge_t;
+
+typedef struct {
+    const cbm_gbuf_t *gb;
+    int64_t branch_id;
+    int64_t project_id;
+    cbm_branch_replay_edge_t *items;
+    size_t count;
+    size_t capacity;
+    size_t has_branch_count;
+    bool allocation_failed;
+    bool invalid;
+    char invalid_reason[128];
+    char invalid_type[128];
+    char invalid_source[64];
+    char invalid_target[64];
+} cbm_branch_edge_capture_t;
+
+static bool git_properties_capacity_add(size_t *capacity, const char *value) {
+    if (!capacity) {
+        return false;
+    }
+    const unsigned char *cursor = (const unsigned char *)(value ? value : "");
+    while (*cursor) {
+        size_t encoded = *cursor == '"' || *cursor == '\\' || *cursor == '\n' || *cursor == '\r' ||
+                                 *cursor == '\t'
+                             ? 2
+                         : *cursor < 0x20 ? 6
+                                          : 1;
+        if (encoded > (size_t)INT_MAX - *capacity) {
+            return false;
+        }
+        *capacity += encoded;
+        cursor++;
+    }
+    return true;
+}
+
+static char *pipeline_git_context_props_json_alloc(const cbm_git_context_t *ctx) {
+    if (!ctx) {
+        return NULL;
+    }
+    const char *fields[] = {ctx->canonical_root, ctx->worktree_root, ctx->git_common_dir,
+                            ctx->branch,         ctx->head_sha,      ctx->base_sha};
+    size_t capacity = CBM_SZ_512;
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        if (!git_properties_capacity_add(&capacity, fields[i])) {
+            return NULL;
+        }
+    }
+    char *json = malloc(capacity);
+    if (!json) {
+        return NULL;
+    }
+    if (cbm_git_context_props_json(ctx, json, (int)capacity) <= 0) {
+        free(json);
+        return NULL;
+    }
+    return json;
+}
+
+static void branch_replay_capture_free(cbm_branch_edge_capture_t *capture) {
+    if (!capture) {
+        return;
+    }
+    for (size_t i = 0; i < capture->count; i++) {
+        free(capture->items[i].target_atom_id);
+        free(capture->items[i].properties_json);
+    }
+    free(capture->items);
+    capture->items = NULL;
+    capture->count = 0;
+    capture->capacity = 0;
+}
+
+static void branch_capture_invalid(cbm_branch_edge_capture_t *capture, const char *reason,
+                                   const cbm_gbuf_edge_t *edge) {
+    if (!capture || capture->invalid || capture->allocation_failed) {
+        return;
+    }
+    capture->invalid = true;
+    (void)snprintf(capture->invalid_reason, sizeof(capture->invalid_reason), "%s",
+                   reason ? reason : "invalid_branch_edge");
+    (void)snprintf(capture->invalid_type, sizeof(capture->invalid_type), "%s",
+                   edge && edge->type ? edge->type : "");
+    (void)snprintf(capture->invalid_source, sizeof(capture->invalid_source), "%lld",
+                   edge ? (long long)edge->source_id : 0LL);
+    (void)snprintf(capture->invalid_target, sizeof(capture->invalid_target), "%lld",
+                   edge ? (long long)edge->target_id : 0LL);
+}
+
+static bool branch_capture_replay_edge(cbm_branch_edge_capture_t *capture,
+                                       cbm_branch_replay_kind_t kind, const cbm_gbuf_node_t *target,
+                                       const cbm_gbuf_edge_t *edge) {
+    if (!capture || !target || !target->atom_id || !edge || !edge->properties_json) {
+        return false;
+    }
+    if (capture->count == capture->capacity) {
+        size_t next = capture->capacity ? capture->capacity * 2 : CBM_SZ_16;
+        if (next < capture->capacity || next > SIZE_MAX / sizeof(*capture->items)) {
+            capture->allocation_failed = true;
+            return false;
+        }
+        cbm_branch_replay_edge_t *grown = realloc(capture->items, next * sizeof(*grown));
+        if (!grown) {
+            capture->allocation_failed = true;
+            return false;
+        }
+        capture->items = grown;
+        capture->capacity = next;
+    }
+
+    char *target_atom_id = strdup(target->atom_id);
+    char *properties_json = strdup(edge->properties_json);
+    if (!target_atom_id || !properties_json) {
+        free(target_atom_id);
+        free(properties_json);
+        capture->allocation_failed = true;
+        return false;
+    }
+    capture->items[capture->count++] = (cbm_branch_replay_edge_t){
+        .kind = kind,
+        .target_id = target->id,
+        .target_atom_id = target_atom_id,
+        .properties_json = properties_json,
+    };
+    return true;
+}
+
+static void capture_branch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
+    cbm_branch_edge_capture_t *capture = (cbm_branch_edge_capture_t *)userdata;
+    if (!capture || !edge || capture->invalid || capture->allocation_failed ||
+        (edge->source_id != capture->branch_id && edge->target_id != capture->branch_id)) {
+        return;
+    }
+
+    if (strcmp(edge->type ? edge->type : "", "HAS_BRANCH") == 0) {
+        if (edge->source_id != capture->project_id || edge->target_id != capture->branch_id) {
+            branch_capture_invalid(capture, "has_branch_orientation_or_endpoint", edge);
+            return;
+        }
+        capture->has_branch_count++;
+        return;
+    }
+
+    if (edge->source_id != capture->branch_id || edge->target_id == capture->branch_id) {
+        branch_capture_invalid(capture, "unsupported_branch_edge_orientation", edge);
+        return;
+    }
+
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(capture->gb, edge->target_id);
+    if (!target || !target->label || !target->atom_id) {
+        branch_capture_invalid(capture, "branch_edge_target_absent", edge);
+        return;
+    }
+
+    if (strcmp(edge->type ? edge->type : "", "CONTAINS_FILE") == 0 &&
+        strcmp(target->label, "File") == 0) {
+        (void)branch_capture_replay_edge(capture, CBM_BRANCH_REPLAY_FILE, target, edge);
+        return;
+    }
+    if (strcmp(edge->type ? edge->type : "", "CONTAINS_FOLDER") == 0 &&
+        strcmp(target->label, "Folder") == 0) {
+        (void)branch_capture_replay_edge(capture, CBM_BRANCH_REPLAY_FOLDER, target, edge);
+        return;
+    }
+    branch_capture_invalid(capture, "unsupported_branch_edge_type_or_target", edge);
+}
+
+static int compare_branch_replay_edges(const void *left, const void *right) {
+    const cbm_branch_replay_edge_t *a = (const cbm_branch_replay_edge_t *)left;
+    const cbm_branch_replay_edge_t *b = (const cbm_branch_replay_edge_t *)right;
+    if (a->kind != b->kind) {
+        return a->kind < b->kind ? -1 : 1;
+    }
+    int atom_cmp = strcmp(a->target_atom_id, b->target_atom_id);
+    if (atom_cmp != 0) {
+        return atom_cmp;
+    }
+    int props_cmp = strcmp(a->properties_json, b->properties_json);
+    if (props_cmp != 0) {
+        return props_cmp;
+    }
+    return (a->target_id > b->target_id) - (a->target_id < b->target_id);
+}
+
+static int record_git_structure_error(cbm_pipeline_t *p, const char *code, const char *operation,
+                                      const char *message, const char *remediation,
+                                      const char *old_qn, const char *new_qn, const char *old_name,
+                                      const char *new_name, const char *detail_key,
+                                      const char *detail_value) {
+    const char *keys[] = {"old_branch_qn", "new_branch_qn", "old_branch_name", "new_branch_name",
+                          detail_key};
+    const char *values[] = {old_qn ? old_qn : "", new_qn ? new_qn : "", old_name ? old_name : "",
+                            new_name ? new_name : "", detail_value ? detail_value : ""};
+    cbm_pipeline_record_fatal_error_detail(
+        p, code, operation, "incremental_git_structure", p && p->db_path ? p->db_path : "", 0,
+        message, remediation, keys, values, detail_key && detail_key[0] ? 5 : 4);
+    return CBM_NOT_FOUND;
+}
+
+static int validate_has_branch_relation(cbm_pipeline_t *p, const cbm_gbuf_t *gb,
+                                        const cbm_gbuf_node_t *project,
+                                        const cbm_gbuf_node_t *branch, const char *new_qn,
+                                        const char *new_name, const char *expected_properties) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_target_type(gb, branch->id, "HAS_BRANCH", &edges, &count) != 0 ||
+        count != 1 || !edges || edges[0]->source_id != project->id ||
+        edges[0]->target_id != branch->id || !edges[0]->properties_json ||
+        strcmp(edges[0]->properties_json, expected_properties ? expected_properties : "") != 0) {
+        char count_text[32];
+        (void)snprintf(count_text, sizeof(count_text), "%d", count);
+        return record_git_structure_error(
+            p, "CBM_INCREMENTAL_HAS_BRANCH_INVALID", "validate_incremental_has_branch",
+            "the loaded graph does not contain exactly one Project-to-Branch HAS_BRANCH relation",
+            "preserve the existing SQLite family, repair or explicitly reindex its malformed "
+            "structural graph, then retry",
+            branch->qualified_name, new_qn, branch->name, new_name, "has_branch_count", count_text);
+    }
+    return 0;
+}
+
+int cbm_pipeline_reconcile_incremental_git_structure(cbm_pipeline_t *p, cbm_gbuf_t *gb) {
+    if (!p || !gb || !p->project_name || !p->project_name[0] || !p->branch_qn || !p->branch_qn[0]) {
+        return record_git_structure_error(
+            p, "CBM_INCREMENTAL_GIT_STRUCTURE_CONTEXT_INVALID", "resolve_incremental_git_structure",
+            "the current Git structural context is absent",
+            "repair Git context capture so the project and exact branch identity are present, then "
+            "retry",
+            "", p ? p->branch_qn : "", "", p && p->git_ctx.branch ? p->git_ctx.branch : "", NULL,
+            NULL);
+    }
+
+    const char *new_qn = p->branch_qn;
+    const char *new_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    char *branch_props = pipeline_git_context_props_json_alloc(&p->git_ctx);
+    if (!branch_props) {
+        return record_git_structure_error(
+            p, "CBM_INCREMENTAL_GIT_PROPERTIES_SERIALIZE_FAILED",
+            "serialize_incremental_git_structure",
+            "the exact current Git properties could not be retained as canonical JSON",
+            "preserve the existing SQLite family, repair the Git context or free memory, then "
+            "retry",
+            "", new_qn, "", new_name, NULL, NULL);
+    }
+
+    const cbm_gbuf_node_t *project = cbm_gbuf_find_by_qn(gb, p->project_name);
+    if (!project || !project->label || !project->name || strcmp(project->label, "Project") != 0 ||
+        strcmp(project->name, p->project_name) != 0) {
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_PROJECT_STRUCTURE_INVALID", "resolve_incremental_project",
+            "the loaded graph lacks the exact Project structural atom",
+            "preserve the existing SQLite family, repair or explicitly reindex its malformed "
+            "structural graph, then retry",
+            "", new_qn, "", new_name, NULL, NULL);
+        free(branch_props);
+        return result;
+    }
+
+    const cbm_gbuf_node_t **branches = NULL;
+    int branch_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Branch", &branches, &branch_count) != 0 || branch_count != 1 ||
+        !branches || !branches[0] || !branches[0]->qualified_name || !branches[0]->name) {
+        char count_text[32];
+        (void)snprintf(count_text, sizeof(count_text), "%d", branch_count);
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_BRANCH_CARDINALITY_INVALID",
+            "validate_incremental_branch_cardinality",
+            "the loaded graph does not contain exactly one complete Branch structural atom",
+            "preserve the existing SQLite family, repair or explicitly reindex its malformed "
+            "structural graph, then retry",
+            "", new_qn, "", new_name, "branch_count", count_text);
+        free(branch_props);
+        return result;
+    }
+
+    const cbm_gbuf_node_t *old_branch = branches[0];
+    if (validate_has_branch_relation(p, gb, project, old_branch, new_qn, new_name,
+                                     old_branch->properties_json ? old_branch->properties_json
+                                                                 : "") != 0) {
+        free(branch_props);
+        return CBM_NOT_FOUND;
+    }
+
+    if (strcmp(old_branch->qualified_name, new_qn) == 0 &&
+        strcmp(old_branch->name, new_name) == 0) {
+        int64_t branch_id =
+            cbm_gbuf_upsert_node(gb, "Branch", new_name, new_qn, NULL, 0, 0, branch_props);
+        int64_t relation_id = branch_id > 0 ? cbm_gbuf_insert_edge(gb, project->id, branch_id,
+                                                                   "HAS_BRANCH", branch_props)
+                                            : 0;
+        const cbm_gbuf_node_t *updated = cbm_gbuf_find_by_qn(gb, new_qn);
+        if (branch_id <= 0 || relation_id <= 0 || !updated ||
+            strcmp(updated->properties_json ? updated->properties_json : "", branch_props) != 0 ||
+            validate_has_branch_relation(p, gb, project, updated, new_qn, new_name, branch_props) !=
+                0) {
+            int result = record_git_structure_error(
+                p, "CBM_INCREMENTAL_GIT_STRUCTURE_UPDATE_FAILED",
+                "refresh_incremental_git_structure",
+                "the same-branch graph property refresh did not produce the exact current state",
+                "preserve the existing SQLite family, inspect the graph-buffer refusal, free "
+                "memory "
+                "or repair the structural graph, then retry",
+                old_branch->qualified_name, new_qn, old_branch->name, new_name, NULL, NULL);
+            free(branch_props);
+            return result;
+        }
+        cbm_log_info("incremental.git_structure", "route", "properties_refreshed", "old_branch",
+                     old_branch->qualified_name, "new_branch", new_qn, "replayed_edges", "0");
+        free(branch_props);
+        return 0;
+    }
+
+    char *old_qn = strdup(old_branch->qualified_name);
+    char *old_name = strdup(old_branch->name);
+    if (!old_qn || !old_name) {
+        free(old_qn);
+        free(old_name);
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_BRANCH_REPLAY_ALLOC_FAILED", "capture_incremental_branch_identity",
+            "the complete prior Branch identity could not be retained before reconciliation",
+            "preserve the existing SQLite family, free memory or reduce repository size, then "
+            "retry",
+            old_branch->qualified_name, new_qn, old_branch->name, new_name, NULL, NULL);
+        free(branch_props);
+        return result;
+    }
+
+    cbm_branch_edge_capture_t capture = {
+        .gb = gb,
+        .branch_id = old_branch->id,
+        .project_id = project->id,
+    };
+    cbm_gbuf_foreach_edge(gb, capture_branch_edge, &capture);
+    if (capture.allocation_failed) {
+        branch_replay_capture_free(&capture);
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_BRANCH_REPLAY_ALLOC_FAILED", "capture_incremental_branch_edges",
+            "the complete deterministic Branch edge replay plan could not be retained",
+            "preserve the existing SQLite family, free memory or reduce repository size, then "
+            "retry",
+            old_qn, new_qn, old_name, new_name, NULL, NULL);
+        free(old_qn);
+        free(old_name);
+        free(branch_props);
+        return result;
+    }
+    if (capture.invalid || capture.has_branch_count != 1) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail),
+                       "reason=%s,type=%s,source_id=%s,target_id=%s,has_branch_count=%zu",
+                       capture.invalid_reason, capture.invalid_type, capture.invalid_source,
+                       capture.invalid_target, capture.has_branch_count);
+        branch_replay_capture_free(&capture);
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_BRANCH_EDGE_INVALID", "validate_incremental_branch_edges",
+            "the prior Branch touches an undocumented or malformed structural edge",
+            "preserve the existing SQLite family, repair or explicitly reindex the named "
+            "structural "
+            "edge, then retry",
+            old_qn, new_qn, old_name, new_name, "edge_detail", detail);
+        free(old_qn);
+        free(old_name);
+        free(branch_props);
+        return result;
+    }
+
+    if (capture.count > 1) {
+        qsort(capture.items, capture.count, sizeof(*capture.items), compare_branch_replay_edges);
+    }
+    if (cbm_gbuf_delete_by_label(gb, "Branch") != 0) {
+        branch_replay_capture_free(&capture);
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_BRANCH_REPLACE_FAILED", "delete_prior_incremental_branch",
+            "the prior Branch atom and its exact structural edges could not be removed in memory",
+            "the on-disk family is unchanged; inspect the graph-buffer refusal, free memory, then "
+            "retry",
+            old_qn, new_qn, old_name, new_name, NULL, NULL);
+        free(old_qn);
+        free(old_name);
+        free(branch_props);
+        return result;
+    }
+
+    int64_t new_branch_id =
+        cbm_gbuf_upsert_node(gb, "Branch", new_name, new_qn, NULL, 0, 0, branch_props);
+    bool replay_failed =
+        new_branch_id <= 0 ||
+        cbm_gbuf_insert_edge(gb, project->id, new_branch_id, "HAS_BRANCH", branch_props) <= 0;
+    size_t file_edges = 0;
+    size_t folder_edges = 0;
+    for (size_t i = 0; i < capture.count && !replay_failed; i++) {
+        const cbm_branch_replay_edge_t *saved = &capture.items[i];
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, saved->target_id);
+        if (!target || !target->atom_id || strcmp(target->atom_id, saved->target_atom_id) != 0) {
+            replay_failed = true;
+            break;
+        }
+        const char *type =
+            saved->kind == CBM_BRANCH_REPLAY_FILE ? "CONTAINS_FILE" : "CONTAINS_FOLDER";
+        if (cbm_gbuf_insert_edge(gb, new_branch_id, saved->target_id, type,
+                                 saved->properties_json) <= 0) {
+            replay_failed = true;
+            break;
+        }
+        file_edges += saved->kind == CBM_BRANCH_REPLAY_FILE ? 1 : 0;
+        folder_edges += saved->kind == CBM_BRANCH_REPLAY_FOLDER ? 1 : 0;
+    }
+
+    const cbm_gbuf_node_t **after_branches = NULL;
+    int after_branch_count = 0;
+    const cbm_gbuf_node_t *after_branch = cbm_gbuf_find_by_qn(gb, new_qn);
+    const cbm_gbuf_edge_t **after_file_edges = NULL;
+    const cbm_gbuf_edge_t **after_folder_edges = NULL;
+    int after_file_count = 0;
+    int after_folder_count = 0;
+    if (!replay_failed) {
+        replay_failed =
+            cbm_gbuf_find_by_label(gb, "Branch", &after_branches, &after_branch_count) != 0 ||
+            after_branch_count != 1 || !after_branches || after_branches[0] != after_branch ||
+            !after_branch || strcmp(after_branch->name, new_name) != 0 ||
+            strcmp(after_branch->properties_json ? after_branch->properties_json : "",
+                   branch_props) != 0 ||
+            validate_has_branch_relation(p, gb, project, after_branch, new_qn, new_name,
+                                         branch_props) != 0 ||
+            cbm_gbuf_find_edges_by_source_type(gb, new_branch_id, "CONTAINS_FILE",
+                                               &after_file_edges, &after_file_count) != 0 ||
+            cbm_gbuf_find_edges_by_source_type(gb, new_branch_id, "CONTAINS_FOLDER",
+                                               &after_folder_edges, &after_folder_count) != 0 ||
+            (size_t)after_file_count != file_edges || (size_t)after_folder_count != folder_edges;
+    }
+
+    size_t replayed = capture.count;
+    branch_replay_capture_free(&capture);
+    if (replay_failed) {
+        int result = record_git_structure_error(
+            p, "CBM_INCREMENTAL_BRANCH_REPLAY_FAILED", "replay_incremental_branch_edges",
+            "the deterministic replacement Branch graph did not read back exactly in memory",
+            "the on-disk family is unchanged; inspect the graph-buffer refusal or structural "
+            "mismatch, repair it, then retry",
+            old_qn, new_qn, old_name, new_name, NULL, NULL);
+        free(old_qn);
+        free(old_name);
+        free(branch_props);
+        return result;
+    }
+
+    char replayed_text[32];
+    (void)snprintf(replayed_text, sizeof(replayed_text), "%zu", replayed);
+    cbm_log_info("incremental.git_structure", "route", "branch_replaced", "old_branch", old_qn,
+                 "new_branch", new_qn, "replayed_edges", replayed_text);
+    free(old_qn);
+    free(old_name);
+    free(branch_props);
+    return 0;
+}
+
 static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
                           const cbm_source_slab_t *source_slab) {
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
@@ -1993,10 +2462,14 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    char branch_props[CBM_SZ_2K];
-    const char *branch_props_json = "{}";
-    if (cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
-        branch_props_json = branch_props;
+    char *branch_props_json = pipeline_git_context_props_json_alloc(&p->git_ctx);
+    if (!branch_props_json) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_GIT_PROPERTIES_SERIALIZE_FAILED", "serialize_git_structure", "structure",
+            p->repo_path, 0,
+            "the exact current Git properties could not be retained as canonical JSON",
+            "repair the Git context or free memory, then retry the complete index");
+        return CBM_NOT_FOUND;
     }
     if (p->branch_qn) {
         int64_t branch_id = cbm_gbuf_upsert_node(p->gbuf, "Branch", branch_name, branch_qn, NULL, 0,
@@ -2007,6 +2480,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
                                  branch_props_json);
         }
     }
+    free(branch_props_json);
 
     /* Collect unique directories and create Folder/Package nodes */
     CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_256);

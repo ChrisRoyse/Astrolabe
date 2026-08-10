@@ -1368,6 +1368,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
+    if (cbm_pipeline_reconcile_incremental_git_structure(p, existing) != 0) {
+        cbm_pipeline_record_gbuf_refusal(p, existing, "incremental_git_structure", db_path);
+        cbm_gbuf_free(existing);
+        free(changed_files);
+        free_deleted_paths(deleted, deleted_count);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        return CBM_NOT_FOUND;
+    }
+
     if (snapshot_noop) {
         cbm_log_info("incremental.noop", "reason", "complete_snapshot_sink");
         cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
