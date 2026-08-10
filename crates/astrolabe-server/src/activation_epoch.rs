@@ -362,10 +362,6 @@ fn read_active_generation_with_lease(
     })?;
     require_string(&value, "/schema", ACTIVE_GENERATION_SCHEMA)?;
     require_path(&value, "/authority_path", &context.active_generation_path)?;
-    require_path(&value, "/publication/path", &context.publication_path)?;
-    require_string(&value, "/publication/sha256", &context.publication_sha256)?;
-    require_path(&value, "/artifact/path", &context.executable_path)?;
-    require_string(&value, "/artifact/sha256", &context.executable_sha256)?;
     let epoch = value
         .pointer("/activation_epoch")
         .and_then(Value::as_u64)
@@ -379,11 +375,66 @@ fn read_active_generation_with_lease(
     }
     let generation_id = json_string(&value, "/generation/id")?;
     let generation_path = canonical_record_path(&value, "/generation/path")?;
-    for pointer in ["/codex/after_sha256", "/claude_code/after_sha256"] {
+    let publication_path = canonical_record_path(&value, "/publication/path")?;
+    let artifact_path = canonical_record_path(&value, "/artifact/path")?;
+    let expected_publication_path = fs::canonicalize(generation_path.join("publication.json"))
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ACTIVE_GENERATION_PUBLICATION_UNRESOLVED: active generation publication below {} could not be canonicalized: {error}; remediation: preserve the authority and restore its exact immutable publication receipt",
+                generation_path.display(),
+            )
+            .into()
+        })?;
+    let expected_artifact_path = fs::canonicalize(generation_path.join("codebase-memory-mcp.exe"))
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ACTIVE_GENERATION_ARTIFACT_UNRESOLVED: active generation artifact below {} could not be canonicalized: {error}; remediation: preserve the authority and restore its exact immutable executable",
+                generation_path.display(),
+            )
+            .into()
+        })?;
+    if publication_path != expected_publication_path || artifact_path != expected_artifact_path {
+        return Err(format!(
+            "ASTRO_ACTIVE_GENERATION_LAYOUT_MISMATCH: active generation {:?} at {} binds publication {} and artifact {}, expected {} and {}; remediation: preserve every immutable generation byte and repair the exact activation authority",
+            generation_id,
+            generation_path.display(),
+            publication_path.display(),
+            artifact_path.display(),
+            expected_publication_path.display(),
+            expected_artifact_path.display(),
+        )
+        .into());
+    }
+    for pointer in [
+        "/publication/sha256",
+        "/artifact/sha256",
+        "/codex/after_sha256",
+        "/claude_code/after_sha256",
+    ] {
         let hash = json_string(&value, pointer)?;
         if !valid_sha256(&hash) {
             return Err(format!(
-                "ASTRO_ACTIVE_GENERATION_CONFIG_HASH_INVALID: {pointer} is not one lowercase SHA-256 digest; remediation: preserve the authority and repair the activation record"
+                "ASTRO_ACTIVE_GENERATION_HASH_INVALID: {pointer} is not one lowercase SHA-256 digest; remediation: preserve the authority and repair the activation record"
+            )
+            .into());
+        }
+    }
+    let artifact_bytes = value
+        .pointer("/artifact/bytes")
+        .and_then(Value::as_u64)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_ACTIVE_GENERATION_ARTIFACT_BYTES_INVALID: /artifact/bytes must be one positive u64; remediation: preserve the authority and repair the activation record".into()
+        })?;
+    if generation_id == context.generation_id && generation_path == context.generation_path {
+        require_path(&value, "/publication/path", &context.publication_path)?;
+        require_string(&value, "/publication/sha256", &context.publication_sha256)?;
+        require_path(&value, "/artifact/path", &context.executable_path)?;
+        require_string(&value, "/artifact/sha256", &context.executable_sha256)?;
+        let executable_bytes = context.executable_path.metadata()?.len();
+        if artifact_bytes != executable_bytes {
+            return Err(format!(
+                "ASTRO_ACTIVE_GENERATION_ARTIFACT_BYTES_MISMATCH: active authority binds {artifact_bytes} bytes but the worker executable has {executable_bytes}; remediation: preserve the immutable generation and repair its activation authority"
             )
             .into());
         }
