@@ -66,6 +66,16 @@ int cbm_worker_progress_publish(uint32_t stage_order, const char *stage, uint64_
  * completion order cannot manufacture a regressed cursor. */
 int cbm_worker_progress_advance_unit(uint32_t stage_order, const char *stage, uint64_t total);
 
+/* Coalesce completed inner work beneath the current stage's serialized unit
+ * counter. `step_completed` is one absolute, monotonic project-wide count, so
+ * parallel producers may race without publishing a regressed cursor. Stale
+ * snapshots are harmlessly subsumed by the greatest observed count. Durable
+ * records retain the same bounded report interval and are forced only at the
+ * exact inner-work terminal. */
+int cbm_worker_progress_observe_step(uint32_t stage_order, const char *stage, uint64_t total,
+                                    uint32_t step_order, const char *step,
+                                    uint64_t step_completed, uint64_t step_total);
+
 /* Publish the terminal semantic record after the response file has been fully
  * written and closed. A successful/result-bearing worker may not exit without
  * this record. */

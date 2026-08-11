@@ -106,6 +106,10 @@ typedef struct {
     uint64_t unit_completed;
     uint64_t unit_total;
     uint64_t unit_last_published_ms;
+    uint32_t observed_step_order;
+    char observed_step[CBM_WORKER_PROGRESS_NAME_CAP];
+    uint64_t observed_step_completed;
+    uint64_t observed_step_total;
     atomic_bool active;
     atomic_bool failed;
 } progress_writer_t;
@@ -426,6 +430,10 @@ static void writer_clear_ordinary_state(void) {
     g_writer.unit_completed = 0;
     g_writer.unit_total = 0;
     g_writer.unit_last_published_ms = 0;
+    g_writer.observed_step_order = 0;
+    g_writer.observed_step[0] = '\0';
+    g_writer.observed_step_completed = 0;
+    g_writer.observed_step_total = 0;
 }
 
 int cbm_worker_progress_configure(const char *path, const char *attempt) {
@@ -518,36 +526,40 @@ int cbm_worker_progress_publish(uint32_t stage_order, const char *stage, uint64_
     return rc;
 }
 
+static int writer_prepare_unit_stage_locked(uint32_t stage_order, const char *stage,
+                                            uint64_t total) {
+    bool same_stage = g_writer.unit_stage_order == stage_order && stage &&
+                      strcmp(g_writer.unit_stage, stage) == 0;
+    if (same_stage) {
+        return g_writer.unit_total == total ? 0 : -1;
+    }
+    bool resume_existing_stage =
+        g_writer.cursor.present && stage && g_writer.cursor.stage_order == stage_order &&
+        strcmp(g_writer.cursor.stage, stage) == 0 && g_writer.cursor.total == total;
+    if (!progress_stage_valid(stage_order, stage) || total == 0 ||
+        (g_writer.cursor.present && stage_order < g_writer.cursor.stage_order) ||
+        (g_writer.cursor.present && stage_order == g_writer.cursor.stage_order &&
+         !resume_existing_stage)) {
+        return -1;
+    }
+    g_writer.unit_stage_order = stage_order;
+    snprintf(g_writer.unit_stage, sizeof(g_writer.unit_stage), "%s", stage);
+    g_writer.unit_completed = resume_existing_stage ? g_writer.cursor.completed : 0;
+    g_writer.unit_total = total;
+    g_writer.unit_last_published_ms = resume_existing_stage ? g_writer.cursor.monotonic_ms : 0;
+    g_writer.observed_step_order = 0;
+    g_writer.observed_step[0] = '\0';
+    g_writer.observed_step_completed = 0;
+    g_writer.observed_step_total = 0;
+    return 0;
+}
+
 int cbm_worker_progress_advance_unit(uint32_t stage_order, const char *stage, uint64_t total) {
     if (!cbm_worker_progress_active()) {
         return 0;
     }
     cbm_mutex_lock(&g_writer.mutex);
-    int rc = 0;
-    bool same_stage = g_writer.unit_stage_order == stage_order && stage &&
-                      strcmp(g_writer.unit_stage, stage) == 0;
-    if (!same_stage) {
-        bool resume_existing_stage =
-            g_writer.cursor.present && stage &&
-            g_writer.cursor.stage_order == stage_order &&
-            strcmp(g_writer.cursor.stage, stage) == 0 &&
-            g_writer.cursor.total == total;
-        if (!progress_stage_valid(stage_order, stage) || total == 0 ||
-            (g_writer.cursor.present && stage_order < g_writer.cursor.stage_order) ||
-            (g_writer.cursor.present && stage_order == g_writer.cursor.stage_order &&
-             !resume_existing_stage)) {
-            rc = -1;
-        } else {
-            g_writer.unit_stage_order = stage_order;
-            snprintf(g_writer.unit_stage, sizeof(g_writer.unit_stage), "%s", stage);
-            g_writer.unit_completed = resume_existing_stage ? g_writer.cursor.completed : 0;
-            g_writer.unit_total = total;
-            g_writer.unit_last_published_ms =
-                resume_existing_stage ? g_writer.cursor.monotonic_ms : 0;
-        }
-    } else if (g_writer.unit_total != total) {
-        rc = -1;
-    }
+    int rc = writer_prepare_unit_stage_locked(stage_order, stage, total);
     if (rc == 0) {
         if (g_writer.unit_completed == UINT64_MAX || g_writer.unit_completed >= total) {
             rc = -1;
@@ -575,6 +587,63 @@ int cbm_worker_progress_advance_unit(uint32_t stage_order, const char *stage, ui
     cbm_mutex_unlock(&g_writer.mutex);
     if (rc != 0) {
         writer_mark_failed("advance_progress_unit");
+    }
+    return rc;
+}
+
+int cbm_worker_progress_observe_step(uint32_t stage_order, const char *stage, uint64_t total,
+                                    uint32_t step_order, const char *step,
+                                    uint64_t step_completed, uint64_t step_total) {
+    if (!cbm_worker_progress_active()) {
+        return 0;
+    }
+    cbm_mutex_lock(&g_writer.mutex);
+    int rc = writer_prepare_unit_stage_locked(stage_order, stage, total);
+    if (rc == 0 &&
+        (step_order <= 1 || !progress_name_valid(step) || step_total == 0 ||
+         step_completed == 0 || step_completed > step_total)) {
+        rc = -1;
+    }
+    if (rc == 0 && g_writer.observed_step_order != 0 &&
+        (g_writer.observed_step_order != step_order ||
+         strcmp(g_writer.observed_step, step) != 0 ||
+         g_writer.observed_step_total != step_total)) {
+        rc = -1;
+    }
+    if (rc == 0 && g_writer.observed_step_order == 0) {
+        g_writer.observed_step_order = step_order;
+        snprintf(g_writer.observed_step, sizeof(g_writer.observed_step), "%s", step);
+        g_writer.observed_step_total = step_total;
+    }
+    /* Parallel callers can arrive after a later snapshot. The greater absolute
+     * completed count already subsumes that work, so do not manufacture a
+     * regression or another record. */
+    if (rc == 0 && step_completed <= g_writer.observed_step_completed) {
+        cbm_mutex_unlock(&g_writer.mutex);
+        return 0;
+    }
+    if (rc == 0) {
+        g_writer.observed_step_completed = step_completed;
+        uint64_t now_ms = cbm_now_ms();
+        if (g_writer.unit_last_published_ms != 0 && now_ms < g_writer.unit_last_published_ms) {
+            rc = -1;
+        }
+        bool publish = rc == 0 &&
+                       (g_writer.unit_last_published_ms == 0 ||
+                        step_completed == step_total ||
+                        now_ms - g_writer.unit_last_published_ms >=
+                            CBM_WORKER_PROGRESS_MAX_REPORT_INTERVAL_MS);
+        if (publish) {
+            rc = writer_publish_locked(stage_order, stage, g_writer.unit_completed, total,
+                                       step_order, step, step_completed, step_total);
+            if (rc == 0) {
+                g_writer.unit_last_published_ms = now_ms;
+            }
+        }
+    }
+    cbm_mutex_unlock(&g_writer.mutex);
+    if (rc != 0) {
+        writer_mark_failed("observe_completed_progress_step");
     }
     return rc;
 }
