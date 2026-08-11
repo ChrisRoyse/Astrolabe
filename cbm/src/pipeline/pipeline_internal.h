@@ -507,7 +507,8 @@ int cbm_extract_preprocessed_translation_unit(
     char *expanded, size_t expanded_size, bool cpp_mode, const char *context_id,
     const uint32_t *line_targets, const uint32_t *line_source_lines, size_t line_count,
     const char *project, const char *const *target_rel_paths,
-    CBMFileResult *const *target_results, size_t target_count, char **diagnostic_out);
+    CBMFileResult *const *target_results, size_t target_count, size_t *projected_targets_out,
+    size_t *screened_targets_out, char **diagnostic_out);
 void cbm_finalize_compiler_context_calls(CBMFileResult *result);
 
 /* ── Infrascan helpers (pass_infrascan.c) ─────────────────────────── */

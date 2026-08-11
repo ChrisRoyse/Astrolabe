@@ -35,6 +35,10 @@ typedef struct {
 // Per-node handler prototypes. Each is called once per node during the
 // unified cursor walk, replacing the old recursive walk_* functions.
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
+/* Conservative ownership discriminator for the compiler-expansion projection.
+ * True includes every node kind from which handle_calls may emit a C-family
+ * call; it may also include nodes whose syntax does not ultimately emit one. */
+bool cbm_preprocessed_call_candidate(CBMLanguage language, TSNode node);
 void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);

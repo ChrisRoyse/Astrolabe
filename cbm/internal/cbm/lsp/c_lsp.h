@@ -62,10 +62,12 @@ typedef struct {
     CBMResolvedCallArray *resolved_calls;
 
     // Optional expanded-buffer ownership map. When present, C LSP emits
-    // resolutions only for calls whose expanded line belongs to the primary
-    // source. Included-file calls are excluded; an invalid mapped call line is
+    // resolutions only for calls whose expanded line belongs to the selected
+    // target. Included-file calls are excluded; an invalid mapped call line is
     // a first-class arena failure.
-    const uint32_t *primary_source_lines;
+    const uint32_t *line_targets;
+    const uint32_t *line_source_lines;
+    uint32_t target_index;
     size_t expanded_line_count;
 
     // Function pointer targets: var_name -> target function QN
@@ -131,11 +133,13 @@ const CBMType *c_simplify_type(CLSPContext *ctx, const CBMType *t, bool unwrap_p
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                    TSNode root, bool cpp_mode);
 
-// Single-file C LSP over compiler-expanded source. The ownership map has one
-// entry per expanded physical line derived from compiler line-control records.
+// Single-file C LSP over compiler-expanded source. The immutable ownership and
+// source-line maps have one entry per expanded physical line derived from
+// compiler line-control records.
 void cbm_run_c_lsp_mapped(CBMArena *arena, CBMFileResult *result, const char *source,
                           int source_len, TSNode root, bool cpp_mode,
-                          const uint32_t *primary_source_lines, size_t expanded_line_count);
+                          const uint32_t *line_targets, const uint32_t *line_source_lines,
+                          uint32_t target_index, size_t expanded_line_count);
 
 // Cross-file LSP: build registry from defs + stdlib, re-parse and resolve.
 void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,

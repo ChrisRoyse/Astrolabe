@@ -1832,6 +1832,22 @@ static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const ch
     }
 }
 
+bool cbm_preprocessed_call_candidate(CBMLanguage language, TSNode node) {
+    const CBMLangSpec *spec = cbm_lang_spec(language);
+    if (!spec || ts_node_is_null(node)) {
+        return false;
+    }
+    const char *kind = ts_node_type(node);
+    if (spec->call_node_types && cbm_kind_in_set(node, spec->call_node_types)) {
+        return true;
+    }
+    if (language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
+        return false;
+    }
+    return strcmp(kind, "declaration") == 0 || strcmp(kind, "if_statement") == 0 ||
+           strcmp(kind, "while_statement") == 0 || strcmp(kind, "do_statement") == 0;
+}
+
 static void extract_kotlin_desugared_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                            const char *enclosing_func_qn) {
     if (strcmp(kind, "property_declaration") == 0) {

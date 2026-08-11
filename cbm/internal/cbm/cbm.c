@@ -61,7 +61,8 @@ int cbm_macro_extraction_enabled(void) {
 }
 
 static bool remap_preprocessed_calls(CBMFileResult *result, int calls_before,
-                                     const uint32_t *primary_source_lines,
+                                     const uint32_t *line_targets,
+                                     const uint32_t *line_source_lines, uint32_t target_index,
                                      size_t expanded_line_count, const char *rel_path) {
     int write = calls_before;
     int foreign_calls = 0;
@@ -79,11 +80,12 @@ static bool remap_preprocessed_calls(CBMFileResult *result, int calls_before,
                 "retry the complete corpus");
             return false;
         }
-        uint32_t source_line = primary_source_lines[call.start_line - 1];
-        if (source_line == UINT32_MAX) {
+        size_t line_index = (size_t)call.start_line - 1U;
+        if (line_targets[line_index] != target_index) {
             foreign_calls++;
             continue;
         }
+        uint32_t source_line = line_source_lines[line_index];
         if (source_line == 0) {
             cbm_log_error("preprocessor.call_source_map_failed", "code",
                           "CBM_PREPROCESS_CALL_ORIGIN_INVALID", "file",
@@ -107,6 +109,50 @@ static bool remap_preprocessed_calls(CBMFileResult *result, int calls_before,
                      rel_path ? rel_path : "<input>", "calls", skipped, "reason",
                      "included_file_owned");
     }
+    return true;
+}
+
+static bool census_preprocessed_call_targets(TSNode root, CBMLanguage language,
+                                             const uint32_t *line_targets, size_t line_count,
+                                             uint8_t *project_target, size_t target_count) {
+    size_t targets_found = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (cbm_preprocessed_call_candidate(language, node)) {
+            size_t expanded_line = (size_t)ts_node_start_point(node).row + 1U;
+            if (expanded_line == 0 || expanded_line > line_count) {
+                ts_tree_cursor_delete(&cursor);
+                return false;
+            }
+            uint32_t target_index = line_targets[expanded_line - 1U];
+            if ((size_t)target_index < target_count && !project_target[target_index]) {
+                project_target[target_index] = 1;
+                targets_found++;
+                if (targets_found == target_count) {
+                    ts_tree_cursor_delete(&cursor);
+                    return true;
+                }
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            continue;
+        }
+        bool found = false;
+        while (ts_tree_cursor_goto_parent(&cursor)) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
     return true;
 }
 
@@ -1876,8 +1922,15 @@ int cbm_extract_preprocessed_translation_unit(
     char *expanded, size_t expanded_size, bool cpp_mode, const char *context_id,
     const uint32_t *line_targets, const uint32_t *line_source_lines, size_t line_count,
     const char *project, const char *const *target_rel_paths,
-    CBMFileResult *const *target_results, size_t target_count, char **diagnostic_out) {
+    CBMFileResult *const *target_results, size_t target_count, size_t *projected_targets_out,
+    size_t *screened_targets_out, char **diagnostic_out) {
     uint64_t started = now_ns();
+    if (projected_targets_out) {
+        *projected_targets_out = 0;
+    }
+    if (screened_targets_out) {
+        *screened_targets_out = 0;
+    }
     if (diagnostic_out) {
         *diagnostic_out = NULL;
     }
@@ -1939,33 +1992,40 @@ int cbm_extract_preprocessed_translation_unit(
         return CBM_NOT_FOUND;
     }
     TSNode root = ts_tree_root_node(tree);
-    uint32_t *primary_lines = malloc(line_count * sizeof(*primary_lines));
-    if (!primary_lines) {
-        ts_tree_delete(tree);
-        if (diagnostic_out) {
-            *diagnostic_out = strdup("compiler expansion source-map allocation failed");
-        }
-        return CBM_NOT_FOUND;
-    }
 
-    int status = 0;
-    for (size_t target_index = 0; target_index < target_count && status == 0; target_index++) {
+    for (size_t target_index = 0; target_index < target_count; target_index++) {
         CBMFileResult *target = target_results[target_index];
         const char *rel_path = target_rel_paths[target_index];
-        if (!target || target->has_error || !rel_path || !rel_path[0] ||
-            !target->module_qn || !target->module_qn[0]) {
-            status = CBM_NOT_FOUND;
+        if (!target || target->has_error || !rel_path || !rel_path[0] || !target->module_qn ||
+            !target->module_qn[0]) {
+            ts_tree_delete(tree);
             if (diagnostic_out) {
                 *diagnostic_out =
                     strdup("compiler expansion target has no complete extracted file identity");
             }
-            break;
+            return CBM_NOT_FOUND;
         }
-        for (size_t line = 0; line < line_count; line++) {
-            primary_lines[line] = line_targets[line] == (uint32_t)target_index
-                                      ? line_source_lines[line]
-                                      : UINT32_MAX;
+    }
+
+    uint8_t *project_target = calloc(target_count, sizeof(*project_target));
+    bool screening_complete = project_target != NULL;
+    if (screening_complete) {
+        screening_complete = census_preprocessed_call_targets(
+            root, language, line_targets, line_count, project_target, target_count);
+    }
+    if (!screening_complete && project_target) {
+        memset(project_target, 1, target_count * sizeof(*project_target));
+    }
+
+    int status = 0;
+    size_t projected_targets = 0;
+    for (size_t target_index = 0; target_index < target_count && status == 0; target_index++) {
+        CBMFileResult *target = target_results[target_index];
+        const char *rel_path = target_rel_paths[target_index];
+        if (project_target && !project_target[target_index]) {
+            continue;
         }
+        projected_targets++;
 
         CBMFileResult temporary;
         memset(&temporary, 0, sizeof(temporary));
@@ -1986,10 +2046,12 @@ int cbm_extract_preprocessed_translation_unit(
         cbm_extract_preprocessed_calls(&context);
         if (!cbm_arena_failed(&temporary.arena)) {
             cbm_run_c_lsp_mapped(&temporary.arena, &temporary, expanded, (int)expanded_size,
-                                 root, cpp_mode, primary_lines, line_count);
+                                 root, cpp_mode, line_targets, line_source_lines,
+                                 (uint32_t)target_index, line_count);
         }
         if (!cbm_arena_failed(&temporary.arena)) {
-            (void)remap_preprocessed_calls(&temporary, 0, primary_lines, line_count, rel_path);
+            (void)remap_preprocessed_calls(&temporary, 0, line_targets, line_source_lines,
+                                           (uint32_t)target_index, line_count, rel_path);
         }
         if (temporary.has_error || cbm_arena_failed(&temporary.arena)) {
             cbm_file_result_set_error(
@@ -2027,10 +2089,16 @@ int cbm_extract_preprocessed_translation_unit(
         }
         release_preprocessed_temporary(&temporary);
     }
-    free(primary_lines);
+    free(project_target);
     ts_tree_delete(tree);
+    if (projected_targets_out) {
+        *projected_targets_out = projected_targets;
+    }
+    if (screened_targets_out) {
+        *screened_targets_out = target_count - projected_targets;
+    }
     atomic_fetch_add(&total_preprocess_ns, now_ns() - started);
-    atomic_fetch_add(&total_files_preprocessed, target_count);
+    atomic_fetch_add(&total_files_preprocessed, projected_targets);
     return status;
 }
 

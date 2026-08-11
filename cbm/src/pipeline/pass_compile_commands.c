@@ -2489,7 +2489,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
     }
     if (index->authority_absent || index->context_count == 0) {
         cbm_log_info("compiler_preprocess.ready", "compiler_invocations", "0", "syntax_trees", "0",
-                     "target_projections", "0", "expanded_bytes", "0", "mapped_lines", "0",
+                     "candidate_targets", "0", "target_projections", "0", "screened_targets",
+                     "0", "expanded_bytes", "0", "mapped_lines", "0",
                      "workspace_local_compiler_markers", "0", "peak_expansion_bytes", "0",
                      "authority", index->authority_absent ? "absent" : "not_applicable", "cache",
                      "one_compiler_expansion_per_context", "canonicalization",
@@ -2540,7 +2541,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
     uint64_t mapped_lines_total = 0;
     uint64_t workspace_local_compiler_markers_total = 0;
     uint64_t working_directory_markers_total = 0;
+    uint64_t candidate_targets = 0;
     uint64_t target_projections = 0;
+    uint64_t screened_targets = 0;
     size_t peak_expansion_bytes = 0;
     size_t peak_compiler_stdout_bytes = 0;
     int status = 0;
@@ -2752,7 +2755,7 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
             cbm_log_info("compiler_preprocess.context", "translation_unit", owner->tu_rel_path,
                          "context_id", owner->view.context_id, "compiler_stdout_bytes",
                          stdout_bytes_text, "expanded_bytes", bytes_text, "expanded_sha256",
-                         expansion_hash, "projection_targets", targets_text, "stderr_total_bytes",
+                         expansion_hash, "candidate_targets", targets_text, "stderr_total_bytes",
                          stderr_text, "stderr_truncated", stderr_truncated ? "true" : "false",
                          "canonicalization", "validated_linemarkers_to_empty_lines",
                          "workspace_local_compiler_markers", workspace_local_compiler_markers_text,
@@ -2764,10 +2767,13 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
                          "source_date_epoch_revision", index->source_date_epoch_revision,
                          "timestamp_macro_input", "immutable_snapshot_last_write_time");
             char *diagnostic = NULL;
+            size_t projected_target_count = 0;
+            size_t screened_target_count = 0;
             status = cbm_extract_preprocessed_translation_unit(
                 expansion.text, expansion.text_bytes, owner->view.cpp_mode, owner->view.context_id,
                 expansion.line_targets, expansion.line_source_lines, expansion.line_count,
-                ctx->project_name, target_rel_paths, target_results, target_count, &diagnostic);
+                ctx->project_name, target_rel_paths, target_results, target_count,
+                &projected_target_count, &screened_target_count, &diagnostic);
             if (status != 0) {
                 status = preprocess_fail(
                     ctx, "CBM_PREPROCESS_PROJECTION_FAILED", "extract_compiler_expansion",
@@ -2777,13 +2783,23 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
             }
             free(diagnostic);
             if (status == 0) {
+                char projected_text[32];
+                char screened_text[32];
+                snprintf(projected_text, sizeof(projected_text), "%zu", projected_target_count);
+                snprintf(screened_text, sizeof(screened_text), "%zu", screened_target_count);
+                cbm_log_info("compiler_preprocess.projection", "translation_unit",
+                             owner->tu_rel_path, "context_id", owner->view.context_id,
+                             "candidate_targets", targets_text, "target_projections",
+                             projected_text, "screened_targets", screened_text);
                 expanded_bytes_total += expansion.text_bytes;
                 compiler_stdout_bytes_total += compiler_stdout_bytes;
                 mapped_lines_total += expansion.mapped_lines;
                 workspace_local_compiler_markers_total +=
                     expansion.workspace_local_compiler_markers;
                 working_directory_markers_total += expansion.working_directory_markers;
-                target_projections += target_count;
+                candidate_targets += target_count;
+                target_projections += projected_target_count;
+                screened_targets += screened_target_count;
                 if (expansion.text_bytes > peak_expansion_bytes) {
                     peak_expansion_bytes = expansion.text_bytes;
                 }
@@ -2831,7 +2847,9 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         uint8_t digest[CBM_SHA256_DIGEST_LEN];
         char set_hash[CBM_SHA256_HEX_LEN + 1];
         char contexts_text[32];
+        char candidates_text[32];
         char projections_text[32];
+        char screened_text[32];
         char total_bytes_text[32];
         char total_stdout_bytes_text[32];
         char mapped_text[32];
@@ -2845,8 +2863,12 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         }
         set_hash[CBM_SHA256_HEX_LEN] = '\0';
         snprintf(contexts_text, sizeof(contexts_text), "%d", index->context_count);
+        snprintf(candidates_text, sizeof(candidates_text), "%llu",
+                 (unsigned long long)candidate_targets);
         snprintf(projections_text, sizeof(projections_text), "%llu",
                  (unsigned long long)target_projections);
+        snprintf(screened_text, sizeof(screened_text), "%llu",
+                 (unsigned long long)screened_targets);
         snprintf(total_bytes_text, sizeof(total_bytes_text), "%llu",
                  (unsigned long long)expanded_bytes_total);
         snprintf(total_stdout_bytes_text, sizeof(total_stdout_bytes_text), "%llu",
@@ -2861,7 +2883,8 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         snprintf(peak_stdout_text, sizeof(peak_stdout_text), "%zu", peak_compiler_stdout_bytes);
         cbm_log_info(
             "compiler_preprocess.ready", "compiler_invocations", contexts_text, "syntax_trees",
-            contexts_text, "target_projections", projections_text, "expanded_bytes",
+            contexts_text, "candidate_targets", candidates_text, "target_projections",
+            projections_text, "screened_targets", screened_text, "expanded_bytes",
             total_bytes_text, "compiler_stdout_bytes", total_stdout_bytes_text, "mapped_lines",
             mapped_text, "workspace_local_compiler_markers", workspace_local_compiler_markers_text,
             "working_directory_markers", working_directory_markers_text, "peak_expansion_bytes",
