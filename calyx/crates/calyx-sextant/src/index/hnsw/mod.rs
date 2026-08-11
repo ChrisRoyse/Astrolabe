@@ -24,7 +24,9 @@ use std::collections::HashMap;
 use calyx_aster::gc::{AnnIndexGraph, AnnTombstoneStats};
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
-use super::quant_config::{PackedQuery, PackedVector, l2_norm, score_packed, score_scalar8_pair};
+use super::quant_config::{
+    PackedQuery, PackedVector, l2_norm, scalar8_query_norm, score_packed, score_scalar8_pair,
+};
 use super::{IndexSearchHit, IndexStats, QuantConfig, SextantIndex, ranked};
 use crate::error::{
     CALYX_SEXTANT_DIM_MISMATCH, CALYX_SEXTANT_EF_TOO_SMALL, CALYX_SEXTANT_INDEX_EMPTY,
@@ -44,7 +46,18 @@ struct Row {
     /// Ephemeral scores aligned one-for-one with `neighbors`. They are derived
     /// construction state and are deliberately excluded from artifact bytes.
     neighbor_scores: Vec<f32>,
+    /// Exact norm of the f32 reconstruction used for Scalar8 construction
+    /// queries. Derived once from immutable packed bytes and excluded from the
+    /// artifact encoding.
+    scalar8_query_norm: Option<f32>,
     deleted: bool,
+}
+
+fn packed_scalar8_query_norm(stored: &PackedVector) -> Option<f32> {
+    match stored {
+        PackedVector::Scalar8 { codes, scale, .. } => Some(scalar8_query_norm(codes, *scale)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -253,7 +266,22 @@ impl HnswIndex {
                     scale: row_scale,
                     norm: row_norm,
                 },
-            ) => score_scalar8_pair(query_codes, *query_scale, row_codes, *row_scale, *row_norm),
+            ) => {
+                let query_norm = self.rows[query_idx].scalar8_query_norm.ok_or_else(|| {
+                    sextant_error(
+                        crate::error::CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                        format!("HNSW Scalar8 construction norm is absent: row={query_idx}"),
+                    )
+                })?;
+                score_scalar8_pair(
+                    query_codes,
+                    *query_scale,
+                    query_norm,
+                    row_codes,
+                    *row_scale,
+                    *row_norm,
+                )
+            }
             _ => {
                 let query = self.construction_query(query_idx)?;
                 self.score_row(&query, row_idx)
@@ -266,7 +294,19 @@ impl HnswIndex {
     pub(super) fn construction_query(&self, index: usize) -> Result<PackedQuery> {
         match &self.rows[index].stored {
             PackedVector::F32 { values } => self.quant.prepare_query(values),
-            PackedVector::Scalar8 { .. } | PackedVector::TurboQuant { .. } => self
+            PackedVector::Scalar8 { codes, scale, .. } => Ok(PackedQuery::F32 {
+                values: codes
+                    .iter()
+                    .map(|code| f32::from(*code as i8) * *scale)
+                    .collect(),
+                norm: self.rows[index].scalar8_query_norm.ok_or_else(|| {
+                    sextant_error(
+                        crate::error::CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                        format!("HNSW Scalar8 construction norm is absent: row={index}"),
+                    )
+                })?,
+            }),
+            PackedVector::TurboQuant { .. } => self
                 .quant
                 .approx_f32(&self.rows[index].stored)
                 .and_then(|approx| self.quant.prepare_query(&approx)),
@@ -282,17 +322,25 @@ impl HnswIndex {
     pub(super) fn reusable_construction_query(&mut self, index: usize) -> Result<PackedQuery> {
         let mut values = std::mem::take(&mut self.construction_scratch);
         values.clear();
-        match &self.rows[index].stored {
-            PackedVector::F32 { values: stored } => values.extend_from_slice(stored),
+        let norm = match &self.rows[index].stored {
+            PackedVector::F32 { values: stored } => {
+                values.extend_from_slice(stored);
+                l2_norm(&values)
+            }
             PackedVector::Scalar8 { codes, scale, .. } => {
-                values.extend(codes.iter().map(|code| f32::from(*code as i8) * *scale))
+                values.extend(codes.iter().map(|code| f32::from(*code as i8) * *scale));
+                self.rows[index].scalar8_query_norm.ok_or_else(|| {
+                    sextant_error(
+                        crate::error::CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                        format!("HNSW Scalar8 construction norm is absent: row={index}"),
+                    )
+                })?
             }
             PackedVector::Binary { .. } | PackedVector::TurboQuant { .. } => {
                 self.construction_scratch = values;
                 return self.construction_query(index);
             }
-        }
-        let norm = l2_norm(&values);
+        };
         Ok(PackedQuery::F32 { values, norm })
     }
 
@@ -434,12 +482,14 @@ impl SextantIndex for HnswIndex {
             ));
         }
         let packed = self.quant.pack(values)?;
+        let packed_scalar8_query_norm = packed_scalar8_query_norm(&packed);
         if let Some(&index) = self.positions.get(&cx_id) {
             let prior_row = self.rows[index].clone();
             let prior_base_seq = self.base_seq;
             let prior_built_at_seq = self.built_at_seq;
             self.remove_fingerprint(index);
             self.rows[index].stored = packed;
+            self.rows[index].scalar8_query_norm = packed_scalar8_query_norm;
             self.rows[index].seq = seq;
             self.rows[index].deleted = false;
             self.index_fingerprint(index);
@@ -475,6 +525,7 @@ impl SextantIndex for HnswIndex {
             level,
             neighbors: Vec::new(),
             neighbor_scores: Vec::new(),
+            scalar8_query_norm: packed_scalar8_query_norm,
             deleted: false,
         });
         self.positions.insert(cx_id, index);

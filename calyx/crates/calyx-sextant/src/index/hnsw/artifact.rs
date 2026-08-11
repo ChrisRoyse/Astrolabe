@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use calyx_core::{CxId, Result, SlotId};
 use calyx_forge::{QuantLevel, QuantizedVec, RotationSeed, SeedId, turboquant_payload_len};
 
-use super::{HNSW_MAX_DIM, HnswIndex, Row};
+use super::{HNSW_MAX_DIM, HnswIndex, Row, packed_scalar8_query_norm};
 use crate::error::{
     CALYX_SEXTANT_HNSW_ARTIFACT_CORRUPT, CALYX_SEXTANT_HNSW_ARTIFACT_IO,
     CALYX_SEXTANT_HNSW_ARTIFACT_STALE, CALYX_SEXTANT_HNSW_ARTIFACT_UNSUPPORTED, sextant_error,
@@ -312,6 +312,7 @@ impl HnswIndex {
             }
             rows.push(Row {
                 cx_id,
+                scalar8_query_norm: packed_scalar8_query_norm(&stored),
                 stored,
                 seq,
                 level,
@@ -524,6 +525,20 @@ impl HnswIndex {
                 return Err(corrupt(format!(
                     "row {ordinal} has invalid ephemeral construction-score state"
                 )));
+            }
+            match (&row.stored, row.scalar8_query_norm) {
+                (PackedVector::Scalar8 { .. }, Some(norm)) if norm.is_finite() && norm >= 0.0 => {}
+                (PackedVector::Scalar8 { .. }, _) => {
+                    return Err(corrupt(format!(
+                        "row {ordinal} has invalid ephemeral Scalar8 construction norm"
+                    )));
+                }
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(corrupt(format!(
+                        "row {ordinal} has a Scalar8 construction norm for a different packed kind"
+                    )));
+                }
             }
             let mut neighbors = HashSet::new();
             for neighbor in &row.neighbors {

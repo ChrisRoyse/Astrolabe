@@ -577,6 +577,7 @@ pub fn score_packed(query: &PackedQuery, row: &PackedVector) -> Result<f32> {
 pub(crate) fn score_scalar8_pair(
     query_codes: &[u8],
     query_scale: f32,
+    query_norm: f32,
     row_codes: &[u8],
     row_scale: f32,
     row_norm: f32,
@@ -584,19 +585,22 @@ pub(crate) fn score_scalar8_pair(
     if query_codes.len() != row_codes.len() {
         return Err(dim_mismatch(query_codes.len(), row_codes.len()));
     }
-    let query_norm = query_codes
-        .iter()
-        .map(|code| {
-            let value = f32::from(*code as i8) * query_scale;
-            f64::from(value) * f64::from(value)
-        })
-        .sum::<f64>()
-        .sqrt() as f32;
     if query_norm == 0.0 || row_norm == 0.0 {
         return Ok(0.0);
     }
     let dot = scalar8_pair_dot(query_codes, query_scale, row_codes);
     Ok((dot * f64::from(row_scale) / (f64::from(query_norm) * f64::from(row_norm))) as f32)
+}
+
+pub(crate) fn scalar8_query_norm(codes: &[u8], scale: f32) -> f32 {
+    codes
+        .iter()
+        .map(|code| {
+            let value = f32::from(*code as i8) * scale;
+            f64::from(value) * f64::from(value)
+        })
+        .sum::<f64>()
+        .sqrt() as f32
 }
 
 /// Asymmetric query-f32 by candidate-i8 dot product. Candidate bytes remain
