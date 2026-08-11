@@ -316,6 +316,8 @@ struct cbm_pipeline {
     cbm_pipeline_parallel_dispatch_t parallel_dispatches[PL_PARALLEL_DISPATCH_CAPACITY];
     size_t parallel_dispatch_count;
     bool parallel_dispatches_complete;
+    cbm_pipeline_parallel_resolver_accounting_t parallel_resolver_accounting;
+    bool parallel_resolver_accounting_present;
     cbm_pipeline_execution_route_t execution_route;
     cbm_pipeline_parallel_dispatch_expectation_t parallel_dispatch_expectation;
 
@@ -922,6 +924,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->parse_recovery_diagnostics = 0;
     p->phase_metrics_complete = true;
     p->parallel_dispatches_complete = true;
+    p->parallel_resolver_accounting_present = false;
     p->compile_context_authority = "not_applicable";
     atomic_init(&p->dangling_rust_module_skips, 0);
     atomic_init(&p->cancelled, 0);
@@ -1224,6 +1227,48 @@ void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
     if (complete) {
         *complete = p && p->parallel_dispatches_complete;
     }
+}
+
+bool cbm_pipeline_get_parallel_resolver_accounting(
+    const cbm_pipeline_t *p, cbm_pipeline_parallel_resolver_accounting_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!p || !p->parallel_resolver_accounting_present) {
+        return false;
+    }
+    if (out) {
+        *out = p->parallel_resolver_accounting;
+    }
+    return true;
+}
+
+int cbm_pipeline_record_parallel_resolver_accounting(cbm_pipeline_t *p, uint64_t completed,
+                                                     uint64_t denominator,
+                                                     uint64_t recounted,
+                                                     uint64_t dynamic_lsp_items,
+                                                     uint64_t cross_lsp_units) {
+    if (!p || p->parallel_resolver_accounting_present || completed != denominator ||
+        recounted != denominator) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_PARALLEL_RESOLVER_ACCOUNTING_INVALID",
+            "retain_parallel_resolver_accounting", "parallel_resolve",
+            p && p->repo_path ? p->repo_path : "", 0,
+            "parallel resolver terminal accounting is absent, duplicated, or internally "
+            "inconsistent",
+            "preserve the generation and repair the exact resolver denominator/recount "
+            "contract before retrying the unchanged repository");
+        return CBM_NOT_FOUND;
+    }
+    p->parallel_resolver_accounting = (cbm_pipeline_parallel_resolver_accounting_t){
+        .completed = completed,
+        .denominator = denominator,
+        .recounted = recounted,
+        .dynamic_lsp_items = dynamic_lsp_items,
+        .cross_lsp_units = cross_lsp_units,
+    };
+    p->parallel_resolver_accounting_present = true;
+    return 0;
 }
 
 cbm_pipeline_execution_route_t cbm_pipeline_get_execution_route(const cbm_pipeline_t *p) {
@@ -4706,6 +4751,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->phase_metrics_complete = true;
     p->parallel_dispatch_count = 0;
     p->parallel_dispatches_complete = true;
+    memset(&p->parallel_resolver_accounting, 0, sizeof(p->parallel_resolver_accounting));
+    p->parallel_resolver_accounting_present = false;
     p->execution_route = CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN;
     p->parallel_dispatch_expectation = CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_UNKNOWN;
     cbm_pipeline_phase_probe_t total_probe = cbm_pipeline_phase_probe_start(p, "total");

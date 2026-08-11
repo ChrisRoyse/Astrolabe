@@ -101,6 +101,20 @@ typedef struct {
     unsigned long error_code;
 } cbm_pipeline_parallel_dispatch_t;
 
+/* Exact terminal accounting for the parallel resolver's immutable work
+ * denominator. The resolver independently reconstructs `recounted` after all
+ * workers join; a successful measured result requires
+ * completed == denominator == recounted. Dynamic cross-LSP rows are processed
+ * normally but owned by the already-counted cross-LSP units, so both quantities
+ * remain explicit instead of being hidden in an ephemeral worker log. */
+typedef struct {
+    uint64_t completed;
+    uint64_t denominator;
+    uint64_t recounted;
+    uint64_t dynamic_lsp_items;
+    uint64_t cross_lsp_units;
+} cbm_pipeline_parallel_resolver_accounting_t;
+
 /* Exact successful execution route. Route describes the persisted operation;
  * worker-dispatch cardinality is an independent measured fact below. UNKNOWN
  * is never a successful response state. */
@@ -217,6 +231,12 @@ void cbm_pipeline_get_phase_metrics(const cbm_pipeline_t *p,
 void cbm_pipeline_get_parallel_dispatches(const cbm_pipeline_t *p,
                                           const cbm_pipeline_parallel_dispatch_t **out,
                                           size_t *count, bool *complete);
+
+/* Return true and copy the retained terminal accounting when the parallel
+ * resolver ran. False is an explicit not-run state; callers use the execution
+ * route/dispatch contract to decide whether that state is valid. */
+bool cbm_pipeline_get_parallel_resolver_accounting(
+    const cbm_pipeline_t *p, cbm_pipeline_parallel_resolver_accounting_t *out);
 
 /* Return the exact successful route and dispatch expectation selected by the
  * current run. A caller must reject UNKNOWN and every contradictory tuple. */

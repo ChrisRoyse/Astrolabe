@@ -3948,6 +3948,15 @@ impl Default for cbm_pipeline_parallel_dispatch_t {
         }
     }
 }
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct cbm_pipeline_parallel_resolver_accounting_t {
+    pub completed: u64,
+    pub denominator: u64,
+    pub recounted: u64,
+    pub dynamic_lsp_items: u64,
+    pub cross_lsp_units: u64,
+}
 pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN:
     cbm_pipeline_execution_route_t = 0;
 pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_UNCHANGED_READ_ONLY:
@@ -4043,6 +4052,12 @@ unsafe extern "C" {
         count: *mut usize,
         complete: *mut bool,
     );
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_parallel_resolver_accounting(
+        p: *const cbm_pipeline_t,
+        out: *mut cbm_pipeline_parallel_resolver_accounting_t,
+    ) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_get_execution_route(

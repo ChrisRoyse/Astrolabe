@@ -8183,6 +8183,85 @@ static bool add_pipeline_parallel_dispatches(
     return complete && dispatches && cardinality_matches;
 }
 
+static bool add_pipeline_parallel_resolver_accounting(
+    yyjson_mut_doc *doc, yyjson_mut_val *root, const cbm_pipeline_t *p,
+    cbm_pipeline_parallel_dispatch_expectation_t expectation,
+    cbm_pipeline_parallel_resolver_accounting_t *accounting_out, bool *present_out) {
+    cbm_pipeline_parallel_resolver_accounting_t accounting = {0};
+    bool present = cbm_pipeline_get_parallel_resolver_accounting(p, &accounting);
+    bool required = expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO;
+    bool internally_consistent = !present ||
+                                 (accounting.completed == accounting.denominator &&
+                                  accounting.recounted == accounting.denominator);
+
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    if (!item ||
+        !yyjson_mut_obj_add_str(doc, item, "state", present ? "measured" : "not_run") ||
+        !yyjson_mut_obj_add_bool(doc, item, "required", required)) {
+        return false;
+    }
+    if (present &&
+        (!yyjson_mut_obj_add_uint(doc, item, "completed", accounting.completed) ||
+         !yyjson_mut_obj_add_uint(doc, item, "denominator", accounting.denominator) ||
+         !yyjson_mut_obj_add_uint(doc, item, "recounted", accounting.recounted) ||
+         !yyjson_mut_obj_add_uint(doc, item, "dynamic_lsp_items", accounting.dynamic_lsp_items) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_units", accounting.cross_lsp_units))) {
+        return false;
+    }
+    if (!yyjson_mut_obj_add_val(doc, root, "parallel_resolver_accounting", item)) {
+        return false;
+    }
+    if (accounting_out) {
+        *accounting_out = accounting;
+    }
+    if (present_out) {
+        *present_out = present;
+    }
+    return present == required && internally_consistent;
+}
+
+static char *build_index_parallel_resolver_accounting_error(
+    const char *project_name, cbm_pipeline_parallel_dispatch_expectation_t expectation,
+    bool present, const cbm_pipeline_parallel_resolver_accounting_t *accounting) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":"
+            "\"CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID\","
+            "\"source_family_preserved\":true}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code",
+                           "CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID");
+    yyjson_mut_obj_add_str(doc, root, "operation", "retain_parallel_resolver_accounting");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "the successful execution contract lacks exact terminal parallel-resolver accounting");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "preserve the database family and repair the resolver accounting producer/consumer "
+        "contract before retrying the unchanged repository");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project_name ? project_name : "");
+    yyjson_mut_obj_add_str(doc, root, "parallel_dispatch_expectation",
+                           pipeline_parallel_dispatch_expectation_name(expectation));
+    yyjson_mut_obj_add_bool(doc, root, "accounting_present", present);
+    if (present && accounting) {
+        yyjson_mut_obj_add_uint(doc, root, "completed", accounting->completed);
+        yyjson_mut_obj_add_uint(doc, root, "denominator", accounting->denominator);
+        yyjson_mut_obj_add_uint(doc, root, "recounted", accounting->recounted);
+        yyjson_mut_obj_add_uint(doc, root, "dynamic_lsp_items", accounting->dynamic_lsp_items);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_units", accounting->cross_lsp_units);
+    }
+    yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json
+                : heap_strdup("{\"status\":\"error\",\"code\":"
+                              "\"CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID\"}");
+}
+
 /* Build the success portion only after the persisted source of truth has been
  * verified and independently read back. Returns a structured error on failure. */
 static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
@@ -8297,6 +8376,16 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
         return build_index_parallel_dispatch_error(project_name, parallel_dispatch_count,
                                                    parallel_dispatches_complete, execution_route,
                                                    dispatch_expectation);
+    }
+
+    cbm_pipeline_parallel_resolver_accounting_t resolver_accounting = {0};
+    bool resolver_accounting_present = false;
+    if (!add_pipeline_parallel_resolver_accounting(
+            doc, root, p, dispatch_expectation, &resolver_accounting,
+            &resolver_accounting_present)) {
+        return build_index_parallel_resolver_accounting_error(
+            project_name, dispatch_expectation, resolver_accounting_present,
+            &resolver_accounting);
     }
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);

@@ -3923,6 +3923,17 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         cbm_aligned_free(workers);
         return CBM_NOT_FOUND;
     }
+    if (cbm_pipeline_record_parallel_resolver_accounting(
+            ctx ? ctx->pipeline : NULL, resolved_items, rc.resolve_items_total,
+            recounted_items, dynamic_lsp_items, cross_lsp_units) != 0) {
+        for (int i = 0; i < worker_count; i++) {
+            if (workers[i].local_edge_buf) {
+                cbm_gbuf_free(workers[i].local_edge_buf);
+            }
+        }
+        cbm_aligned_free(workers);
+        return CBM_NOT_FOUND;
+    }
     char completed_items[32];
     char recounted_items_buf[32];
     char dynamic_lsp_items_buf[32];
