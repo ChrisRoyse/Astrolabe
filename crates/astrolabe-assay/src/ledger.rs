@@ -10,6 +10,7 @@
 //! the ledgered card bit-for-bit, which is exactly the reproducibility contract
 //! the blueprint requires (`reproduce` re-derives within tolerance).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ use crate::bits::{
     AxisValues, BitsConfig, SignalRankingCard, SlotObservations, build_signal_ranking,
 };
 use crate::error::{
+    ASTRO_ASSAY_INPUT_FINGERPRINT_COLLISION, ASTRO_ASSAY_INPUT_FINGERPRINT_INVALID,
     ASTRO_ASSAY_READBACK_MISMATCH, ASTRO_ASSAY_REPRODUCE_MISMATCH, ASTRO_ASSAY_STORE_CORRUPT,
     ASTRO_ASSAY_STORE_IO, AssayError, Result,
 };
@@ -29,6 +31,31 @@ pub const ASSAY_LEDGER_TAG: &str = "astro-assay-card-ledger-v1";
 /// The hex hash that seeds an empty chain (the genesis previous-hash).
 pub const GENESIS_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn valid_input_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn invalid_input_fingerprint(value: &str) -> AssayError {
+    AssayError::new(
+        ASTRO_ASSAY_INPUT_FINGERPRINT_INVALID,
+        format!(
+            "assay card input fingerprint {value:?} is not 64 lowercase hexadecimal characters"
+        ),
+        "recompute the fingerprint from the canonical measurement inputs before appending",
+    )
+}
+
+fn input_fingerprint_collision(message: impl Into<String>) -> AssayError {
+    AssayError::new(
+        ASTRO_ASSAY_INPUT_FINGERPRINT_COLLISION,
+        message,
+        "preserve the ledger, identify the two input preimages, and rebuild only after assigning distinct canonical fingerprints",
+    )
+}
 
 /// One ledgered assay card entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +159,7 @@ impl CardLedger {
         })?;
         let mut entries = Vec::new();
         let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut input_identities: BTreeMap<String, u64> = BTreeMap::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() {
                 continue;
@@ -147,6 +175,9 @@ impl CardLedger {
                     "quarantine the corrupt ledger and rebuild it",
                 )
             })?;
+            if !valid_input_fingerprint(&entry.input_fingerprint) {
+                return Err(invalid_input_fingerprint(&entry.input_fingerprint));
+            }
             if entry.seq != entries.len() as u64 {
                 return Err(AssayError::new(
                     ASTRO_ASSAY_STORE_CORRUPT,
@@ -190,6 +221,14 @@ impl CardLedger {
                     "quarantine the corrupt ledger and rebuild it",
                 ));
             }
+            if let Some(first_seq) =
+                input_identities.insert(entry.input_fingerprint.clone(), entry.seq)
+            {
+                return Err(input_fingerprint_collision(format!(
+                    "ledger reuses input fingerprint {} at seq {} after seq {}; every canonical input identity must occur exactly once",
+                    entry.input_fingerprint, entry.seq, first_seq
+                )));
+            }
             prev = entry.entry_hash.clone();
             entries.push(entry);
         }
@@ -207,7 +246,24 @@ impl CardLedger {
         seed: u64,
         input_fingerprint: &str,
     ) -> Result<AssayCardEntry> {
+        if !valid_input_fingerprint(input_fingerprint) {
+            return Err(invalid_input_fingerprint(input_fingerprint));
+        }
         let existing = self.read_all()?;
+        if let Some(prior) = existing
+            .iter()
+            .find(|entry| entry.input_fingerprint == input_fingerprint)
+        {
+            if prior.seed == seed && prior.card == *card {
+                // Idempotent replay: read_all already proved the exact durable
+                // entry and its chain, so returning it performs no mutation.
+                return Ok(prior.clone());
+            }
+            return Err(input_fingerprint_collision(format!(
+                "input fingerprint {input_fingerprint} already identifies seq {} with seed {} and different card bytes; refused seed {seed}",
+                prior.seq, prior.seed
+            )));
+        }
         let seq = existing.len() as u64;
         let prev_hash = existing
             .last()

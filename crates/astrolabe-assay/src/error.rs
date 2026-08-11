@@ -84,6 +84,12 @@ pub const ASTRO_ASSAY_MEASUREMENT_INPUT_INVALID: &str = "ASTRO_ASSAY_MEASUREMENT
 /// A card read back from the ledger did not re-derive to the recorded value
 /// (reproduce/FSV failure).
 pub const ASTRO_ASSAY_REPRODUCE_MISMATCH: &str = "ASTRO_ASSAY_REPRODUCE_MISMATCH";
+/// An assay-card input identity was malformed instead of being a canonical
+/// lowercase 256-bit content fingerprint.
+pub const ASTRO_ASSAY_INPUT_FINGERPRINT_INVALID: &str = "ASTRO_ASSAY_INPUT_FINGERPRINT_INVALID";
+/// One canonical assay-card input identity resolved to more than one durable
+/// payload/seed, or was already duplicated in the append-only chain.
+pub const ASTRO_ASSAY_INPUT_FINGERPRINT_COLLISION: &str = "ASTRO_ASSAY_INPUT_FINGERPRINT_COLLISION";
 /// A lens capability-gate input was malformed: misaligned sample vectors, a
 /// non-finite measured value, or an out-of-range correlation.
 pub const ASTRO_ASSAY_GATE_INPUT_INVALID: &str = "ASTRO_ASSAY_GATE_INPUT_INVALID";

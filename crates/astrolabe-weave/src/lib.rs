@@ -82,8 +82,9 @@ pub use kernel_index::{
     read_persisted_kernel_member_index_descriptor,
 };
 pub use signal_cards::{
-    SIGNAL_AXIS_STRUCTURAL_DEGREE, SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes,
-    derive_symbol_axes, measure_index_time_signal_cards, signal_cards_from_symbol_axes,
+    ASTRO_WEAVE_SIGNAL_CARD_INPUT_INVALID, ProducedSignalCard, SIGNAL_AXIS_STRUCTURAL_DEGREE,
+    SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes, derive_symbol_axes,
+    measure_index_time_signal_cards, signal_cards_from_symbol_axes,
 };
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT,

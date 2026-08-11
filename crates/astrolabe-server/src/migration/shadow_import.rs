@@ -1017,15 +1017,15 @@ where
     let mut axes = Vec::new();
     let mut cards_persisted = 0usize;
     let mut cards_ledgered = 0usize;
-    for card in &production.cards {
+    for produced in &production.cards {
+        let card = &produced.card;
         let axis = card.axis.clone();
         // Ledger the card first so the persisted config doc can cite its entry.
-        // The fingerprint pairs the entry with the (project, axis, seed) that
-        // produced it (a provenance tag; the reproducible-input hash is future work
-        // once the aligned observation matrix is captured alongside the card).
-        let fingerprint =
-            format!("index_time_signal_cards:{project}:{axis}:seed{SHADOW_SIGNAL_CARDS_SEED:#x}");
-        let entry = match ledger.append(card, SHADOW_SIGNAL_CARDS_SEED, &fingerprint) {
+        // The producer structurally pairs the card with a versioned content hash
+        // over the source axes, exact aligned observations, resolved bits config,
+        // requested slot roster, and seed. A label is never accepted as identity.
+        let fingerprint = &produced.input_fingerprint;
+        let entry = match ledger.append(card, SHADOW_SIGNAL_CARDS_SEED, fingerprint) {
             Ok(entry) => entry,
             Err(error) => {
                 return signal_cards_unavailable(format!(
@@ -1056,6 +1056,7 @@ where
             "axis": axis,
             "scope": Value::Null,
             "seq": entry.seq,
+            "input_fingerprint": entry.input_fingerprint,
             "produced_at": produced_at,
             "freshness": "fresh",
             "freshness_lag": 0,
@@ -1106,6 +1107,7 @@ where
             "signal_count": card.signals.len(),
             "trust": trust,
             "ledger_seq": entry.seq,
+            "input_fingerprint": fingerprint,
             "config_key": key,
         }));
     }

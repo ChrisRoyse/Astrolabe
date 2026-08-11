@@ -246,7 +246,38 @@ pub struct BitsConfig {
     pub estimator_sample_cap: usize,
 }
 
+/// Versioned domain for the exact bits-estimator contract fingerprint.
+///
+/// Bump this context whenever estimator semantics change even if the exposed
+/// knob roster does not. That makes a code-level estimator change a new input
+/// identity instead of colliding with a card produced by the prior contract.
+const ASSAY_BITS_CONFIG_FINGERPRINT_CONTEXT: &str =
+    "Astrolabe 2026-08-11 assay bits measurement contract v1";
+
 impl BitsConfig {
+    /// Content-addresses every resolved knob plus the estimator contract version.
+    ///
+    /// The preimage is fixed-width and big-endian. It is deliberately independent
+    /// of Rust/Serde field layout so the persisted identity remains reproducible
+    /// across processes and worker counts.
+    pub fn measurement_contract_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(ASSAY_BITS_CONFIG_FINGERPRINT_CONTEXT);
+        hasher.update(&(self.k as u64).to_be_bytes());
+        hasher.update(&(self.floor as u64).to_be_bytes());
+        hasher.update(&(self.bootstrap_resamples as u64).to_be_bytes());
+        hasher.update(&self.bootstrap_subsample_permille.to_be_bytes());
+        hasher.update(&self.ci_confidence_permille.to_be_bytes());
+        hasher.update(&(self.posterior_draws as u64).to_be_bytes());
+        hasher.update(&self.posterior_prior_alpha.to_bits().to_be_bytes());
+        hasher.update(&(self.floor_bins as u64).to_be_bytes());
+        hasher.update(&self.projection_factor_permille.to_be_bytes());
+        hasher.update(&self.sufficiency_slack_bits.to_bits().to_be_bytes());
+        hasher.update(&self.dpi_slack_bits.to_bits().to_be_bytes());
+        hasher.update(&self.min_slot_signal_bits.to_bits().to_be_bytes());
+        hasher.update(&(self.estimator_sample_cap as u64).to_be_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
     /// Builds the config from the registry knob defaults.
     ///
     /// This reads each declared default and asserts (via the knob's own
