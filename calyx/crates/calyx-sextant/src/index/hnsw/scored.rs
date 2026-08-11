@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
 
-pub(super) fn top_k_indices(scored: Vec<(usize, f32)>, k: usize) -> Vec<usize> {
+pub(super) fn top_k_scored(scored: Vec<(usize, f32)>, k: usize) -> Vec<(usize, f32)> {
     let mut scored = scored;
     sort_scored(&mut scored);
     scored.truncate(k);
-    scored.into_iter().map(|(idx, _)| idx).collect()
+    scored
 }
 
 pub(super) fn diversified_neighbor_scores(

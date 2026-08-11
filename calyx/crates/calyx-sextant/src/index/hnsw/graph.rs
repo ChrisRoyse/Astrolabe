@@ -5,7 +5,7 @@ use rayon::prelude::*;
 
 use super::HnswIndex;
 use super::scored::{
-    ScoredIndex, diversified_neighbor_scores, score_better, sort_scored, top_k_indices,
+    ScoredIndex, diversified_neighbor_scores, score_better, sort_scored, top_k_scored,
     worst_position, worst_scored,
 };
 use crate::error::{CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE, sextant_error};
@@ -26,13 +26,16 @@ impl HnswIndex {
         let neighbors_result = self.construction_candidates(index, &query);
         self.recycle_construction_query(query);
         let mut neighbors = neighbors_result?;
-        append_stride_neighbors(index, &mut neighbors);
-        neighbors.sort_unstable();
-        neighbors.dedup();
-        self.rows[index].neighbors = neighbors.clone();
-        self.rows[index].neighbor_scores.clear();
+        neighbors.sort_unstable_by_key(|(neighbor, _)| *neighbor);
+        neighbors.dedup_by_key(|(neighbor, _)| *neighbor);
+        let reciprocal_neighbors = neighbors
+            .iter()
+            .map(|(neighbor, _)| *neighbor)
+            .collect::<Vec<_>>();
+        self.rows[index].neighbors = reciprocal_neighbors.clone();
+        self.rows[index].neighbor_scores = neighbors.into_iter().map(|(_, score)| score).collect();
         self.prune_neighbors(index)?;
-        for neighbor in neighbors.drain(..) {
+        for neighbor in reciprocal_neighbors {
             self.add_reciprocal_neighbor(neighbor, index)?;
         }
         Ok(())
@@ -48,39 +51,53 @@ impl HnswIndex {
         }
     }
 
-    fn construction_candidates(&self, index: usize, query: &PackedQuery) -> Result<Vec<usize>> {
-        if index <= EXACT_CONSTRUCTION_ROWS {
-            return self.exhaustive_candidates(index, query);
-        }
-        let candidates = self.approximate_candidate_set(index, query)?;
-        let scored = scored_from_indices(self, &candidates, query)?;
-        let mut neighbors = top_k_indices(scored.clone(), self.max_neighbors);
+    fn construction_candidates(
+        &self,
+        index: usize,
+        query: &PackedQuery,
+    ) -> Result<Vec<(usize, f32)>> {
+        let scored = if index <= EXACT_CONSTRUCTION_ROWS {
+            self.exhaustive_candidate_scores(index, query)?
+        } else {
+            let candidates = self.approximate_candidate_set(index, query)?;
+            scored_from_indices(self, &candidates, query)?
+        };
+        let mut neighbors = top_k_scored(scored.clone(), self.max_neighbors);
         for level in 1..=self.rows[index].level {
             let level_scored = scored
                 .iter()
                 .copied()
                 .filter(|(idx, _)| self.rows[*idx].level >= level)
                 .collect();
-            neighbors.extend(top_k_indices(level_scored, self.max_neighbors));
+            neighbors.extend(top_k_scored(level_scored, self.max_neighbors));
+        }
+        let mut stride_neighbors = Vec::new();
+        append_stride_neighbors(index, &mut stride_neighbors);
+        for neighbor in stride_neighbors {
+            let position = scored
+                .binary_search_by_key(&neighbor, |(candidate, _)| *candidate)
+                .map_err(|_| {
+                    sextant_error(
+                        CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                        format!(
+                            "HNSW construction score is absent for required stride neighbor: origin={index} candidate={neighbor}"
+                        ),
+                    )
+                })?;
+            neighbors.push(scored[position]);
         }
         Ok(neighbors)
     }
 
-    fn exhaustive_candidates(&self, index: usize, query: &PackedQuery) -> Result<Vec<usize>> {
-        let scored = (0..index)
+    fn exhaustive_candidate_scores(
+        &self,
+        index: usize,
+        query: &PackedQuery,
+    ) -> Result<Vec<(usize, f32)>> {
+        (0..index)
             .into_par_iter()
             .map(|idx| self.score_row(query, idx).map(|score| (idx, score)))
-            .collect::<Result<Vec<_>>>()?;
-        let mut neighbors = top_k_indices(scored.clone(), self.max_neighbors);
-        for level in 1..=self.rows[index].level {
-            let level_scored = scored
-                .iter()
-                .copied()
-                .filter(|(idx, _)| self.rows[*idx].level >= level)
-                .collect();
-            neighbors.extend(top_k_indices(level_scored, self.max_neighbors));
-        }
-        Ok(neighbors)
+            .collect()
     }
 
     fn approximate_candidate_set(&self, index: usize, query: &PackedQuery) -> Result<Vec<usize>> {
