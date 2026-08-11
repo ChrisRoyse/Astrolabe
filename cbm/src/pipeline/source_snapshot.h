@@ -33,7 +33,8 @@ typedef struct {
  * exactly once so partial derived files have one cleanup owner. */
 int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
                                 const cbm_discover_opts_t *opts, cbm_file_info_t *files,
-                                int file_count, cbm_source_snapshot_t *snapshot);
+                                int file_count, uint64_t progress_total,
+                                cbm_source_snapshot_t *snapshot);
 
 /* Prove whether the complete live discovery is byte-identical to the persisted
  * file-hash generation without creating a mirrored snapshot. Every candidate is
@@ -54,7 +55,7 @@ int cbm_source_snapshot_destroy(cbm_source_snapshot_t *snapshot);
  * SHA-256, and publish one ordered source slab. The operation is atomic: on
  * failure slab remains empty and no consumer can observe a partial corpus. */
 int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
-                          cbm_source_slab_t *slab);
+                          uint64_t progress_total, cbm_source_slab_t *slab);
 
 /* Borrow one immutable entry. Returns NULL for an invalid index or malformed
  * slab; an exact empty source returns a non-NULL pointer with length zero. */

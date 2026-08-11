@@ -58,6 +58,7 @@ enum {
 #include "foundation/profile.h"
 #include "foundation/mem.h"
 #include "foundation/sha256.h"
+#include "foundation/worker_progress.h"
 #include "foundation/schema_version.h"
 #include "foundation/slab_alloc.h"
 #include "helpers.h"
@@ -2714,6 +2715,18 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         free(file_qn);
         free(dir);
         free(parent_qn_heap);
+        if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_STRUCTURE, "structure",
+                                            (uint64_t)file_count) != 0) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_structure_progress",
+                "structure", rel, (size_t)i,
+                "the completed structural file unit could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
+            cbm_ht_free(seen_dirs);
+            return CBM_NOT_FOUND;
+        }
     }
 
     /* Free seen_dirs keys */
@@ -2952,6 +2965,7 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
     };
     enum { PREDUMP_PASS_COUNT = 6 };
+    uint64_t progress_total = p->mode == CBM_MODE_FAST ? 4U : PREDUMP_PASS_COUNT;
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
@@ -2988,11 +3002,38 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
                           "reported cause");
             return rc;
         }
+        if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_PREDUMP, "predump",
+                                            progress_total) != 0) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_predump_progress",
+                "predump", passes[i].name, (size_t)i,
+                "the completed predump pass could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            return CBM_NOT_FOUND;
+        }
     }
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */
+static int pipeline_progress_publish(cbm_pipeline_t *p, uint32_t stage_order,
+                                     const char *stage, uint64_t completed, uint64_t total,
+                                     uint32_t step_order, const char *step,
+                                     uint64_t step_completed, uint64_t step_total) {
+    if (cbm_worker_progress_publish(stage_order, stage, completed, total, step_order, step,
+                                    step_completed, step_total) == 0) {
+        return 0;
+    }
+    cbm_pipeline_record_fatal_error(
+        p, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_semantic_progress", stage,
+        p && p->repo_path ? p->repo_path : "", (size_t)completed,
+        "the supervised worker could not publish its semantic work cursor",
+        "preserve the worker workspace, repair the progress stream failure, and retry the "
+        "unchanged repository");
+    return CBM_NOT_FOUND;
+}
+
 static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                  const cbm_file_info_t *files, int file_count, int worker_count,
                                  struct timespec *t) {
@@ -3194,7 +3235,19 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_pipeline_pass_k8s(ctx, files, file_count);
     cbm_pipeline_phase_probe_end(p, "k8s", &k8s_probe);
     cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
-    return check_cancel(p) ? CBM_NOT_FOUND : 0;
+    if (check_cancel(p)) {
+        return CBM_NOT_FOUND;
+    }
+    if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_ENRICH, "enrich", 2) != 0) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_enrichment_progress",
+            "enrich", p->repo_path, 1,
+            "the completed infrastructure enrichment could not advance semantic progress",
+            "preserve the worker workspace, repair the progress stream, and retry the unchanged "
+            "repository");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 /* A project name is the live database filename identity. Reusing that name for
@@ -4563,6 +4616,15 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (rc != 0) {
         return rc;
     }
+    if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_ENRICH, "enrich", 2) != 0) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_enrichment_progress",
+            "enrich", p->repo_path, 2,
+            "the completed history enrichment could not advance semantic progress",
+            "preserve the worker workspace, repair the progress stream, and retry the unchanged "
+            "repository");
+        return CBM_NOT_FOUND;
+    }
 
     CBM_PROF_START(t_predump);
     rc = run_predump_passes(p, ctx);
@@ -4570,12 +4632,22 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (rc != 0) {
         return rc;
     }
-
     if (!check_cancel(p)) {
         struct timespec t;
         CBM_PROF_START(t_dump);
         rc = dump_and_persist_hashes(p, all_files, all_count, &t);
         CBM_PROF_END("pipeline", "4_dump_and_persist", t_dump);
+        if (rc == 0 &&
+            cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_PERSIST, "persist", 1) !=
+                0) {
+            cbm_pipeline_record_fatal_error(
+                p, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_persist_progress",
+                "persist", p->repo_path, 1,
+                "the completed store publication could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            return CBM_NOT_FOUND;
+        }
     }
     return rc;
 }
@@ -4599,7 +4671,6 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
-
     if (cbm_pxc_prepare_rust_manifest(ctx) != 0) {
         return CBM_NOT_FOUND;
     }
@@ -4643,6 +4714,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_source_slab_t source_slab = {0};
     cbm_file_info_t *source_files = NULL;
     int source_count = 0;
+    uint64_t source_progress_total = 0;
     int rc = 0;
 
     /* C/C++ #define Macro nodes (#375) dominate extraction on macro-dense repos
@@ -4714,6 +4786,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         rc = CBM_PIPELINE_EMPTY_SOURCE_CORPUS;
         goto cleanup;
     }
+    source_progress_total = (uint64_t)file_count + (uint64_t)source_count;
+    if (pipeline_progress_publish(p, CBM_WORKER_PROGRESS_STAGE_DISCOVERY, "discovery", 1, 1, 1,
+                                  "complete", 1, 1) != 0) {
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
 
     cbm_pipeline_phase_probe_t unchanged_route_probe =
         cbm_pipeline_phase_probe_start(p, "unchanged_route");
@@ -4736,7 +4814,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     char *snapshot_store_path = resolve_db_path(p);
     int snapshot_rc = snapshot_store_path
                           ? cbm_source_snapshot_capture(p->repo_path, snapshot_store_path, &opts,
-                                                        files, file_count, &source_snapshot)
+                                                        files, file_count, source_progress_total,
+                                                        &source_snapshot)
                           : CBM_NOT_FOUND;
     if (!snapshot_store_path) {
         cbm_log_error("pipeline.err", "phase", "source_snapshot", "code",
@@ -4796,14 +4875,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     cbm_pipeline_phase_probe_t source_slab_probe =
         cbm_pipeline_phase_probe_start(p, "source_slab");
-    if (cbm_source_slab_build(source_files, source_count, &source_slab) != 0) {
+    if (cbm_source_slab_build(source_files, source_count, source_progress_total, &source_slab) !=
+        0) {
         cbm_pipeline_phase_probe_end(p, "source_slab", &source_slab_probe);
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
     cbm_pipeline_phase_probe_end(p, "source_slab", &source_slab_probe);
     p->current_source_slab = &source_slab;
-
     cbm_pipeline_phase_probe_t compile_context_probe =
         cbm_pipeline_phase_probe_start(p, "compile_context");
     cbm_pipeline_ctx_t compile_context_owner = {

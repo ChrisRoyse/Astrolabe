@@ -14,6 +14,8 @@
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
+#include "foundation/worker_progress.h"
 #include "yyjson/yyjson.h"
 #ifdef ASTRO_SPAWN
 #include "astro_spawn.h"
@@ -2334,6 +2336,43 @@ static char *hex_encode_bytes(const char *bytes, size_t byte_count) {
     return encoded;
 }
 
+typedef struct {
+    uint64_t context_index;
+    uint64_t context_total;
+    uint64_t last_published_bytes;
+    uint64_t last_published_ms;
+    uint32_t output_step_order;
+} compiler_stdout_progress_t;
+
+static bool publish_compiler_stdout_progress(uint64_t captured_bytes, void *ud) {
+    compiler_stdout_progress_t *progress = (compiler_stdout_progress_t *)ud;
+    if (!progress || captured_bytes == 0 || captured_bytes == UINT64_MAX ||
+        captured_bytes <= progress->last_published_bytes) {
+        return false;
+    }
+    uint64_t now_ms = cbm_now_ms();
+    if (progress->last_published_ms != 0 && now_ms < progress->last_published_ms) {
+        return false;
+    }
+    if (progress->last_published_ms != 0 &&
+        now_ms - progress->last_published_ms <
+            CBM_WORKER_PROGRESS_MAX_REPORT_INTERVAL_MS) {
+        return true;
+    }
+    /* Captured compiler expansion is application output, not generic process
+     * I/O. Its final byte count is genuinely unknown until EOF, so the protocol
+     * carries the explicit unknown denominator instead of an estimate. */
+    if (cbm_worker_progress_publish(
+            CBM_WORKER_PROGRESS_STAGE_COMPILER_PREPROCESS, "compiler_preprocess",
+            progress->context_index, progress->context_total, progress->output_step_order,
+            "compiler_output", captured_bytes, CBM_WORKER_PROGRESS_TOTAL_UNKNOWN) != 0) {
+        return false;
+    }
+    progress->last_published_bytes = captured_bytes;
+    progress->last_published_ms = now_ms;
+    return true;
+}
+
 static void log_failed_compiler_invocation(const compile_context_owner_t *owner,
                                            char *const *argv, int argc,
                                            const char *working_directory) {
@@ -2505,6 +2544,13 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
     size_t peak_expansion_bytes = 0;
     size_t peak_compiler_stdout_bytes = 0;
     int status = 0;
+    if ((uint64_t)index->context_count > (uint64_t)(UINT32_MAX - 4U) / 4U) {
+        status = preprocess_fail(
+            ctx, "CBM_PREPROCESS_PROGRESS_CAPACITY_OVERFLOW", "validate_compiler_progress_capacity",
+            ctx->repo_path, (size_t)index->context_count,
+            "the compiler context count exceeds the progress cursor representation",
+            "split the corpus generation or extend the progress step-order representation");
+    }
     for (int context_index = 0; context_index < index->context_count && status == 0;
          context_index++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -2593,16 +2639,70 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         size_t output_bytes = 0;
         cbm_spawn_error_t spawn_error = {0};
         cbm_spawn_bounded_capture_t stderr_capture = {0};
-        int spawn_status = cbm_spawn_capture_with_stderr_cwd_source_epoch(
+        uint32_t step_base = (uint32_t)context_index * 4U;
+        compiler_stdout_progress_t stdout_progress = {
+            .context_index = (uint64_t)context_index,
+            .context_total = (uint64_t)index->context_count,
+            .last_published_bytes = 0,
+            .last_published_ms = 0,
+            .output_step_order = step_base + 1U,
+        };
+        int spawn_status = cbm_spawn_capture_with_stderr_cwd_source_epoch_progress(
             (const char *const *)argv, working_directory, index->source_date_epoch, &output,
-            &output_bytes, PREPROCESS_STDERR_LIMIT, &stderr_capture, &spawn_error);
+            &output_bytes, PREPROCESS_STDERR_LIMIT, &stderr_capture,
+            publish_compiler_stdout_progress, &stdout_progress, &spawn_error);
         if (spawn_status != 0) {
-            status = compiler_spawn_fail(ctx, owner, &spawn_error, &stderr_capture, output,
-                                         output_bytes, argv, argc, working_directory);
+            status = spawn_status == CBM_SPAWN_E_PROGRESS
+                         ? preprocess_fail(
+                               ctx, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                               "publish_compiler_stdout_progress", owner->tu_rel_path,
+                               output_bytes,
+                               "the advancing compiler stdout cursor could not be published",
+                               "preserve the worker workspace, repair the progress stream, and "
+                               "retry the unchanged repository")
+                         : compiler_spawn_fail(ctx, owner, &spawn_error, &stderr_capture, output,
+                                               output_bytes, argv, argc, working_directory);
             free(output);
             free(stderr_capture.data);
             free_preprocess_argv(argv, argc);
             free(working_directory);
+            break;
+        }
+        /* The interval publisher may have coalesced the final pipe reads. Emit
+         * the exact EOF byte cursor before advancing to compiler_complete so
+         * the last semantic remainder is visible and durably ordered. */
+        if (output_bytes > 0 && output_bytes > stdout_progress.last_published_bytes &&
+            cbm_worker_progress_publish(
+                CBM_WORKER_PROGRESS_STAGE_COMPILER_PREPROCESS, "compiler_preprocess",
+                (uint64_t)context_index, (uint64_t)index->context_count, step_base + 1U,
+                "compiler_output", (uint64_t)output_bytes,
+                CBM_WORKER_PROGRESS_TOTAL_UNKNOWN) != 0) {
+            free(output);
+            free(stderr_capture.data);
+            free_preprocess_argv(argv, argc);
+            free(working_directory);
+            status = preprocess_fail(
+                ctx, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                "publish_compiler_stdout_remainder", owner->tu_rel_path, output_bytes,
+                "the final compiler stdout cursor could not be published",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            break;
+        }
+        if (cbm_worker_progress_publish(CBM_WORKER_PROGRESS_STAGE_COMPILER_PREPROCESS,
+                                        "compiler_preprocess", (uint64_t)context_index,
+                                        (uint64_t)index->context_count, step_base + 2U,
+                                        "compiler_complete", 1, 1) != 0) {
+            free(output);
+            free(stderr_capture.data);
+            free_preprocess_argv(argv, argc);
+            free(working_directory);
+            status = preprocess_fail(
+                ctx, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_compiler_progress",
+                owner->tu_rel_path, output_bytes,
+                "the completed compiler child could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
             break;
         }
         size_t compiler_stdout_bytes = output_bytes;
@@ -2613,6 +2713,19 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         compiler_expansion_t expansion = {0};
         status = map_compiler_expansion(ctx, index, owner, working_directory,
                                         target_by_source_index, output, output_bytes, &expansion);
+        if (status == 0) {
+            if (cbm_worker_progress_publish(CBM_WORKER_PROGRESS_STAGE_COMPILER_PREPROCESS,
+                                            "compiler_preprocess", (uint64_t)context_index,
+                                            (uint64_t)index->context_count, step_base + 3U,
+                                            "mapping_complete", 1, 1) != 0) {
+                status = preprocess_fail(
+                    ctx, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                    "publish_compiler_mapping_progress", owner->tu_rel_path, output_bytes,
+                    "the completed compiler source map could not advance semantic progress",
+                    "preserve the worker workspace, repair the progress stream, and retry the "
+                    "unchanged repository");
+            }
+        }
         if (status == 0) {
             char expansion_hash[CBM_SHA256_HEX_LEN + 1];
             char bytes_text[32];
@@ -2682,6 +2795,18 @@ int cbm_compile_context_extract_calls(cbm_pipeline_ctx_t *ctx, cbm_compile_conte
         compiler_expansion_destroy(&expansion);
         free_preprocess_argv(argv, argc);
         free(working_directory);
+        if (status == 0 &&
+            cbm_worker_progress_publish(
+                CBM_WORKER_PROGRESS_STAGE_COMPILER_PREPROCESS, "compiler_preprocess",
+                (uint64_t)context_index + 1U, (uint64_t)index->context_count, step_base + 4U,
+                "context_complete", 1, 1) != 0) {
+            status = preprocess_fail(
+                ctx, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_compiler_progress",
+                owner->tu_rel_path, (size_t)context_index,
+                "the completed compiler context could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+        }
     }
 
     if (status == 0) {

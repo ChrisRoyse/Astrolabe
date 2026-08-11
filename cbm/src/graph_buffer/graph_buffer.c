@@ -34,7 +34,9 @@ enum {
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "foundation/worker_progress.h"
 #include <sqlite3.h>
 
 #include <limits.h>
@@ -3714,10 +3716,32 @@ static bool gbuf_has_row_sink(const cbm_gbuf_t *gb) {
     return gb && (gb->row_node_sink || gb->row_edge_sink);
 }
 
+static int publish_persist_progress(uint32_t step_order, const char *step, uint64_t completed,
+                                    uint64_t total, uint64_t *last_published_ms) {
+    if (total == 0 || !last_published_ms) {
+        return GB_ERR;
+    }
+    uint64_t now_ms = cbm_now_ms();
+    if (*last_published_ms != 0 && now_ms < *last_published_ms) {
+        return GB_ERR;
+    }
+    if (completed != total && *last_published_ms != 0 &&
+        now_ms - *last_published_ms < CBM_WORKER_PROGRESS_MAX_REPORT_INTERVAL_MS) {
+        return 0;
+    }
+    int rc = cbm_worker_progress_publish(CBM_WORKER_PROGRESS_STAGE_PERSIST, "persist", 0, 1,
+                                         step_order, step, completed, total);
+    if (rc == 0) {
+        *last_published_ms = now_ms;
+    }
+    return rc;
+}
+
 static int emit_row_sink_nodes(cbm_gbuf_t *gb, const CBMDumpNode *nodes, int node_count) {
     if (!gb || !gb->row_node_sink) {
         return 0;
     }
+    uint64_t last_published_ms = 0;
     for (int i = 0; i < node_count; i++) {
         const CBMDumpNode *n = &nodes[i];
         cbm_gbuf_row_node_t row = {
@@ -3742,6 +3766,10 @@ static int emit_row_sink_nodes(cbm_gbuf_t *gb, const CBMDumpNode *nodes, int nod
             cbm_log_error("gbuf.row_sink.err", "kind", "node");
             return GB_ERR;
         }
+        if (publish_persist_progress(1, "row_nodes", (uint64_t)i + 1U,
+                                     (uint64_t)node_count, &last_published_ms) != 0) {
+            return GB_ERR;
+        }
     }
     return 0;
 }
@@ -3750,6 +3778,7 @@ static int emit_row_sink_edges(cbm_gbuf_t *gb, const CBMDumpEdge *edges, int edg
     if (!gb || !gb->row_edge_sink) {
         return 0;
     }
+    uint64_t last_published_ms = 0;
     for (int i = 0; i < edge_count; i++) {
         const CBMDumpEdge *e = &edges[i];
         cbm_gbuf_row_edge_t row = {
@@ -3764,6 +3793,10 @@ static int emit_row_sink_edges(cbm_gbuf_t *gb, const CBMDumpEdge *edges, int edg
         };
         if (gb->row_edge_sink(&row, gb->row_sink_ctx) != 0) {
             cbm_log_error("gbuf.row_sink.err", "kind", "edge");
+            return GB_ERR;
+        }
+        if (publish_persist_progress(2, "row_edges", (uint64_t)i + 1U,
+                                     (uint64_t)edge_count, &last_published_ms) != 0) {
             return GB_ERR;
         }
     }
@@ -3987,6 +4020,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     enum { DUMP_PARTITION_NODES = 1 << 16 };
     bool free_heavy = false;
     int rc = 0;
+    uint64_t node_progress_ms = 0;
     for (int off = 0; off < node_idx; off += DUMP_PARTITION_NODES) {
         int chunk = node_idx - off;
         if (chunk > DUMP_PARTITION_NODES) {
@@ -3994,6 +4028,14 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         }
         rc = cbm_writer_append_nodes(w, &dump_nodes[off], chunk);
         if (rc != 0) {
+            break;
+        }
+        /* Row-sink publication, when active, owns persist substeps 1 and 2.
+         * Keep the direct SQLite writer at a fixed later substep on both routes
+         * so enabling the sink cannot regress the hierarchical cursor. */
+        if (publish_persist_progress(3, "sqlite_nodes", (uint64_t)(off + chunk),
+                                     (uint64_t)node_idx, &node_progress_ms) != 0) {
+            rc = GB_ERR;
             break;
         }
         free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_over_budget());

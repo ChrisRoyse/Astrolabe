@@ -10,13 +10,12 @@
  *      POSIX WIFSIGNALED/WTERMSIG, Windows NTSTATUS exception exit codes
  *      (0xC0000005 access-violation, 0xC00000FD stack-overflow, …), and
  *      GCC/MinGW SEH C++ exception markers (0x20474343 / 0x21474343).
- *   2. A quiet-timeout — kill + report HANG when the child makes no progress
- *      (emits no new log line) for a configurable window. This catches external
- *      tree-sitter scanners that infinite-loop (a hang, not a crash).
+ *   2. A quiet-timeout — kill + report HANG when an application-semantic
+ *      progress reader observes no validated forward work for a configurable
+ *      window. Logs are diagnostics and never reset this correctness budget.
  *
- * The reap loop is EINTR-safe. Line tailing keeps a partial final line buffered
- * (an incomplete, un-newline-terminated line is not yet "progress" and is not
- * mis-read as a completed marker).
+ * The reap loop is EINTR-safe. Diagnostic line tailing keeps a partial final
+ * line buffered so it is not mis-read as a completed log event.
  */
 #ifndef CBM_SUBPROCESS_H
 #define CBM_SUBPROCESS_H
@@ -33,6 +32,7 @@ typedef enum {
                             * or a GCC/MinGW SEH C++ exception marker */
     CBM_PROC_HANG,         /* made no progress within the quiet-timeout; we killed it */
     CBM_PROC_KILLED,       /* terminated by a non-fault signal we did not initiate */
+    CBM_PROC_PROGRESS_FAILED, /* semantic progress stream was invalid/unreadable */
     CBM_PROC_SPAWN_FAILED  /* fork/exec/CreateProcess failed — no child ever ran */
 } cbm_proc_outcome_t;
 
@@ -42,9 +42,19 @@ typedef struct {
     int term_signal; /* WTERMSIG on POSIX; 0 otherwise */
 } cbm_proc_result_t;
 
-/* Called for each newly-completed (newline-terminated) log line while the child
- * runs. A completed line also resets the quiet-timeout (it is progress). */
+/* Called for each newly-completed (newline-terminated) diagnostic log line. */
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
+
+typedef enum {
+    CBM_PROC_PROGRESS_INVALID = -1,
+    CBM_PROC_PROGRESS_IDLE = 0,
+    CBM_PROC_PROGRESS_ADVANCED = 1,
+} cbm_proc_progress_result_t;
+
+/* Poll one caller-owned semantic progress source. terminal is true after the
+ * exact child has exited and asks the consumer to validate its complete stream.
+ * INVALID terminates a still-live child and classifies it as PROGRESS_FAILED. */
+typedef cbm_proc_progress_result_t (*cbm_proc_progress_cb)(bool terminal, void *ud);
 
 /* Called once, immediately after the child is successfully spawned, with the
  * child's OS process id (POSIX pid / Windows PID). Lets a supervisor record the
@@ -59,10 +69,12 @@ typedef struct {
                                   * NULL => discard child output, no tailing */
     cbm_proc_log_cb on_log_line; /* optional per-line callback */
     void *log_ud;                /* user data for on_log_line */
+    cbm_proc_progress_cb on_progress; /* required when quiet_timeout_ms > 0 */
+    void *progress_ud;                /* user data for on_progress */
     cbm_proc_spawn_cb on_spawn;  /* optional: called with the child PID right after spawn */
     void *spawn_ud;              /* user data for on_spawn */
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
-                                  * ms with no new completed log line */
+                                  * ms with no semantic advance */
     bool delete_log_on_exit;     /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 

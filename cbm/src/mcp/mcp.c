@@ -8515,8 +8515,15 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
 enum { CBM_WORKER_RESPONSE_TAIL_MAX = 2048 };
 
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome,
-                                           int exit_code, const char *worker_response,
-                                           const char *worker_log, const char *worker_log_path) {
+                                            int exit_code, const char *worker_response,
+                                            const char *worker_log, const char *worker_log_path,
+                                            const char *progress_path,
+                                            const char *progress_error_code,
+                                            const char *progress_error_detail,
+                                            const char *progress_stage,
+                                            uint64_t progress_record_count,
+                                            uint64_t progress_completed,
+                                            uint64_t progress_total) {
 #else
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
 #endif
@@ -8526,19 +8533,26 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
-    const char *code = outcome == CBM_PROC_HANG    ? "CBM_INDEX_WORKER_HUNG"
-                       : outcome == CBM_PROC_CRASH ? "CBM_INDEX_WORKER_CRASHED"
-                                                   : "CBM_INDEX_WORKER_FAILED";
+    const char *code =
+        outcome == CBM_PROC_HANG              ? "CBM_INDEX_WORKER_HUNG"
+        : outcome == CBM_PROC_CRASH           ? "CBM_INDEX_WORKER_CRASHED"
+        : outcome == CBM_PROC_PROGRESS_FAILED ? "CBM_INDEX_WORKER_PROGRESS_PROTOCOL_FAILED"
+                                              : "CBM_INDEX_WORKER_FAILED";
     yyjson_mut_obj_add_str(doc, root, "code", code);
     yyjson_mut_obj_add_str(
         doc, root, "message",
         outcome == CBM_PROC_HANG
-            ? "the isolated index worker stopped making measurable progress"
+            ? "the isolated index worker stopped making semantic progress"
+        : outcome == CBM_PROC_PROGRESS_FAILED
+            ? "the isolated index worker semantic-progress stream failed validation"
             : "the isolated index worker terminated before a complete graph was committed");
     yyjson_mut_obj_add_str(
         doc, root, "remediation",
-        "inspect the worker exit code, response tail, persisted log, and source path; fix the "
-        "reported root cause before submitting the repository again");
+        outcome == CBM_PROC_PROGRESS_FAILED
+            ? "preserve the worker workspace and repair the exact progress producer/consumer "
+              "diagnostic before retrying the unchanged repository"
+            : "inspect the worker exit code, response tail, persisted log, and source path; fix "
+              "the reported root cause before submitting the repository again");
 #ifdef ASTRO_WORKER_DIAG
     /* #282: carry the worker's own evidence so a contained failure is
      * attributable from this artifact alone. */
@@ -8558,6 +8572,24 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     if (worker_log_path && worker_log_path[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "worker_log_path", worker_log_path);
     }
+    if (progress_path && progress_path[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_path", progress_path);
+    }
+    if (progress_error_code && progress_error_code[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_error_code",
+                                  progress_error_code);
+    }
+    if (progress_error_detail && progress_error_detail[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_error_detail",
+                                  progress_error_detail);
+    }
+    if (progress_stage && progress_stage[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_stage", progress_stage);
+    }
+    yyjson_mut_obj_add_uint(doc, root, "worker_progress_record_count",
+                           progress_record_count);
+    yyjson_mut_obj_add_uint(doc, root, "worker_progress_completed", progress_completed);
+    yyjson_mut_obj_add_uint(doc, root, "worker_progress_total", progress_total);
 #endif
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
@@ -8717,7 +8749,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
                                                 "a complete index_repository response");
     } else {
         failure = build_worker_failure_response(args, wr.outcome, wr.exit_code, wr.response,
-                                                wr.log_tail, wr.log_path);
+                                                 wr.log_tail, wr.log_path, wr.progress_path,
+                                                 wr.progress_error_code,
+                                                 wr.progress_error_detail, wr.progress_stage,
+                                                 wr.progress_record_count,
+                                                 wr.progress_completed, wr.progress_total);
     }
 #else
     char *failure =

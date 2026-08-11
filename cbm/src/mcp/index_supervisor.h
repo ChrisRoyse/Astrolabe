@@ -21,14 +21,20 @@
 #define CBM_INDEX_SUPERVISOR_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
 
 /* Worker-role state, set once from the CLI arg parser (main.c) when this process
  * was spawned as a supervised worker. When active, indexing must run in-process
  * (the gate must NOT re-supervise). response_out (may be NULL) is the file the
- * worker writes its final result string to, for the parent to read back. */
-void cbm_index_set_worker_role(bool is_worker, const char *response_out);
+ * worker writes its final result string to, for the parent to read back. The
+ * optional progress strings are copied into private writer state. */
+int cbm_index_set_worker_role(bool is_worker, const char *response_out,
+                              const char *progress_out, const char *progress_attempt);
+/* Publish the terminal semantic record only after the worker response has been
+ * fully written and closed. Inactive, unsupervised worker roles are a no-op. */
+int cbm_index_worker_progress_complete(void);
 void cbm_index_set_transition_writer_project(const char *project);
 bool cbm_index_transition_writer_matches(const char *project);
 bool cbm_index_worker_active(void);
@@ -60,6 +66,13 @@ typedef struct {
                      * every build for a single struct layout; only the
                      * ASTRO_WORKER_DIAG supervisor fills it. */
     char *log_path; /* persisted worker log on non-CLEAN outcome (caller frees) */
+    char *progress_path; /* private semantic stream retained on non-CLEAN outcome */
+    char *progress_error_code;
+    char *progress_error_detail;
+    char *progress_stage;
+    uint64_t progress_record_count;
+    uint64_t progress_completed;
+    uint64_t progress_total;
 } cbm_index_worker_result_t;
 
 /* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>`,

@@ -656,25 +656,44 @@ unsafe extern "C" fn cbm_log_silent_sink(_line: *const c_char) {}
 
 pub struct CbmIndexWorkerRole {
     _response_out: Option<CString>,
+    _progress_out: Option<CString>,
+    _progress_attempt: Option<CString>,
     _transition_writer_project: Option<CString>,
 }
 
 impl CbmIndexWorkerRole {
     pub fn activate(
         response_out: Option<&str>,
+        progress_out: Option<&str>,
+        progress_attempt: Option<&str>,
         transition_writer_project: Option<&str>,
     ) -> Result<Self, BridgeError> {
         initialize_cbm_allocator()?;
         let response_out = response_out.map(CString::new).transpose()?;
+        let progress_out = progress_out.map(CString::new).transpose()?;
+        let progress_attempt = progress_attempt.map(CString::new).transpose()?;
         let transition_writer_project = transition_writer_project.map(CString::new).transpose()?;
         // SAFETY: CBM copies response_out into process-global worker state.
         unsafe {
-            cbm_sys::cbm_index_set_worker_role(
+            let worker_role_rc = cbm_sys::cbm_index_set_worker_role(
                 true,
                 response_out
                     .as_ref()
                     .map_or(ptr::null(), |path| path.as_ptr()),
+                progress_out
+                    .as_ref()
+                    .map_or(ptr::null(), |path| path.as_ptr()),
+                progress_attempt
+                    .as_ref()
+                    .map_or(ptr::null(), |attempt| attempt.as_ptr()),
             );
+            if worker_role_rc != 0 {
+                return Err(envelope(
+                    "ASTRO_INDEX_WORKER_PROGRESS_CONFIG_FAILED",
+                    "libcbm refused the supervised worker semantic-progress binding",
+                    "Start index_repository through the installed Astrolabe supervisor and preserve its worker workspace diagnostic.",
+                ));
+            }
             cbm_sys::cbm_index_set_transition_writer_project(
                 transition_writer_project
                     .as_ref()
@@ -683,8 +702,24 @@ impl CbmIndexWorkerRole {
         }
         Ok(Self {
             _response_out: response_out,
+            _progress_out: progress_out,
+            _progress_attempt: progress_attempt,
             _transition_writer_project: transition_writer_project,
         })
+    }
+
+    pub fn complete_progress(&self) -> Result<(), BridgeError> {
+        // SAFETY: activation configured the process-global writer. The C API
+        // is a no-op when this worker role has no supervised progress channel.
+        let rc = unsafe { cbm_sys::cbm_index_worker_progress_complete() };
+        if rc != 0 {
+            return Err(envelope(
+                "ASTRO_INDEX_WORKER_PROGRESS_COMPLETE_FAILED",
+                "the worker response was written but its terminal semantic-progress record could not be published",
+                "Preserve the worker workspace and inspect the progress-stream diagnostic before retrying.",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -693,7 +728,8 @@ impl Drop for CbmIndexWorkerRole {
         // SAFETY: resetting the process-global worker role has no preconditions.
         unsafe {
             cbm_sys::cbm_index_set_transition_writer_project(ptr::null());
-            cbm_sys::cbm_index_set_worker_role(false, ptr::null());
+            let _ =
+                cbm_sys::cbm_index_set_worker_role(false, ptr::null(), ptr::null(), ptr::null());
         }
     }
 }

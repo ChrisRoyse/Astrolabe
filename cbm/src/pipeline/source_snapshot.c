@@ -16,6 +16,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
 #include "foundation/win_utf8.h"
+#include "foundation/worker_progress.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -106,6 +107,8 @@ typedef struct {
     cbm_file_info_t **identity_files;
     const wchar_t **identity_wide_paths;
     snapshot_identity_probe_result_t *identity_results;
+    uint64_t progress_total;
+    volatile LONG progress_failed;
 } snapshot_dispatcher_t;
 
 static int64_t filetime_to_unix_ns(LONGLONG ticks);
@@ -1275,6 +1278,13 @@ static VOID CALLBACK snapshot_dispatch_callback(PTP_CALLBACK_INSTANCE instance, 
         }
         if (dispatcher->operation == SNAPSHOT_DISPATCH_CAPTURE) {
             snapshot_capture_prepared(&dispatcher->capture_results[index]);
+            if (dispatcher->capture_results[index].complete &&
+                !dispatcher->capture_results[index].failure_code &&
+                cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_SOURCE_CAPTURE,
+                                                 "source_capture",
+                                                 dispatcher->progress_total) != 0) {
+                InterlockedExchange(&dispatcher->progress_failed, 1);
+            }
         } else if (dispatcher->operation == SNAPSHOT_DISPATCH_IDENTITY) {
             snapshot_probe_current_identity(dispatcher->identity_files[index],
                                             dispatcher->identity_wide_paths[index],
@@ -1345,10 +1355,11 @@ static int snapshot_dispatcher_init(snapshot_dispatcher_t *dispatcher, int item_
     return 0;
 }
 
-static void snapshot_dispatch_capture(snapshot_dispatcher_t *dispatcher,
-                                      snapshot_capture_result_t *results, int count) {
+static int snapshot_dispatch_capture(snapshot_dispatcher_t *dispatcher,
+                                     snapshot_capture_result_t *results, int count,
+                                     uint64_t progress_total) {
     if (count == 0) {
-        return;
+        return 0;
     }
     dispatcher->operation = SNAPSHOT_DISPATCH_CAPTURE;
     dispatcher->capture_results = results;
@@ -1356,11 +1367,15 @@ static void snapshot_dispatch_capture(snapshot_dispatcher_t *dispatcher,
     dispatcher->identity_wide_paths = NULL;
     dispatcher->identity_results = NULL;
     dispatcher->item_count = count;
+    dispatcher->progress_total = progress_total;
+    InterlockedExchange(&dispatcher->progress_failed, 0);
     InterlockedExchange(&dispatcher->next_index, SNAPSHOT_INDEX_ORIGIN);
     for (int i = 0; i < dispatcher->worker_count; i++) {
         SubmitThreadpoolWork(dispatcher->work);
     }
     WaitForThreadpoolWorkCallbacks(dispatcher->work, FALSE);
+    return InterlockedCompareExchange(&dispatcher->progress_failed, 0, 0) == 0 ? 0
+                                                                                : CBM_NOT_FOUND;
 }
 
 static void snapshot_dispatch_identity(snapshot_dispatcher_t *dispatcher, cbm_file_info_t **files,
@@ -1684,9 +1699,11 @@ static int snapshot_remove_tree(const char *path) {
 
 int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
                                 const cbm_discover_opts_t *opts, cbm_file_info_t *files,
-                                int file_count, cbm_source_snapshot_t *snapshot) {
+                                int file_count, uint64_t progress_total,
+                                cbm_source_snapshot_t *snapshot) {
     if (!repo_path || !store_path || !store_path[0] || !opts || file_count < 0 ||
-        (file_count > 0 && !files) || !snapshot || snapshot->root) {
+        (file_count > 0 && !files) || progress_total < (uint64_t)file_count || !snapshot ||
+        snapshot->root) {
         snapshot_log_failure("CBM_SOURCE_SNAPSHOT_INVALID_ARGUMENT", "validate_capture", repo_path,
                              ERROR_INVALID_PARAMETER);
         return CBM_NOT_FOUND;
@@ -1813,7 +1830,13 @@ int cbm_source_snapshot_capture(const char *repo_path, const char *store_path,
         return CBM_NOT_FOUND;
     }
 
-    snapshot_dispatch_capture(&dispatcher, results, file_count);
+    if (snapshot_dispatch_capture(&dispatcher, results, file_count, progress_total) != 0) {
+        snapshot_log_failure("CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                             "publish_source_capture_progress", root, ERROR_WRITE_FAULT);
+        snapshot_capture_results_free(results, file_count);
+        snapshot_dispatcher_close(&dispatcher);
+        return CBM_NOT_FOUND;
+    }
     for (int i = 0; i < file_count; i++) {
         if (!results[i].complete || results[i].failure_code) {
             const char *code = results[i].failure_code ? results[i].failure_code
@@ -1940,9 +1963,10 @@ void cbm_source_slab_destroy(cbm_source_slab_t *slab) {
     memset(slab, 0, sizeof(*slab));
 }
 
-int cbm_source_slab_build(const cbm_file_info_t *files, int file_count, cbm_source_slab_t *slab) {
+int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
+                          uint64_t progress_total, cbm_source_slab_t *slab) {
     if (!slab || file_count <= 0 || !files || slab->bytes || slab->offsets || slab->lengths ||
-        slab->file_count != 0) {
+        slab->file_count != 0 || progress_total < (uint64_t)file_count) {
         source_slab_log_failure(
             "CBM_SOURCE_SLAB_INVALID_ARGUMENT", "validate", "", 0, 0, 0,
             "the immutable source slab request is incomplete or already initialized",
@@ -2070,6 +2094,17 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count, cbm_sour
         source_slab_hash_frame_u64(&corpus_hash, (uint64_t)length);
         cbm_sha256_update(&corpus_hash, candidate.bytes + cursor, length);
         cursor += length + 1;
+        if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_SOURCE_CAPTURE,
+                                            "source_capture", progress_total) != 0) {
+            source_slab_log_failure(
+                "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED", "publish_source_slab_progress",
+                files[i].path, length, process_headroom, machine_available,
+                "the completed immutable source read could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            cbm_source_slab_destroy(&candidate);
+            return CBM_NOT_FOUND;
+        }
     }
 
     uint8_t digest[CBM_SHA256_DIGEST_LEN];

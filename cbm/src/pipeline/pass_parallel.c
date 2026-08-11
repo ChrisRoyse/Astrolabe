@@ -11,6 +11,7 @@
  * Depends on: worker_pool, graph_buffer (shared IDs + merge), extraction (cbm.h)
  */
 #include "foundation/constants.h"
+#include "foundation/worker_progress.h"
 
 enum {
     PP_RING = 4,
@@ -1067,6 +1068,20 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         const char *source = (const char *)source_bytes;
         if (source_len == 0) {
             extract_admission_release(ec, &admission, fi, cbm_mem_rss(), 0, true, NULL);
+            if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_PARALLEL_EXTRACT,
+                                                "parallel_extract",
+                                                (uint64_t)ec->file_count) != 0) {
+                ws->errors++;
+                atomic_store_explicit(ec->cancelled, SKIP_ONE, memory_order_relaxed);
+                cbm_pipeline_record_fatal_error(
+                    ec->pipeline, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                    "publish_parallel_extract_progress", "parallel_extract",
+                    fi->rel_path ? fi->rel_path : "", (size_t)sort_pos,
+                    "the completed extraction unit could not advance semantic progress",
+                    "preserve the worker workspace, repair the progress stream, and retry the "
+                    "unchanged repository");
+                break;
+            }
             continue;
         }
 
@@ -1203,6 +1218,19 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         extract_admission_release(ec, &admission, fi, parse_rss,
                                   result_arena_bytes + result_array_bytes,
                                   !result->has_error, &result->error);
+        if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_PARALLEL_EXTRACT,
+                                            "parallel_extract", (uint64_t)ec->file_count) != 0) {
+            ws->errors++;
+            atomic_store_explicit(ec->cancelled, SKIP_ONE, memory_order_relaxed);
+            cbm_pipeline_record_fatal_error(
+                ec->pipeline, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                "publish_parallel_extract_progress", "parallel_extract",
+                fi->rel_path ? fi->rel_path : "", (size_t)sort_pos,
+                "the completed extraction unit could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            break;
+        }
     }
 
     /* Final cleanup (parser already destroyed in loop, just slab state) */
@@ -1649,6 +1677,22 @@ static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
     }
 }
 
+static int advance_registry_progress(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                                     int index, int file_count) {
+    if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_REGISTRY, "registry",
+                                        (uint64_t)file_count) == 0) {
+        return 0;
+    }
+    cbm_pipeline_record_fatal_error(
+        ctx ? ctx->pipeline : NULL, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+        "publish_registry_progress", "registry",
+        file && file->rel_path ? file->rel_path : "", (size_t)index,
+        "the completed registry file unit could not advance semantic progress",
+        "preserve the worker workspace, repair the progress stream, and retry the unchanged "
+        "repository");
+    return CBM_NOT_FOUND;
+}
+
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count, CBMFileResult **result_cache) {
     cbm_log_info("parallel.registry.start", "files", itoa_log(file_count));
@@ -1688,6 +1732,10 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         CBMFileResult *result = result_cache[i];
         if (!result) {
+            if (advance_registry_progress(ctx, &files[i], i, file_count) != 0) {
+                cbm_pipeline_namespace_map_free(namespace_map);
+                return CBM_NOT_FOUND;
+            }
             continue;
         }
 
@@ -1715,6 +1763,10 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                                       pp_module_is_dir(files[i].language));
         create_channel_edges(ctx, result, rel, module_qn);
         free(module_qn);
+        if (advance_registry_progress(ctx, &files[i], i, file_count) != 0) {
+            cbm_pipeline_namespace_map_free(namespace_map);
+            return CBM_NOT_FOUND;
+        }
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);
@@ -3156,6 +3208,20 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (!result) {
             atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                       memory_order_relaxed);
+            if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_RESOLVE, "resolve",
+                                                (uint64_t)rc->file_count) != 0) {
+                ws->errors++;
+                atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+                cbm_pipeline_record_fatal_error(
+                    rc->pipeline, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                    "publish_parallel_resolve_progress", "resolve",
+                    rc->files[file_idx].rel_path ? rc->files[file_idx].rel_path : "",
+                    (size_t)file_idx,
+                    "the completed empty-result resolution unit could not advance semantic "
+                    "progress",
+                    "preserve the worker workspace, repair the progress stream, and retry the "
+                    "unchanged repository");
+            }
             continue;
         }
         atomic_fetch_add_explicit(&rc->total_files_visited, 1, memory_order_relaxed);
@@ -3182,6 +3248,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
             result->rw.count == 0 && result->defs.count == 0 && result->impl_traits.count == 0 &&
             !cross_lsp_eligible) {
+            if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_RESOLVE, "resolve",
+                                                (uint64_t)rc->file_count) != 0) {
+                ws->errors++;
+                atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+                cbm_pipeline_record_fatal_error(
+                    rc->pipeline, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                    "publish_parallel_resolve_progress", "resolve", rel ? rel : "",
+                    (size_t)file_idx,
+                    "the completed no-op resolution unit could not advance semantic progress",
+                    "preserve the worker workspace, repair the progress stream, and retry the "
+                    "unchanged repository");
+            }
             continue;
         }
 
@@ -3376,6 +3454,19 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                   memory_order_relaxed);
+        if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_RESOLVE, "resolve",
+                                            (uint64_t)rc->file_count) != 0) {
+            ws->errors++;
+            atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+            cbm_pipeline_record_fatal_error(
+                rc->pipeline, "CBM_INDEX_WORKER_PROGRESS_WRITE_FAILED",
+                "publish_parallel_resolve_progress", "resolve", rel ? rel : "",
+                (size_t)file_idx,
+                "the completed resolution unit could not advance semantic progress",
+                "preserve the worker workspace, repair the progress stream, and retry the "
+                "unchanged repository");
+            break;
+        }
     }
 
     /* Tear down this worker's thread-local parser + slab state, mirroring

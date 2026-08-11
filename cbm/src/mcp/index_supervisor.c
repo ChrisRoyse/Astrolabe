@@ -8,6 +8,8 @@
 #include "foundation/log.h"
 #include "foundation/platform.h" /* cbm_resolve_cache_dir */
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
+#include "foundation/sha256.h"
+#include "foundation/worker_progress.h"
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 #include <yyjson/yyjson.h>
 
@@ -40,13 +42,45 @@ static bool g_worker_active = false;
 static char g_worker_response_out[1024] = {0};
 static char g_transition_writer_project[256] = {0};
 
-void cbm_index_set_worker_role(bool is_worker, const char *response_out) {
-    g_worker_active = is_worker;
+int cbm_index_set_worker_role(bool is_worker, const char *response_out,
+                              const char *progress_out, const char *progress_attempt) {
+    bool has_progress_out = progress_out && progress_out[0];
+    bool has_progress_attempt = progress_attempt && progress_attempt[0];
+    if (!is_worker) {
+        if (has_progress_out || has_progress_attempt) {
+            cbm_log_error("index.worker.role_invalid", "code",
+                          "CBM_INDEX_WORKER_PROGRESS_ROLE_INVALID", "message",
+                          "semantic-progress arguments require the private worker role",
+                          "remediation", "remove private worker arguments from ordinary CLI use");
+            return -1;
+        }
+        cbm_worker_progress_reset();
+        g_worker_active = false;
+        g_worker_response_out[0] = '\0';
+        return 0;
+    }
+    if (has_progress_out != has_progress_attempt) {
+        cbm_log_error("index.worker.role_invalid", "code",
+                      "CBM_INDEX_WORKER_PROGRESS_CONFIGURATION_MISSING", "message",
+                      "the supervised worker has an incomplete semantic-progress binding",
+                      "remediation", "start the worker only through its index supervisor");
+        return -1;
+    }
+    if (has_progress_out) {
+        if (cbm_worker_progress_configure(progress_out, progress_attempt) != 0 ||
+            cbm_worker_progress_publish(CBM_WORKER_PROGRESS_STAGE_STARTUP, "startup", 1, 1, 1,
+                                        "configured", 1, 1) != 0) {
+            cbm_worker_progress_reset();
+            return -1;
+        }
+    }
+    g_worker_active = true;
     if (response_out && response_out[0]) {
         snprintf(g_worker_response_out, sizeof(g_worker_response_out), "%s", response_out);
     } else {
         g_worker_response_out[0] = '\0';
     }
+    return 0;
 }
 
 void cbm_index_set_transition_writer_project(const char *project) {
@@ -70,6 +104,10 @@ const char *cbm_index_worker_response_out(void) {
     return g_worker_response_out[0] ? g_worker_response_out : NULL;
 }
 
+int cbm_index_worker_progress_complete(void) {
+    return cbm_worker_progress_complete();
+}
+
 /* #845: opt-in host mark — see the header. Set once from the real binary's
  * main(); embedders never set it, so should_wrap() stays false for them. */
 static bool g_host_marked = false;
@@ -88,14 +126,15 @@ bool cbm_index_supervisor_should_wrap(void) {
     return true;
 }
 
-/* Quiet-timeout (ms) for a supervised worker: killed + reported as a hang if it
- * emits no NEW log line within the window. This is a NO-PROGRESS timeout — every
- * completed log line the worker tails (per-batch parallel.extract.progress every
- * 10 files, plus each pass boundary) resets it — NOT a total-time cap, so a large
- * repo that keeps making progress is never falsely killed. Default: 15 min (a
- * genuinely stuck file emits nothing, so this fires only on a real hang). */
+/* Quiet-timeout (ms) for a supervised worker. Only a validated forward cursor
+ * from the request-owned semantic progress stream resets this no-progress
+ * budget; operational log level and log delivery are deliberately irrelevant.
+ * This is not a total-time cap. */
 static int worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
+    _Static_assert(DEFAULT_QUIET_TIMEOUT_MS >=
+                       2 * CBM_WORKER_PROGRESS_MAX_REPORT_INTERVAL_MS,
+                   "semantic report interval must stay below the no-progress budget");
     return DEFAULT_QUIET_TIMEOUT_MS;
 }
 
@@ -206,6 +245,19 @@ static int worker_tmp_dir(char *out, size_t out_sz, int pid) {
     return cbm_mkdtemp(out, out_sz) ? 0 : -1;
 }
 
+static cbm_proc_progress_result_t worker_progress_poll(bool terminal, void *ud) {
+    cbm_worker_progress_reader_t *reader = (cbm_worker_progress_reader_t *)ud;
+    cbm_worker_progress_poll_result_t result =
+        cbm_worker_progress_reader_poll(reader, terminal);
+    if (result == CBM_WORKER_PROGRESS_POLL_ADVANCED) {
+        return CBM_PROC_PROGRESS_ADVANCED;
+    }
+    if (result == CBM_WORKER_PROGRESS_POLL_IDLE) {
+        return CBM_PROC_PROGRESS_IDLE;
+    }
+    return CBM_PROC_PROGRESS_INVALID;
+}
+
 #ifdef ASTRO_ENV_STORE
 /* Bind the process-local store override into this request's private transport.
  * The Rust worker applies and reads it back before stripping it from the public
@@ -267,6 +319,13 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     result->response = NULL;
     result->log_tail = NULL;
     result->log_path = NULL;
+    result->progress_path = NULL;
+    result->progress_error_code = NULL;
+    result->progress_error_detail = NULL;
+    result->progress_stage = NULL;
+    result->progress_record_count = 0;
+    result->progress_completed = 0;
+    result->progress_total = 0;
 
     char self[1024] = {0};
     if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
@@ -286,12 +345,16 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     char resp_path[1200];
     char log_path[1200];
     char args_path[1200];
+    char progress_path[1200];
     int resp_len = snprintf(resp_path, sizeof(resp_path), "%s/response.json", workspace);
     int log_len = snprintf(log_path, sizeof(log_path), "%s/worker.log", workspace);
     int args_len = snprintf(args_path, sizeof(args_path), "%s/args.json", workspace);
+    int progress_len =
+        snprintf(progress_path, sizeof(progress_path), "%s/progress.bin", workspace);
     if (resp_len < 0 || (size_t)resp_len >= sizeof(resp_path) || log_len < 0 ||
         (size_t)log_len >= sizeof(log_path) || args_len < 0 ||
-        (size_t)args_len >= sizeof(args_path)) {
+        (size_t)args_len >= sizeof(args_path) || progress_len < 0 ||
+        (size_t)progress_len >= sizeof(progress_path)) {
         (void)cbm_rmdir(workspace);
         cbm_log_error("index.supervisor.workspace", "code",
                       "CBM_INDEX_WORKER_WORKSPACE_PATH_FAILED", "message",
@@ -321,15 +384,26 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     }
     free(worker_args);
 
-    /* No --progress: the worker's DEFAULT structured logging already provides the
-     * no-progress heartbeat (INFO parallel.extract.progress every 10 files + each
-     * pass boundary — all newline-terminated → tailed → reset the quiet-timeout).
-     * --progress would be strictly worse here: it installs a REPLACE-mode sink that
-     * suppresses those default lines and emits per-file extraction as a carriage-
-     * return in-place update (no trailing '\n'), which cbm_tail_log does not count
-     * as progress. (It would not corrupt the response either — that goes to the
-     * separate --response-out file, not stdout.) */
-    const char *argv[10];
+    /* The workspace name was created atomically for this one request. Its digest
+     * is the exact parent-generated attempt identity carried in every progress
+     * record; it is an identity token, not a security primitive. */
+    char progress_attempt[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(workspace, strlen(workspace), progress_attempt);
+    cbm_worker_progress_reader_t *progress_reader =
+        cbm_worker_progress_reader_new(progress_path, progress_attempt);
+    if (!progress_reader) {
+        (void)cbm_unlink(args_path);
+        (void)cbm_rmdir(workspace);
+        cbm_log_error("index.supervisor.progress_reader", "code",
+                      "CBM_INDEX_WORKER_PROGRESS_READER_CREATE_FAILED", "message",
+                      "the request-owned semantic progress reader could not be created",
+                      "remediation", "free memory or shorten the configured cache path and retry");
+        return -1;
+    }
+
+    /* Operational logging remains independent observability. Only the validated
+     * private progress stream below can reset the no-progress budget. */
+    const char *argv[14];
     int n = 0;
     argv[n++] = self;
     argv[n++] = "cli";
@@ -339,12 +413,18 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     argv[n++] = args_path;
     argv[n++] = "--response-out";
     argv[n++] = resp_path;
+    argv[n++] = "--worker-progress-out";
+    argv[n++] = progress_path;
+    argv[n++] = "--worker-progress-attempt";
+    argv[n++] = progress_attempt;
     argv[n] = NULL;
 
     cbm_proc_opts_t opts = {0};
     opts.bin = self;
     opts.argv = argv;
     opts.log_file = log_path;
+    opts.on_progress = worker_progress_poll;
+    opts.progress_ud = progress_reader;
     opts.quiet_timeout_ms = worker_quiet_timeout_ms();
     /* We manage log deletion ourselves after reaping (below): keep it on failure
      * for post-mortem, delete it only on a clean run. See the observability
@@ -355,8 +435,10 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     int run_rc = cbm_subprocess_run(&opts, &r);
 
     if (run_rc != 0) {
+        cbm_worker_progress_reader_free(progress_reader);
         (void)cbm_unlink(resp_path);
         (void)cbm_unlink(args_path);
+        (void)cbm_unlink(progress_path);
         (void)cbm_unlink(log_path); /* empty/partial log from a failed spawn — nothing to keep */
         (void)cbm_rmdir(workspace);
         cbm_log_error("index.supervisor.spawn_failed", "code", "CBM_INDEX_WORKER_SPAWN_FAILED",
@@ -364,6 +446,30 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
                       "inspect process-creation and worker-log diagnostics before retrying");
         return -1;
     }
+
+    const char *progress_error_code =
+        cbm_worker_progress_reader_error_code(progress_reader);
+    const char *progress_error_detail =
+        cbm_worker_progress_reader_error_detail(progress_reader);
+    const char *progress_stage = cbm_worker_progress_reader_stage(progress_reader);
+    result->progress_record_count =
+        cbm_worker_progress_reader_record_count(progress_reader);
+    result->progress_completed = cbm_worker_progress_reader_completed(progress_reader);
+    result->progress_total = cbm_worker_progress_reader_total(progress_reader);
+    bool result_bearing_exit =
+        r.outcome == CBM_PROC_CLEAN || r.outcome == CBM_PROC_EXIT_NONZERO;
+    if (result_bearing_exit && !cbm_worker_progress_reader_complete(progress_reader)) {
+        r.outcome = CBM_PROC_PROGRESS_FAILED;
+        progress_error_code = "CBM_INDEX_WORKER_PROGRESS_COMPLETION_MISSING";
+        progress_error_detail =
+            "the worker exited normally without its exact terminal semantic-progress record";
+    }
+    result->progress_error_code =
+        progress_error_code ? cbm_strdup(progress_error_code) : NULL;
+    result->progress_error_detail =
+        progress_error_detail ? cbm_strdup(progress_error_detail) : NULL;
+    result->progress_stage = progress_stage ? cbm_strdup(progress_stage) : NULL;
+    cbm_worker_progress_reader_free(progress_reader);
 
     result->outcome = r.outcome;
     result->exit_code = r.exit_code;
@@ -405,12 +511,15 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
      * msg=prof pass/sub-phase report is only written there, and deleting it on
      * success made profiling clean runs impossible. Keep it and say where it is. */
     if (r.outcome == CBM_PROC_CLEAN && !cbm_profile_active) {
+        (void)cbm_unlink(progress_path);
         (void)cbm_unlink(log_path);
         (void)cbm_rmdir(workspace);
     } else if (r.outcome == CBM_PROC_CLEAN) {
+        (void)cbm_unlink(progress_path);
         cbm_log_info("index.supervisor.profile_log", "log", log_path);
     } else {
         result->log_path = cbm_strdup(log_path);
+        result->progress_path = cbm_strdup(progress_path);
         cbm_log_warn("index.supervisor.worker_failed", "outcome", cbm_proc_outcome_str(r.outcome),
                      "exit_code", exit_buf, "log", log_path);
     }
@@ -425,5 +534,13 @@ void cbm_index_worker_result_free(cbm_index_worker_result_t *result) {
         result->log_tail = NULL;
         free(result->log_path);
         result->log_path = NULL;
+        free(result->progress_path);
+        result->progress_path = NULL;
+        free(result->progress_error_code);
+        result->progress_error_code = NULL;
+        free(result->progress_error_detail);
+        result->progress_error_detail = NULL;
+        free(result->progress_stage);
+        result->progress_stage = NULL;
     }
 }

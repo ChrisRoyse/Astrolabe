@@ -676,10 +676,11 @@ done:
 }
 
 static int spawn_capture_impl(const char *const *argv, const char *working_directory,
-                              char **out_data, size_t *out_len,
-                              size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
-                              bool capture_stderr, const char *source_date_epoch,
-                              cbm_spawn_error_t *err) {
+                               char **out_data, size_t *out_len,
+                               size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
+                               bool capture_stderr, const char *source_date_epoch,
+                               cbm_spawn_stdout_progress_cb on_stdout_progress, void *progress_ud,
+                               cbm_spawn_error_t *err) {
     if (out_data) {
         *out_data = NULL;
     }
@@ -930,6 +931,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     bool stderr_truncated = false;
     char chunk[SPAWN_READ_CHUNK];
     bool read_ok = true;
+    bool progress_ok = true;
     int read_failure_code = CBM_SPAWN_OK;
     DWORD read_gle = 0;
     for (;;) {
@@ -950,6 +952,12 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
             read_ok = false;
             read_failure_code = CBM_SPAWN_E_NOMEM;
             read_gle = ERROR_NOT_ENOUGH_MEMORY;
+            break;
+        }
+        if (on_stdout_progress &&
+            !on_stdout_progress((uint64_t)buf.len, progress_ud)) {
+            progress_ok = false;
+            (void)TerminateProcess(pi.hProcess, 1);
             break;
         }
     }
@@ -991,6 +999,14 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         stderr_reader = NULL;
     }
 
+    if (!progress_ok) {
+        free(buf.data);
+        free(stderr_buf.data);
+        return spawn_fail(err, CBM_SPAWN_E_PROGRESS, "CBM_SPAWN_E_PROGRESS",
+                          "the compiler stdout progress cursor could not be published",
+                          "preserve the worker workspace and repair the semantic progress stream",
+                          0, got_code ? (int)code : -1);
+    }
     if (!read_ok || !stderr_read_ok) {
         free(buf.data);
         free(stderr_buf.data);
@@ -1052,7 +1068,8 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, NULL, NULL,
+                              err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
@@ -1060,7 +1077,7 @@ int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
     return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, NULL,
-                              err);
+                              NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
@@ -1073,7 +1090,7 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                           "bind the child to its captured compiler working directory", 0, -1);
     }
     return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
-                              out_stderr, true, NULL, err);
+                              out_stderr, true, NULL, NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd_source_epoch(
@@ -1088,7 +1105,24 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch(
                           -1);
     }
     return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
-                              out_stderr, true, source_date_epoch, err);
+                              out_stderr, true, source_date_epoch, NULL, NULL, err);
+}
+
+int cbm_spawn_capture_with_stderr_cwd_source_epoch_progress(
+    const char *const *argv, const char *working_directory, const char *source_date_epoch,
+    char **out_data, size_t *out_len, size_t stderr_limit,
+    cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_stdout_progress_cb on_stdout_progress,
+    void *progress_ud, cbm_spawn_error_t *err) {
+    if (!working_directory || !working_directory[0] || !source_date_epoch ||
+        !source_date_epoch[0] || !on_stdout_progress) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "progress spawn requires an explicit cwd, source epoch, and callback",
+                          "bind the compiler child to its context and semantic progress writer", 0,
+                          -1);
+    }
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+                              out_stderr, true, source_date_epoch, on_stdout_progress,
+                              progress_ud, err);
 }
 
 #else /* !_WIN32 */
@@ -1102,10 +1136,11 @@ static int spawn_file_actions_addclose_nonstandard(posix_spawn_file_actions_t *a
 }
 
 static int spawn_capture_impl(const char *const *argv, const char *working_directory,
-                              char **out_data, size_t *out_len,
-                              size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
-                              bool capture_stderr, const char *source_date_epoch,
-                              cbm_spawn_error_t *err) {
+                               char **out_data, size_t *out_len,
+                               size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
+                               bool capture_stderr, const char *source_date_epoch,
+                               cbm_spawn_stdout_progress_cb on_stdout_progress, void *progress_ud,
+                               cbm_spawn_error_t *err) {
     if (out_data) {
         *out_data = NULL;
     }
@@ -1263,6 +1298,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     bool stderr_retain = true;
     char chunk[SPAWN_READ_CHUNK];
     bool read_ok = true;
+    bool progress_ok = true;
     bool stderr_read_ok = true;
     int stdout_failure_code = CBM_SPAWN_OK;
     int stderr_failure_code = CBM_SPAWN_OK;
@@ -1318,6 +1354,10 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
                             if (read_errno == 0) {
                                 read_errno = (unsigned long)ENOMEM;
                             }
+                        } else if (read_ok && on_stdout_progress &&
+                                   !on_stdout_progress((uint64_t)buf.len, progress_ud)) {
+                            progress_ok = false;
+                            (void)kill(pid, SIGKILL);
                         }
                     } else if (stderr_retain) {
                         spawn_prefix_result_t append = spawn_buf_append_prefix(
@@ -1376,6 +1416,9 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
             }
             streams[stream].revents = 0;
         }
+        if (!progress_ok) {
+            break;
+        }
     }
     for (int stream = 0; stream < 2; stream++) {
         if (streams[stream].fd >= 0) {
@@ -1389,6 +1432,14 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         waited = waitpid(pid, &status, 0);
     } while (waited < 0 && errno == EINTR);
 
+    if (!progress_ok) {
+        free(buf.data);
+        free(stderr_buf.data);
+        return spawn_fail(err, CBM_SPAWN_E_PROGRESS, "CBM_SPAWN_E_PROGRESS",
+                          "the compiler stdout progress cursor could not be published",
+                          "preserve the worker workspace and repair the semantic progress stream",
+                          0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
     if (!read_ok || !stderr_read_ok) {
         free(buf.data);
         free(stderr_buf.data);
@@ -1451,7 +1502,8 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, NULL, NULL,
+                              err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
@@ -1459,7 +1511,7 @@ int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
     return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, NULL,
-                              err);
+                              NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
@@ -1472,7 +1524,7 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                           "bind the child to its captured compiler working directory", 0, -1);
     }
     return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
-                              out_stderr, true, NULL, err);
+                              out_stderr, true, NULL, NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd_source_epoch(
@@ -1487,7 +1539,24 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch(
                           -1);
     }
     return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
-                              out_stderr, true, source_date_epoch, err);
+                              out_stderr, true, source_date_epoch, NULL, NULL, err);
+}
+
+int cbm_spawn_capture_with_stderr_cwd_source_epoch_progress(
+    const char *const *argv, const char *working_directory, const char *source_date_epoch,
+    char **out_data, size_t *out_len, size_t stderr_limit,
+    cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_stdout_progress_cb on_stdout_progress,
+    void *progress_ud, cbm_spawn_error_t *err) {
+    if (!working_directory || !working_directory[0] || !source_date_epoch ||
+        !source_date_epoch[0] || !on_stdout_progress) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "progress spawn requires an explicit cwd, source epoch, and callback",
+                          "bind the compiler child to its context and semantic progress writer", 0,
+                          -1);
+    }
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+                              out_stderr, true, source_date_epoch, on_stdout_progress,
+                              progress_ud, err);
 }
 
 #endif /* _WIN32 */

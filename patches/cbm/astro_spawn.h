@@ -52,7 +52,8 @@ typedef enum {
     CBM_SPAWN_E_NOMEM = 6,          /* allocation failed */
     CBM_SPAWN_E_WAIT = 7,           /* could not reap the child */
     CBM_SPAWN_E_EXIT = 8,           /* child ran and exited non-zero */
-    CBM_SPAWN_E_ENVIRONMENT = 9     /* exact child environment could not be built */
+    CBM_SPAWN_E_ENVIRONMENT = 9,    /* exact child environment could not be built */
+    CBM_SPAWN_E_PROGRESS = 10       /* semantic stdout progress could not be published */
 } cbm_spawn_code_t;
 
 /* Fail-closed error record: {code, message, remediation} plus the OS-level
@@ -72,6 +73,10 @@ typedef struct {
     uint64_t total_len; /* every stderr byte drained from the child */
     bool truncated;     /* total_len exceeded the caller's retained prefix */
 } cbm_spawn_bounded_capture_t;
+
+/* Called only after another non-empty stdout byte range has been captured.
+ * Returning false terminates the exact child and reports CBM_SPAWN_E_PROGRESS. */
+typedef bool (*cbm_spawn_stdout_progress_cb)(uint64_t captured_bytes, void *ud);
 
 /*
  * Spawn argv[0] with the NULL-terminated argv array — no shell — and capture
@@ -124,6 +129,12 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch(
     const char *const *argv, const char *working_directory, const char *source_date_epoch,
     char **out_data, size_t *out_len, size_t stderr_limit,
     cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_error_t *err);
+
+int cbm_spawn_capture_with_stderr_cwd_source_epoch_progress(
+    const char *const *argv, const char *working_directory, const char *source_date_epoch,
+    char **out_data, size_t *out_len, size_t stderr_limit,
+    cbm_spawn_bounded_capture_t *out_stderr, cbm_spawn_stdout_progress_cb on_stdout_progress,
+    void *progress_ud, cbm_spawn_error_t *err);
 
 #ifdef __cplusplus
 }

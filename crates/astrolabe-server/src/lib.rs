@@ -697,6 +697,14 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     let progress = strip_flag(&mut args, "--progress");
     let index_worker = strip_flag(&mut args, "--index-worker");
     let response_out = strip_flag_value(&mut args, "--response-out");
+    let worker_progress_out = strip_flag_value(&mut args, "--worker-progress-out");
+    let worker_progress_attempt = strip_flag_value(&mut args, "--worker-progress-attempt");
+    if worker_progress_out.is_some() != worker_progress_attempt.is_some() {
+        return Err("ASTRO_INDEX_WORKER_PROGRESS_CONFIGURATION_MISSING: --worker-progress-out and --worker-progress-attempt must be supplied together".into());
+    }
+    if !index_worker && worker_progress_out.is_some() {
+        return Err("ASTRO_INDEX_WORKER_PROGRESS_ROLE_INVALID: semantic progress arguments are private to --index-worker".into());
+    }
     // #515/#530 internal pooled historical-index extraction serve worker. Spawned ONCE
     // per recycle interval by `run_git_archaeology` (git_archaeology.rs) and served every
     // evidence commit's extraction serially over an atomic request/response file handshake,
@@ -746,9 +754,11 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
             )
         },
     );
-    let _worker_role = if index_worker {
+    let worker_role = if index_worker {
         Some(astrolabe_bridge::CbmIndexWorkerRole::activate(
             response_out.as_deref(),
+            worker_progress_out.as_deref(),
+            worker_progress_attempt.as_deref(),
             transition_writer_project.as_deref(),
         )?)
     } else {
@@ -759,6 +769,9 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
     if tool_name == "verify_chain" {
         let code = run_verify_chain_cli(&args_json, raw_json, response_out.as_deref())?;
+        if let Some(role) = worker_role.as_ref() {
+            role.complete_progress()?;
+        }
         if progress {
             eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
         }
@@ -792,6 +805,9 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
         fs::write(path, &result)?;
     }
     if index_worker {
+        if let Some(role) = worker_role.as_ref() {
+            role.complete_progress()?;
+        }
         // #282 (attempt 15): the response file is a supervised worker's ONLY
         // result channel — its stdout/stderr are the supervisor's log handle
         // (or worse, whatever handle state the spawn produced), so printing

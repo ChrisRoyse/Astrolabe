@@ -30,6 +30,7 @@ enum {
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
     MAIN_MAX_PORT = 65536,
     MAIN_WORKER_RESPONSE_WRITE_FAILED = 2,
+    MAIN_WORKER_PROGRESS_COMPLETE_FAILED = 3,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
 #define SLEN(s) (sizeof(s) - 1)
@@ -442,7 +443,14 @@ static int run_cli(int argc, char **argv) {
      * dispatch below sees only the tool name + its args. */
     bool index_worker = cli_strip_flag(&argc, argv, "--index-worker");
     const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
-    cbm_index_set_worker_role(index_worker, response_out);
+    const char *worker_progress_out =
+        cli_strip_flag_value(&argc, argv, "--worker-progress-out");
+    const char *worker_progress_attempt =
+        cli_strip_flag_value(&argc, argv, "--worker-progress-attempt");
+    if (cbm_index_set_worker_role(index_worker, response_out, worker_progress_out,
+                                  worker_progress_attempt) != 0) {
+        return SKIP_ONE;
+    }
 
     if (index_worker) {
         /* #435: an index worker's stderr is redirected to the parent-tailed log
@@ -684,6 +692,17 @@ static int run_cli(int argc, char **argv) {
                     "inspect the worker response path and storage device before retrying");
                 fflush(NULL);
                 _Exit(MAIN_WORKER_RESPONSE_WRITE_FAILED);
+            }
+            if (cbm_index_worker_progress_complete() != 0) {
+                cbm_log_error(
+                    "index.worker.progress_complete_failed", "code",
+                    "CBM_INDEX_WORKER_PROGRESS_COMPLETE_FAILED", "message",
+                    "the supervised worker response was written but its terminal semantic "
+                    "progress record could not be published",
+                    "remediation",
+                    "preserve the worker workspace and inspect the progress-stream diagnostic");
+                fflush(NULL);
+                _Exit(MAIN_WORKER_PROGRESS_COMPLETE_FAILED);
             }
             /* Supervised worker: the response is delivered (file + stdout).
              * Skip the multi-GB teardown (server/store frees) — the process

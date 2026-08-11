@@ -102,27 +102,27 @@ const char *cbm_proc_outcome_str(cbm_proc_outcome_t o) {
         return "hang";
     case CBM_PROC_KILLED:
         return "killed";
+    case CBM_PROC_PROGRESS_FAILED:
+        return "progress_failed";
     case CBM_PROC_SPAWN_FAILED:
     default:
         return "spawn_failed";
     }
 }
 
-/* Tail newly-appended complete lines from the child log, starting at *tail_pos.
- * A partial (non-newline-terminated) final line is left buffered: *tail_pos is
- * not advanced past it, so it is re-read once completed. Returns true if any
- * complete line was consumed (i.e. there was progress). */
-static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb cb, void *ud) {
+/* Tail newly-appended complete diagnostic lines from the child log, starting at
+ * *tail_pos. A partial final line remains buffered. Log bytes never constitute
+ * semantic work and therefore never affect the quiet-timeout. */
+static void cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb cb, void *ud) {
     if (!log_file) {
-        return false;
+        return;
     }
     /* #415: cbm_fopen widens + adds "\\?\" so a worker log under a deep store
      * (<store>/logs/.worker-<pid>.log) is tailable instead of failing at MAX_PATH. */
     FILE *lf = cbm_fopen(log_file, "r");
     if (!lf) {
-        return false;
+        return;
     }
-    bool progressed = false;
     if (fseek(lf, *tail_pos, SEEK_SET) == 0) {
         char line[1024];
         for (;;) {
@@ -135,15 +135,13 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
             if (complete) {
                 line[l - 1] = '\0';
                 *tail_pos = ftell(lf);
-                progressed = true;
                 if (line[0] && cb) {
                     cb(line, ud);
                 }
             } else if (l == sizeof(line) - 1) {
                 /* Oversized line filled the buffer without a newline — consume it
-                 * anyway (counts as progress) so we never stall on one long line. */
+                 * so diagnostic delivery never stalls on one long line. */
                 *tail_pos = ftell(lf);
-                progressed = true;
                 if (cb) {
                     cb(line, ud);
                 }
@@ -155,7 +153,6 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
         }
     }
     fclose(lf);
-    return progressed;
 }
 
 /* ── Windows command-line quoting (pure; unit-tested on every platform) ─────── */
@@ -417,19 +414,37 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
+    bool progress_failed = false;
     for (;;) {
         DWORD w = WaitForSingleObject(pi.hProcess, 200);
-        if (cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud)) {
-            last_activity = cbm_now_ms();
+        cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud);
+        bool done = w == WAIT_OBJECT_0;
+        if (opts->on_progress) {
+            cbm_proc_progress_result_t progress =
+                opts->on_progress(done, opts->progress_ud);
+            if (progress == CBM_PROC_PROGRESS_INVALID) {
+                if (!done) {
+                    (void)TerminateProcess(pi.hProcess, 1);
+                    (void)WaitForSingleObject(pi.hProcess, INFINITE);
+                }
+                progress_failed = true;
+                break;
+            }
+            if (progress == CBM_PROC_PROGRESS_ADVANCED) {
+                last_activity = cbm_now_ms();
+            }
         }
-        if (w == WAIT_OBJECT_0) {
+        if (done) {
             break;
         }
         if (opts->quiet_timeout_ms > 0 &&
             (cbm_now_ms() - last_activity) >= (uint64_t)opts->quiet_timeout_ms) {
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, INFINITE);
-            timed_out = true;
+            cbm_proc_progress_result_t terminal =
+                opts->on_progress(true, opts->progress_ud);
+            progress_failed = terminal == CBM_PROC_PROGRESS_INVALID;
+            timed_out = !progress_failed;
             break;
         }
     }
@@ -445,7 +460,8 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
     out->exit_code = (int)code;
     out->term_signal = 0;
-    out->outcome = cbm_proc_classify(true, (int)code, 0, timed_out);
+    out->outcome = progress_failed ? CBM_PROC_PROGRESS_FAILED
+                                   : cbm_proc_classify(true, (int)code, 0, timed_out);
     return 0;
 }
 
@@ -489,6 +505,7 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
+    bool progress_failed = false;
     int wstatus = 0;
     for (;;) {
         pid_t wr;
@@ -497,8 +514,23 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         } while (wr < 0 && errno == EINTR);
         bool done = (wr == pid);
 
-        if (cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud)) {
-            last_activity = cbm_now_ms();
+        cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud);
+        if (opts->on_progress) {
+            cbm_proc_progress_result_t progress =
+                opts->on_progress(done, opts->progress_ud);
+            if (progress == CBM_PROC_PROGRESS_INVALID) {
+                if (!done) {
+                    (void)kill(pid, SIGKILL);
+                    do {
+                        wr = waitpid(pid, &wstatus, 0);
+                    } while (wr < 0 && errno == EINTR);
+                }
+                progress_failed = true;
+                break;
+            }
+            if (progress == CBM_PROC_PROGRESS_ADVANCED) {
+                last_activity = cbm_now_ms();
+            }
         }
         if (done) {
             break;
@@ -509,7 +541,10 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
             do {
                 wr = waitpid(pid, &wstatus, 0);
             } while (wr < 0 && errno == EINTR);
-            timed_out = true;
+            cbm_proc_progress_result_t terminal =
+                opts->on_progress(true, opts->progress_ud);
+            progress_failed = terminal == CBM_PROC_PROGRESS_INVALID;
+            timed_out = !progress_failed;
             break;
         }
         struct timespec ts = {0, 100000000L}; /* 100 ms poll */
@@ -520,7 +555,11 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         (void)unlink(opts->log_file);
     }
 
-    if (WIFEXITED(wstatus)) {
+    if (progress_failed) {
+        out->exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+        out->term_signal = WIFSIGNALED(wstatus) ? WTERMSIG(wstatus) : 0;
+        out->outcome = CBM_PROC_PROGRESS_FAILED;
+    } else if (WIFEXITED(wstatus)) {
         out->exit_code = WEXITSTATUS(wstatus);
         out->term_signal = 0;
         out->outcome = cbm_proc_classify(true, out->exit_code, 0, timed_out);
@@ -547,6 +586,14 @@ int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     out->exit_code = -1;
     out->term_signal = 0;
     if (!opts || !opts->bin || !opts->bin[0]) {
+        return -1;
+    }
+    if (opts->quiet_timeout_ms > 0 && !opts->on_progress) {
+        cbm_log_error("subprocess.progress_contract_missing", "code",
+                      "CBM_PROC_PROGRESS_CALLBACK_REQUIRED", "message",
+                      "a quiet timeout requires an application-semantic progress reader",
+                      "remediation",
+                      "bind the supervised operation to its exact semantic progress source");
         return -1;
     }
 #ifdef _WIN32

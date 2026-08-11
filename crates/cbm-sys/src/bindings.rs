@@ -4453,7 +4453,15 @@ unsafe extern "C" {
     pub fn cbm_free_string(value: *mut ::std::os::raw::c_char);
 }
 unsafe extern "C" {
-    pub fn cbm_index_set_worker_role(is_worker: bool, response_out: *const ::std::os::raw::c_char);
+    pub fn cbm_index_set_worker_role(
+        is_worker: bool,
+        response_out: *const ::std::os::raw::c_char,
+        progress_out: *const ::std::os::raw::c_char,
+        progress_attempt: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_index_worker_progress_complete() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn cbm_index_set_transition_writer_project(project: *const ::std::os::raw::c_char);
