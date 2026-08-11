@@ -574,6 +574,31 @@ pub fn score_packed(query: &PackedQuery, row: &PackedVector) -> Result<f32> {
     }
 }
 
+pub(crate) fn score_scalar8_pair(
+    query_codes: &[u8],
+    query_scale: f32,
+    row_codes: &[u8],
+    row_scale: f32,
+    row_norm: f32,
+) -> Result<f32> {
+    if query_codes.len() != row_codes.len() {
+        return Err(dim_mismatch(query_codes.len(), row_codes.len()));
+    }
+    let query_norm = query_codes
+        .iter()
+        .map(|code| {
+            let value = f32::from(*code as i8) * query_scale;
+            f64::from(value) * f64::from(value)
+        })
+        .sum::<f64>()
+        .sqrt() as f32;
+    if query_norm == 0.0 || row_norm == 0.0 {
+        return Ok(0.0);
+    }
+    let dot = scalar8_pair_dot(query_codes, query_scale, row_codes);
+    Ok((dot * f64::from(row_scale) / (f64::from(query_norm) * f64::from(row_norm))) as f32)
+}
+
 /// Asymmetric query-f32 by candidate-i8 dot product. Candidate bytes remain
 /// packed and are sign-extended directly into SIMD lanes; no candidate-wide
 /// decode or temporary allocation occurs.
@@ -589,6 +614,24 @@ fn scalar8_dot(values: &[f32], codes: &[u8]) -> f64 {
         .iter()
         .zip(codes)
         .map(|(value, code)| f64::from(*value) * f64::from(*code as i8))
+        .sum()
+}
+
+fn scalar8_pair_dot(query_codes: &[u8], query_scale: f32, row_codes: &[u8]) -> f64 {
+    debug_assert_eq!(query_codes.len(), row_codes.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: feature detection proves AVX2 support, and the helper only
+        // loads within the equal-length slices established by score_scalar8_pair.
+        return unsafe { scalar8_pair_dot_avx2(query_codes, query_scale, row_codes) };
+    }
+    query_codes
+        .iter()
+        .zip(row_codes)
+        .map(|(query, row)| {
+            let value = f32::from(*query as i8) * query_scale;
+            f64::from(value) * f64::from(*row as i8)
+        })
         .sum()
 }
 
@@ -634,6 +677,52 @@ unsafe fn scalar8_dot_avx2(values: &[f32], codes: &[u8]) -> f64 {
         let mut dot = low.into_iter().sum::<f64>() + high.into_iter().sum::<f64>();
         for tail in index..values.len() {
             dot += f64::from(values[tail]) * f64::from(codes[tail] as i8);
+        }
+        dot
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scalar8_pair_dot_avx2(query_codes: &[u8], query_scale: f32, row_codes: &[u8]) -> f64 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mut low_acc = _mm256_setzero_pd();
+        let mut high_acc = _mm256_setzero_pd();
+        let scale = _mm256_set1_ps(query_scale);
+        let vectorized = query_codes.len() / 8 * 8;
+        let mut index = 0_usize;
+        while index < vectorized {
+            let query_packed = _mm_loadl_epi64(query_codes.as_ptr().add(index).cast::<__m128i>());
+            let query_wide = _mm256_cvtepi8_epi32(query_packed);
+            let query_values = _mm256_mul_ps(_mm256_cvtepi32_ps(query_wide), scale);
+            let query_low = _mm256_castps256_ps128(query_values);
+            let query_high = _mm256_extractf128_ps::<1>(query_values);
+
+            let row_packed = _mm_loadl_epi64(row_codes.as_ptr().add(index).cast::<__m128i>());
+            let row_wide = _mm256_cvtepi8_epi32(row_packed);
+            let row_low = _mm256_castsi256_si128(row_wide);
+            let row_high = _mm256_extracti128_si256::<1>(row_wide);
+
+            low_acc = _mm256_add_pd(
+                low_acc,
+                _mm256_mul_pd(_mm256_cvtps_pd(query_low), _mm256_cvtepi32_pd(row_low)),
+            );
+            high_acc = _mm256_add_pd(
+                high_acc,
+                _mm256_mul_pd(_mm256_cvtps_pd(query_high), _mm256_cvtepi32_pd(row_high)),
+            );
+            index += 8;
+        }
+        let mut low = [0.0_f64; 4];
+        let mut high = [0.0_f64; 4];
+        _mm256_storeu_pd(low.as_mut_ptr(), low_acc);
+        _mm256_storeu_pd(high.as_mut_ptr(), high_acc);
+        let mut dot = low.into_iter().sum::<f64>() + high.into_iter().sum::<f64>();
+        for tail in index..query_codes.len() {
+            let value = f32::from(query_codes[tail] as i8) * query_scale;
+            dot += f64::from(value) * f64::from(row_codes[tail] as i8);
         }
         dot
     }

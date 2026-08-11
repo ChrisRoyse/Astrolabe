@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use calyx_aster::gc::{AnnIndexGraph, AnnTombstoneStats};
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
-use super::quant_config::{PackedQuery, PackedVector, l2_norm, score_packed};
+use super::quant_config::{PackedQuery, PackedVector, l2_norm, score_packed, score_scalar8_pair};
 use super::{IndexSearchHit, IndexStats, QuantConfig, SextantIndex, ranked};
 use crate::error::{
     CALYX_SEXTANT_DIM_MISMATCH, CALYX_SEXTANT_EF_TOO_SMALL, CALYX_SEXTANT_INDEX_EMPTY,
@@ -238,6 +238,27 @@ impl HnswIndex {
     /// internal invariant violation, not a caller state.
     pub(super) fn score_row(&self, query: &PackedQuery, idx: usize) -> Result<f32> {
         score_packed(query, &self.rows[idx].stored)
+    }
+
+    pub(super) fn score_row_pair(&self, query_idx: usize, row_idx: usize) -> Result<f32> {
+        match (&self.rows[query_idx].stored, &self.rows[row_idx].stored) {
+            (
+                PackedVector::Scalar8 {
+                    codes: query_codes,
+                    scale: query_scale,
+                    ..
+                },
+                PackedVector::Scalar8 {
+                    codes: row_codes,
+                    scale: row_scale,
+                    norm: row_norm,
+                },
+            ) => score_scalar8_pair(query_codes, *query_scale, row_codes, *row_scale, *row_norm),
+            _ => {
+                let query = self.construction_query(query_idx)?;
+                self.score_row(&query, row_idx)
+            }
+        }
     }
 
     /// Builds the construction-time query for an already-inserted row from its

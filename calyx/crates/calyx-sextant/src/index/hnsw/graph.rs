@@ -35,8 +35,16 @@ impl HnswIndex {
         self.rows[index].neighbors = reciprocal_neighbors.clone();
         self.rows[index].neighbor_scores = neighbors.into_iter().map(|(_, score)| score).collect();
         self.prune_neighbors(index)?;
-        for neighbor in reciprocal_neighbors {
-            self.add_reciprocal_neighbor(neighbor, index)?;
+        let reciprocal_scores = reciprocal_neighbors
+            .par_iter()
+            .copied()
+            .map(|neighbor| {
+                self.score_row_pair(neighbor, index)
+                    .map(|score| (neighbor, score))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (neighbor, score) in reciprocal_scores {
+            self.add_reciprocal_neighbor(neighbor, index, score)?;
         }
         Ok(())
     }
@@ -155,7 +163,12 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn add_reciprocal_neighbor(&mut self, origin: usize, candidate: usize) -> Result<()> {
+    fn add_reciprocal_neighbor(
+        &mut self,
+        origin: usize,
+        candidate: usize,
+        score: f32,
+    ) -> Result<()> {
         if self.rows[origin].neighbors.contains(&candidate) {
             return self.prune_neighbors(origin);
         }
@@ -164,10 +177,6 @@ impl HnswIndex {
             return self.prune_neighbors(origin);
         }
         self.validate_cached_neighbors(origin)?;
-        let query = self.reusable_construction_query(origin)?;
-        let score_result = self.score_row(&query, candidate);
-        self.recycle_construction_query(query);
-        let score = score_result?;
         if !score.is_finite() {
             return Err(sextant_error(
                 CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
