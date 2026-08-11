@@ -67,8 +67,7 @@ impl HnswIndex {
         let scored = if index <= EXACT_CONSTRUCTION_ROWS {
             self.exhaustive_candidate_scores(index, query)?
         } else {
-            let candidates = self.approximate_candidate_set(index, query)?;
-            scored_from_indices(self, &candidates, query)?
+            self.approximate_candidate_scores(index, query)?
         };
         let mut neighbors = top_k_scored(scored.clone(), self.max_neighbors);
         for level in 1..=self.rows[index].level {
@@ -108,29 +107,58 @@ impl HnswIndex {
             .collect()
     }
 
-    fn approximate_candidate_set(&self, index: usize, query: &PackedQuery) -> Result<Vec<usize>> {
+    fn approximate_candidate_scores(
+        &self,
+        index: usize,
+        query: &PackedQuery,
+    ) -> Result<Vec<(usize, f32)>> {
         let mut candidates = Vec::with_capacity(CONSTRUCTION_EF + RECENT_CONSTRUCTION_SCAN + 24);
+        let mut scored = Vec::with_capacity(CONSTRUCTION_EF + RECENT_CONSTRUCTION_SCAN + 24);
         let ef = CONSTRUCTION_EF.min(index).max(self.max_neighbors);
         if let Some(entry) = self.entry_point_before(index) {
             let start = self.greedy_descent_before(query, entry, index)?;
-            candidates.extend(
-                self.beam_search_indices(
-                    query,
-                    start,
-                    ef,
-                    index,
-                    CONSTRUCTION_VISIT_LIMIT_EF_MULTIPLIER,
-                )?
-                .into_iter()
-                .map(|(idx, _)| idx),
-            );
+            scored.extend(self.beam_search_indices(
+                query,
+                start,
+                ef,
+                index,
+                CONSTRUCTION_VISIT_LIMIT_EF_MULTIPLIER,
+            )?);
+            candidates.extend(scored.iter().map(|(candidate, _)| *candidate));
         }
         let recent_start = index.saturating_sub(RECENT_CONSTRUCTION_SCAN);
         candidates.extend(recent_start..index);
         append_stride_neighbors(index, &mut candidates);
         candidates.sort_unstable();
         candidates.dedup();
-        Ok(candidates)
+        scored.sort_unstable_by_key(|(candidate, _)| *candidate);
+        let missing = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                scored
+                    .binary_search_by_key(candidate, |(scored_candidate, _)| *scored_candidate)
+                    .is_err()
+            })
+            .collect::<Vec<_>>();
+        scored.extend(scored_from_indices(self, &missing, query)?);
+        scored.sort_unstable_by_key(|(candidate, _)| *candidate);
+        if scored.len() != candidates.len()
+            || scored
+                .iter()
+                .zip(&candidates)
+                .any(|((scored_candidate, _), candidate)| scored_candidate != candidate)
+        {
+            return Err(sextant_error(
+                CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                format!(
+                    "HNSW approximate candidate-score coverage drifted: origin={index} candidates={} scores={}",
+                    candidates.len(),
+                    scored.len(),
+                ),
+            ));
+        }
+        Ok(scored)
     }
 
     fn prune_neighbors(&mut self, index: usize) -> Result<()> {
