@@ -1,6 +1,7 @@
 use std::collections::{BinaryHeap, HashSet};
 
 use calyx_core::{CxId, Result};
+use rayon::prelude::*;
 
 use super::HnswIndex;
 use super::scored::{
@@ -52,17 +53,14 @@ impl HnswIndex {
             return self.exhaustive_candidates(index, query);
         }
         let candidates = self.approximate_candidate_set(index, query)?;
-        let mut neighbors = top_k_indices(
-            scored_from_indices(self, &candidates, query)?,
-            self.max_neighbors,
-        );
+        let scored = scored_from_indices(self, &candidates, query)?;
+        let mut neighbors = top_k_indices(scored.clone(), self.max_neighbors);
         for level in 1..=self.rows[index].level {
-            let level_scored = candidates
+            let level_scored = scored
                 .iter()
                 .copied()
-                .filter(|idx| self.rows[*idx].level >= level)
-                .map(|idx| self.score_row(query, idx).map(|score| (idx, score)))
-                .collect::<Result<Vec<_>>>()?;
+                .filter(|(idx, _)| self.rows[*idx].level >= level)
+                .collect();
             neighbors.extend(top_k_indices(level_scored, self.max_neighbors));
         }
         Ok(neighbors)
@@ -70,15 +68,17 @@ impl HnswIndex {
 
     fn exhaustive_candidates(&self, index: usize, query: &PackedQuery) -> Result<Vec<usize>> {
         let scored = (0..index)
+            .into_par_iter()
             .map(|idx| self.score_row(query, idx).map(|score| (idx, score)))
             .collect::<Result<Vec<_>>>()?;
-        let mut neighbors = top_k_indices(scored, self.max_neighbors);
+        let mut neighbors = top_k_indices(scored.clone(), self.max_neighbors);
         for level in 1..=self.rows[index].level {
-            let scored = (0..index)
-                .filter(|idx| self.rows[*idx].level >= level)
-                .map(|idx| self.score_row(query, idx).map(|score| (idx, score)))
-                .collect::<Result<Vec<_>>>()?;
-            neighbors.extend(top_k_indices(scored, self.max_neighbors));
+            let level_scored = scored
+                .iter()
+                .copied()
+                .filter(|(idx, _)| self.rows[*idx].level >= level)
+                .collect();
+            neighbors.extend(top_k_indices(level_scored, self.max_neighbors));
         }
         Ok(neighbors)
     }
