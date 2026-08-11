@@ -316,6 +316,7 @@ impl HnswIndex {
                 seq,
                 level,
                 neighbors,
+                neighbor_scores: Vec::new(),
                 deleted: flags & 1 != 0,
             });
         }
@@ -345,6 +346,7 @@ impl HnswIndex {
             quant,
             built_at_seq: header.built_at_seq,
             base_seq: header.base_seq,
+            construction_scratch: Vec::new(),
         };
         if !index.rows.is_empty() {
             index.quant.lock_after_first_insert();
@@ -513,6 +515,14 @@ impl HnswIndex {
                     "row {ordinal} has {} neighbors above max {}",
                     row.neighbors.len(),
                     self.max_neighbors
+                )));
+            }
+            if !row.neighbor_scores.is_empty()
+                && (row.neighbor_scores.len() != row.neighbors.len()
+                    || row.neighbor_scores.iter().any(|score| !score.is_finite()))
+            {
+                return Err(corrupt(format!(
+                    "row {ordinal} has invalid ephemeral construction-score state"
                 )));
             }
             let mut neighbors = HashSet::new();

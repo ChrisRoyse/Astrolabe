@@ -7,33 +7,29 @@ pub(super) fn top_k_indices(scored: Vec<(usize, f32)>, k: usize) -> Vec<usize> {
     scored.into_iter().map(|(idx, _)| idx).collect()
 }
 
-pub(super) fn diversified_neighbors(
+pub(super) fn diversified_neighbor_scores(
     mut scored: Vec<(usize, f32)>,
     origin: usize,
     max_neighbors: usize,
-) -> Vec<usize> {
+) -> Vec<(usize, f32)> {
     sort_scored(&mut scored);
     let nearest_cap = (max_neighbors / 2).max(1);
-    let mut chosen: Vec<usize> = scored
-        .iter()
-        .take(nearest_cap)
-        .map(|(idx, _)| *idx)
-        .collect();
+    let mut chosen: Vec<(usize, f32)> = scored.iter().take(nearest_cap).copied().collect();
     scored.sort_by(|a, b| {
         ordinal_distance(b.0, origin)
             .cmp(&ordinal_distance(a.0, origin))
             .then_with(|| b.1.total_cmp(&a.1))
             .then_with(|| a.0.cmp(&b.0))
     });
-    for (idx, _) in scored {
+    for candidate in scored {
         if chosen.len() >= max_neighbors {
             break;
         }
-        if !chosen.contains(&idx) {
-            chosen.push(idx);
+        if !chosen.iter().any(|(idx, _)| *idx == candidate.0) {
+            chosen.push(candidate);
         }
     }
-    chosen.sort_unstable();
+    chosen.sort_unstable_by_key(|(idx, _)| *idx);
     chosen
 }
 

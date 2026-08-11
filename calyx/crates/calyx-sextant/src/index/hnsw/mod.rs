@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use calyx_aster::gc::{AnnIndexGraph, AnnTombstoneStats};
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
-use super::quant_config::{PackedQuery, PackedVector, score_packed};
+use super::quant_config::{PackedQuery, PackedVector, l2_norm, score_packed};
 use super::{IndexSearchHit, IndexStats, QuantConfig, SextantIndex, ranked};
 use crate::error::{
     CALYX_SEXTANT_DIM_MISMATCH, CALYX_SEXTANT_EF_TOO_SMALL, CALYX_SEXTANT_INDEX_EMPTY,
@@ -41,6 +41,9 @@ struct Row {
     seq: u64,
     level: u8,
     neighbors: Vec<usize>,
+    /// Ephemeral scores aligned one-for-one with `neighbors`. They are derived
+    /// construction state and are deliberately excluded from artifact bytes.
+    neighbor_scores: Vec<f32>,
     deleted: bool,
 }
 
@@ -57,6 +60,8 @@ pub struct HnswIndex {
     quant: QuantConfig,
     built_at_seq: u64,
     base_seq: u64,
+    /// Reused only while reconstructing a packed row as a construction query.
+    construction_scratch: Vec<f32>,
 }
 
 impl HnswIndex {
@@ -73,6 +78,7 @@ impl HnswIndex {
             quant: QuantConfig::none(),
             built_at_seq: 0,
             base_seq: 0,
+            construction_scratch: Vec::new(),
         }
     }
 
@@ -250,6 +256,32 @@ impl HnswIndex {
         }
     }
 
+    /// Builds the same query as `construction_query` while retaining one
+    /// bounded f32 allocation across packed-row graph construction.
+    pub(super) fn reusable_construction_query(&mut self, index: usize) -> Result<PackedQuery> {
+        let mut values = std::mem::take(&mut self.construction_scratch);
+        values.clear();
+        match &self.rows[index].stored {
+            PackedVector::F32 { values: stored } => values.extend_from_slice(stored),
+            PackedVector::Scalar8 { codes, scale, .. } => {
+                values.extend(codes.iter().map(|code| f32::from(*code as i8) * *scale))
+            }
+            PackedVector::Binary { .. } | PackedVector::TurboQuant { .. } => {
+                self.construction_scratch = values;
+                return self.construction_query(index);
+            }
+        }
+        let norm = l2_norm(&values);
+        Ok(PackedQuery::F32 { values, norm })
+    }
+
+    pub(super) fn recycle_construction_query(&mut self, query: PackedQuery) {
+        if let PackedQuery::F32 { mut values, .. } = query {
+            values.clear();
+            self.construction_scratch = values;
+        }
+    }
+
     pub fn recall_at(&self, queries: &[Vec<f32>], k: usize, ef: usize) -> Result<f32> {
         if queries.is_empty() {
             return Ok(1.0);
@@ -421,6 +453,7 @@ impl SextantIndex for HnswIndex {
             seq,
             level,
             neighbors: Vec::new(),
+            neighbor_scores: Vec::new(),
             deleted: false,
         });
         self.positions.insert(cx_id, index);
@@ -514,7 +547,9 @@ impl SextantIndex for HnswIndex {
     fn rebuild(&mut self) -> Result<()> {
         for row in &mut self.rows {
             row.neighbors.clear();
+            row.neighbor_scores.clear();
         }
+        self.construction_scratch.clear();
         self.entry_point = None;
         for idx in 0..self.rows.len() {
             self.connect_new_row(idx)?;

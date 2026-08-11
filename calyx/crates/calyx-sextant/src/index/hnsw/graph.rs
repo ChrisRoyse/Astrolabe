@@ -4,9 +4,10 @@ use calyx_core::{CxId, Result};
 
 use super::HnswIndex;
 use super::scored::{
-    ScoredIndex, diversified_neighbors, score_better, sort_scored, top_k_indices, worst_position,
-    worst_scored,
+    ScoredIndex, diversified_neighbor_scores, score_better, sort_scored, top_k_indices,
+    worst_position, worst_scored,
 };
+use crate::error::{CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE, sextant_error};
 use crate::index::quant_config::PackedQuery;
 
 const EXACT_CONSTRUCTION_ROWS: usize = 4_096;
@@ -20,18 +21,18 @@ impl HnswIndex {
         if index == 0 {
             return Ok(());
         }
-        let query = self.construction_query(index)?;
-        let mut neighbors = self.construction_candidates(index, &query)?;
+        let query = self.reusable_construction_query(index)?;
+        let neighbors_result = self.construction_candidates(index, &query);
+        self.recycle_construction_query(query);
+        let mut neighbors = neighbors_result?;
         append_stride_neighbors(index, &mut neighbors);
         neighbors.sort_unstable();
         neighbors.dedup();
         self.rows[index].neighbors = neighbors.clone();
+        self.rows[index].neighbor_scores.clear();
         self.prune_neighbors(index)?;
         for neighbor in neighbors.drain(..) {
-            if !self.rows[neighbor].neighbors.contains(&index) {
-                self.rows[neighbor].neighbors.push(index);
-            }
-            self.prune_neighbors(neighbor)?;
+            self.add_reciprocal_neighbor(neighbor, index)?;
         }
         Ok(())
     }
@@ -108,19 +109,80 @@ impl HnswIndex {
     }
 
     fn prune_neighbors(&mut self, index: usize) -> Result<()> {
-        let query = self.construction_query(index)?;
-        let mut candidates = self.rows[index].neighbors.clone();
-        candidates.sort_unstable();
-        candidates.dedup();
-        candidates.retain(|neighbor| *neighbor != index && *neighbor < self.rows.len());
-        let scored = candidates
-            .into_iter()
-            .map(|neighbor| {
-                self.score_row(&query, neighbor)
-                    .map(|score| (neighbor, score))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.rows[index].neighbors = diversified_neighbors(scored, index, self.max_neighbors);
+        let cached = !self.rows[index].neighbor_scores.is_empty();
+        if cached {
+            self.validate_cached_neighbors(index)?;
+        }
+        let mut candidates = std::mem::take(&mut self.rows[index].neighbors);
+        let scores = std::mem::take(&mut self.rows[index].neighbor_scores);
+        let scored = if cached {
+            candidates.into_iter().zip(scores).collect()
+        } else {
+            candidates.sort_unstable();
+            candidates.dedup();
+            candidates.retain(|neighbor| *neighbor != index && *neighbor < self.rows.len());
+            let query = self.reusable_construction_query(index)?;
+            let scored_result = candidates
+                .into_iter()
+                .map(|neighbor| {
+                    self.score_row(&query, neighbor)
+                        .map(|score| (neighbor, score))
+                })
+                .collect::<Result<Vec<_>>>();
+            self.recycle_construction_query(query);
+            scored_result?
+        };
+        let selected = diversified_neighbor_scores(scored, index, self.max_neighbors);
+        self.rows[index].neighbors = selected.iter().map(|(neighbor, _)| *neighbor).collect();
+        self.rows[index].neighbor_scores = selected.into_iter().map(|(_, score)| score).collect();
+        Ok(())
+    }
+
+    fn add_reciprocal_neighbor(&mut self, origin: usize, candidate: usize) -> Result<()> {
+        if self.rows[origin].neighbors.contains(&candidate) {
+            return self.prune_neighbors(origin);
+        }
+        if self.rows[origin].neighbor_scores.is_empty() {
+            self.rows[origin].neighbors.push(candidate);
+            return self.prune_neighbors(origin);
+        }
+        self.validate_cached_neighbors(origin)?;
+        let query = self.reusable_construction_query(origin)?;
+        let score_result = self.score_row(&query, candidate);
+        self.recycle_construction_query(query);
+        let score = score_result?;
+        if !score.is_finite() {
+            return Err(sextant_error(
+                CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                format!(
+                    "HNSW reciprocal score is non-finite: origin={origin} candidate={candidate}"
+                ),
+            ));
+        }
+        self.rows[origin].neighbors.push(candidate);
+        self.rows[origin].neighbor_scores.push(score);
+        self.prune_neighbors(origin)
+    }
+
+    fn validate_cached_neighbors(&self, index: usize) -> Result<()> {
+        let row = &self.rows[index];
+        let aligned = row.neighbor_scores.len() == row.neighbors.len();
+        let canonical = row.neighbors.windows(2).all(|pair| pair[0] < pair[1])
+            && row
+                .neighbors
+                .iter()
+                .all(|neighbor| *neighbor != index && *neighbor < self.rows.len());
+        let finite = row.neighbor_scores.iter().all(|score| score.is_finite());
+        if !aligned || !canonical || !finite {
+            return Err(sextant_error(
+                CALYX_SEXTANT_HNSW_CONSTRUCTION_STATE,
+                format!(
+                    "HNSW construction-score cache invariant failed at row {index}: neighbors={} scores={} canonical={canonical} finite={finite}",
+                    row.neighbors.len(),
+                    row.neighbor_scores.len(),
+                ),
+            ));
+        }
         Ok(())
     }
 

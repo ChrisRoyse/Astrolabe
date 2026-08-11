@@ -656,7 +656,7 @@ fn pack_sign_bits(values: &[f32]) -> Vec<u8> {
     bits
 }
 
-fn l2_norm(values: &[f32]) -> f32 {
+pub(crate) fn l2_norm(values: &[f32]) -> f32 {
     values
         .iter()
         .map(|value| f64::from(*value) * f64::from(*value))
