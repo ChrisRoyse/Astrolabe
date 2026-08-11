@@ -324,7 +324,7 @@ fn scored_from_indices(
     query: &PackedQuery,
 ) -> Result<Vec<(usize, f32)>> {
     candidates
-        .iter()
+        .par_iter()
         .copied()
         .map(|idx| index.score_row(query, idx).map(|score| (idx, score)))
         .collect()
