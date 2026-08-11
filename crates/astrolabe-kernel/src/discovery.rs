@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// Schema for the prepared, evaluator-independent discovery generation.
-pub const DISCOVERY_PREPARED_SCHEMA: &str = "astrolabe.association_discovery.prepared.v1";
+pub const DISCOVERY_PREPARED_SCHEMA: &str = "astrolabe.association_discovery.prepared.v2";
 /// Schema for the finalized reasoning generation.
 pub const DISCOVERY_FINAL_SCHEMA: &str = "astrolabe.association_discovery.final.v1";
 /// Refusal raised for incomplete or internally inconsistent source state.
@@ -179,6 +179,19 @@ impl Default for AssociationDiscoveryConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedConcept {
     pub cx_id: CxId,
+    /// Hash of kind, language, qualified-name tokens, and signature/shape only.
+    /// It is retained separately so lexical equivalence never silently merges
+    /// concepts whose measured graph contexts differ.
+    pub lexical_key: String,
+    /// Hash of every incident typed association in canonical evidence order.
+    pub association_signature_sha256: String,
+    /// Exact count of incident typed evidence rows. A self-edge counts once.
+    pub incident_typed_edge_count: u64,
+    /// Exact incident evidence counts by the source-declared association family.
+    pub association_family_counts: BTreeMap<String, u64>,
+    /// Contextual normalization over both `lexical_key` and the measured
+    /// `association_signature_sha256`. This remains an additional identity;
+    /// `cx_id` is never replaced or merged.
     pub normalized_key: String,
     pub tokens: Vec<String>,
     pub symbol_kind: String,
@@ -268,16 +281,60 @@ pub struct ValidationFold {
     pub future_excluded_pair_count: usize,
     pub training_leakage_pair_count: usize,
     pub predicted_pair_count: usize,
+    /// Complete evaluation universe: every predicted pair plus each held-out
+    /// pair absent from the candidate set.
+    pub evaluation_pair_count: usize,
+    /// Exact number of ranked candidates admitted by the declared top-K cutoff.
+    pub top_k_evaluated_count: usize,
+    /// Exact held-out positives present anywhere in the produced candidate set.
+    pub held_out_candidate_count: usize,
     pub hits_at_k: usize,
+    pub false_positives_at_k: usize,
+    pub false_negatives_at_k: usize,
     pub precision_at_k: f64,
     pub recall_at_k: f64,
     pub reciprocal_rank: f64,
-    pub coverage: f64,
-    pub brier_score: Option<f64>,
+    /// Fraction of the produced candidate ranking inspected by top-K.
+    pub candidate_coverage_at_k: f64,
+    /// Fraction of held-out positive pairs present anywhere in the produced
+    /// candidate ranking, independently of the top-K cutoff.
+    pub held_out_candidate_coverage: f64,
+    /// Brier score of the explicit binary top-K decision policy over the full
+    /// evaluation universe. Resource Allocation remains a rank score and is
+    /// never relabeled as a probability.
+    pub binary_brier_at_k: Option<f64>,
+    pub no_skill_binary_brier: Option<f64>,
+    pub binary_brier_skill_at_k: Option<f64>,
+    pub rank_score_semantics: String,
     pub null_hits_at_k: usize,
     pub usable: bool,
     pub unusable_reason: Option<String>,
     pub validated_pair_ids: Vec<String>,
+}
+
+/// Cross-fold stability of one exactly named validation metric.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ValidationMetricStability {
+    pub sample_count: usize,
+    pub mean: f64,
+    pub population_stddev: f64,
+    pub minimum: f64,
+    pub maximum: f64,
+}
+
+/// Stability is separate from means so a volatile result cannot look like a
+/// stable one merely because its average is attractive.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrossValidationStability {
+    pub precision_at_k: Option<ValidationMetricStability>,
+    pub recall_at_k: Option<ValidationMetricStability>,
+    pub reciprocal_rank: Option<ValidationMetricStability>,
+    pub candidate_coverage_at_k: Option<ValidationMetricStability>,
+    pub held_out_candidate_coverage: Option<ValidationMetricStability>,
+    pub binary_brier_at_k: Option<ValidationMetricStability>,
+    pub no_skill_binary_brier: Option<ValidationMetricStability>,
+    pub binary_brier_skill_at_k: Option<ValidationMetricStability>,
+    pub null_hits_at_k: Option<ValidationMetricStability>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -288,8 +345,13 @@ pub struct CrossValidationReport {
     pub mean_precision_at_k: f64,
     pub mean_recall_at_k: f64,
     pub mean_reciprocal_rank: f64,
-    pub mean_coverage: f64,
+    pub mean_candidate_coverage_at_k: f64,
+    pub mean_held_out_candidate_coverage: f64,
+    pub mean_binary_brier_at_k: Option<f64>,
+    pub mean_no_skill_binary_brier: Option<f64>,
+    pub mean_binary_brier_skill_at_k: Option<f64>,
     pub mean_null_hits_at_k: f64,
+    pub stability: CrossValidationStability,
     pub validated_pair_ids: Vec<String>,
 }
 
@@ -405,7 +467,11 @@ pub fn prepare_association_discovery(
     validate_config(config)?;
     validate_input(input)?;
     let (pool, worker_pool_reused) = worker_pool(config.workers)?;
-    let normalized_concepts = normalize_concepts(&input.concepts);
+    // The typed edge sort is already required for canonical artifact bytes.
+    // Reuse that one order for association-aware normalization rather than
+    // building a second per-concept edge inventory (PC-04/PC-29, #1097).
+    let typed_edges = sorted_typed_edges(&input.typed_edges);
+    let normalized_concepts = normalize_concepts(&input.concepts, &typed_edges);
     let kernel_graph = kernel_graph(input)?;
     let indexed = kernel_graph.compile()?;
     let algorithm_graph = assoc_graph(input)?;
@@ -525,7 +591,7 @@ pub fn prepare_association_discovery(
         config: config.clone(),
         completeness: input.completeness.clone(),
         normalized_concepts,
-        typed_edges: sorted_typed_edges(&input.typed_edges),
+        typed_edges,
         algorithm_projection_edge_count: algorithm_graph.edge_count(),
         latent,
         spectral,
@@ -778,21 +844,109 @@ fn validate_input(input: &AssociationDiscoveryInput) -> Result<()> {
     Ok(())
 }
 
-fn normalize_concepts(concepts: &[DiscoveryConceptInput]) -> Vec<NormalizedConcept> {
+struct ConceptAssociationAccumulator {
+    digest: Sha256,
+    incident_typed_edge_count: u64,
+    association_family_counts: BTreeMap<String, u64>,
+}
+
+impl ConceptAssociationAccumulator {
+    fn new() -> Self {
+        let mut digest = Sha256::new();
+        update_framed_digest(&mut digest, b"astrolabe.concept_association_context.v1");
+        Self {
+            digest,
+            incident_typed_edge_count: 0,
+            association_family_counts: BTreeMap::new(),
+        }
+    }
+
+    fn observe(&mut self, edge: &DiscoveryTypedEdgeInput, role: &[u8], counterpart: CxId) {
+        update_framed_digest(&mut self.digest, role);
+        update_framed_digest(&mut self.digest, counterpart.as_bytes());
+        update_framed_digest(&mut self.digest, &edge.edge_type_code.to_be_bytes());
+        update_framed_digest(&mut self.digest, edge.edge_type_name.as_bytes());
+        update_framed_digest(&mut self.digest, edge.family.as_bytes());
+        update_framed_digest(&mut self.digest, &edge.weight.to_bits().to_be_bytes());
+        update_framed_digest(&mut self.digest, edge.trust.as_str().as_bytes());
+        match &edge.temporal_direction {
+            Some(direction) => {
+                update_framed_digest(&mut self.digest, b"temporal_direction:present");
+                update_framed_digest(&mut self.digest, direction.as_bytes());
+            }
+            None => update_framed_digest(&mut self.digest, b"temporal_direction:absent"),
+        }
+        match edge.observed_at_millis {
+            Some(observed_at_millis) => {
+                update_framed_digest(&mut self.digest, b"observed_at:present");
+                update_framed_digest(&mut self.digest, &observed_at_millis.to_be_bytes());
+            }
+            None => update_framed_digest(&mut self.digest, b"observed_at:absent"),
+        }
+        self.incident_typed_edge_count += 1;
+        *self
+            .association_family_counts
+            .entry(edge.family.clone())
+            .or_default() += 1;
+    }
+}
+
+fn normalize_concepts(
+    concepts: &[DiscoveryConceptInput],
+    typed_edges: &[DiscoveryTypedEdgeInput],
+) -> Vec<NormalizedConcept> {
+    let mut association_context = concepts
+        .iter()
+        .map(|concept| (concept.cx_id, ConceptAssociationAccumulator::new()))
+        .collect::<BTreeMap<_, _>>();
+    for edge in typed_edges {
+        if edge.src == edge.dst {
+            association_context
+                .get_mut(&edge.src)
+                .expect("validated typed-edge source")
+                .observe(edge, b"self", edge.src);
+        } else {
+            association_context
+                .get_mut(&edge.src)
+                .expect("validated typed-edge source")
+                .observe(edge, b"outgoing", edge.dst);
+            association_context
+                .get_mut(&edge.dst)
+                .expect("validated typed-edge destination")
+                .observe(edge, b"incoming", edge.src);
+        }
+    }
     let mut normalized = concepts
         .iter()
         .map(|concept| {
             let tokens = concept_tokens(&concept.qualified_name);
-            let preimage = format!(
+            let lexical_preimage = format!(
                 "{}\0{}\0{}\0{}",
                 concept.symbol_kind.to_lowercase(),
                 concept.language.to_lowercase(),
                 tokens.join("\u{1f}"),
                 concept.signature_or_shape.trim().to_lowercase()
             );
+            let lexical_key = sha256_hex(lexical_preimage.as_bytes());
+            let association = association_context
+                .remove(&concept.cx_id)
+                .expect("every validated concept has an association accumulator");
+            let association_digest = association.digest.finalize();
+            let association_signature_sha256 = digest_hex(&association_digest);
+            let mut contextual = Sha256::new();
+            update_framed_digest(
+                &mut contextual,
+                b"astrolabe.contextual_concept_normalization.v2",
+            );
+            update_framed_digest(&mut contextual, lexical_key.as_bytes());
+            update_framed_digest(&mut contextual, association_signature_sha256.as_bytes());
             NormalizedConcept {
                 cx_id: concept.cx_id,
-                normalized_key: sha256_hex(preimage.as_bytes()),
+                lexical_key,
+                association_signature_sha256,
+                incident_typed_edge_count: association.incident_typed_edge_count,
+                association_family_counts: association.association_family_counts,
+                normalized_key: digest_hex(&contextual.finalize()),
                 tokens,
                 symbol_kind: concept.symbol_kind.clone(),
                 language: concept.language.clone(),
@@ -1274,30 +1428,124 @@ fn cross_validate(
     });
     let folds = collect_domain_results(folds)?;
     let usable = folds.iter().filter(|fold| fold.usable).collect::<Vec<_>>();
-    let denominator = usable.len().max(1) as f64;
     let mut validated = usable
         .iter()
         .flat_map(|fold| fold.validated_pair_ids.iter().cloned())
         .collect::<Vec<_>>();
     validated.sort();
     validated.dedup();
+    let precision_at_k = metric_stability(
+        "precision_at_k",
+        usable.iter().map(|fold| fold.precision_at_k),
+    )?;
+    let recall_at_k = metric_stability("recall_at_k", usable.iter().map(|fold| fold.recall_at_k))?;
+    let reciprocal_rank = metric_stability(
+        "reciprocal_rank",
+        usable.iter().map(|fold| fold.reciprocal_rank),
+    )?;
+    let candidate_coverage_at_k = metric_stability(
+        "candidate_coverage_at_k",
+        usable.iter().map(|fold| fold.candidate_coverage_at_k),
+    )?;
+    let held_out_candidate_coverage = metric_stability(
+        "held_out_candidate_coverage",
+        usable.iter().map(|fold| fold.held_out_candidate_coverage),
+    )?;
+    let binary_brier_at_k = metric_stability(
+        "binary_brier_at_k",
+        usable.iter().filter_map(|fold| fold.binary_brier_at_k),
+    )?;
+    let no_skill_binary_brier = metric_stability(
+        "no_skill_binary_brier",
+        usable.iter().filter_map(|fold| fold.no_skill_binary_brier),
+    )?;
+    let binary_brier_skill_at_k = metric_stability(
+        "binary_brier_skill_at_k",
+        usable
+            .iter()
+            .filter_map(|fold| fold.binary_brier_skill_at_k),
+    )?;
+    let null_hits_at_k = metric_stability(
+        "null_hits_at_k",
+        usable.iter().map(|fold| fold.null_hits_at_k as f64),
+    )?;
+    let mean_precision_at_k = precision_at_k.as_ref().map_or(0.0, |row| row.mean);
+    let mean_recall_at_k = recall_at_k.as_ref().map_or(0.0, |row| row.mean);
+    let mean_reciprocal_rank = reciprocal_rank.as_ref().map_or(0.0, |row| row.mean);
+    let mean_candidate_coverage_at_k = candidate_coverage_at_k.as_ref().map_or(0.0, |row| row.mean);
+    let mean_held_out_candidate_coverage = held_out_candidate_coverage
+        .as_ref()
+        .map_or(0.0, |row| row.mean);
+    let mean_binary_brier_at_k = binary_brier_at_k.as_ref().map(|row| row.mean);
+    let mean_no_skill_binary_brier = no_skill_binary_brier.as_ref().map(|row| row.mean);
+    let mean_binary_brier_skill_at_k = binary_brier_skill_at_k.as_ref().map(|row| row.mean);
+    let mean_null_hits_at_k = null_hits_at_k.as_ref().map_or(0.0, |row| row.mean);
     Ok(CrossValidationReport {
         split_kind: plan.split_kind.to_string(),
         usable_fold_count: usable.len(),
-        mean_precision_at_k: usable.iter().map(|fold| fold.precision_at_k).sum::<f64>()
-            / denominator,
-        mean_recall_at_k: usable.iter().map(|fold| fold.recall_at_k).sum::<f64>() / denominator,
-        mean_reciprocal_rank: usable.iter().map(|fold| fold.reciprocal_rank).sum::<f64>()
-            / denominator,
-        mean_coverage: usable.iter().map(|fold| fold.coverage).sum::<f64>() / denominator,
-        mean_null_hits_at_k: usable
-            .iter()
-            .map(|fold| fold.null_hits_at_k as f64)
-            .sum::<f64>()
-            / denominator,
+        mean_precision_at_k,
+        mean_recall_at_k,
+        mean_reciprocal_rank,
+        mean_candidate_coverage_at_k,
+        mean_held_out_candidate_coverage,
+        mean_binary_brier_at_k,
+        mean_no_skill_binary_brier,
+        mean_binary_brier_skill_at_k,
+        mean_null_hits_at_k,
+        stability: CrossValidationStability {
+            precision_at_k,
+            recall_at_k,
+            reciprocal_rank,
+            candidate_coverage_at_k,
+            held_out_candidate_coverage,
+            binary_brier_at_k,
+            no_skill_binary_brier,
+            binary_brier_skill_at_k,
+            null_hits_at_k,
+        },
         folds,
         validated_pair_ids: validated,
     })
+}
+
+fn metric_stability(
+    name: &str,
+    values: impl IntoIterator<Item = f64>,
+) -> Result<Option<ValidationMetricStability>> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return invalid_graph(format!(
+            "cross-validation metric {name} contains a non-finite fold value"
+        ));
+    }
+    let sample_count = values.len();
+    let mean = values.iter().sum::<f64>() / sample_count as f64;
+    let population_stddev = (values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / sample_count as f64)
+        .sqrt();
+    let minimum = values
+        .iter()
+        .copied()
+        .min_by(f64::total_cmp)
+        .expect("non-empty validation metric");
+    let maximum = values
+        .iter()
+        .copied()
+        .max_by(f64::total_cmp)
+        .expect("non-empty validation metric");
+    Ok(Some(ValidationMetricStability {
+        sample_count,
+        mean,
+        population_stddev,
+        minimum,
+        maximum,
+    }))
 }
 
 #[derive(Debug)]
@@ -1437,12 +1685,22 @@ fn validation_fold(
             future_excluded_pair_count: plan.future_excluded_pairs.len(),
             training_leakage_pair_count: 0,
             predicted_pair_count: 0,
+            evaluation_pair_count: 0,
+            top_k_evaluated_count: 0,
+            held_out_candidate_count: 0,
             hits_at_k: 0,
+            false_positives_at_k: 0,
+            false_negatives_at_k: 0,
             precision_at_k: 0.0,
             recall_at_k: 0.0,
             reciprocal_rank: 0.0,
-            coverage: 0.0,
-            brier_score: None,
+            candidate_coverage_at_k: 0.0,
+            held_out_candidate_coverage: 0.0,
+            binary_brier_at_k: None,
+            no_skill_binary_brier: None,
+            binary_brier_skill_at_k: None,
+            rank_score_semantics: "resource_allocation_rank_score_not_a_calibrated_probability"
+                .to_string(),
             null_hits_at_k: 0,
             usable: false,
             unusable_reason: Some("fold has no held-out pairs or no training edges".to_string()),
@@ -1485,26 +1743,30 @@ fn validation_fold(
         .position(|(pair, _)| plan.held_out_pairs.contains(pair))
         .map(|index| 1.0 / (index + 1) as f64)
         .unwrap_or(0.0);
-    let maximum = ranked
+    let held_out_candidates = predicted
         .iter()
-        .map(|(_, score)| *score)
-        .max()
-        .unwrap_or(1)
-        .max(1) as f64;
-    let brier = if ranked.is_empty() {
-        None
-    } else {
+        .filter(|(pair, _)| plan.held_out_pairs.contains(pair))
+        .count();
+    let false_positives_at_k = k.saturating_sub(hits);
+    let false_negatives_at_k = plan.held_out_pairs.len().saturating_sub(hits);
+    let evaluation_pair_count = predicted.len().saturating_add(
+        plan.held_out_pairs
+            .len()
+            .saturating_sub(held_out_candidates),
+    );
+    let binary_brier_at_k = Some(
+        (false_positives_at_k + false_negatives_at_k) as f64 / evaluation_pair_count.max(1) as f64,
+    );
+    let prevalence = plan.held_out_pairs.len() as f64 / evaluation_pair_count.max(1) as f64;
+    let no_skill_binary_brier = Some(prevalence * (1.0 - prevalence));
+    let binary_brier_skill_at_k = if no_skill_binary_brier.is_some_and(|score| score > f64::EPSILON)
+    {
         Some(
-            ranked
-                .iter()
-                .map(|(pair, score)| {
-                    let probability = *score as f64 / maximum;
-                    let outcome = f64::from(plan.held_out_pairs.contains(pair));
-                    (probability - outcome).powi(2)
-                })
-                .sum::<f64>()
-                / ranked.len() as f64,
+            1.0 - binary_brier_at_k.expect("defined evaluation universe")
+                / no_skill_binary_brier.expect("positive no-skill Brier"),
         )
+    } else {
+        None
     };
     let mut permuted = predicted.clone();
     permuted.sort_by_key(|(pair, _)| sha256_hex(pair_id(pair.0, pair.1).as_bytes()));
@@ -1528,12 +1790,22 @@ fn validation_fold(
         future_excluded_pair_count: plan.future_excluded_pairs.len(),
         training_leakage_pair_count: leakage,
         predicted_pair_count: predicted.len(),
+        evaluation_pair_count,
+        top_k_evaluated_count: k,
+        held_out_candidate_count: held_out_candidates,
         hits_at_k: hits,
+        false_positives_at_k,
+        false_negatives_at_k,
         precision_at_k: hits as f64 / k.max(1) as f64,
         recall_at_k: hits as f64 / plan.held_out_pairs.len() as f64,
         reciprocal_rank,
-        coverage: k as f64 / predicted.len().max(1) as f64,
-        brier_score: brier,
+        candidate_coverage_at_k: k as f64 / predicted.len().max(1) as f64,
+        held_out_candidate_coverage: held_out_candidates as f64 / plan.held_out_pairs.len() as f64,
+        binary_brier_at_k,
+        no_skill_binary_brier,
+        binary_brier_skill_at_k,
+        rank_score_semantics: "resource_allocation_rank_score_not_a_calibrated_probability"
+            .to_string(),
         null_hits_at_k: null_hits,
         usable: true,
         unusable_reason: None,
@@ -1715,10 +1987,6 @@ fn deterministic_pair_fold(
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) as usize % fold_count
 }
 
-fn direct_pairs(edges: &[DiscoveryTypedEdgeInput]) -> BTreeSet<(CxId, CxId)> {
-    direct_pairs_iter(edges.iter())
-}
-
 fn direct_pairs_iter<'a>(
     edges: impl IntoIterator<Item = &'a DiscoveryTypedEdgeInput>,
 ) -> BTreeSet<(CxId, CxId)> {
@@ -1757,14 +2025,22 @@ fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
+fn update_framed_digest(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         use std::fmt::Write;
         write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
     }
     out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    digest_hex(&Sha256::digest(bytes))
 }
 
 fn incomplete<T>(message: impl Into<String>) -> Result<T> {

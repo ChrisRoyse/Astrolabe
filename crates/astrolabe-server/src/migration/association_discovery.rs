@@ -7,7 +7,7 @@ use std::path::Path;
 use astrolabe_domain::{EdgeKind, TrustTag};
 use astrolabe_kernel::{
     AssociationCompletenessWitness, AssociationDiscoveryConfig, AssociationDiscoveryInput,
-    DiscoveryConceptInput, DiscoveryTypedEdgeInput, EvaluatorRun,
+    DISCOVERY_PREPARED_SCHEMA, DiscoveryConceptInput, DiscoveryTypedEdgeInput, EvaluatorRun,
     FinalAssociationDiscoveryEnvelope, PreparedAssociationDiscoveryEnvelope,
     finalize_association_discovery, prepare_association_discovery,
 };
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-const DISCOVERY_TOOL_SCHEMA: &str = "astrolabe.discover_associations.v1";
+const DISCOVERY_TOOL_SCHEMA: &str = "astrolabe.discover_associations.v2";
 const DISCOVERY_PERSISTED_SCHEMA: &str = "astrolabe.association_discovery.persisted.v1";
 const DISCOVERY_COMPACT_HEADER_SCHEMA: &str = "astrolabe.association_discovery.compact_header.v1";
 const DISCOVERY_CHUNK_DESCRIPTOR_SCHEMA: &str =
@@ -1375,6 +1375,10 @@ fn prepared_request_key(
     config: &AssociationDiscoveryConfig,
 ) -> Result<Vec<u8>, DynError> {
     let mut preimage = Vec::new();
+    // Schema is a transitive input to every serialized stage. Binding it here
+    // prevents a semantically obsolete prepared generation from satisfying a
+    // newer request merely because source/config bytes are unchanged (PC-15).
+    frame_local(&mut preimage, DISCOVERY_PREPARED_SCHEMA.as_bytes());
     frame_local(&mut preimage, project.as_bytes());
     frame_local(&mut preimage, source_generation_sha256.as_bytes());
     frame_local(&mut preimage, &serde_json::to_vec(config)?);

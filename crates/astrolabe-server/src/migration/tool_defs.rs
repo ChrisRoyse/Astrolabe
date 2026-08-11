@@ -28,7 +28,7 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 24] {
         anchor_erase_tool_definition(),
         // #1009: L5 latent (indirect) associations.
         discover_latent_links_tool_definition(),
-        // #1012: composed grounded association discovery generation.
+        // #1012/#1097: composed, association-contextualized discovery generation.
         discover_associations_tool_definition(),
     ]
 }
@@ -37,7 +37,7 @@ pub(crate) fn discover_associations_tool_definition() -> Value {
     json!({
         "name": "discover_associations",
         "title": "Discover Grounded Associations",
-        "description": "Runs Astrolabe's complete retained-generation discovery pipeline: deterministic concept normalization without identity merging; the full typed structural/semantic/temporal relationship multigraph; Swanson corpus mining with Resource Allocation, Adamic-Adar, direct-link exclusion and disclosed hub gates; sparse spectral community and cross-community bridge measurement; bounded cycle-safe typed multi-hop walks; citation-bound independent AI evaluation; leakage-free grouped held-out validation with precision/recall/MRR/calibration/null evidence; and a separately fingerprinted compact reasoning kernel. prepare persists exact provisional candidate/evidence stages. publish requires independent evaluator receipts tied to that physical hash and atomically publishes every Assay/Kernel stage plus a ledger record. read independently decodes and hashes the physical generation. No stage silently falls back or reconstructs per query.",
+        "description": "Runs Astrolabe's complete retained-generation discovery pipeline: deterministic concept normalization contextualized by every incident typed association without identity merging; the full typed structural/semantic/temporal relationship multigraph; Swanson corpus mining with Resource Allocation, Adamic-Adar, direct-link exclusion and disclosed hub gates; sparse spectral community and cross-community bridge measurement; bounded cycle-safe typed multi-hop walks; citation-bound independent AI evaluation; leakage-free grouped held-out validation with precision/recall/MRR, separate candidate and held-out coverage, complete-universe binary Brier@K, cross-fold stability, and null evidence; and a separately fingerprinted compact reasoning kernel. Resource Allocation is disclosed as an uncalibrated rank score, never a probability. prepare persists exact provisional candidate/evidence stages. publish requires independent evaluator receipts tied to that physical hash and atomically publishes every Assay/Kernel stage plus a ledger record. read independently decodes and hashes the physical generation. No stage silently falls back or reconstructs per query.",
         "inputSchema": {
             "type": "object",
             "properties": {
