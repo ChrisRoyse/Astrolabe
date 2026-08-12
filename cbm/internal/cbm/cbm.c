@@ -1153,8 +1153,13 @@ CBMExtractionOutcomeClass cbm_extraction_outcome_classify(const char *code) {
         return CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL;
     }
 
+    /* This is deliberately an allowlist of errors whose producer is bound to
+     * one file's bytes (or to that file's explicit parse budget).  Codes that
+     * report an AST/span/router contract, missing typed child, or unclassified
+     * producer are infrastructure-fatal by default.  Do not add a code here
+     * merely because its name sounds source-like: first make every producer
+     * carry the same provenance class, splitting mixed codes when necessary. */
     static const char *const exact_content_codes[] = {
-        "CBM_LANGUAGE_UNSUPPORTED",
         "CBM_PARSE_TOTAL_BUDGET_EXCEEDED",
         "CBM_PARSE_PROGRESS_STALLED",
         "CBM_PARSE_FINAL_BALANCE_TIMEOUT",
@@ -1162,7 +1167,6 @@ CBMExtractionOutcomeClass cbm_extraction_outcome_classify(const char *code) {
         "CBM_BASH_SOURCE_ARGUMENT_INVALID",
         "CBM_JSON_PARSE_INVALID",
         "CBM_JSON_SCHEMA_KEY_INVALID",
-        "CBM_RUST_RAW_IDENTIFIER_INVALID",
         "CBM_RUST_PATH_ATTRIBUTE_LITERAL_INVALID",
         "CBM_RUST_PATH_ATTRIBUTE_VALUE_MISSING",
         "CBM_RUST_PATH_ATTRIBUTE_DUPLICATE",
@@ -1171,24 +1175,19 @@ CBMExtractionOutcomeClass cbm_extraction_outcome_classify(const char *code) {
         "CBM_RUST_MACRO_TOKEN_INVALID",
         "CBM_RUST_MACRO_DUPLICATE_BINDING",
         "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
-        "CBM_RUST_MACRO_EDITION_UNKNOWN",
         "CBM_RUST_MACRO_FRAGMENT_UNSUPPORTED",
         "CBM_RUST_MACRO_LOCAL_AMBIGUITY",
         "CBM_RUST_MACRO_TRANSCRIBER_UNSUPPORTED",
         "CBM_RUST_MACRO_UNBOUND_METAVARIABLE",
-        "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISSING",
         "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISMATCH",
-        "CBM_RUST_MACRO_TRANSCRIBER_INVALID",
         "CBM_RUST_MACRO_REPETITION_WITHOUT_DRIVER",
         "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
-        "CBM_RUST_MACRO_INVOCATION_INVALID",
         "CBM_RUST_MACRO_FRAGMENT_INVALID",
         "CBM_RUST_MACRO_NO_MATCH",
         "CBM_RUST_MACRO_RECURSION_CYCLE",
         "CBM_RUST_MACRO_EXPANSION_INVALID",
         "CBM_RUST_KNOWN_MACRO_FORM_UNSUPPORTED",
         "CBM_RUST_KNOWN_MACRO_EXPRESSION_INVALID",
-        "CBM_RUST_KNOWN_MACRO_INVOCATION_INVALID",
     };
     for (size_t i = 0; i < sizeof(exact_content_codes) / sizeof(exact_content_codes[0]); i++) {
         if (strcmp(code, exact_content_codes[i]) == 0) {

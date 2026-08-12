@@ -2981,7 +2981,7 @@ static bool macro_scan_doc_comment(RustLSPContext *ctx, const char *source, size
     if (!ctx || !source || !content_start || !content_end || !comment_end ||
         kind == MACRO_DOC_COMMENT_NONE) {
         if (ctx) {
-            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_INVALID",
+            cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_CONTRACT_INVALID",
                                   "rust_lsp_macro_doc_comment_arguments", start);
         }
         return false;
@@ -3575,7 +3575,7 @@ static bool macro_lex_list(RustLSPContext *ctx, const char *source, size_t len, 
         } else {
             size_t end = macro_scan_leaf(source, len, start);
             if (end <= start || end > len) {
-                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_INVALID",
+                cbm_arena_mark_failed(ctx->arena, "CBM_RUST_MACRO_TOKEN_CONTRACT_INVALID",
                                       "rust_lsp_macro_leaf", start);
                 return false;
             }
@@ -7051,8 +7051,8 @@ static bool rust_resolve_known_macro_expr(RustLSPContext *ctx, const RustKnownMa
         }
     }
     if (ts_node_is_null(body)) {
-        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_KNOWN_MACRO_EXPRESSION_INVALID", operation,
-                              expr_len);
+        cbm_arena_mark_failed(ctx->arena, "CBM_RUST_KNOWN_MACRO_EXPRESSION_AST_INVALID",
+                              operation, expr_len);
         ts_tree_delete(tree);
         ts_parser_delete(parser);
         return false;
