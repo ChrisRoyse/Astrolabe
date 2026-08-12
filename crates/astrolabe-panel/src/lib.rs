@@ -61,6 +61,8 @@ pub const PANEL_SCHEMA_ID_V2: &str = "astro.panel.v2";
 pub const PANEL_SCHEMA_ID_V3: &str = "astro.panel.v3";
 /// Panel schema id emitted by the v4 semantic-input-bound roster.
 pub const PANEL_SCHEMA_ID_V4: &str = "astro.panel.v4";
+/// Panel schema id emitted by the v5 content-defect-complete semantic roster.
+pub const PANEL_SCHEMA_ID_V5: &str = "astro.panel.v5";
 /// First Astrolabe panel version.
 pub const DEFAULT_PANEL_VERSION: u32 = 1;
 /// Second Astrolabe panel version — adds the S23 `layer_role` frozen slot (#180a).
@@ -69,8 +71,10 @@ pub const PANEL_V2_VERSION: u32 = 2;
 pub const PANEL_V3_VERSION: u32 = 3;
 /// Fourth Astrolabe panel version — binds every measured node semantic input into CxId.
 pub const PANEL_V4_VERSION: u32 = 4;
+/// Fifth Astrolabe panel version — typed content-defect atom coverage.
+pub const PANEL_V5_VERSION: u32 = 5;
 /// Current exhaustive code-memory panel version.
-pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V4_VERSION;
+pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V5_VERSION;
 /// Frozen seed registry schema identifier.
 pub const ASTRO_SEED_REGISTRY_SCHEMA: &str = "astro.seed_registry.v1";
 /// Frozen seed registry artifact kind.
@@ -257,9 +261,16 @@ impl FrozenLensContract {
     /// concrete vector for its frozen probe fixture, rather than minting a bogus
     /// identity that omits the math.
     pub fn for_slot(slot: &PanelSlotSpec) -> PanelResult<Self> {
+        Self::for_slot_version(slot, CURRENT_SEMANTIC_PANEL_VERSION)
+    }
+
+    /// Creates a frozen contract using the registry identity of one exact panel
+    /// version. This keeps historical manifests reproducible after append-only
+    /// semantic schema evolution.
+    pub fn for_slot_version(slot: &PanelSlotSpec, version: u32) -> PanelResult<Self> {
         let shape = shape_fingerprint(slot.shape);
         let weights_sha = if slot.slot >= semantic::SEMANTIC_SLOT_START {
-            semantic::semantic_weights_identity(slot.slot_id())?
+            semantic::semantic_weights_identity_for_panel(slot.slot_id(), version)?
         } else if matches!(slot.slot, 18 | 19 | 20 | 22) {
             nomic_weights_identity()
         } else {
@@ -797,7 +808,7 @@ pub static PANEL_V2_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
 /// registry. Existing S0-S23 specs and lens identities remain byte-identical.
 pub static PANEL_V3_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
     let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
-    slots.extend(semantic::SEMANTIC_SLOT_SPECS.iter().copied());
+    slots.extend(semantic::SEMANTIC_SLOT_SPECS_V4.iter().copied());
     slots
 });
 
@@ -807,6 +818,14 @@ pub static PANEL_V3_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
 /// is bound into CxId.
 pub static PANEL_V4_SLOTS: LazyLock<Vec<PanelSlotSpec>> =
     LazyLock::new(|| PANEL_V3_SLOTS.iter().copied().collect());
+
+/// Frozen v5 slot roster. Existing physical slot specifications stay
+/// byte-identical; S186-S195 add exact content-defect measurements.
+pub static PANEL_V5_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
+    slots.extend(semantic::SEMANTIC_SLOT_SPECS.iter().copied());
+    slots
+});
 
 /// Returns the frozen v1 slot roster.
 pub fn default_panel_slots() -> &'static [PanelSlotSpec] {
@@ -828,6 +847,11 @@ pub fn default_panel_v4_slots() -> &'static [PanelSlotSpec] {
     &PANEL_V4_SLOTS
 }
 
+/// Returns the frozen v5 roster including typed content-defect atoms.
+pub fn default_panel_v5_slots() -> &'static [PanelSlotSpec] {
+    &PANEL_V5_SLOTS
+}
+
 /// Returns the frozen slot roster for a panel roster version.
 ///
 /// Fails closed for a version that has no frozen roster rather than silently
@@ -838,10 +862,11 @@ pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> 
         PANEL_V2_VERSION => Ok(&PANEL_V2_SLOTS),
         PANEL_V3_VERSION => Ok(&PANEL_V3_SLOTS),
         PANEL_V4_VERSION => Ok(&PANEL_V4_SLOTS),
+        PANEL_V5_VERSION => Ok(&PANEL_V5_SLOTS),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen slot roster"),
-            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 (S0-S185), or 4 (S0-S185 with semantic-input-bound identity).",
+            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 or 4 (S0-S185), or 5 (S0-S195 with typed content-defect atoms).",
         )),
     }
 }
@@ -853,10 +878,11 @@ pub fn schema_id_for_version(version: u32) -> PanelResult<&'static str> {
         PANEL_V2_VERSION => Ok(PANEL_SCHEMA_ID_V2),
         PANEL_V3_VERSION => Ok(PANEL_SCHEMA_ID_V3),
         PANEL_V4_VERSION => Ok(PANEL_SCHEMA_ID_V4),
+        PANEL_V5_VERSION => Ok(PANEL_SCHEMA_ID_V5),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen schema id"),
-            "Measure with panel version 1, 2, 3, or 4.",
+            "Measure with panel version 1, 2, 3, 4, or 5.",
         )),
     }
 }
@@ -907,7 +933,7 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
                 u8::from(spec.guard_raw),
             ],
         );
-        let lens_id = FrozenLensContract::for_slot(spec)?.lens_id();
+        let lens_id = FrozenLensContract::for_slot_version(spec, version)?.lens_id();
         append_part(&mut bytes, lens_id.as_bytes());
     }
     Ok(sha256_digest(&[&bytes]))
@@ -916,9 +942,9 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
 /// Returns a slot specification by id, searching the current superset roster.
 ///
 /// Older rosters are byte-identical prefixes, so their consumers see the same
-/// answer while v3 semantic slots additionally resolve.
+/// physical slot specification while later semantic slots additionally resolve.
 pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
-    PANEL_V4_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
+    PANEL_V5_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
 }
 
 /// Returns the default frozen contracts for every v1 slot.
@@ -1254,13 +1280,13 @@ fn absent_reason_label(reason: &AbsentReason) -> String {
     }
 }
 
-/// Returns a slot specification by its stable key, searching the v2 superset roster.
+/// Returns a slot specification by its stable key, searching the current superset roster.
 ///
 /// The lens capability gate (`astrolabe-assay`, #35) reaches verdicts in lens-name
 /// space; this bridges a gated lens key to its frozen [`SlotId`] so a per-repo
 /// admission set can be applied to a readout without touching the frozen roster.
 pub fn slot_spec_by_key(key: &str) -> Option<&'static PanelSlotSpec> {
-    PANEL_V4_SLOTS.iter().find(|slot| slot.key == key)
+    PANEL_V5_SLOTS.iter().find(|slot| slot.key == key)
 }
 
 impl PanelReadout {
@@ -1347,6 +1373,16 @@ fn validate_semantic_panel_input(version: u32, input: &PanelInput) -> PanelResul
         ));
     };
     for (slot_id, value) in &input.semantic_values {
+        if !slots_for_version(version)?
+            .iter()
+            .any(|slot| slot.slot_id() == *slot_id)
+        {
+            return Err(PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                format!("semantic input slot {slot_id} is absent from panel version {version}"),
+                "Use the panel version that commissioned this typed semantic atom.",
+            ));
+        }
         let rule = semantic::semantic_rule_by_slot(*slot_id).ok_or_else(|| {
             PanelError::new(
                 ASTRO_PANEL_CONTRACT_INVALID,
@@ -1523,7 +1559,8 @@ impl PanelDriver {
                 slots.insert(*slot_id, vector);
                 summary.measured += 1;
             }
-            let family_rules = semantic::semantic_rule_count_for_family(family);
+            let family_rules =
+                semantic::semantic_rule_count_for_family_version(family, self.version);
             summary.semantic_not_present = family_rules
                 .checked_sub(input.semantic_values.len())
                 .ok_or_else(|| {

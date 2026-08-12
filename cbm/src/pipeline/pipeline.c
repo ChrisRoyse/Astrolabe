@@ -1723,7 +1723,7 @@ static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_
     char *props = (char *)malloc(props_capacity);
     int props_length = props ? snprintf(
                                   props, props_capacity,
-                                  "{\"outcome_class\":\"content_defect\",\"code\":\"%s\","
+                                  "{\"outcome_class\":\"content_defect\",\"defect_code\":\"%s\","
                                   "\"operation\":\"%s\",\"phase\":\"%s\","
                                   "\"file_sha256\":\"%s\",\"site_identity\":\"%s\","
                                   "\"requested\":%zu,\"discarded_atom_facts\":%llu,"

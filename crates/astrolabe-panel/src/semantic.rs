@@ -26,8 +26,11 @@ pub const SEMANTIC_VALUE_SLOT_START: u16 = 31;
 pub const SEMANTIC_PRESENCE_DIM: u32 = 256;
 /// Dimension of deterministic categorical/path/set encodings.
 pub const SEMANTIC_HASH_DIM: u32 = 65_536;
-/// Versioned semantic registry schema.
+/// Versioned semantic registry schema used by the frozen panel-v3/v4 prefix.
 pub const SEMANTIC_REGISTRY_SCHEMA: &str = "astro.cbm.semantic-registry.v1";
+/// Registry schema for panel v5, which appends typed content-defect atoms and
+/// gives each value lens an identity independent of unrelated future additions.
+pub const SEMANTIC_REGISTRY_SCHEMA_V2: &str = "astro.cbm.semantic-registry.v2";
 /// Stable algorithm identity for exact structured encoders.
 pub const SEMANTIC_ENCODER_ID: &str = "astro.cbm.semantic-encoders.v1";
 /// Frozen framing contract for learned panel-v3 code/prose inputs.  The
@@ -1564,10 +1567,104 @@ pub const SEMANTIC_RULES: &[SemanticRule] = &[
         Numeric,
         "sem.edge.co_changes"
     ),
+    rule!(
+        155,
+        186,
+        Node,
+        "properties.outcome_class",
+        Text,
+        Category,
+        "sem.node.outcome_class"
+    ),
+    rule!(
+        156,
+        187,
+        Node,
+        "properties.defect_code",
+        Text,
+        Category,
+        "sem.node.defect_code"
+    ),
+    rule!(
+        157,
+        188,
+        Node,
+        "properties.phase",
+        Text,
+        Category,
+        "sem.node.phase"
+    ),
+    rule!(
+        158,
+        189,
+        Node,
+        "properties.file_sha256",
+        Text,
+        Category,
+        "sem.node.file_sha256"
+    ),
+    rule!(
+        159,
+        190,
+        Node,
+        "properties.site_identity",
+        Text,
+        Reference,
+        "sem.node.site_identity"
+    ),
+    rule!(
+        160,
+        191,
+        Node,
+        "properties.requested",
+        Integer,
+        Numeric,
+        "sem.node.requested"
+    ),
+    rule!(
+        161,
+        192,
+        Node,
+        "properties.discarded_atom_facts",
+        Integer,
+        Numeric,
+        "sem.node.discarded_atom_facts"
+    ),
+    rule!(
+        162,
+        193,
+        Node,
+        "properties.discarded_relationship_facts",
+        Integer,
+        Numeric,
+        "sem.node.discarded_relationship_facts"
+    ),
+    rule!(
+        163,
+        194,
+        Node,
+        "properties.unmeasured_file",
+        Boolean,
+        Boolean,
+        "sem.node.unmeasured_file"
+    ),
+    rule!(
+        164,
+        195,
+        Edge,
+        "properties.outcome_class",
+        Text,
+        Category,
+        "sem.edge.outcome_class"
+    ),
 ];
 
-/// Last slot id in the v3 frozen roster.
-pub const SEMANTIC_SLOT_END: u16 = 185;
+/// Number of rules frozen into the panel-v3/v4 prefix.
+pub const SEMANTIC_V4_RULE_COUNT: usize = 155;
+/// Last semantic slot id in the panel-v3/v4 frozen roster.
+pub const SEMANTIC_V4_SLOT_END: u16 = 185;
+/// Last semantic slot id in the current frozen roster.
+pub const SEMANTIC_SLOT_END: u16 = 195;
 
 const PRESENCE_SLOTS: &[PanelSlotSpec] = &[
     presence_slot(24, "sem.presence.project"),
@@ -1592,10 +1689,8 @@ const fn presence_slot(slot: u16, key: &'static str) -> PanelSlotSpec {
     }
 }
 
-/// Frozen v3 semantic slot specifications.
-pub static SEMANTIC_SLOT_SPECS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
-    let mut out = PRESENCE_SLOTS.to_vec();
-    out.extend(SEMANTIC_RULES.iter().map(|rule| PanelSlotSpec {
+fn slot_spec_for_rule(rule: &SemanticRule) -> PanelSlotSpec {
+    PanelSlotSpec {
         slot: rule.value_slot,
         key: rule.slot_key,
         shape: rule.kind.shape(),
@@ -1608,7 +1703,25 @@ pub static SEMANTIC_SLOT_SPECS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| 
         retrieval_only: false,
         excluded_from_dedup: false,
         guard_raw: false,
-    }));
+    }
+}
+
+/// Frozen semantic slot specifications used by panel v3 and v4. This prefix
+/// must never be rebuilt from the current registry or old rosters would drift.
+pub static SEMANTIC_SLOT_SPECS_V4: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut out = PRESENCE_SLOTS.to_vec();
+    out.extend(
+        SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT]
+            .iter()
+            .map(slot_spec_for_rule),
+    );
+    out
+});
+
+/// Frozen current semantic slot specifications.
+pub static SEMANTIC_SLOT_SPECS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut out = PRESENCE_SLOTS.to_vec();
+    out.extend(SEMANTIC_RULES.iter().map(slot_spec_for_rule));
     out
 });
 
@@ -1666,6 +1779,17 @@ pub fn semantic_rule_count_for_family(family: SemanticFamily) -> usize {
         .unwrap_or(0)
 }
 
+/// Number of independently typed rules in a family for one frozen panel
+/// version. Older panels see only their immutable registry prefix.
+pub fn semantic_rule_count_for_family_version(family: SemanticFamily, version: u32) -> usize {
+    let rules = if version <= crate::PANEL_V4_VERSION {
+        &SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT]
+    } else {
+        SEMANTIC_RULES
+    };
+    rules.iter().filter(|rule| rule.family == family).count()
+}
+
 /// True for a family-level semantic presence slot.
 pub fn is_semantic_presence_slot(slot: SlotId) -> bool {
     PRESENCE_SLOTS.iter().any(|spec| spec.slot_id() == slot)
@@ -1673,9 +1797,23 @@ pub fn is_semantic_presence_slot(slot: SlotId) -> bool {
 
 /// Content address of the exact ordered registry manifest.
 pub fn semantic_registry_sha256() -> [u8; 32] {
+    semantic_registry_sha256_for_panel(crate::CURRENT_SEMANTIC_PANEL_VERSION)
+}
+
+/// Content address of the exact ordered registry manifest for a frozen panel
+/// version. Panel v3/v4 retain their original prefix and schema bytes.
+pub fn semantic_registry_sha256_for_panel(version: u32) -> [u8; 32] {
+    let (schema, rules) = if version <= crate::PANEL_V4_VERSION {
+        (
+            SEMANTIC_REGISTRY_SCHEMA,
+            &SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT],
+        )
+    } else {
+        (SEMANTIC_REGISTRY_SCHEMA_V2, SEMANTIC_RULES)
+    };
     let mut hasher = Sha256::new();
-    hasher.update(SEMANTIC_REGISTRY_SCHEMA.as_bytes());
-    for rule in SEMANTIC_RULES {
+    hasher.update(schema.as_bytes());
+    for rule in rules {
         for part in [
             rule.ordinal.to_string(),
             rule.family.as_str().to_string(),
@@ -1694,10 +1832,20 @@ pub fn semantic_registry_sha256() -> [u8; 32] {
 
 /// Frozen weights/spec identity for a semantic slot.
 pub fn semantic_weights_identity(slot: SlotId) -> PanelResult<[u8; 32]> {
+    semantic_weights_identity_for_panel(slot, crate::CURRENT_SEMANTIC_PANEL_VERSION)
+}
+
+/// Frozen weights/spec identity for a semantic slot in one panel version.
+///
+/// Panel v3/v4 preserve the historical whole-registry identity. Panel v5 value
+/// lenses bind only their own typed rule, so appending an unrelated future lens
+/// cannot mutate an existing lens id. Presence lenses still bind the complete
+/// registry because each new ordinal changes their interpreted dimensions.
+pub fn semantic_weights_identity_for_panel(slot: SlotId, version: u32) -> PanelResult<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(SEMANTIC_ENCODER_ID.as_bytes());
-    hasher.update(semantic_registry_sha256());
     if is_semantic_presence_slot(slot) {
+        hasher.update(semantic_registry_sha256_for_panel(version));
         hasher.update(b"presence");
         hasher.update(slot.get().to_be_bytes());
         return Ok(hasher.finalize().into());
@@ -1709,6 +1857,13 @@ pub fn semantic_weights_identity(slot: SlotId) -> PanelResult<[u8; 32]> {
             "Restore the exact panel-v3 semantic registry before measuring code-memory atoms.",
         )
     })?;
+    if version <= crate::PANEL_V4_VERSION {
+        hasher.update(semantic_registry_sha256_for_panel(version));
+    } else {
+        hasher.update(SEMANTIC_REGISTRY_SCHEMA_V2.as_bytes());
+        hasher.update(rule.ordinal.to_be_bytes());
+        hasher.update(rule.value_slot.to_be_bytes());
+    }
     hasher.update(rule.family.as_str().as_bytes());
     hasher.update(rule.path.as_bytes());
     hasher.update(rule.source_type.as_str().as_bytes());

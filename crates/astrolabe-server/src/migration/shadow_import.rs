@@ -804,9 +804,9 @@ fn parse_api_callees(encoded: &str) -> Option<Vec<astrolabe_panel::ApiCall>> {
 
 /// Panel roster version the shadow import pipeline measures and persists.
 ///
-/// The current semantic panel keeps S0-S185 byte-identical to v3 while versioning
-/// the complete node-input identity contract. Persisted CxIds therefore move
-/// only through an explicit roster/protocol version, never an in-place mutation.
+/// The current semantic panel extends v4 through an explicit frozen roster
+/// version. Persisted CxIds therefore move only through a protocol version,
+/// never an in-place mutation.
 pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::CURRENT_SEMANTIC_PANEL_VERSION;
 
 /// Slots the shadow import feeds to the panel driver.
@@ -815,10 +815,11 @@ pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::CURRENT_SEMANTIC_P
 /// substrate carries no token-multi source, so it stays a labeled `LensUnavailable`
 /// absence rather than a measured row). S23 (`layer_role`) IS included so the
 /// directory-role layout frames can be built (#336). Applicability is still enforced
-/// per class by the panel driver, while S24-S185 are dispatched only from exact
+/// per class by the panel driver, while S24-S195 are dispatched only from exact
 /// typed semantic source values.
 pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
-    astrolabe_panel::PANEL_V4_SLOTS
+    astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)
+        .expect("current semantic panel version has a frozen roster")
         .iter()
         .filter(|slot| slot.slot != 22)
         .map(|slot| (*slot).slot_id())
