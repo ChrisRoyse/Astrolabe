@@ -10560,7 +10560,8 @@ fn modality_for_label(label: SymbolLabel) -> Modality {
         | SymbolLabel::Channel
         | SymbolLabel::EnvVar
         | SymbolLabel::ParseDiagnostic
-        | SymbolLabel::RuntimeModuleRequest => Modality::Structured,
+        | SymbolLabel::RuntimeModuleRequest
+        | SymbolLabel::ContentDefect => Modality::Structured,
         SymbolLabel::Project | SymbolLabel::Branch | SymbolLabel::Folder => Modality::Structured,
         _ => Modality::Code,
     }

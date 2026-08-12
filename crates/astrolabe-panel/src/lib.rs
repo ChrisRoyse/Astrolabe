@@ -994,7 +994,8 @@ pub const fn label_class(label: SymbolLabel) -> LabelClass {
         | SymbolLabel::Package
         | SymbolLabel::EnvVar
         | SymbolLabel::ParseDiagnostic
-        | SymbolLabel::RuntimeModuleRequest => LabelClass::StructuredResource,
+        | SymbolLabel::RuntimeModuleRequest
+        | SymbolLabel::ContentDefect => LabelClass::StructuredResource,
         SymbolLabel::Section => LabelClass::Section,
         SymbolLabel::Project | SymbolLabel::Branch | SymbolLabel::Folder => LabelClass::Structural,
     }

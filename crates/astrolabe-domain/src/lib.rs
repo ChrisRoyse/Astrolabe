@@ -450,6 +450,11 @@ pub enum SymbolLabel {
     /// Appended to preserve the persisted serde discriminants of every existing
     /// symbol label.
     RuntimeModuleRequest,
+    /// Source-local extraction defect retained as a measured, typed graph atom.
+    ///
+    /// Appended to preserve the persisted serde discriminants of every existing
+    /// symbol label.
+    ContentDefect,
 }
 
 impl SymbolLabel {
@@ -493,6 +498,7 @@ impl SymbolLabel {
             Self::Folder => "Folder",
             Self::ParseDiagnostic => "ParseDiagnostic",
             Self::RuntimeModuleRequest => "RuntimeModuleRequest",
+            Self::ContentDefect => "ContentDefect",
         }
     }
 
@@ -504,7 +510,7 @@ impl SymbolLabel {
     /// Every stable node label in declaration order. The single canonical roster
     /// the ingest admission path and the emission-vocabulary parity check both
     /// enumerate.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::Function,
         Self::Method,
         Self::Class,
@@ -542,6 +548,7 @@ impl SymbolLabel {
         Self::Folder,
         Self::ParseDiagnostic,
         Self::RuntimeModuleRequest,
+        Self::ContentDefect,
     ];
 
     /// Parses a Codebase Memory MCP node-label string into Astrolabe's stable
@@ -656,11 +663,13 @@ pub enum EdgeKind {
     Raises = 41,
     /// File-to-parser-diagnostic provenance edge.
     HasDiagnostic = 42,
+    /// File-to-source-local-content-defect provenance edge.
+    HasContentDefect = 43,
 }
 
 impl EdgeKind {
     /// All stable edge kinds in `etype` order.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::Calls,
         Self::ResolvedCalls,
         Self::Imports,
@@ -703,6 +712,7 @@ impl EdgeKind {
         Self::CrossTrpcCalls,
         Self::Raises,
         Self::HasDiagnostic,
+        Self::HasContentDefect,
     ];
 
     /// Returns the stable `u16` edge vocabulary code.
@@ -732,6 +742,7 @@ impl EdgeKind {
             Self::Throws => "THROWS",
             Self::Raises => "RAISES",
             Self::HasDiagnostic => "HAS_DIAGNOSTIC",
+            Self::HasContentDefect => "HAS_CONTENT_DEFECT",
             Self::Tests => "TESTS",
             Self::TestsFile => "TESTS_FILE",
             Self::HttpCalls => "HTTP_CALLS",
@@ -781,6 +792,7 @@ impl EdgeKind {
             "THROWS" => Some(Self::Throws),
             "RAISES" => Some(Self::Raises),
             "HAS_DIAGNOSTIC" => Some(Self::HasDiagnostic),
+            "HAS_CONTENT_DEFECT" => Some(Self::HasContentDefect),
             "TESTS" => Some(Self::Tests),
             "TESTS_FILE" => Some(Self::TestsFile),
             "HTTP_CALLS" => Some(Self::HttpCalls),
@@ -818,7 +830,8 @@ impl EdgeKind {
             | Self::DefinesMethod
             | Self::Contains
             | Self::HasBranch
-            | Self::HasDiagnostic => EdgeWeightPrior::new(1.0, None),
+            | Self::HasDiagnostic
+            | Self::HasContentDefect => EdgeWeightPrior::new(1.0, None),
             Self::Inherits
             | Self::Implements
             | Self::Override
