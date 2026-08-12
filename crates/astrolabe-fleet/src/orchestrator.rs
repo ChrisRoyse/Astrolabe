@@ -1492,57 +1492,14 @@ fn pipeline_job(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let Some(kernel) = find_key(&inner, "kernel_artifact") else {
-        return fail(
-            "kernel",
-            "pipeline result carries no kernel_artifact section".to_string(),
-            None,
-        );
-    };
-    if kernel["status"].as_str() != Some("persisted") {
-        return fail(
-            "kernel",
-            format!(
-                "kernel artifact not persisted: status {:?}, reason {:?}",
-                kernel["status"].as_str().unwrap_or("<missing>"),
-                kernel["reason"].as_str().unwrap_or("<none>")
-            ),
-            Some(format!(
-                "repo: {}\nphase: kernel persist\n{kernel}\n",
-                row.record.full_name
-            )),
-        );
-    }
     let scope = kernel_scope_id(&index_project);
-    if kernel["scope_id"].as_str() != Some(scope.as_str()) {
-        return fail(
-            "identity",
-            format!(
-                "{ASTRO_FLEET_PROJECT_IDENTITY}: kernel scope {:?} differs from returned-project scope {scope:?}",
-                kernel["scope_id"].as_str()
-            ),
-            Some(format!(
-                "repo: {}\nphase: kernel identity binding\nstable store key: {store_key}\nreturned project: {index_project}\nreported kernel: {kernel}\n",
-                row.record.full_name
-            )),
-        );
-    }
-    let reported_members_hash = kernel["members_hash"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-
-    // Independent persisted-state verification (the transition gate).
-    let verify = verify_persisted(&store_dir, &index_project, &scope, &reported_members_hash);
-    let (
-        sqlite_nodes,
-        sqlite_edges,
-        sqlite_content_defects,
-        sqlite_content_defect_relationships,
-        vault_base_rows,
-        kernel_member_count,
-    ) = match verify {
-        Ok(counts) => counts,
+    // Independent persisted-state verification is the transition gate. The
+    // Kernel CF, not the bounded command response, is the source of truth:
+    // routine responses intentionally replace large weave surfaces with a
+    // compact persisted-surface reference. Reading the artifact here also
+    // avoids coupling fleet correctness to response materialization policy.
+    let persisted = match verify_persisted(&store_dir, &index_project, &scope) {
+        Ok(readback) => readback,
         Err(detail) => {
             return fail(
                 "verify",
@@ -1554,6 +1511,15 @@ fn pipeline_job(
             );
         }
     };
+    let PersistedPipelineReadback {
+        sqlite_nodes,
+        sqlite_edges,
+        content_defects: sqlite_content_defects,
+        content_defect_relationships: sqlite_content_defect_relationships,
+        vault_base_rows,
+        kernel_member_count,
+        kernel_members_hash,
+    } = persisted;
     if sqlite_content_defects != degradation.content_defects
         || sqlite_content_defect_relationships != degradation.content_defect_relationships
     {
@@ -1673,7 +1639,7 @@ fn pipeline_job(
             vault_base_rows: Some(vault_base_rows),
             pipeline_status: Some(inner_status.to_string()),
             pipeline_degradation: Some(degradation),
-            kernel_members_hash: Some(reported_members_hash),
+            kernel_members_hash: Some(kernel_members_hash),
             kernel_member_count: Some(kernel_member_count),
             stage_ms,
             index_admission: Some(index_admission),
@@ -1872,17 +1838,26 @@ fn exact_zero_byte_guard_project(store_dir: &Path, suffix: &str) -> Option<Strin
     project
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PersistedPipelineReadback {
+    sqlite_nodes: u64,
+    sqlite_edges: u64,
+    content_defects: u64,
+    content_defect_relationships: u64,
+    vault_base_rows: u64,
+    kernel_member_count: u64,
+    kernel_members_hash: String,
+}
+
 /// Independent persisted-state readback: CBM sqlite counts, shadow-vault Base
-/// rows, and the persisted kernel artifact whose members-hash must equal the
-/// pipeline's claim. Returns
-/// `(sqlite_nodes, sqlite_edges, content_defects,
-/// content_defect_relationships, vault_base_rows, kernel_member_count)`.
+/// rows, and the exact persisted Kernel-CF artifact. The artifact's schema,
+/// scope, member cardinality, and members hash are re-derived from the stored
+/// member identities before the fleet transition can use them.
 fn verify_persisted(
     store_dir: &Path,
     project: &str,
     scope: &str,
-    reported_members_hash: &str,
-) -> Result<(u64, u64, u64, u64, u64, u64), String> {
+) -> Result<PersistedPipelineReadback, String> {
     // (a) CBM sqlite. The child has completed and closed publication before
     // this gate runs, so verification has no authority to recover or mutate
     // the store. A WAL/open-state fault refuses instead of silently upgrading
@@ -1981,26 +1956,54 @@ fn verify_persisted(
     }
 
     // (c) Persisted kernel artifact, read back independently of the write
-    // path; its members-hash must match the pipeline's claim.
+    // path. Its exact member identities are the source of truth for the hash
+    // and count used by the fleet catalog (PC-32/PC-35/PC-37).
     let artifact = astrolabe_ingest::read_persisted_kernel_artifact(&vault, scope)
         .map_err(|error| format!("read persisted kernel artifact for {scope}: {error}"))?
         .ok_or_else(|| {
             format!("no persisted kernel artifact in the Kernel CF for scope {scope}")
         })?;
-    if artifact.members_hash != reported_members_hash {
+    if artifact.schema != astrolabe_kernel::KERNEL_ARTIFACT_SCHEMA {
         return Err(format!(
-            "persisted kernel members-hash {} != pipeline-reported {} for scope {scope}",
-            artifact.members_hash, reported_members_hash
+            "persisted kernel artifact for scope {scope} has schema {:?}, expected {:?}",
+            artifact.schema,
+            astrolabe_kernel::KERNEL_ARTIFACT_SCHEMA
         ));
     }
-    Ok((
+    if artifact.scope_id != scope {
+        return Err(format!(
+            "{ASTRO_FLEET_PROJECT_IDENTITY}: persisted Kernel-CF key for scope {scope:?} contains artifact scope {:?}",
+            artifact.scope_id
+        ));
+    }
+    if artifact.member_count != artifact.members.len() {
+        return Err(format!(
+            "persisted kernel artifact for scope {scope} declares {} members but contains {}",
+            artifact.member_count,
+            artifact.members.len()
+        ));
+    }
+    let member_ids = artifact
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<Vec<_>>();
+    let derived_members_hash = astrolabe_kernel::members_hash(&member_ids);
+    if artifact.members_hash != derived_members_hash {
+        return Err(format!(
+            "persisted kernel members-hash {} != re-derived {} for scope {scope}",
+            artifact.members_hash, derived_members_hash
+        ));
+    }
+    Ok(PersistedPipelineReadback {
         sqlite_nodes,
         sqlite_edges,
         content_defects,
         content_defect_relationships,
         vault_base_rows,
-        artifact.member_count as u64,
-    ))
+        kernel_member_count: artifact.member_count as u64,
+        kernel_members_hash: derived_members_hash,
+    })
 }
 
 fn pipeline_degradation(inner: &Value) -> Result<PipelineDegradation, String> {
@@ -2032,20 +2035,6 @@ fn pipeline_degradation(inner: &Value) -> Result<PipelineDegradation, String> {
         ));
     }
     Ok(degradation)
-}
-
-/// Depth-first search for the first object under `key` anywhere in the tree.
-fn find_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    match value {
-        Value::Object(map) => {
-            if let Some(found) = map.get(key) {
-                return Some(found);
-            }
-            map.values().find_map(|child| find_key(child, key))
-        }
-        Value::Array(items) => items.iter().find_map(|child| find_key(child, key)),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
