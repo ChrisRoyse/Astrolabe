@@ -7510,13 +7510,15 @@ enum { INDEX_BROWSER_RUNTIME_REQUEST_CAP = 50 };
 
 static bool is_lower_hex_sha256(const char *value);
 
-/* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
- * top-level "skipped_count" (0 on clean runs) so consumers can rely on it.
+/* Attach a bounded view of typed per-file outcomes observed by this run. The
+ * complete corpus count is independently read from canonical ContentDefect
+ * rows below; this array is explanatory, never the source of truth.
  * When there are skips, also emits:
  *   "skipped": {"files":[{path,reason,phase}..(<=50)], "count":N, "truncated":bool}
  * and, if a per-run logfile was written, "logfile": "<path>".
- * The run status stays "indexed" — a skipped file is the expected handled
- * outcome, not a failure. errs[] is borrowed (copied into doc). */
+ * A handled skip produces the explicitly degraded `partial_success` status;
+ * it never impersonates a clean `indexed` generation. errs[] is borrowed
+ * (copied into doc). */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
     yyjson_mut_obj_add_int(doc, root, "skipped_count", count < 0 ? 0 : count);
@@ -7531,6 +7533,25 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "phase", errs[i].phase ? errs[i].phase : "");
+        yyjson_mut_obj_add_str(
+            doc, fe, "outcome_class",
+            errs[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT
+                ? "content_defect"
+                : errs[i].outcome_class == CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL
+                      ? "infrastructure_fatal"
+                      : "unclassified");
+        yyjson_mut_obj_add_strcpy(doc, fe, "code", errs[i].code ? errs[i].code : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "operation",
+                                  errs[i].operation ? errs[i].operation : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "file_sha256",
+                                  errs[i].file_sha256 ? errs[i].file_sha256 : "");
+        yyjson_mut_obj_add_uint(doc, fe, "requested", (uint64_t)errs[i].requested);
+        yyjson_mut_obj_add_uint(doc, fe, "discarded_atom_facts",
+                                errs[i].discarded_atom_facts);
+        yyjson_mut_obj_add_uint(doc, fe, "discarded_relationship_facts",
+                                errs[i].discarded_relationship_facts);
+        yyjson_mut_obj_add_bool(doc, fe, "graph_diagnostic_persisted",
+                                errs[i].graph_diagnostic_persisted);
         yyjson_mut_arr_add_val(files, fe);
     }
     yyjson_mut_obj_add_val(doc, skipped, "files", files);
@@ -7878,6 +7899,38 @@ static char *build_index_state_mismatch_error(const char *project_name, int expe
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
     return json ? json : heap_strdup("{\"code\":\"CBM_INDEX_PERSISTED_STATE_MISMATCH\"}");
+}
+
+static char *build_content_defect_readback_error(const char *project_name, int observed_this_run,
+                                                 int persisted_nodes, int persisted_edges,
+                                                 bool full_generation) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_CONTENT_DEFECT_READBACK_MISMATCH\"}");
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_CONTENT_DEFECT_READBACK_MISMATCH");
+    yyjson_mut_obj_add_str(doc, root, "operation", "recount_persisted_content_defects");
+    yyjson_mut_obj_add_str(
+        doc, root, "message",
+        "typed source-local defect nodes and relationships do not match the completed outcome inventory");
+    yyjson_mut_obj_add_str(
+        doc, root, "remediation",
+        "preserve the published store, inspect ContentDefect and HAS_CONTENT_DEFECT rows, and repair the atomic outcome transaction before retrying");
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project_name ? project_name : "");
+    yyjson_mut_obj_add_int(doc, root, "observed_this_run", observed_this_run);
+    yyjson_mut_obj_add_int(doc, root, "persisted_nodes", persisted_nodes);
+    yyjson_mut_obj_add_int(doc, root, "persisted_edges", persisted_edges);
+    yyjson_mut_obj_add_bool(doc, root, "full_generation", full_generation);
+    yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json ? json
+                : heap_strdup(
+                      "{\"status\":\"error\",\"code\":\"CBM_CONTENT_DEFECT_READBACK_MISMATCH\"}");
 }
 
 static bool vector_state_matches_capability(const cbm_index_capability_t *capability,
@@ -8305,6 +8358,41 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
         return build_index_state_mismatch_error(project_name, exp_nodes, exp_edges, nodes, edges);
     }
 
+    int content_defect_nodes =
+        cbm_store_count_nodes_by_label(store, project_name, "ContentDefect");
+    int content_defect_edges =
+        cbm_store_count_edges_by_type(store, project_name, "HAS_CONTENT_DEFECT");
+    bool current_outcomes_valid = true;
+    int content_defects_observed_this_run = 0;
+    for (int i = 0; i < file_error_count; i++) {
+        bool valid = file_errors[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT &&
+                     file_errors[i].graph_diagnostic_persisted && file_errors[i].code &&
+                     file_errors[i].code[0] && file_errors[i].file_sha256 &&
+                     is_lower_hex_sha256(file_errors[i].file_sha256);
+        current_outcomes_valid = current_outcomes_valid && valid;
+        if (valid) {
+            content_defects_observed_this_run++;
+        }
+    }
+    cbm_pipeline_execution_route_t content_route = cbm_pipeline_get_execution_route(p);
+    bool full_generation = content_route == CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED;
+    bool content_counts_valid = content_defect_nodes >= 0 && content_defect_edges >= 0 &&
+                                content_defect_nodes == content_defect_edges &&
+                                content_defects_observed_this_run <= content_defect_nodes &&
+                                (!full_generation ||
+                                 content_defects_observed_this_run == content_defect_nodes);
+    if (!current_outcomes_valid || !content_counts_valid) {
+        return build_content_defect_readback_error(
+            project_name, content_defects_observed_this_run, content_defect_nodes,
+            content_defect_edges, full_generation);
+    }
+    yyjson_mut_obj_add_int(doc, root, "content_defect_count", content_defect_nodes);
+    yyjson_mut_obj_add_int(doc, root, "content_defect_relationship_count", content_defect_edges);
+    yyjson_mut_obj_add_int(doc, root, "content_defects_observed_this_run",
+                           content_defects_observed_this_run);
+    yyjson_mut_obj_add_str(doc, root, "content_defect_source_of_truth",
+                           "sqlite.nodes(ContentDefect)+edges(HAS_CONTENT_DEFECT)");
+
     cbm_project_t persisted_project = {0};
     int project_rc = cbm_store_get_project(store, project_name, &persisted_project);
     if (project_rc != CBM_STORE_OK) {
@@ -8454,6 +8542,12 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
             "unaffected syntax, and each degradation is persisted as a ParseDiagnostic node "
             "with exact source span and remediation.");
     }
+
+    bool partial_success = content_defect_nodes > 0 || ambiguous_skips > 0 ||
+                           unresolved_source_skips > 0 || dangling_rust_module_skips > 0 ||
+                           parse_recovery_diagnostics > 0;
+    yyjson_mut_obj_add_str(doc, root, "status",
+                           partial_success ? "partial_success" : "indexed");
 
     bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
@@ -9332,9 +9426,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         postcondition_error = build_index_success_response(
             srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
             file_errors, file_error_count, has_logfile ? logfile_path : NULL);
-        if (!postcondition_error) {
-            yyjson_mut_obj_add_str(doc, root, "status", "indexed");
-        }
     } else if (rc == CBM_PIPELINE_EMPTY_SOURCE_CORPUS) {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "code", "CBM_PIPELINE_EMPTY_SOURCE_CORPUS");

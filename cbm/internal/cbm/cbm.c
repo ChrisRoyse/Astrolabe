@@ -1075,6 +1075,119 @@ static void cbm_file_result_discard_atoms(CBMFileResult *result) {
     result->source_len = 0;
 }
 
+static uint64_t cbm_nonnegative_count(int count) {
+    return count > 0 ? (uint64_t)count : 0;
+}
+
+static uint64_t cbm_saturating_add_u64(uint64_t left, uint64_t right) {
+    return UINT64_MAX - left < right ? UINT64_MAX : left + right;
+}
+
+static uint64_t cbm_file_result_atom_facts(const CBMFileResult *result) {
+    if (!result) {
+        return 0;
+    }
+    return cbm_saturating_add_u64(cbm_nonnegative_count(result->defs.count),
+                                  cbm_nonnegative_count(result->diagnostics.count));
+}
+
+static uint64_t cbm_file_result_relationship_facts(const CBMFileResult *result) {
+    if (!result) {
+        return 0;
+    }
+    uint64_t count = 0;
+#define CBM_ADD_RELATIONSHIP_FACTS(field)                                                     \
+    count = cbm_saturating_add_u64(count, cbm_nonnegative_count(result->field.count))
+    CBM_ADD_RELATIONSHIP_FACTS(calls);
+    CBM_ADD_RELATIONSHIP_FACTS(imports);
+    CBM_ADD_RELATIONSHIP_FACTS(usages);
+    CBM_ADD_RELATIONSHIP_FACTS(local_bindings);
+    CBM_ADD_RELATIONSHIP_FACTS(throws);
+    CBM_ADD_RELATIONSHIP_FACTS(rw);
+    CBM_ADD_RELATIONSHIP_FACTS(type_refs);
+    CBM_ADD_RELATIONSHIP_FACTS(env_accesses);
+    CBM_ADD_RELATIONSHIP_FACTS(type_assigns);
+    CBM_ADD_RELATIONSHIP_FACTS(impl_traits);
+    CBM_ADD_RELATIONSHIP_FACTS(resolved_calls);
+    CBM_ADD_RELATIONSHIP_FACTS(string_refs);
+    CBM_ADD_RELATIONSHIP_FACTS(infra_bindings);
+    CBM_ADD_RELATIONSHIP_FACTS(channels);
+#undef CBM_ADD_RELATIONSHIP_FACTS
+    return count;
+}
+
+static bool cbm_code_has_any(const char *code, const char *const *needles, size_t needle_count) {
+    if (!code) {
+        return false;
+    }
+    for (size_t i = 0; i < needle_count; i++) {
+        if (strstr(code, needles[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+CBMExtractionOutcomeClass cbm_extraction_outcome_classify(const char *code) {
+    if (!code || !code[0]) {
+        return CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL;
+    }
+
+    /* Resource loss and contract/integrity failures always win over source-like
+     * suffixes. This deny-first order prevents a code such as
+     * *_CONTEXT_INVALID or *_PARSER_ALLOC_FAILED from becoming recoverable. */
+    static const char *const fatal_markers[] = {
+        "ALLOC",       "CAPACITY",    "OVERFLOW",   "LIMIT_EXCEEDED",
+        "STACK_",      "CONTEXT_",    "ABI_",       "CORRUPT",
+        "SOURCE_SLAB", "COMPACTION",  "METRICS_",   "PREPROCESS_",
+        "INTERNAL_",   "INVARIANT",   "PARSER_INIT", "PARSER_ALLOC",
+    };
+    if (cbm_code_has_any(code, fatal_markers,
+                         sizeof(fatal_markers) / sizeof(fatal_markers[0])) ||
+        strcmp(code, "CBM_GRAMMAR_STUBBED") == 0 ||
+        strcmp(code, "CBM_PARSE_FAILED") == 0 ||
+        strcmp(code, "CBM_RUST_SOURCE_PATH_MISSING") == 0) {
+        return CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL;
+    }
+
+    static const char *const exact_content_codes[] = {
+        "CBM_LANGUAGE_UNSUPPORTED",
+        "CBM_GRAMMAR_UNAVAILABLE",
+        "CBM_PARSE_TOTAL_BUDGET_EXCEEDED",
+        "CBM_PARSE_PROGRESS_STALLED",
+        "CBM_PARSE_FINAL_BALANCE_TIMEOUT",
+        "CBM_BASH_SOURCE_ARGUMENT_MISSING",
+        "CBM_BASH_SOURCE_ARGUMENT_INVALID",
+        "CBM_POWERSHELL_EMBEDDED_PARSE_FAILED",
+        "CBM_JSON_PARSE_INVALID",
+        "CBM_JSON_SCHEMA_KEY_INVALID",
+        "CBM_RUST_RAW_IDENTIFIER_INVALID",
+        "CBM_RUST_SOURCE_PATH_INVALID",
+    };
+    for (size_t i = 0; i < sizeof(exact_content_codes) / sizeof(exact_content_codes[0]); i++) {
+        if (strcmp(code, exact_content_codes[i]) == 0) {
+            return CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
+        }
+    }
+
+    if (strncmp(code, "CBM_RUST_PATH_ATTRIBUTE_", strlen("CBM_RUST_PATH_ATTRIBUTE_")) == 0) {
+        return CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
+    }
+    if (strncmp(code, "CBM_RUST_MACRO_", strlen("CBM_RUST_MACRO_")) == 0 ||
+        strncmp(code, "CBM_RUST_KNOWN_MACRO_", strlen("CBM_RUST_KNOWN_MACRO_")) == 0) {
+        static const char *const content_markers[] = {
+            "NO_MATCH",       "INVALID",       "UNSUPPORTED", "DUPLICATE_BINDING",
+            "UNBOUND_",       "CARDINALITY_",   "REPETITION_", "RECURSION_CYCLE",
+            "PARSE_FAILED",   "EDITION_UNKNOWN",
+        };
+        if (cbm_code_has_any(code, content_markers,
+                             sizeof(content_markers) / sizeof(content_markers[0]))) {
+            return CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
+        }
+    }
+    return CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL;
+}
+
 void cbm_file_result_set_error(CBMFileResult *result, const char *code, const char *operation,
                                const char *phase, size_t requested, const char *message,
                                const char *remediation) {
@@ -1092,6 +1205,10 @@ void cbm_file_result_set_error(CBMFileResult *result, const char *code, const ch
                     : "inspect the structured extraction code and operation, fix the cause, then "
                       "retry the complete corpus";
     result->error.requested = requested;
+    result->error.outcome_class = cbm_extraction_outcome_classify(result->error.code);
+    result->error.content_defect_recorded = false;
+    result->error.discarded_atom_facts = cbm_file_result_atom_facts(result);
+    result->error.discarded_relationship_facts = cbm_file_result_relationship_facts(result);
     result->error_msg = result->error.message;
     cbm_file_result_discard_atoms(result);
 }

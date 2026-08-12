@@ -5537,6 +5537,47 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_nodes.step_or_reset");
 }
 
+/* O(log N + M) indexed range count, where N is the persisted graph and M is
+ * the selected label/type cardinality. The invariant is the exact project plus
+ * label/type key. This is the narrow PC-35/PC-37 readback for #1020; the real
+ * Astrolabe receipt was N=192,772 nodes on 2026-08-12, not the tiny FSV corpus. */
+static int cbm_store_count_typed_rows(cbm_store_t *s, const char *project, const char *value,
+                                      bool nodes) {
+    if (!s || !s->db || !project || !project[0] || !value || !value[0]) {
+        return CBM_STORE_ERR;
+    }
+    const char *sql = nodes ? "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = ?2;"
+                            : "SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        store_set_error(s, sqlite3_errmsg(s->db));
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, value);
+    int count = CBM_STORE_ERR;
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        sqlite3_int64 observed = sqlite3_column_int64(stmt, 0);
+        if (observed >= 0 && observed <= INT_MAX) {
+            count = (int)observed;
+        } else {
+            store_set_error(s, "typed row count is outside the current int representation");
+        }
+    } else {
+        store_set_error(s, sqlite3_errmsg(s->db));
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int cbm_store_count_nodes_by_label(cbm_store_t *s, const char *project, const char *label) {
+    return cbm_store_count_typed_rows(s, project, label, true);
+}
+
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_project,
                                         "DELETE FROM nodes WHERE project = ?1;");

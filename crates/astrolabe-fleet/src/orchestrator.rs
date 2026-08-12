@@ -335,6 +335,38 @@ pub struct IndexAdmissionTelemetry {
     pub recovered_abandoned_capacity: bool,
 }
 
+/// Typed, lossless account of every accepted per-corpus degradation emitted
+/// by the native index generation. A nonzero field makes the generation a
+/// `partial_success`; a zeroed account makes it `indexed`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PipelineDegradation {
+    /// Canonical `ContentDefect` nodes independently recounted in SQLite.
+    pub content_defects: u64,
+    /// Canonical `HAS_CONTENT_DEFECT` edges independently recounted in SQLite.
+    pub content_defect_relationships: u64,
+    /// Content defects diagnosed by this invocation (rather than retained
+    /// from an incremental generation).
+    pub content_defects_observed_this_run: u64,
+    /// Reference edges withheld because one source resolved to several atoms.
+    pub ambiguous_reference_skips: u64,
+    /// Reference edges withheld because the asserted source atom was absent.
+    pub unresolved_reference_source_skips: u64,
+    /// Rust module declarations with neither compiler-defined target path.
+    pub dangling_rust_module_skips: u64,
+    /// Files for which tree-sitter persisted an exact recovery diagnostic.
+    pub parse_recovery_diagnostics: u64,
+}
+
+impl PipelineDegradation {
+    fn is_partial(&self) -> bool {
+        self.content_defects > 0
+            || self.ambiguous_reference_skips > 0
+            || self.unresolved_reference_source_skips > 0
+            || self.dangling_rust_module_skips > 0
+            || self.parse_recovery_diagnostics > 0
+    }
+}
+
 /// One repo's verdict row in the run report.
 #[derive(Clone, Debug, Serialize)]
 pub struct RepoVerdict {
@@ -357,6 +389,11 @@ pub struct RepoVerdict {
     pub sqlite_edges: Option<u64>,
     /// Independently counted shadow-vault Base rows.
     pub vault_base_rows: Option<u64>,
+    /// Exact native completion class after counter/status consistency checks.
+    pub pipeline_status: Option<String>,
+    /// Typed native degradation account, with content-defect totals replaced
+    /// by independent SQLite readback before publication.
+    pub pipeline_degradation: Option<PipelineDegradation>,
     /// Kernel members-hash read back from the persisted artifact.
     pub kernel_members_hash: Option<String>,
     /// Kernel member count read back from the persisted artifact.
@@ -471,6 +508,8 @@ pub fn run_pipeline_pass_outcome(
                         sqlite_nodes: None,
                         sqlite_edges: None,
                         vault_base_rows: None,
+                        pipeline_status: None,
+                        pipeline_degradation: None,
                         kernel_members_hash: None,
                         kernel_member_count: None,
                         stage_ms: BTreeMap::new(),
@@ -975,6 +1014,8 @@ fn pipeline_job(
         sqlite_nodes: None,
         sqlite_edges: None,
         vault_base_rows: None,
+        pipeline_status: None,
+        pipeline_degradation: None,
         kernel_members_hash: None,
         kernel_member_count: None,
         stage_ms: BTreeMap::new(),
@@ -1375,10 +1416,28 @@ fn pipeline_job(
         }
     };
     let inner_status = inner["status"].as_str().unwrap_or("<missing>");
-    if inner_status != "indexed" {
+    let mut degradation = match pipeline_degradation(&inner) {
+        Ok(degradation) => degradation,
+        Err(detail) => {
+            return fail(
+                "parse",
+                format!("index_repository degradation telemetry invalid: {detail}"),
+                Some(format!(
+                    "repo: {}\nphase: degradation telemetry\n{}\n",
+                    row.record.full_name,
+                    head_of(&inner.to_string(), 8000)
+                )),
+            );
+        }
+    };
+    let status_consistent = matches!(inner_status, "partial_success") && degradation.is_partial()
+        || matches!(inner_status, "indexed") && !degradation.is_partial();
+    if !status_consistent {
         return fail(
             "pipeline",
-            format!("index_repository status {inner_status:?}, expected \"indexed\""),
+            format!(
+                "index_repository status {inner_status:?} disagrees with typed degradation counters {degradation:?}"
+            ),
             Some(format!(
                 "repo: {}\nphase: result status\n{}\n",
                 row.record.full_name,
@@ -1475,7 +1534,14 @@ fn pipeline_job(
 
     // Independent persisted-state verification (the transition gate).
     let verify = verify_persisted(&store_dir, &index_project, &scope, &reported_members_hash);
-    let (sqlite_nodes, sqlite_edges, vault_base_rows, kernel_member_count) = match verify {
+    let (
+        sqlite_nodes,
+        sqlite_edges,
+        sqlite_content_defects,
+        sqlite_content_defect_relationships,
+        vault_base_rows,
+        kernel_member_count,
+    ) = match verify {
         Ok(counts) => counts,
         Err(detail) => {
             return fail(
@@ -1488,6 +1554,25 @@ fn pipeline_job(
             );
         }
     };
+    if sqlite_content_defects != degradation.content_defects
+        || sqlite_content_defect_relationships != degradation.content_defect_relationships
+    {
+        return fail(
+            "verify",
+            format!(
+                "persisted content-defect state ({sqlite_content_defects} nodes, {sqlite_content_defect_relationships} relationships) differs from the native result ({} nodes, {} relationships)",
+                degradation.content_defects, degradation.content_defect_relationships
+            ),
+            Some(format!(
+                "repo: {}\nphase: independent content-defect readback\nproject: {index_project}\nreported nodes: {}\nreported relationships: {}\npersisted nodes: {sqlite_content_defects}\npersisted relationships: {sqlite_content_defect_relationships}\n",
+                row.record.full_name,
+                degradation.content_defects,
+                degradation.content_defect_relationships,
+            )),
+        );
+    }
+    degradation.content_defects = sqlite_content_defects;
+    degradation.content_defect_relationships = sqlite_content_defect_relationships;
 
     // #454 disk accounting: the store's measured on-disk bytes ride the
     // `kerneled` transition (or the `--force` fact refresh) onto the catalog
@@ -1586,6 +1671,8 @@ fn pipeline_job(
             sqlite_nodes: Some(sqlite_nodes),
             sqlite_edges: Some(sqlite_edges),
             vault_base_rows: Some(vault_base_rows),
+            pipeline_status: Some(inner_status.to_string()),
+            pipeline_degradation: Some(degradation),
             kernel_members_hash: Some(reported_members_hash),
             kernel_member_count: Some(kernel_member_count),
             stage_ms,
@@ -1734,7 +1821,10 @@ fn recognized_pipeline_index_project(store_dir: &Path, clone_path: &str) -> Opti
         return interrupted_pipeline_guard_project(store_dir);
     }
     let inner: Value = serde_json::from_str(envelope["content"][0]["text"].as_str()?).ok()?;
-    if inner["status"].as_str() != Some("indexed") {
+    if !matches!(
+        inner["status"].as_str(),
+        Some("indexed" | "partial_success")
+    ) {
         return None;
     }
     let project = inner["project"].as_str()?;
@@ -1785,18 +1875,24 @@ fn exact_zero_byte_guard_project(store_dir: &Path, suffix: &str) -> Option<Strin
 /// Independent persisted-state readback: CBM sqlite counts, shadow-vault Base
 /// rows, and the persisted kernel artifact whose members-hash must equal the
 /// pipeline's claim. Returns
-/// `(sqlite_nodes, sqlite_edges, vault_base_rows, kernel_member_count)`.
+/// `(sqlite_nodes, sqlite_edges, content_defects,
+/// content_defect_relationships, vault_base_rows, kernel_member_count)`.
 fn verify_persisted(
     store_dir: &Path,
     project: &str,
     scope: &str,
     reported_members_hash: &str,
-) -> Result<(u64, u64, u64, u64), String> {
-    // (a) CBM sqlite. Opened read-write because a WAL-journaled SQLite may
-    // need to recover its WAL on open; only SELECTs run here.
+) -> Result<(u64, u64, u64, u64, u64, u64), String> {
+    // (a) CBM sqlite. The child has completed and closed publication before
+    // this gate runs, so verification has no authority to recover or mutate
+    // the store. A WAL/open-state fault refuses instead of silently upgrading
+    // this source-of-truth read to write-capable access (#1064 PC-09/PC-43).
     let db_path = store_dir.join(format!("{project}.db"));
-    let connection = rusqlite::Connection::open(&db_path)
-        .map_err(|error| format!("open CBM sqlite {}: {error}", db_path.display()))?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("open CBM sqlite read-only {}: {error}", db_path.display()))?;
     let count = |sql: &str| -> Result<u64, String> {
         connection
             .query_row(sql, [], |row| row.get::<_, i64>(0))
@@ -1808,6 +1904,37 @@ fn verify_persisted(
     if sqlite_nodes == 0 {
         return Err(format!(
             "CBM sqlite {} has zero nodes — the index pass persisted nothing",
+            db_path.display()
+        ));
+    }
+    // Cost receipt (2026-08-12): two covering-index probes over the measured
+    // Astrolabe production store (N=192,772 nodes / 328,710 edges), using
+    // idx_nodes_label(project,label) and idx_edges_type(project,type). This
+    // opens no Calyx row family and restores no MVCC rows. The invariant is
+    // one project identity and one diagnostic label/type per completed repo;
+    // no per-file or per-node query is introduced (PC-35/PC-37/PC-41, #1064).
+    let project_count = |sql: &str| -> Result<u64, String> {
+        connection
+            .query_row(sql, [project], |row| row.get::<_, i64>(0))
+            .and_then(|count| {
+                u64::try_from(count).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })
+            })
+            .map_err(|error| format!("{sql}: {error}"))
+    };
+    let content_defects =
+        project_count("SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = 'ContentDefect'")?;
+    let content_defect_relationships = project_count(
+        "SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = 'HAS_CONTENT_DEFECT'",
+    )?;
+    if content_defects != content_defect_relationships {
+        return Err(format!(
+            "CBM sqlite {} has {content_defects} ContentDefect nodes but {content_defect_relationships} HAS_CONTENT_DEFECT relationships",
             db_path.display()
         ));
     }
@@ -1869,9 +1996,42 @@ fn verify_persisted(
     Ok((
         sqlite_nodes,
         sqlite_edges,
+        content_defects,
+        content_defect_relationships,
         vault_base_rows,
         artifact.member_count as u64,
     ))
+}
+
+fn pipeline_degradation(inner: &Value) -> Result<PipelineDegradation, String> {
+    let count = |key: &str| -> Result<u64, String> {
+        inner
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{key} must be a nonnegative integer"))
+    };
+    let degradation = PipelineDegradation {
+        content_defects: count("content_defect_count")?,
+        content_defect_relationships: count("content_defect_relationship_count")?,
+        content_defects_observed_this_run: count("content_defects_observed_this_run")?,
+        ambiguous_reference_skips: count("ambiguous_reference_skips")?,
+        unresolved_reference_source_skips: count("unresolved_reference_source_skips")?,
+        dangling_rust_module_skips: count("dangling_rust_module_skips")?,
+        parse_recovery_diagnostics: count("parse_recovery_diagnostics")?,
+    };
+    if degradation.content_defects != degradation.content_defect_relationships {
+        return Err(format!(
+            "content defect nodes ({}) differ from relationships ({})",
+            degradation.content_defects, degradation.content_defect_relationships
+        ));
+    }
+    if degradation.content_defects_observed_this_run > degradation.content_defects {
+        return Err(format!(
+            "content defects observed this run ({}) exceed persisted defects ({})",
+            degradation.content_defects_observed_this_run, degradation.content_defects
+        ));
+    }
+    Ok(degradation)
 }
 
 /// Depth-first search for the first object under `key` anywhere in the tree.

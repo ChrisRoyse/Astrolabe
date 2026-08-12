@@ -50,6 +50,10 @@ CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
     ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, message);
     ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, remediation);
     ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, requested);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, outcome_class);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, content_defect_recorded);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, discarded_atom_facts);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMExtractionError, discarded_relationship_facts);
 
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, arena);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, defs);

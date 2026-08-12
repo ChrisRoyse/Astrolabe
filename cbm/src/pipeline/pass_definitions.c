@@ -872,13 +872,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
             continue;
         }
-        /* Preserve the extractor's exact first failure in the pipeline's
-         * diagnostic inventory. The extraction barrier below rejects the whole
-         * corpus before later passes or publication. */
+        /* The shared extraction barrier reads the structured result directly,
+         * classifies it once, and either records a canonical ContentDefect or
+         * fails the generation. Do not duplicate it into the legacy list. */
         if (result->has_error) {
-            cbm_pipeline_add_file_error(ctx->pipeline, rel,
-                                        result->error_msg ? result->error_msg : "extract failed",
-                                        "extract");
             errors++;
         }
 
@@ -922,10 +919,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
     }
 
-    /* Authoritative extraction is an all-files barrier. A result carrying
-     * has_error (or a discovered file that could not be read/extracted) makes
-     * the whole pass fail before imports, later passes, or publication can see
-     * a partial graph. */
+    /* Authoritative extraction is a typed all-files barrier. Infrastructure
+     * failures stop the generation; independently-isolatable content defects
+     * become graph facts before later passes can consume the empty result. */
     int extraction_rc = cbm_pipeline_reject_file_failures(ctx->pipeline, files, file_count,
                                                           local_cache, "sequential_extract");
     if (extraction_rc != 0) {

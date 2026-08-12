@@ -125,52 +125,6 @@ static uint64_t extract_now_ns(void) {
 
 /* ── Helpers (duplicated from pass files — kept static for isolation) ── */
 
-/* ── Per-worker failure list (Stage 2 / Track B) ────────────────────
- * Each extract worker appends read/extract/oversized failures into its OWN list
- * (no lock on the hot path); the lists are merged into the pipeline's
- * cbm_file_error_t array in the existing sequential merge loop. */
-typedef struct {
-    cbm_file_error_t *items;
-    int count;
-    int cap;
-} pp_err_list_t;
-
-/* NULL-safe heap strdup. */
-static char *pp_err_dup(const char *s) {
-    if (!s) {
-        return NULL;
-    }
-    size_t n = strlen(s) + 1;
-    char *d = (char *)malloc(n);
-    if (d) {
-        memcpy(d, s, n);
-    }
-    return d;
-}
-
-static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
-                       const char *phase) {
-    if (!list) {
-        return;
-    }
-    if (list->count >= list->cap) {
-        int ncap = list->cap ? list->cap * 2 : 8;
-        cbm_file_error_t *grown =
-            (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown));
-        if (!grown) {
-            /* The barrier also rejects every missing non-empty result, so an
-             * inventory-allocation failure cannot turn extraction into success. */
-            return;
-        }
-        list->items = grown;
-        list->cap = ncap;
-    }
-    list->items[list->count].path = pp_err_dup(path);
-    list->items[list->count].reason = pp_err_dup(reason);
-    list->items[list->count].phase = pp_err_dup(phase);
-    list->count++;
-}
-
 static const char *itoa_log(int val) {
     static CBM_TLS char bufs[PP_RING][CBM_SZ_32];
     static CBM_TLS int idx = 0;
@@ -577,9 +531,6 @@ typedef struct {
 
     const cbm_source_slab_t *source_slab; /* hash-bound immutable source bytes */
 
-    /* Per-worker skip lists (separate allocation, indexed by worker_id — no hot-
-     * path lock). Merged into the pipeline in the sequential merge loop. */
-    pp_err_list_t *err_lists;
     /* Back-pressure futility latch: set when a full collect+nap cycle ended
      * still over budget — the resident floor (graph + retained sources), not
      * in-flight transients, holds the memory, so napping cannot reclaim it.
@@ -599,6 +550,10 @@ typedef struct {
     bool admission_calibrating;
     bool admission_calibrated;
     bool admission_failed;
+    /* Exact next size-sorted source permitted to establish the generation's
+     * memory amplification. Content defects advance this cursor by one; every
+     * other worker waits, so calibration choice is schedule-independent. */
+    int admission_calibration_sort_pos;
     size_t admission_exclusive_amplification;
     size_t admission_active_reserved_bytes;
     size_t admission_peak_reserved_bytes;
@@ -811,7 +766,8 @@ static bool extract_admission_acquire(extract_ctx_t *ec, int sort_pos,
         }
 
         if (!ec->admission_calibrated) {
-            if (sort_pos == 0 && !ec->admission_calibrating && ec->admission_active_files == 0) {
+            if (sort_pos == ec->admission_calibration_sort_pos &&
+                !ec->admission_calibrating && ec->admission_active_files == 0) {
                 if (token->source_bytes > process_headroom ||
                     token->source_bytes > machine_available) {
                     ec->admission_failed = true;
@@ -913,7 +869,29 @@ static void extract_admission_release(extract_ctx_t *ec, extract_admission_t *to
     if (token->calibration) {
         size_t observed_growth =
             parse_rss > token->rss_before ? parse_rss - token->rss_before : 0;
-        if (!extraction_succeeded) {
+        bool content_defect = extraction_error &&
+                              extraction_error->outcome_class ==
+                                  CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
+        if (!extraction_succeeded && content_defect) {
+            /* A source-local defect cannot establish a trustworthy memory
+             * amplification, but it also cannot abort the corpus. Advance to
+             * exactly the next immutable size/path-sorted file. Allowing an
+             * arbitrary waiter here would leak worker scheduling into policy. */
+            if (ec->admission_calibration_sort_pos < ec->file_count) {
+                ec->admission_calibration_sort_pos++;
+            }
+            char next_position[CBM_SZ_32];
+            snprintf(next_position, sizeof(next_position), "%d",
+                     ec->admission_calibration_sort_pos);
+            cbm_log_warn("parallel.extract.admission.calibration_source_isolated", "code",
+                         extraction_error->code, "path",
+                         file && file->rel_path ? file->rel_path : "", "next_sort_position",
+                         next_position, "message",
+                         "the deterministic calibration source was isolated as a content defect",
+                         "remediation",
+                         "inspect the persisted ContentDefect; the next size-ordered source will "
+                         "calibrate memory admission");
+        } else if (!extraction_succeeded) {
             ec->admission_failed = true;
             const char *cause_code = extraction_error && extraction_error->code
                                          ? extraction_error->code
@@ -1033,13 +1011,17 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         int file_idx = ec->sorted[sort_pos].idx;
         const cbm_file_info_t *fi = &ec->files[file_idx];
-        pp_err_list_t *errs = ec->err_lists ? &ec->err_lists[worker_id] : NULL;
 
         extract_admission_t admission;
         if (!extract_admission_acquire(ec, sort_pos, fi, &admission)) {
-            pp_err_add(errs, fi->rel_path,
-                       "memory admission refused (CBM_EXTRACTION_MEMORY_ADMISSION_REFUSED)",
-                       "admission");
+            cbm_pipeline_record_fatal_error(
+                ec->pipeline, "CBM_EXTRACTION_MEMORY_ADMISSION_REFUSED",
+                "acquire_extraction_memory", "parallel_extract", fi->rel_path,
+                extract_admission_source_bytes(fi),
+                "the complete source file could not be admitted within measured memory",
+                "close competing memory-intensive work or increase the declared memory budget, "
+                "then retry the unchanged corpus");
+            atomic_store_explicit(ec->cancelled, 1, memory_order_relaxed);
             ws->errors++;
             break;
         }
@@ -1058,9 +1040,13 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 "remediation",
                 "preserve the source-slab diagnostic and retry the complete unchanged corpus");
             ws->errors++;
-            pp_err_add(errs, fi->rel_path,
-                       "source slab entry invalid (CBM_EXTRACTION_SOURCE_SLAB_INVALID)",
-                       "source_slab");
+            cbm_pipeline_record_fatal_error(
+                ec->pipeline, "CBM_EXTRACTION_SOURCE_SLAB_INVALID", "read_source_slab",
+                "parallel_extract", fi->rel_path, source_size,
+                "the extraction source entry is absent, malformed, or differs from the captured "
+                "file size",
+                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+            atomic_store_explicit(ec->cancelled, 1, memory_order_relaxed);
             extract_admission_release(ec, &admission, fi, cbm_mem_rss(), 0, false, NULL);
             break;
         }
@@ -1115,12 +1101,18 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         if (!result) {
             log_extract_fail(sort_pos, file_elapsed_ms, fi->rel_path);
             ws->errors++;
-            pp_err_add(errs, fi->rel_path, "extract failed", "extract");
+            cbm_pipeline_record_fatal_error(
+                ec->pipeline, "CBM_EXTRACTION_RESULT_ALLOC_FAILED", "allocate_file_result",
+                "parallel_extract", fi->rel_path, sizeof(CBMFileResult),
+                "the authoritative per-file extraction result could not be allocated",
+                "free memory or reduce concurrent extraction workers, then retry the unchanged "
+                "corpus");
+            atomic_store_explicit(ec->cancelled, 1, memory_order_relaxed);
             cbm_destroy_thread_parser();
             cbm_slab_reclaim();
             cbm_mem_collect();
             extract_admission_release(ec, &admission, fi, parse_rss, 0, false, NULL);
-            continue;
+            break;
         }
 
         size_t extracted_arena_bytes = result->arena.total_alloc;
@@ -1169,12 +1161,10 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
         log_extract_done(sort_pos, file_elapsed_ms, result->defs.count, fi->rel_path);
 
-        /* Preserve the extractor's exact first failure in the per-worker
-         * inventory. Workers finish and join; the extraction barrier rejects
-         * the complete corpus before registry construction or publication. */
+        /* The deterministic post-merge barrier owns classification and durable
+         * recording. Keeping a second worker-order copy would make outcome order
+         * scheduling-dependent and would double-count content defects. */
         if (result->has_error) {
-            pp_err_add(errs, fi->rel_path, result->error_msg ? result->error_msg : "extract failed",
-                       "extract");
             ws->errors++;
         }
 
@@ -1362,6 +1352,12 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     CBM_PROF_START(t_sort);
     file_sort_entry_t *sorted = malloc((size_t)file_count * sizeof(file_sort_entry_t));
     if (!sorted) {
+        cbm_pipeline_record_fatal_error(
+            ctx->pipeline, "CBM_EXTRACTION_SORT_ALLOC_FAILED", "allocate_file_sort",
+            "parallel_extract", ctx->repo_path,
+            (size_t)file_count * sizeof(file_sort_entry_t),
+            "the deterministic extraction schedule could not be allocated",
+            "free memory or reduce concurrent repository work, then retry the unchanged corpus");
         return CBM_NOT_FOUND;
     }
     for (int i = 0; i < file_count; i++) {
@@ -1375,19 +1371,16 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     extract_worker_state_t *workers = NULL;
     if (cbm_aligned_alloc((void **)&workers, CBM_CACHE_LINE,
                           (size_t)worker_count * sizeof(extract_worker_state_t)) != 0) {
+        cbm_pipeline_record_fatal_error(
+            ctx->pipeline, "CBM_EXTRACTION_WORKER_STATE_ALLOC_FAILED", "allocate_worker_state",
+            "parallel_extract", ctx->repo_path,
+            (size_t)worker_count * sizeof(extract_worker_state_t),
+            "the bounded extraction worker state could not be allocated",
+            "free memory or reduce concurrent repository work, then retry the unchanged corpus");
         free(sorted);
         return CBM_NOT_FOUND;
     }
     memset(workers, 0, (size_t)worker_count * sizeof(extract_worker_state_t));
-
-    /* Per-worker skip lists (separate allocation; merged into the pipeline in the
-     * sequential merge loop below). */
-    pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
-    if (!err_lists) {
-        cbm_aligned_free(workers);
-        free(sorted);
-        return CBM_NOT_FOUND;
-    }
 
     extract_ctx_t ec = {
         .files = files,
@@ -1402,7 +1395,6 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .result_cache = result_cache,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
-        .err_lists = err_lists,
         .source_slab = ctx->source_slab,
         .pipeline = ctx->pipeline,
     };
@@ -1430,17 +1422,6 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_cond_destroy(&ec.admission_cv);
     cbm_mutex_destroy(&ec.admission_mu);
     if (dispatch_rc != 0) {
-        if (err_lists) {
-            for (int i = 0; i < worker_count; i++) {
-                for (int j = 0; j < err_lists[i].count; j++) {
-                    free(err_lists[i].items[j].path);
-                    free(err_lists[i].items[j].reason);
-                    free(err_lists[i].items[j].phase);
-                }
-                free(err_lists[i].items);
-            }
-            free(err_lists);
-        }
         for (int i = 0; i < worker_count; i++) {
             if (workers[i].local_gbuf) {
                 cbm_gbuf_free(workers[i].local_gbuf);
@@ -1467,24 +1448,6 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     CBM_PROF_END_N("parallel_extract", "4_merge_gbufs_seq", t_merge, total_nodes);
     cbm_parallel_rebase_shared_ids(ctx->gbuf, shared_ids, "parallel_extract.merge");
-
-    /* Merge per-worker failure lists into the pipeline (SEQUENTIAL — no lock).
-     * Runs unconditionally (not gated on local_gbuf) so a worker whose files all
-     * failed still surfaces its diagnostics. */
-    if (err_lists) {
-        for (int i = 0; i < worker_count; i++) {
-            for (int j = 0; j < err_lists[i].count; j++) {
-                cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
-                                            err_lists[i].items[j].reason,
-                                            err_lists[i].items[j].phase);
-                free(err_lists[i].items[j].path);
-                free(err_lists[i].items[j].reason);
-                free(err_lists[i].items[j].phase);
-            }
-            free(err_lists[i].items);
-        }
-        free(err_lists);
-    }
 
     int extraction_rc = cbm_pipeline_reject_file_failures(ctx->pipeline, files, file_count,
                                                           result_cache, "parallel_extract");

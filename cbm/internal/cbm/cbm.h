@@ -570,6 +570,15 @@ typedef struct {
     int cap;
 } CBMParseDiagnosticArray;
 
+/* Binding two-class outcome contract (#1020). Unknown/unclassified failures
+ * are never recoverable: callers must treat them as infrastructure-fatal until
+ * a source-local isolation rule is added deliberately. */
+typedef enum {
+    CBM_EXTRACTION_OUTCOME_UNCLASSIFIED = 0,
+    CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL = 1,
+    CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT = 2,
+} CBMExtractionOutcomeClass;
+
 /* Exact first failure from authoritative per-file extraction.
  *
  * Every pointer is borrowed from a static string or the result arena and is
@@ -583,6 +592,16 @@ typedef struct {
     const char *message;
     const char *remediation;
     size_t requested;
+    CBMExtractionOutcomeClass outcome_class;
+    /* Pipeline-owned idempotency bit. Set only after both the graph fact and
+     * the response/readback inventory exist in the unpublished generation. */
+    bool content_defect_recorded;
+    /* Exact counts of already-extracted source facts discarded when the first
+     * terminal error was latched. These are facts, not projected unique graph
+     * rows: a parse that never produced a tree can have zero discarded facts
+     * while still leaving an explicitly unmeasured file. */
+    uint64_t discarded_atom_facts;
+    uint64_t discarded_relationship_facts;
 } CBMExtractionError;
 
 // Full extraction result for one file.
@@ -817,6 +836,11 @@ CBMFileResult *cbm_extract_file_at_path_with_metadata(
 void cbm_file_result_set_error(CBMFileResult *result, const char *code, const char *operation,
                                const char *phase, size_t requested, const char *message,
                                const char *remediation);
+
+/* Classify one structured extraction code under the binding two-class policy.
+ * The allowlist contains only independently isolatable source-content defects;
+ * every unknown, contract, resource, I/O, or integrity code is fatal. */
+CBMExtractionOutcomeClass cbm_extraction_outcome_classify(const char *code);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);

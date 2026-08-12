@@ -601,6 +601,10 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
 int cbm_store_count_nodes(cbm_store_t *s, const char *project);
 
+/* Narrow indexed recounts for persisted typed outcomes. These open only the
+ * nodes(project,label) / edges(project,type) ranges and never scan row bodies. */
+int cbm_store_count_nodes_by_label(cbm_store_t *s, const char *project, const char *label);
+
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
 
 int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path);

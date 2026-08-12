@@ -291,22 +291,34 @@ bool cbm_pipeline_get_fatal_error(const cbm_pipeline_t *p, cbm_pipeline_error_t 
 
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 
-/* One discovered source file that failed before authoritative extraction
- * completed. All strings are owned by the pipeline (copied on record, freed in
- * cbm_pipeline_free). These records feed the extraction barrier: any entry is
- * terminal and prevents publication of a partial graph. Benign zero-byte files
- * do not produce an entry. */
+typedef enum {
+    CBM_FILE_OUTCOME_UNCLASSIFIED = 0,
+    CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL = 1,
+    CBM_FILE_OUTCOME_CONTENT_DEFECT = 2,
+} cbm_file_outcome_class_t;
+
+/* One typed discovered-source outcome (#1020). All strings are owned by the
+ * pipeline. Infrastructure-fatal entries prevent publication; content-defect
+ * entries are publishable only after an exact ContentDefect node and
+ * HAS_CONTENT_DEFECT edge have been inserted into the same graph transaction. */
 typedef struct {
     char *path;   /* repo-relative path of the failed discovered file */
-    char *reason; /* human-readable cause (e.g. "oversized (712 MB > 512 MB)",
-                   * "parse timeout", "read failed") */
-    char *phase;  /* "read" | "extract" | "oversized". "cross_lsp" is a RESERVED
-                   * phase string for Track C's crash-attribution signal and is
-                   * intentionally NOT emitted today (the cross-LSP passes are
-                   * best-effort/void with no genuine per-file failure). */
+    char *reason; /* compatibility alias of message for older consumers */
+    char *phase;
+    cbm_file_outcome_class_t outcome_class;
+    char *code;
+    char *operation;
+    char *file_sha256;
+    char *message;
+    char *remediation;
+    size_t requested;
+    uint64_t discarded_atom_facts;
+    uint64_t discarded_relationship_facts;
+    bool graph_diagnostic_persisted;
 } cbm_file_error_t;
 
-/* Record a discovered-file failure. path/reason/phase are copied. NULL-safe on p.
+/* Record a legacy discovered-file infrastructure failure. path/reason/phase are
+ * copied. NULL-safe on p. New classified sites use the internal typed API.
  *
  * NOT thread-safe: call it from the sequential extraction pass, or from the
  * parallel merge step (never from inside a parallel worker — workers collect

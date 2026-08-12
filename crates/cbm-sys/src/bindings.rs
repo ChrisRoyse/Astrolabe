@@ -1104,6 +1104,13 @@ impl Default for CBMParseDiagnosticArray {
         }
     }
 }
+pub const CBMExtractionOutcomeClass_CBM_EXTRACTION_OUTCOME_UNCLASSIFIED: CBMExtractionOutcomeClass =
+    0;
+pub const CBMExtractionOutcomeClass_CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL:
+    CBMExtractionOutcomeClass = 1;
+pub const CBMExtractionOutcomeClass_CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT:
+    CBMExtractionOutcomeClass = 2;
+pub type CBMExtractionOutcomeClass = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMExtractionError {
@@ -1113,6 +1120,10 @@ pub struct CBMExtractionError {
     pub message: *const ::std::os::raw::c_char,
     pub remediation: *const ::std::os::raw::c_char,
     pub requested: usize,
+    pub outcome_class: CBMExtractionOutcomeClass,
+    pub content_defect_recorded: bool,
+    pub discarded_atom_facts: u64,
+    pub discarded_relationship_facts: u64,
 }
 impl Default for CBMExtractionError {
     fn default() -> Self {
@@ -1384,6 +1395,11 @@ unsafe extern "C" {
         message: *const ::std::os::raw::c_char,
         remediation: *const ::std::os::raw::c_char,
     );
+}
+unsafe extern "C" {
+    pub fn cbm_extraction_outcome_classify(
+        code: *const ::std::os::raw::c_char,
+    ) -> CBMExtractionOutcomeClass;
 }
 unsafe extern "C" {
     pub fn cbm_free_result(result: *mut CBMFileResult);
@@ -2876,6 +2892,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn cbm_store_count_nodes_by_label(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        label: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_store_count_nodes_scoped(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
@@ -4114,12 +4137,27 @@ unsafe extern "C" {
         out: *mut cbm_pipeline_error_t,
     ) -> bool;
 }
+pub const cbm_file_outcome_class_t_CBM_FILE_OUTCOME_UNCLASSIFIED: cbm_file_outcome_class_t = 0;
+pub const cbm_file_outcome_class_t_CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL: cbm_file_outcome_class_t =
+    1;
+pub const cbm_file_outcome_class_t_CBM_FILE_OUTCOME_CONTENT_DEFECT: cbm_file_outcome_class_t = 2;
+pub type cbm_file_outcome_class_t = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_file_error_t {
     pub path: *mut ::std::os::raw::c_char,
     pub reason: *mut ::std::os::raw::c_char,
     pub phase: *mut ::std::os::raw::c_char,
+    pub outcome_class: cbm_file_outcome_class_t,
+    pub code: *mut ::std::os::raw::c_char,
+    pub operation: *mut ::std::os::raw::c_char,
+    pub file_sha256: *mut ::std::os::raw::c_char,
+    pub message: *mut ::std::os::raw::c_char,
+    pub remediation: *mut ::std::os::raw::c_char,
+    pub requested: usize,
+    pub discarded_atom_facts: u64,
+    pub discarded_relationship_facts: u64,
+    pub graph_diagnostic_persisted: bool,
 }
 impl Default for cbm_file_error_t {
     fn default() -> Self {
