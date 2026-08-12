@@ -26,6 +26,7 @@ param(
     [int]$ReadinessWaitSeconds = 0,
     [int]$LauncherLeaseWaitSeconds = 0,
     [string]$RunId = '',
+    [AllowEmptyString()][string]$PriorityPolicy = 'production',
     [ValidateSet('InteractiveToken', 'S4U')]
     [string]$TaskLogonType = 'InteractiveToken',
     [switch]$AllowS4UIsolatedLocalFsv,
@@ -286,6 +287,8 @@ if ([IO.Path]::GetFullPath((Get-Location).Path).TrimEnd('\') -cne
     $script:AstroDetachedCanonicalRoot) {
     throw "DETACH_RUN[ASTRO_DETACH_ROOT_INVALID]: {code=ASTRO_DETACH_ROOT_INVALID; message=`"detach-run must execute from C:\code\Astrolabe`"; remediation=`"change to the canonical checkout and retry`"}"
 }
+$priorityPolicyResolved = Resolve-AstroDetachedPriorityPolicy `
+    -Name $PriorityPolicy
 
 $plan = ConvertFrom-AstroDetachedCommandPlan `
     -SingleCommand $Command `
@@ -658,6 +661,7 @@ $intentRecord = Write-AstroDetachedRecord `
         launcher_lease_wait_seconds = $LauncherLeaseWaitSeconds
         task_name = $taskNameExact
         task_logon_type = $TaskLogonType
+        priority_policy = $priorityPolicyResolved
         s4u_isolated_local_fsv = [bool]$AllowS4UIsolatedLocalFsv
         principal_user_id = $principal
         principal_sid = $principalSid
@@ -712,6 +716,7 @@ $taskSnapshot = $null
 $taskRecord = $null
 $taskCreated = $false
 $taskStarted = $false
+$preserveTaskOnPriorityMismatch = $false
 $prestartStage = 'task-service-connect'
 try {
     $taskService = Get-AstroDetachedTaskService
@@ -724,11 +729,20 @@ try {
         -ActionPath $bootstrapPath `
         -ActionArguments $actionArguments `
         -WorkingDirectory $script:AstroDetachedCanonicalRoot `
-        -Description "Astrolabe issue #$Issue detached launcher run $RunId"
+        -Description "Astrolabe issue #$Issue detached launcher run $RunId" `
+        -SchedulerPriority ([int]$priorityPolicyResolved.scheduler_priority)
     $taskCreated = $true
     $prestartStage = 'task-first-readback'
     $taskSnapshot = Get-AstroDetachedTaskSnapshot $registered
     $expectedLogon = if ($TaskLogonType -ceq 'InteractiveToken') { 3 } else { 2 }
+    if (-not $taskSnapshot.xml_priority_present -or
+        $taskSnapshot.scheduler_priority -ne
+            [int]$priorityPolicyResolved.scheduler_priority -or
+        $taskSnapshot.xml_priority -ne
+            [int]$priorityPolicyResolved.scheduler_priority) {
+        $preserveTaskOnPriorityMismatch = $true
+        throw "DETACH_RUN[ASTRO_DETACH_TASK_PRIORITY_MISMATCH]: {code=ASTRO_DETACH_TASK_PRIORITY_MISMATCH; message=`"registered task priority differs from the named policy: expected=$($priorityPolicyResolved.scheduler_priority) com=$($taskSnapshot.scheduler_priority) xml=$($taskSnapshot.xml_priority) explicit=$($taskSnapshot.xml_priority_present)`"; remediation=`"preserve the exact task and run directory; inspect Task Scheduler normalization without reprioritizing the live definition`"}"
+    }
     if ($taskSnapshot.path -cne "\$taskNameExact" -or
         $taskSnapshot.name -cne $taskNameExact -or
         -not $taskSnapshot.enabled -or
@@ -760,6 +774,7 @@ try {
         -PreviousSha256 $intentRecord.Sha256 `
         -Payload ([ordered]@{
             task = $taskSnapshot
+            priority_policy = $priorityPolicyResolved
             definition_read_back_before_start = $true
             registrar_identity = Get-AstroDetachedCurrentIdentity
         })
@@ -794,7 +809,8 @@ catch {
     }
     $removed = $false
     $cleanupError = $null
-    if ($taskCreated -and -not $taskStarted) {
+    if ($taskCreated -and -not $taskStarted -and
+        -not $preserveTaskOnPriorityMismatch) {
         try {
             [void](Remove-AstroDetachedTaskExact `
                 -TaskService $taskService `
@@ -890,6 +906,29 @@ while ([DateTime]::UtcNow -lt $deadline) {
         $boundaryRecord = $records[3]
         $workRecord = $records[4]
         $leaseRecord = $records[5]
+        foreach ($priorityBinding in @(
+                @{
+                    Candidate = $runnerRecord.Payload.priority_policy
+                    Context = 'runner record'
+                },
+                @{
+                    Candidate = $boundaryRecord.Payload.priority_policy
+                    Context = 'boundary record'
+                },
+                @{
+                    Candidate = $workRecord.Payload.priority_policy
+                    Context = 'work record'
+                },
+                @{
+                    Candidate = $leaseRecord.Payload.priority_policy
+                    Context = 'launcher-lease record'
+                }
+            )) {
+            Assert-AstroDetachedPriorityPolicyBinding `
+                -Candidate $priorityBinding.Candidate `
+                -Expected $priorityPolicyResolved `
+                -Context $priorityBinding.Context
+        }
         $bootstrapStart = Read-AstroDetachedBootstrapRecord `
             -RunDirectory $runDirectory `
             -Name 'bootstrap-start.json'
@@ -915,7 +954,12 @@ while ([DateTime]::UtcNow -lt $deadline) {
                 -TaskService $taskService `
                 -TaskName $taskNameExact
         )
-        if ($liveTaskReadback.xml_sha256 -cne $taskSnapshot.xml_sha256) {
+        if ($liveTaskReadback.xml_sha256 -cne $taskSnapshot.xml_sha256 -or
+            -not $liveTaskReadback.xml_priority_present -or
+            $liveTaskReadback.scheduler_priority -ne
+                [int]$priorityPolicyResolved.scheduler_priority -or
+            $liveTaskReadback.xml_priority -ne
+                [int]$priorityPolicyResolved.scheduler_priority) {
             throw "DETACH_RUN[ASTRO_DETACH_LIVE_TASK_CHANGED]: {code=ASTRO_DETACH_LIVE_TASK_CHANGED; message=`"task XML changed before readiness acceptance`"; remediation=`"preserve task/run state and inspect the mutation`"}"
         }
         $lastLock = Read-AstroLauncherLock (
@@ -937,23 +981,54 @@ while ([DateTime]::UtcNow -lt $deadline) {
             -ProcessStartUtcTicks (
                 [long]$runnerRecord.Payload.identity.process_start_utc_ticks
             ) `
-            -SessionId ([int]$runnerRecord.Payload.identity.session_id)
+            -SessionId ([int]$runnerRecord.Payload.identity.session_id) `
+            -ExpectedPriorityClass (
+                [string]$priorityPolicyResolved.process_priority_class
+            ) `
+            -ExpectedBasePriority (
+                [int]$priorityPolicyResolved.process_base_priority
+            )
         $bootstrapProbe = Get-AstroDetachedProcessProbe `
             -ProcessId ([int]$bootstrapValues.bootstrap_pid) `
             -ProcessStartUtcTicks (
                 [long]$bootstrapValues.bootstrap_start_utc_ticks
             ) `
-            -SessionId ([int]$bootstrapValues.bootstrap_session_id)
+            -SessionId ([int]$bootstrapValues.bootstrap_session_id) `
+            -ExpectedPriorityClass (
+                [string]$priorityPolicyResolved.process_priority_class
+            ) `
+            -ExpectedBasePriority (
+                [int]$priorityPolicyResolved.process_base_priority
+            )
+        $boundaryProbe = Get-AstroDetachedProcessProbe `
+            -ProcessId ([int]$boundaryRecord.Payload.identity.pid) `
+            -ProcessStartUtcTicks (
+                [long]$boundaryRecord.Payload.identity.process_start_utc_ticks
+            ) `
+            -SessionId ([int]$boundaryRecord.Payload.identity.session_id) `
+            -ExpectedPriorityClass (
+                [string]$priorityPolicyResolved.process_priority_class
+            ) `
+            -ExpectedBasePriority (
+                [int]$priorityPolicyResolved.process_base_priority
+            )
         $workProbe = Get-AstroDetachedProcessProbe `
             -ProcessId ([int]$workRecord.Payload.identity.pid) `
             -ProcessStartUtcTicks (
                 [long]$workRecord.Payload.identity.process_start_utc_ticks
             ) `
-            -SessionId ([int]$workRecord.Payload.identity.session_id)
+            -SessionId ([int]$workRecord.Payload.identity.session_id) `
+            -ExpectedPriorityClass (
+                [string]$priorityPolicyResolved.process_priority_class
+            ) `
+            -ExpectedBasePriority (
+                [int]$priorityPolicyResolved.process_base_priority
+            )
         if ($bootstrapProbe.state -cne 'exact-live' -or
             $runnerProbe.state -cne 'exact-live' -or
+            $boundaryProbe.state -cne 'exact-live' -or
             $workProbe.state -cne 'exact-live') {
-            throw "DETACH_RUN[ASTRO_DETACH_READY_OWNER_NOT_LIVE]: {code=ASTRO_DETACH_READY_OWNER_NOT_LIVE; message=`"bootstrap/runner/work probes are not all exact-live: bootstrap=$($bootstrapProbe.state), runner=$($runnerProbe.state), work=$($workProbe.state)`"; remediation=`"read terminal records instead of claiming live readiness`"}"
+            throw "DETACH_RUN[ASTRO_DETACH_READY_OWNER_NOT_LIVE]: {code=ASTRO_DETACH_READY_OWNER_NOT_LIVE; message=`"bootstrap/runner/boundary/work probes are not all exact-live with the declared priority: bootstrap=$($bootstrapProbe.state), runner=$($runnerProbe.state), boundary=$($boundaryProbe.state), work=$($workProbe.state)`"; remediation=`"read terminal records instead of claiming live readiness; preserve any priority mismatch`"}"
         }
         $result = [ordered]@{
             schema = 'astrolabe.detached.start-result.v1'
@@ -966,6 +1041,9 @@ while ([DateTime]::UtcNow -lt $deadline) {
             task_principal_sid = $taskSnapshot.principal_sid
             task_logon_type = $TaskLogonType
             task_action_path = $taskSnapshot.action_path
+            priority_policy = $priorityPolicyResolved
+            task_scheduler_priority = $taskSnapshot.scheduler_priority
+            task_xml_priority = $taskSnapshot.xml_priority
             task_session_id = [int]$runnerRecord.Payload.identity.session_id
             bootstrap_identity = [ordered]@{
                 pid = [int]$bootstrapValues.bootstrap_pid
@@ -976,8 +1054,11 @@ while ([DateTime]::UtcNow -lt $deadline) {
             bootstrap_start_path = $bootstrapStart.Path
             bootstrap_start_sha256 = $bootstrapStart.Sha256
             runner_identity = $runnerRecord.Payload.identity
+            runner_priority_probe = $runnerProbe
             launcher_boundary_identity = $boundaryRecord.Payload.identity
+            launcher_boundary_priority_probe = $boundaryProbe
             work_launcher_identity = $workRecord.Payload.identity
+            work_launcher_priority_probe = $workProbe
             authoritative_lock_sha256 = [string]$lastLock.Sha256
             lifecycle_head_name = $leaseRecord.Name
             lifecycle_head_sha256 = $leaseRecord.Sha256

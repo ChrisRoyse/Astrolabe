@@ -43,7 +43,9 @@ $taskService = $null
 $taskName = $null
 $taskXmlSha256 = $null
 $taskCleanupAttempted = $false
+$taskPreservationRequired = $false
 $terminalWritten = $false
+$priorityPolicy = $null
 $exitCode = 70
 
 function Get-DetachedFileEvidence {
@@ -88,9 +90,36 @@ try {
         [string]$intentPayload.repository_root -cne $script:AstroDetachedCanonicalRoot) {
         throw 'intent issue/run/root binding is invalid'
     }
+    $priorityPolicy = Resolve-AstroDetachedPriorityPolicy -Name 'production'
+    try {
+        $intentPriority = $intentPayload.PSObject.Properties['priority_policy']
+        $taskPriority = $taskPayload.PSObject.Properties['priority_policy']
+        if ($null -eq $intentPriority -or $null -eq $taskPriority) {
+            throw "priority policy is missing from intent or task record"
+        }
+        Assert-AstroDetachedPriorityPolicyBinding `
+            -Candidate $intentPriority.Value `
+            -Expected $priorityPolicy `
+            -Context 'intent'
+        Assert-AstroDetachedPriorityPolicyBinding `
+            -Candidate $taskPriority.Value `
+            -Expected $priorityPolicy `
+            -Context 'task record'
+    }
+    catch {
+        $taskPreservationRequired = $true
+        throw "DETACH_RUNNER[ASTRO_DETACH_PRIORITY_BINDING_INVALID]: {code=ASTRO_DETACH_PRIORITY_BINDING_INVALID; message=`"$($_.Exception.Message)`"; remediation=`"preserve task/run/process state and inspect the immutable chain; never infer or substitute priority`"}"
+    }
     $taskName = [string]$intentPayload.task_name
     $taskXmlSha256 = [string]$taskPayload.task.xml_sha256
     $runnerIdentity = Get-AstroDetachedCurrentIdentity
+    if ($runnerIdentity.priority_class -cne
+            [string]$priorityPolicy.process_priority_class -or
+        $runnerIdentity.base_priority -ne
+            [int]$priorityPolicy.process_base_priority) {
+        $taskPreservationRequired = $true
+        throw "DETACH_RUNNER[ASTRO_DETACH_RUNNER_PRIORITY_MISMATCH]: {code=ASTRO_DETACH_RUNNER_PRIORITY_MISMATCH; message=`"task runner priority differs from the immutable policy: expected=$($priorityPolicy.process_priority_class)/$($priorityPolicy.process_base_priority) observed=$($runnerIdentity.priority_class)/$($runnerIdentity.base_priority)`"; remediation=`"preserve task/run/process state and inspect Task Scheduler policy inheritance; do not reprioritize the live generation`"}"
+    }
     $bootstrapStart = Read-AstroDetachedBootstrapRecord `
         -RunDirectory $run `
         -Name 'bootstrap-start.json'
@@ -139,8 +168,15 @@ try {
         -ProcessStartUtcTicks (
             [long]$bootstrapValues.bootstrap_start_utc_ticks
         ) `
-        -SessionId ([int]$bootstrapValues.bootstrap_session_id)
+        -SessionId ([int]$bootstrapValues.bootstrap_session_id) `
+        -ExpectedPriorityClass (
+            [string]$priorityPolicy.process_priority_class
+        ) `
+        -ExpectedBasePriority ([int]$priorityPolicy.process_base_priority)
     if ($bootstrapProbe.state -cne 'exact-live') {
+        if ($bootstrapProbe.state -ceq 'priority-mismatch') {
+            $taskPreservationRequired = $true
+        }
         throw "DETACH_RUNNER[ASTRO_DETACH_BOOTSTRAP_NOT_LIVE]: {code=ASTRO_DETACH_BOOTSTRAP_NOT_LIVE; message=`"bootstrap is not exact-live during runner admission: $($bootstrapProbe.state)`"; remediation=`"preserve the run/task bytes and inspect process ancestry without restarting`"}"
     }
     $runnerParent = Get-AstroDetachedParentIdentity `
@@ -210,6 +246,14 @@ try {
         -TaskService $taskService `
         -TaskName $taskName
     $liveTaskSnapshot = Get-AstroDetachedTaskSnapshot $liveTask
+    if (-not $liveTaskSnapshot.xml_priority_present -or
+        $liveTaskSnapshot.scheduler_priority -ne
+            [int]$priorityPolicy.scheduler_priority -or
+        $liveTaskSnapshot.xml_priority -ne
+            [int]$priorityPolicy.scheduler_priority) {
+        $taskPreservationRequired = $true
+        throw "DETACH_RUNNER[ASTRO_DETACH_TASK_PRIORITY_MISMATCH]: {code=ASTRO_DETACH_TASK_PRIORITY_MISMATCH; message=`"live task priority differs from the immutable policy`"; remediation=`"preserve the exact task/run/process state and inspect Task Scheduler normalization without reprioritizing it`"}"
+    }
     if ($liveTaskSnapshot.xml_sha256 -cne $taskXmlSha256 -or
         $liveTaskSnapshot.action_path -cne
             [string]$intentPayload.bootstrap_path -or
@@ -233,6 +277,7 @@ try {
             task_xml_sha256 = $taskXmlSha256
             task_session_id = $runnerIdentity.session_id
             task_logon_type = [string]$intentPayload.task_logon_type
+            priority_policy = $priorityPolicy
             psmodulepath_policy = $modulePathPolicy
             bootstrap = [ordered]@{
                 identity = [ordered]@{
@@ -314,6 +359,20 @@ try {
         -ArgumentList ([string[]]$launcherArguments) `
         -LogFile $logPath `
         -WorkingDirectory $script:AstroDetachedCanonicalRoot
+    $boundaryProbe = Get-AstroDetachedProcessProbe `
+        -ProcessId ([int]$lease.ProcessId) `
+        -ProcessStartUtcTicks ([long]$lease.ProcessStartUtcTicks) `
+        -SessionId ([int]$lease.SessionId) `
+        -ExpectedPriorityClass (
+            [string]$priorityPolicy.process_priority_class
+        ) `
+        -ExpectedBasePriority ([int]$priorityPolicy.process_base_priority)
+    if ($boundaryProbe.state -cne 'exact-live') {
+        if ($boundaryProbe.state -ceq 'priority-mismatch') {
+            $taskPreservationRequired = $true
+        }
+        throw "DETACH_RUNNER[ASTRO_DETACH_BOUNDARY_PRIORITY_MISMATCH]: {code=ASTRO_DETACH_BOUNDARY_PRIORITY_MISMATCH; message=`"launcher boundary is not exact-live at the declared priority: $($boundaryProbe.state)`"; remediation=`"preserve the retained process/run/task and inspect priority inheritance; do not reprioritize or retry`"}"
+    }
     $boundaryRecord = Write-AstroDetachedRecord `
         -RunDirectory $run `
         -Name '003-boundary.json' `
@@ -327,8 +386,12 @@ try {
                 process_start_utc_ticks = [long]$lease.ProcessStartUtcTicks
                 process_started_utc = [string]$lease.ProcessStartedUtc
                 session_id = [int]$lease.SessionId
+                priority_class = [string]$boundaryProbe.observed_priority_class
+                base_priority = [int]$boundaryProbe.observed_base_priority
             }
             role = 'launcher-boundary'
+            priority_policy = $priorityPolicy
+            priority_probe = $boundaryProbe
             application_path = [string]$lease.ApplicationPath
             command_line = [string]$lease.CommandLine
             log_path = $logPath
@@ -369,8 +432,15 @@ try {
     $ownerProbe = Get-AstroDetachedProcessProbe `
         -ProcessId ([int]$lock.OwnerPid) `
         -ProcessStartUtcTicks ([long]$lock.OwnerProcessStartUtcTicks) `
-        -SessionId $ownerSession
+        -SessionId $ownerSession `
+        -ExpectedPriorityClass (
+            [string]$priorityPolicy.process_priority_class
+        ) `
+        -ExpectedBasePriority ([int]$priorityPolicy.process_base_priority)
     if ($ownerProbe.state -cne 'exact-live') {
+        if ($ownerProbe.state -ceq 'priority-mismatch') {
+            $taskPreservationRequired = $true
+        }
         throw "authoritative launcher owner is not exact-live: $($ownerProbe.state)"
     }
     $ownerParent = Get-AstroDetachedParentIdentity `
@@ -397,8 +467,12 @@ try {
                 process_start_utc_ticks = [long]$lock.OwnerProcessStartUtcTicks
                 process_started_utc = [string]$lock.OwnerProcessStarted
                 session_id = $ownerSession
+                priority_class = [string]$ownerProbe.observed_priority_class
+                base_priority = [int]$ownerProbe.observed_base_priority
             }
             role = 'authoritative-launcher-owner'
+            priority_policy = $priorityPolicy
+            priority_probe = $ownerProbe
             exact_parent_identity = $ownerParent
             boundary_identity = $boundaryRecord.Payload.identity
             issue = [int]$lock.Issue
@@ -427,6 +501,8 @@ try {
             lock_json_base64 = [Convert]::ToBase64String($lockBytes)
             issue = [int]$lock.Issue
             owner_identity = $workRecord.Payload.identity
+            priority_policy = $priorityPolicy
+            owner_priority_probe = $ownerProbe
             protocol_authority_path = [string]$lock.ProtocolAuthorityPath
             protocol_authority_sha256 = [string]$lock.ProtocolAuthoritySha256
             workspace_root = [string]$lock.WorkspaceRoot
@@ -447,13 +523,21 @@ try {
         -ProcessStartUtcTicks (
             [long]$boundaryRecord.Payload.identity.process_start_utc_ticks
         ) `
-        -SessionId ([int]$boundaryRecord.Payload.identity.session_id)
+        -SessionId ([int]$boundaryRecord.Payload.identity.session_id) `
+        -ExpectedPriorityClass (
+            [string]$priorityPolicy.process_priority_class
+        ) `
+        -ExpectedBasePriority ([int]$priorityPolicy.process_base_priority)
     $workProbe = Get-AstroDetachedProcessProbe `
         -ProcessId ([int]$workRecord.Payload.identity.pid) `
         -ProcessStartUtcTicks (
             [long]$workRecord.Payload.identity.process_start_utc_ticks
         ) `
-        -SessionId ([int]$workRecord.Payload.identity.session_id)
+        -SessionId ([int]$workRecord.Payload.identity.session_id) `
+        -ExpectedPriorityClass (
+            [string]$priorityPolicy.process_priority_class
+        ) `
+        -ExpectedBasePriority ([int]$priorityPolicy.process_base_priority)
     $targetState = Get-DetachedPathAbsence (
         Join-Path $script:AstroDetachedCanonicalRoot 'target'
     )
@@ -480,6 +564,7 @@ try {
         -Payload ([ordered]@{
             outcome = if ($exitCode -eq 0) { 'success' } else { 'child-nonzero' }
             child_exit_code = $exitCode
+            priority_policy = $priorityPolicy
             boundary_probe = $boundaryProbe
             work_probe = $workProbe
             launcher_lock_state = [string]$finalLock.State
@@ -511,6 +596,7 @@ try {
             task_xml_sha256 = [string]$removedTask.xml_sha256
             task_absent = $true
             runner_identity = $runnerIdentity
+            priority_policy = $priorityPolicy
             protocol_artifacts_preserved = $true
         })
     [void](Read-AstroDetachedRecord `
@@ -559,6 +645,8 @@ catch {
                     terminal_record_previously_written = $terminalWritten
                     task_cleanup_attempted = [bool]$taskCleanupAttempted
                     task_cleanup_retried = $false
+                    priority_policy = $priorityPolicy
+                    task_preservation_required = $taskPreservationRequired
                 })
             $chain = Read-AstroDetachedRecord `
                 -RunDirectory $run `
@@ -582,7 +670,8 @@ catch {
     if ($null -ne $taskService -and
         -not [string]::IsNullOrWhiteSpace($taskName) -and
         $taskXmlSha256 -cmatch '^[0-9a-f]{64}$' -and
-        -not $taskCleanupAttempted) {
+        -not $taskCleanupAttempted -and
+        -not $taskPreservationRequired) {
         try {
             $registered = Get-AstroDetachedRegisteredTask `
                 -TaskService $taskService `
@@ -610,6 +699,7 @@ catch {
                         task_xml_sha256 = $taskXmlSha256
                         task_absent = $true
                         cleanup_after_fault = $true
+                        priority_policy = $priorityPolicy
                         protocol_artifacts_preserved = $true
                     }))
             }

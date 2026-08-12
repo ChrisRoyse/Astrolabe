@@ -196,6 +196,87 @@ function ConvertTo-AstroDetachedUtcIso {
     return [DateTime]::new($UtcTicks, [DateTimeKind]::Utc).ToString('o')
 }
 
+function Resolve-AstroDetachedPriorityPolicy {
+    <#
+    Detached work has one registry-declared production scheduling contract.
+    Resolution is O(1) once per admission; the resolved tuple is immutable for
+    the complete ownership chain. Measured against the 192,873-node canonical
+    self-host run on 2026-08-12 (issue #1104; PC-03/35/37/38/41).
+    #>
+    param([AllowEmptyString()][string]$Name)
+
+    if ($Name -cne 'production') {
+        $shown = if ([string]::IsNullOrWhiteSpace($Name)) { '<empty>' } else { $Name }
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_PRIORITY_POLICY_UNSUPPORTED]: {code=ASTRO_DETACH_PRIORITY_POLICY_UNSUPPORTED; message=`"detached priority policy '$shown' is not registered`"; remediation=`"pass -PriorityPolicy production; background, numeric, and inherited priority modes are unsupported and never selected as a fallback`"}"
+    }
+    return [ordered]@{
+        registry_schema = 'astrolabe.detached-priority-registry.v1'
+        name = 'production'
+        scheduler_priority = 4
+        process_priority_class = 'Normal'
+        process_base_priority = 8
+        io_priority = 'normal'
+        memory_priority = 'normal'
+        inheritance = 'task-bootstrap-and-descendants'
+    }
+}
+
+function Assert-AstroDetachedPriorityPolicyBinding {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $keys = @(
+        'registry_schema',
+        'name',
+        'scheduler_priority',
+        'process_priority_class',
+        'process_base_priority',
+        'io_priority',
+        'memory_priority',
+        'inheritance'
+    )
+    $candidateCount = if ($Candidate -is [Collections.IDictionary]) {
+        [int]$Candidate.Count
+    }
+    else {
+        [int]@($Candidate.PSObject.Properties).Count
+    }
+    if ($candidateCount -ne $keys.Count) {
+        throw "DETACH_PROTOCOL[ASTRO_DETACH_PRIORITY_BINDING_INVALID]: {code=ASTRO_DETACH_PRIORITY_BINDING_INVALID; message=`"$Context priority policy has $candidateCount fields; expected $($keys.Count)`"; remediation=`"preserve the run and inspect the immutable priority-policy record; never infer missing or extra fields`"}"
+    }
+    foreach ($key in $keys) {
+        if ($Candidate -is [Collections.IDictionary]) {
+            if (-not $Candidate.Contains($key)) {
+                throw "DETACH_PROTOCOL[ASTRO_DETACH_PRIORITY_BINDING_INVALID]: {code=ASTRO_DETACH_PRIORITY_BINDING_INVALID; message=`"$Context priority policy is missing '$key'`"; remediation=`"preserve the run and inspect the immutable priority-policy record; never infer a missing field`"}"
+            }
+            $actual = $Candidate[$key]
+        }
+        else {
+            $property = $Candidate.PSObject.Properties[$key]
+            if ($null -eq $property) {
+                throw "DETACH_PROTOCOL[ASTRO_DETACH_PRIORITY_BINDING_INVALID]: {code=ASTRO_DETACH_PRIORITY_BINDING_INVALID; message=`"$Context priority policy is missing '$key'`"; remediation=`"preserve the run and inspect the immutable priority-policy record; never infer a missing field`"}"
+            }
+            $actual = $property.Value
+        }
+        $wanted = $Expected[$key]
+        $matches = if ($key -in @(
+                'scheduler_priority',
+                'process_base_priority'
+            )) {
+            [int]$actual -eq [int]$wanted
+        }
+        else {
+            [string]$actual -ceq [string]$wanted
+        }
+        if (-not $matches) {
+            throw "DETACH_PROTOCOL[ASTRO_DETACH_PRIORITY_BINDING_INVALID]: {code=ASTRO_DETACH_PRIORITY_BINDING_INVALID; message=`"$Context priority policy field '$key' differs: expected='$wanted' observed='$actual'`"; remediation=`"preserve the run and inspect the immutable priority-policy record; never clamp, inherit, or substitute a fallback`"}"
+        }
+    }
+}
+
 function Get-AstroDetachedCurrentIdentity {
     $process = Get-Process -Id $PID -ErrorAction Stop
     $ticks = [long]$process.StartTime.ToUniversalTime().Ticks
@@ -205,6 +286,8 @@ function Get-AstroDetachedCurrentIdentity {
         process_started_utc = ConvertTo-AstroDetachedUtcIso $ticks
         session_id = [int]$process.SessionId
         user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        priority_class = [string]$process.PriorityClass
+        base_priority = [int]$process.BasePriority
     }
 }
 
@@ -212,7 +295,9 @@ function Get-AstroDetachedProcessProbe {
     param(
         [Parameter(Mandatory)][int]$ProcessId,
         [Parameter(Mandatory)][long]$ProcessStartUtcTicks,
-        [Parameter(Mandatory)][int]$SessionId
+        [Parameter(Mandatory)][int]$SessionId,
+        [string]$ExpectedPriorityClass = '',
+        [int]$ExpectedBasePriority = -1
     )
 
     try {
@@ -227,6 +312,10 @@ function Get-AstroDetachedProcessProbe {
                 expected_session_id = $SessionId
                 observed_process_start_utc_ticks = $null
                 observed_session_id = $null
+                expected_priority_class = if ([string]::IsNullOrEmpty($ExpectedPriorityClass)) { $null } else { $ExpectedPriorityClass }
+                expected_base_priority = if ($ExpectedBasePriority -lt 0) { $null } else { $ExpectedBasePriority }
+                observed_priority_class = $null
+                observed_base_priority = $null
                 error = $null
             }
         }
@@ -237,6 +326,10 @@ function Get-AstroDetachedProcessProbe {
             expected_session_id = $SessionId
             observed_process_start_utc_ticks = $null
             observed_session_id = $null
+            expected_priority_class = if ([string]::IsNullOrEmpty($ExpectedPriorityClass)) { $null } else { $ExpectedPriorityClass }
+            expected_base_priority = if ($ExpectedBasePriority -lt 0) { $null } else { $ExpectedBasePriority }
+            observed_priority_class = $null
+            observed_base_priority = $null
             error = "$($_.FullyQualifiedErrorId): $($_.Exception.Message)"
         }
     }
@@ -245,6 +338,8 @@ function Get-AstroDetachedProcessProbe {
         $observedTicks = [long]$process.StartTime.ToUniversalTime().Ticks
         $observedSession = [int]$process.SessionId
         $hasExited = [bool]$process.HasExited
+        $observedPriorityClass = [string]$process.PriorityClass
+        $observedBasePriority = [int]$process.BasePriority
     }
     catch {
         return [ordered]@{
@@ -254,17 +349,29 @@ function Get-AstroDetachedProcessProbe {
             expected_session_id = $SessionId
             observed_process_start_utc_ticks = $null
             observed_session_id = $null
+            expected_priority_class = if ([string]::IsNullOrEmpty($ExpectedPriorityClass)) { $null } else { $ExpectedPriorityClass }
+            expected_base_priority = if ($ExpectedBasePriority -lt 0) { $null } else { $ExpectedBasePriority }
+            observed_priority_class = $null
+            observed_base_priority = $null
             error = "$($_.FullyQualifiedErrorId): $($_.Exception.Message)"
         }
     }
     $exact = $observedTicks -eq $ProcessStartUtcTicks -and
         $observedSession -eq $SessionId
+    $priorityMatches =
+        ([string]::IsNullOrEmpty($ExpectedPriorityClass) -or
+            $observedPriorityClass -ceq $ExpectedPriorityClass) -and
+        ($ExpectedBasePriority -lt 0 -or
+            $observedBasePriority -eq $ExpectedBasePriority)
     return [ordered]@{
         state = if (-not $exact) {
             'reused'
         }
         elseif ($hasExited) {
             'exact-exited'
+        }
+        elseif (-not $priorityMatches) {
+            'priority-mismatch'
         }
         else {
             'exact-live'
@@ -274,6 +381,10 @@ function Get-AstroDetachedProcessProbe {
         expected_session_id = $SessionId
         observed_process_start_utc_ticks = $observedTicks
         observed_session_id = $observedSession
+        expected_priority_class = if ([string]::IsNullOrEmpty($ExpectedPriorityClass)) { $null } else { $ExpectedPriorityClass }
+        expected_base_priority = if ($ExpectedBasePriority -lt 0) { $null } else { $ExpectedBasePriority }
+        observed_priority_class = $observedPriorityClass
+        observed_base_priority = $observedBasePriority
         error = $null
     }
 }
@@ -911,6 +1022,10 @@ function Get-AstroDetachedTaskSnapshot {
         '/task:Task/task:Principals/task:Principal/task:UserId',
         $namespace
     )
+    $priorityNode = $xmlDocument.SelectSingleNode(
+        '/task:Task/task:Settings/task:Priority',
+        $namespace
+    )
     if ($null -eq $principalSidNode -or
         [string]::IsNullOrWhiteSpace([string]$principalSidNode.InnerText)) {
         throw 'detached task XML does not contain one principal UserId'
@@ -955,6 +1070,14 @@ function Get-AstroDetachedTaskSnapshot {
         multiple_instances = [int]$definition.Settings.MultipleInstances
         start_when_available = [bool]$definition.Settings.StartWhenAvailable
         wake_to_run = [bool]$definition.Settings.WakeToRun
+        scheduler_priority = [int]$definition.Settings.Priority
+        xml_priority_present = $null -ne $priorityNode
+        xml_priority = if ($null -ne $priorityNode) {
+            [int]$priorityNode.InnerText
+        }
+        else {
+            $null
+        }
         xml_sha256 = Get-AstroDetachedSha256Bytes $xmlBytes
         xml_bytes = [long]$xmlBytes.Length
         xml_base64 = [Convert]::ToBase64String($xmlBytes)
@@ -971,7 +1094,8 @@ function Register-AstroDetachedTaskCreateOnly {
         [Parameter(Mandatory)][string]$ActionPath,
         [Parameter(Mandatory)][string]$ActionArguments,
         [Parameter(Mandatory)][string]$WorkingDirectory,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][int]$SchedulerPriority
     )
 
     if ($TaskName -cnotmatch '^Astrolabe\.Detached\.[0-9a-f]{32}$') {
@@ -982,6 +1106,9 @@ function Register-AstroDetachedTaskCreateOnly {
             -TaskName $TaskName `
             -AllowAbsent)) {
         throw "DETACH_TASK[ASTRO_DETACH_TASK_COLLISION]: {code=ASTRO_DETACH_TASK_COLLISION; message=`"create-only task already exists: $TaskName`"; remediation=`"preserve and inspect the existing task; choose a fresh run ID`"}"
+    }
+    if ($SchedulerPriority -lt 0 -or $SchedulerPriority -gt 10) {
+        throw "DETACH_TASK[ASTRO_DETACH_TASK_PRIORITY_INVALID]: {code=ASTRO_DETACH_TASK_PRIORITY_INVALID; message=`"scheduler priority is outside the Task Scheduler schema range: $SchedulerPriority`"; remediation=`"correct the named priority registry; never substitute an inherited or clamped value`"}"
     }
     $logonValue = if ($LogonType -ceq 'InteractiveToken') { 3 } else { 2 }
     $definition = $TaskService.NewTask(0)
@@ -999,6 +1126,7 @@ function Register-AstroDetachedTaskCreateOnly {
     $definition.Settings.MultipleInstances = 2
     $definition.Settings.StartWhenAvailable = $false
     $definition.Settings.WakeToRun = $false
+    $definition.Settings.Priority = $SchedulerPriority
     $action = $definition.Actions.Create(0)
     $action.Path = $ActionPath
     $action.Arguments = $ActionArguments
