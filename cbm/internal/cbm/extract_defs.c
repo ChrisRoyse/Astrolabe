@@ -5351,6 +5351,12 @@ typedef struct {
     bool entered;
 } JSONWalkFrame;
 
+typedef enum {
+    JSON_TEXT_OK = 0,
+    JSON_TEXT_INVALID,
+    JSON_TEXT_RESOURCE_FAILURE,
+} JSONTextOutcome;
+
 static bool json_text_reserve(JSONTextBuffer *buf, size_t additional) {
     if (!buf || additional > SIZE_MAX - buf->len - SKIP_CHAR) {
         return false;
@@ -5447,22 +5453,26 @@ static bool json_append_codepoint(JSONTextBuffer *buf, uint32_t codepoint) {
 /* Decode one JSON string key into a canonical UTF-8/display representation.
  * Control code points remain textual \u00xx so embedded NUL never truncates a
  * graph identity. Equivalent escape spellings otherwise converge. */
-static bool json_decode_key(const char *source, TSNode key_node, JSONTextBuffer *decoded) {
+static JSONTextOutcome json_decode_key(const char *source, TSNode key_node,
+                                       JSONTextBuffer *decoded) {
     uint32_t start = ts_node_start_byte(key_node);
     uint32_t end = ts_node_end_byte(key_node);
     if (!source || end < start + PAIR_LEN || source[start] != '"' || source[end - SKIP_CHAR] != '"') {
-        return false;
+        return JSON_TEXT_INVALID;
     }
     for (uint32_t i = start + SKIP_CHAR; i < end - SKIP_CHAR; i++) {
         unsigned char ch = (unsigned char)source[i];
         if (ch != '\\') {
-            if (ch < 0x20 || !json_text_append_char(decoded, (char)ch)) {
-                return false;
+            if (ch < 0x20) {
+                return JSON_TEXT_INVALID;
+            }
+            if (!json_text_append_char(decoded, (char)ch)) {
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             continue;
         }
         if (++i >= end - SKIP_CHAR) {
-            return false;
+            return JSON_TEXT_INVALID;
         }
         ch = (unsigned char)source[i];
         switch (ch) {
@@ -5470,71 +5480,71 @@ static bool json_decode_key(const char *source, TSNode key_node, JSONTextBuffer 
         case '\\':
         case '/':
             if (!json_text_append_char(decoded, (char)ch)) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         case 'b':
             if (!json_append_codepoint(decoded, '\b')) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         case 'f':
             if (!json_append_codepoint(decoded, '\f')) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         case 'n':
             if (!json_append_codepoint(decoded, '\n')) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         case 'r':
             if (!json_append_codepoint(decoded, '\r')) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         case 't':
             if (!json_append_codepoint(decoded, '\t')) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         case 'u': {
             if (i + 4 >= end - SKIP_CHAR) {
-                return false;
+                return JSON_TEXT_INVALID;
             }
             uint32_t codepoint = 0;
             if (!json_parse_hex4(source + i + SKIP_CHAR, &codepoint)) {
-                return false;
+                return JSON_TEXT_INVALID;
             }
             i += 4;
             if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
                 if (i + 6 >= end || source[i + SKIP_CHAR] != '\\' ||
                     source[i + PAIR_LEN] != 'u') {
-                    return false;
+                    return JSON_TEXT_INVALID;
                 }
                 uint32_t low = 0;
                 if (!json_parse_hex4(source + i + 3, &low) || low < 0xdc00 || low > 0xdfff) {
-                    return false;
+                    return JSON_TEXT_INVALID;
                 }
                 codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
                 i += 6;
             } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
-                return false;
+                return JSON_TEXT_INVALID;
             }
             if (!json_append_codepoint(decoded, codepoint)) {
-                return false;
+                return JSON_TEXT_RESOURCE_FAILURE;
             }
             break;
         }
         default:
-            return false;
+            return JSON_TEXT_INVALID;
         }
     }
     if (!decoded->data && !json_text_reserve(decoded, 0)) {
-        return false;
+        return JSON_TEXT_RESOURCE_FAILURE;
     }
     decoded->data[decoded->len] = '\0';
-    return true;
+    return JSON_TEXT_OK;
 }
 
 static bool json_path_append_key(JSONTextBuffer *path, const char *decoded_key) {
@@ -5690,13 +5700,28 @@ static bool extract_json_schema_variables(CBMExtractCtx *ctx, TSNode root) {
             if (strcmp(kind, "pair") == 0) {
                 TSNode key_node = ts_node_child_by_field_name(frame->node, TS_FIELD("key"));
                 JSONTextBuffer decoded = {0};
-                if (ts_node_is_null(key_node) || !json_decode_key(ctx->source, key_node, &decoded) ||
-                    !json_path_append_key(&path, decoded.data ? decoded.data : "")) {
+                JSONTextOutcome key_outcome = ts_node_is_null(key_node)
+                                                  ? JSON_TEXT_INVALID
+                                                  : json_decode_key(ctx->source, key_node, &decoded);
+                if (key_outcome != JSON_TEXT_OK) {
+                    free(decoded.data);
+                    ok = key_outcome == JSON_TEXT_RESOURCE_FAILURE
+                             ? json_schema_fail(
+                                   ctx, "CBM_JSON_SCHEMA_ALLOC_FAILED", "decode_json_key", 0,
+                                   "the JSON object key decoder could not retain bounded state",
+                                   "free memory or reduce concurrent extraction workers, then retry")
+                             : json_schema_fail(
+                                   ctx, "CBM_JSON_SCHEMA_KEY_INVALID", "normalize_json_key", 0,
+                                   "a JSON object key could not be normalized without losing identity",
+                                   "repair invalid key escaping or Unicode and retry the complete corpus");
+                    break;
+                }
+                if (!json_path_append_key(&path, decoded.data ? decoded.data : "")) {
                     free(decoded.data);
                     ok = json_schema_fail(
-                        ctx, "CBM_JSON_SCHEMA_KEY_INVALID", "normalize_json_key", 0,
-                        "a JSON object key could not be normalized without losing identity",
-                        "repair invalid key escaping or Unicode and retry the complete corpus");
+                        ctx, "CBM_JSON_SCHEMA_ALLOC_FAILED", "append_json_key_path", path.len,
+                        "the normalized JSON schema path could not retain bounded state",
+                        "free memory or reduce concurrent extraction workers, then retry");
                     break;
                 }
 

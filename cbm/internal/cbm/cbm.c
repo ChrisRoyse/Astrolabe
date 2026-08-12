@@ -1137,51 +1137,61 @@ CBMExtractionOutcomeClass cbm_extraction_outcome_classify(const char *code) {
      * suffixes. This deny-first order prevents a code such as
      * *_CONTEXT_INVALID or *_PARSER_ALLOC_FAILED from becoming recoverable. */
     static const char *const fatal_markers[] = {
-        "ALLOC",       "CAPACITY",    "OVERFLOW",   "LIMIT_EXCEEDED",
-        "STACK_",      "CONTEXT_",    "ABI_",       "CORRUPT",
-        "SOURCE_SLAB", "COMPACTION",  "METRICS_",   "PREPROCESS_",
-        "INTERNAL_",   "INVARIANT",   "PARSER_INIT", "PARSER_ALLOC",
+        "ALLOC",        "CAPACITY",    "OVERFLOW",    "LIMIT_EXCEEDED",
+        "STACK_",       "CONTEXT_",    "ABI_",        "CORRUPT",
+        "SOURCE_SLAB",  "COMPACTION",  "METRICS_",    "PREPROCESS_",
+        "INTERNAL_",    "INVARIANT",   "PARSER_INIT", "PARSER_ALLOC",
+        "GRAMMAR_",     "PARSE_FAILED",
     };
     if (cbm_code_has_any(code, fatal_markers,
                          sizeof(fatal_markers) / sizeof(fatal_markers[0])) ||
         strcmp(code, "CBM_GRAMMAR_STUBBED") == 0 ||
-        strcmp(code, "CBM_PARSE_FAILED") == 0 ||
-        strcmp(code, "CBM_RUST_SOURCE_PATH_MISSING") == 0) {
+        strcmp(code, "CBM_RUST_SOURCE_PATH_MISSING") == 0 ||
+        strcmp(code, "CBM_RUST_SOURCE_PATH_INVALID") == 0 ||
+        strcmp(code, "CBM_RUST_PATH_ATTRIBUTE_AST_INVALID") == 0 ||
+        strcmp(code, "CBM_RUST_MACRO_RULE_INVALID") == 0) {
         return CBM_EXTRACTION_OUTCOME_INFRASTRUCTURE_FATAL;
     }
 
     static const char *const exact_content_codes[] = {
         "CBM_LANGUAGE_UNSUPPORTED",
-        "CBM_GRAMMAR_UNAVAILABLE",
         "CBM_PARSE_TOTAL_BUDGET_EXCEEDED",
         "CBM_PARSE_PROGRESS_STALLED",
         "CBM_PARSE_FINAL_BALANCE_TIMEOUT",
         "CBM_BASH_SOURCE_ARGUMENT_MISSING",
         "CBM_BASH_SOURCE_ARGUMENT_INVALID",
-        "CBM_POWERSHELL_EMBEDDED_PARSE_FAILED",
         "CBM_JSON_PARSE_INVALID",
         "CBM_JSON_SCHEMA_KEY_INVALID",
         "CBM_RUST_RAW_IDENTIFIER_INVALID",
-        "CBM_RUST_SOURCE_PATH_INVALID",
+        "CBM_RUST_PATH_ATTRIBUTE_LITERAL_INVALID",
+        "CBM_RUST_PATH_ATTRIBUTE_VALUE_MISSING",
+        "CBM_RUST_PATH_ATTRIBUTE_DUPLICATE",
+        "CBM_RUST_PATH_ATTRIBUTE_TARGET_INVALID",
+        "CBM_RUST_PATH_ATTRIBUTE_TARGET_MISSING",
+        "CBM_RUST_MACRO_TOKEN_INVALID",
+        "CBM_RUST_MACRO_DUPLICATE_BINDING",
+        "CBM_RUST_MACRO_PATTERN_UNSUPPORTED",
+        "CBM_RUST_MACRO_EDITION_UNKNOWN",
+        "CBM_RUST_MACRO_FRAGMENT_UNSUPPORTED",
+        "CBM_RUST_MACRO_LOCAL_AMBIGUITY",
+        "CBM_RUST_MACRO_TRANSCRIBER_UNSUPPORTED",
+        "CBM_RUST_MACRO_UNBOUND_METAVARIABLE",
+        "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISSING",
+        "CBM_RUST_MACRO_REPETITION_CARDINALITY_MISMATCH",
+        "CBM_RUST_MACRO_TRANSCRIBER_INVALID",
+        "CBM_RUST_MACRO_REPETITION_WITHOUT_DRIVER",
+        "CBM_RUST_MACRO_REPETITION_NESTING_MISMATCH",
+        "CBM_RUST_MACRO_INVOCATION_INVALID",
+        "CBM_RUST_MACRO_FRAGMENT_INVALID",
+        "CBM_RUST_MACRO_NO_MATCH",
+        "CBM_RUST_MACRO_RECURSION_CYCLE",
+        "CBM_RUST_MACRO_EXPANSION_INVALID",
+        "CBM_RUST_KNOWN_MACRO_FORM_UNSUPPORTED",
+        "CBM_RUST_KNOWN_MACRO_EXPRESSION_INVALID",
+        "CBM_RUST_KNOWN_MACRO_INVOCATION_INVALID",
     };
     for (size_t i = 0; i < sizeof(exact_content_codes) / sizeof(exact_content_codes[0]); i++) {
         if (strcmp(code, exact_content_codes[i]) == 0) {
-            return CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
-        }
-    }
-
-    if (strncmp(code, "CBM_RUST_PATH_ATTRIBUTE_", strlen("CBM_RUST_PATH_ATTRIBUTE_")) == 0) {
-        return CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
-    }
-    if (strncmp(code, "CBM_RUST_MACRO_", strlen("CBM_RUST_MACRO_")) == 0 ||
-        strncmp(code, "CBM_RUST_KNOWN_MACRO_", strlen("CBM_RUST_KNOWN_MACRO_")) == 0) {
-        static const char *const content_markers[] = {
-            "NO_MATCH",       "INVALID",       "UNSUPPORTED", "DUPLICATE_BINDING",
-            "UNBOUND_",       "CARDINALITY_",   "REPETITION_", "RECURSION_CYCLE",
-            "PARSE_FAILED",   "EDITION_UNKNOWN",
-        };
-        if (cbm_code_has_any(code, content_markers,
-                             sizeof(content_markers) / sizeof(content_markers[0]))) {
             return CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT;
         }
     }
