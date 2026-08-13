@@ -2899,6 +2899,14 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn cbm_store_count_nodes_by_label_and_name(
+        s: *mut cbm_store_t,
+        project: *const ::std::os::raw::c_char,
+        label: *const ::std::os::raw::c_char,
+        name: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_store_count_nodes_scoped(
         s: *mut cbm_store_t,
         project: *const ::std::os::raw::c_char,
@@ -4157,6 +4165,7 @@ pub struct cbm_file_error_t {
     pub requested: usize,
     pub discarded_atom_facts: u64,
     pub discarded_relationship_facts: u64,
+    pub unmeasured_file: bool,
     pub graph_diagnostic_persisted: bool,
 }
 impl Default for cbm_file_error_t {

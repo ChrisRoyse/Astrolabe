@@ -735,8 +735,36 @@ pub(crate) fn handle_index_repository(
                     return Ok(error_result);
                 }
             };
-            // #1037: from here on the stage holds a durable CBM store, so every
-            // abort preserves it instead of destroying it.
+            // The completed CBM store is already the expensive durable product.
+            // Arm it before touching its declared log so any promotion/readback
+            // failure preserves rather than destroys the stage (#1037).
+            if let Some(fingerprint) = stage_fingerprint.as_ref()
+                && let Err(error) = publication.arm_stage_preservation(fingerprint, &result)
+            {
+                return tool_error_result(
+                    publication
+                        .abort("stage preservation arming", error)
+                        .to_string(),
+                );
+            }
+            let result = match promote_shadow_skip_log(
+                &result,
+                publication.stage_cache(),
+                &cache_dir,
+                &project,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    return tool_error_result(
+                        publication
+                            .abort("index skip-log promotion", error)
+                            .to_string(),
+                    );
+                }
+            };
+            // Rebind preserved-stage replay to the response containing the durable
+            // content-addressed log receipt. This replaces, never weakens, the
+            // pre-promotion arming above.
             if let Some(fingerprint) = stage_fingerprint.as_ref()
                 && let Err(error) = publication.arm_stage_preservation(fingerprint, &result)
             {
@@ -881,6 +909,143 @@ fn supervised_index_worker_args(
         transition_grant.for_worker_cache(worker_cache)?,
     );
     Ok(serde_json::to_string(&value)?)
+}
+
+/// Move a shadow worker's declared full skip log out of its transaction stage
+/// before successful publication removes that stage (#1024).
+///
+/// The C indexer writes the complete, uncapped outcome inventory beneath its
+/// active cache. A shadow worker's active cache is transaction-owned, so leaving
+/// the reported path untouched makes a successful response point at bytes that
+/// publication immediately deletes. Promotion is one same-volume rename followed
+/// by an independent read/hash over the already-produced log; it performs no
+/// repository, SQLite, or vault traversal (PC-32/37/38/41).
+fn promote_shadow_skip_log(
+    result: &str,
+    stage_cache: &Path,
+    live_cache: &Path,
+    project: &str,
+) -> Result<String, DynError> {
+    let envelope: Value = serde_json::from_str(result)?;
+    let structured_path = envelope
+        .get("structuredContent")
+        .and_then(|value| value.get("logfile"))
+        .and_then(Value::as_str);
+    let text_payload = envelope
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    let text_path = text_payload
+        .as_ref()
+        .and_then(|value| value.get("logfile"))
+        .and_then(Value::as_str);
+    let reported = match (structured_path, text_path) {
+        (None, None) => return Ok(result.to_string()),
+        (Some(left), Some(right)) if left == right => left,
+        (Some(_), Some(_)) => {
+            return Err(
+                "ASTRO_SHADOW_INDEX_LOG_ENVELOPE_MISMATCH: structuredContent.logfile and content[0].text.logfile disagree; remediation: preserve the stage and repair the MCP mirror before retrying"
+                    .into(),
+            );
+        }
+        _ => {
+            return Err(
+                "ASTRO_SHADOW_INDEX_LOG_ENVELOPE_INCOMPLETE: exactly one MCP result representation declares a skip log; remediation: preserve the stage and repair the MCP mirror before retrying"
+                    .into(),
+            );
+        }
+    };
+
+    let reported_path = PathBuf::from(reported);
+    if !reported_path.is_file() {
+        return Err(format!(
+            "ASTRO_SHADOW_INDEX_LOG_MISSING: the completed index declared skip log {} but the file is absent; remediation: preserve the staged generation and inspect CBM log publication",
+            reported_path.display()
+        )
+        .into());
+    }
+    let source_parent = reported_path.parent().ok_or_else(|| -> DynError {
+        "ASTRO_SHADOW_INDEX_LOG_PARENT_MISSING: the declared skip log has no parent directory; remediation: preserve the stage and inspect CBM log path construction".into()
+    })?;
+    let stage_log_dir = stage_cache.join("logs");
+    let live_log_dir = live_cache.join("logs");
+    let canonical_parent = fs::canonicalize(source_parent)?;
+    let from_stage =
+        stage_log_dir.exists() && canonical_parent == fs::canonicalize(&stage_log_dir)?;
+    let from_live = live_log_dir.exists() && canonical_parent == fs::canonicalize(&live_log_dir)?;
+    if !from_stage && !from_live {
+        return Err(format!(
+            "ASTRO_SHADOW_INDEX_LOG_PATH_ESCAPE: declared skip log {} belongs to neither the exact transaction log directory {} nor live log directory {}; remediation: preserve all paths and repair worker cache binding",
+            reported_path.display(),
+            stage_log_dir.display(),
+            live_log_dir.display()
+        )
+        .into());
+    }
+
+    let (source_bytes, source_sha256) = shadow_skip_log_hash(&reported_path)?;
+    fs::create_dir_all(&live_log_dir)?;
+    let destination = if from_live {
+        reported_path.clone()
+    } else {
+        live_log_dir.join(format!("{project}-{source_sha256}.log"))
+    };
+    if from_stage {
+        if destination.exists() {
+            let existing = shadow_skip_log_hash(&destination)?;
+            if existing != (source_bytes, source_sha256.clone()) {
+                return Err(format!(
+                    "ASTRO_SHADOW_INDEX_LOG_CONTENT_ADDRESS_COLLISION: existing durable log {} does not match declared stage bytes for sha256 {}; remediation: preserve both files and inspect the content-address invariant",
+                    destination.display(), source_sha256
+                )
+                .into());
+            }
+        } else {
+            fs::rename(&reported_path, &destination)?;
+        }
+    }
+    let (durable_bytes, durable_sha256) = shadow_skip_log_hash(&destination)?;
+    if durable_bytes != source_bytes || durable_sha256 != source_sha256 {
+        return Err(format!(
+            "ASTRO_SHADOW_INDEX_LOG_READBACK_MISMATCH: durable log {} disagrees with the declared stage bytes; remediation: preserve the transaction and durable log and inspect the same-volume promotion",
+            destination.display()
+        )
+        .into());
+    }
+    augment_tool_result(
+        result,
+        json!({
+            "logfile": destination,
+            "logfile_bytes": durable_bytes,
+            "logfile_sha256": durable_sha256,
+        }),
+    )
+}
+
+fn shadow_skip_log_hash(path: &Path) -> Result<(u64, String), DynError> {
+    use std::io::BufRead as _;
+
+    let mut reader = std::io::BufReader::new(fs::File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        bytes = bytes.checked_add(chunk.len() as u64).ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_SHADOW_INDEX_LOG_SIZE_OVERFLOW: byte count overflowed while hashing {}; remediation: preserve the log and repair the size representation",
+                path.display()
+            )
+            .into()
+        })?;
+        hasher.update(chunk);
+        let consumed = chunk.len();
+        reader.consume(consumed);
+    }
+    Ok((bytes, hex_lower(&hasher.finalize())))
 }
 
 fn run_supervised_index_with_transition(

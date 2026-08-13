@@ -314,6 +314,7 @@ typedef struct {
     size_t requested;
     uint64_t discarded_atom_facts;
     uint64_t discarded_relationship_facts;
+    bool unmeasured_file;
     bool graph_diagnostic_persisted;
 } cbm_file_error_t;
 

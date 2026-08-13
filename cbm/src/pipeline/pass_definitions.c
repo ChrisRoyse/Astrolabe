@@ -730,7 +730,8 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
 /* Create IMPORTS edges for one file's imports.  Mirrors the resolution
  * logic in pass_parallel.c register_and_link_def — keep the two in sync. */
 static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                        const char *rel, CBMHashTable *namespace_map) {
+                                        const cbm_file_info_t *file, CBMHashTable *namespace_map) {
+    const char *rel = file ? file->rel_path : NULL;
     int count = 0;
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -744,7 +745,7 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
             continue;
         }
         const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+            cbm_pipeline_resolve_import_node(ctx, file, file_qn, imp, (size_t)j, namespace_map);
         if (target && target->id != source_node->id) {
             char *imp_props = cbm_pipeline_import_edge_properties(ctx, rel, imp);
             if (!imp_props) {
@@ -909,7 +910,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * resolve to defs already in the graph, but the file's
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
-            total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
+            total_imports += create_import_edges_for_file(ctx, result, &files[i], NULL);
             char *module_qn =
                 cbm_pipeline_fqn_module_dir(ctx->project_name, rel, pd_module_is_dir(lang));
             create_channel_edges_for_file(ctx, result, rel, module_qn);
@@ -980,8 +981,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!result) {
                 continue;
             }
-            total_imports +=
-                create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
+            total_imports += create_import_edges_for_file(ctx, result, &files[i], namespace_map);
             char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
                                                           pd_module_is_dir(files[i].language));
             create_channel_edges_for_file(ctx, result, files[i].rel_path, module_qn);

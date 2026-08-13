@@ -1574,7 +1574,8 @@ static int link_diagnostic(cbm_pipeline_ctx_t *ctx, const CBMParseDiagnostic *di
 
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                const char *rel, CBMHashTable *namespace_map) {
+                                const cbm_file_info_t *file, CBMHashTable *namespace_map) {
+    const char *rel = file ? file->rel_path : NULL;
     int count = 0;
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1588,7 +1589,7 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
             continue;
         }
         const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+            cbm_pipeline_resolve_import_node(ctx, file, file_qn, imp, (size_t)j, namespace_map);
         if (target && target->id != source_node->id) {
             char *imp_props = cbm_pipeline_import_edge_properties(ctx, rel, imp);
             if (!imp_props) {
@@ -1721,7 +1722,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             diagnostic_edges += link_diagnostic(ctx, &result->diagnostics.items[d], rel);
         }
 
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        imports_edges += create_imports_edges(ctx, result, &files[i], namespace_map);
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pp_module_is_dir(files[i].language));
         create_channel_edges(ctx, result, rel, module_qn);

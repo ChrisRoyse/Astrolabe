@@ -5578,6 +5578,44 @@ int cbm_store_count_nodes_by_label(cbm_store_t *s, const char *project, const ch
     return cbm_store_count_typed_rows(s, project, label, true);
 }
 
+/* Narrow outcome-code recount over the already-open project store. SQLite uses
+ * the project/label range and scans only that label's M rows; it does not open a
+ * second store or walk the graph. The exact invariant is
+ * (project, ContentDefect, defect-code name) (PC-35/PC-37). */
+int cbm_store_count_nodes_by_label_and_name(cbm_store_t *s, const char *project, const char *label,
+                                            const char *name) {
+    if (!s || !s->db || !project || !project[0] || !label || !label[0] || !name || !name[0]) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = ?2 AND name = ?3;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        store_set_error(s, sqlite3_errmsg(s->db));
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, label);
+    bind_text(stmt, ST_COL_3, name);
+    int count = CBM_STORE_ERR;
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        sqlite3_int64 observed = sqlite3_column_int64(stmt, 0);
+        if (observed >= 0 && observed <= INT_MAX) {
+            count = (int)observed;
+        } else {
+            store_set_error(s, "typed outcome-code count is outside the current int representation");
+        }
+    } else {
+        store_set_error(s, sqlite3_errmsg(s->db));
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_project,
                                         "DELETE FROM nodes WHERE project = ?1;");

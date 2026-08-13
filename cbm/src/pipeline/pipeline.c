@@ -1587,13 +1587,6 @@ static const char *cbm_pipeline_code_from_legacy_reason(const char *reason) {
     return code;
 }
 
-static cbm_file_outcome_class_t cbm_pipeline_file_outcome_class(
-    CBMExtractionOutcomeClass extraction_class) {
-    return extraction_class == CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT
-               ? CBM_FILE_OUTCOME_CONTENT_DEFECT
-               : CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL;
-}
-
 static bool cbm_pipeline_file_sha256_valid(const char *sha256) {
     if (!sha256 || strlen(sha256) != CBM_SHA256_HEX_LEN) {
         return false;
@@ -1644,37 +1637,60 @@ static char *cbm_pipeline_json_escape_alloc(const char *value) {
     return escaped;
 }
 
+static int cbm_pipeline_cancel_content_defect(cbm_pipeline_t *p) {
+    if (p) {
+        atomic_store(&p->cancelled, SKIP_ONE);
+    }
+    return CBM_NOT_FOUND;
+}
+
 /* Materialize one source-local defect inside the same graph generation that
- * will publish the surviving corpus. Cost is O(1) per already-occurring defect;
- * the immutable loop key is (rel_path, file_sha256, code, operation) (#1064,
- * PC-32/35/37/38/41; production N=3,599 Astrolabe source files, 2026-08-12). */
-static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_info_t *file,
-                                              CBMExtractionError *error) {
-    if (!p || !p->gbuf || !file || !file->rel_path || !file->rel_path[0] || !error ||
-        error->outcome_class != CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT || !error->code ||
-        !error->operation || !error->phase || !error->message || !error->remediation ||
+ * will publish the surviving corpus. The caller already has the exact File
+ * record in its current loop, so this is O(1) per already-occurring defect and
+ * performs no second file/corpus scan. Production N=3,615 Astrolabe source
+ * files / 192,873 nodes / 328,899 edges (2026-08-12 receipt); Synapse N remains
+ * unknown until #1024's required full run. The ordered site tuple is immutable
+ * across scheduling and is hashed with length-delimited frames (#1064,
+ * PC-32/35/37/38/41). */
+int cbm_pipeline_materialize_content_defect(
+    cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *file, const char *code,
+    const char *operation, const char *phase, const char *message, const char *remediation,
+    size_t requested, uint64_t discarded_atom_facts, uint64_t discarded_relationship_facts,
+    bool unmeasured_file, const char *const *site_identity_parts, size_t site_identity_part_count) {
+    bool site_identity_valid = site_identity_parts && site_identity_part_count > 0 &&
+                               site_identity_part_count <= 8;
+    for (size_t i = 0; site_identity_valid && i < site_identity_part_count; i++) {
+        site_identity_valid = site_identity_parts[i] != NULL;
+    }
+    if (!p || !gbuf || !file || !file->rel_path || !file->rel_path[0] || !code || !operation ||
+        !phase || !message || !remediation || !site_identity_valid ||
         !cbm_pipeline_file_sha256_valid(file->sha256)) {
         cbm_pipeline_record_fatal_error(
-            p, "CBM_CONTENT_DEFECT_INPUT_INVALID", "record_content_defect", "extract",
+            p, "CBM_CONTENT_DEFECT_INPUT_INVALID", "record_content_defect",
+            phase ? phase : "content_defect",
             file && file->rel_path ? file->rel_path : "", 0,
             "a source-local defect lacked its typed class, content identity, or structured fields",
             "repair the extraction outcome handoff; an unprovable defect cannot publish");
-        return CBM_NOT_FOUND;
-    }
-    if (error->content_defect_recorded) {
-        return 0;
+        return cbm_pipeline_cancel_content_defect(p);
     }
 
     char *file_qn = cbm_pipeline_fqn_compute(p->project_name, file->rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(p->gbuf, file_qn) : NULL;
-    if (!file_qn || !file_node) {
+    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
+    if (!file_qn || !file_node || !file_node->source_sha256 ||
+        strcmp(file_node->source_sha256, file->sha256) != 0) {
         free(file_qn);
         cbm_pipeline_record_fatal_error(
-            p, "CBM_CONTENT_DEFECT_FILE_ATOM_MISSING", "attach_content_defect", "extract",
+            p,
+            file_node ? "CBM_CONTENT_DEFECT_FILE_IDENTITY_MISMATCH"
+                      : "CBM_CONTENT_DEFECT_FILE_ATOM_MISSING",
+            "attach_content_defect", phase,
             file->rel_path, 0,
-            "the exact File atom was absent while attaching a source-local defect",
-            "repair structure/extraction ordering before retrying the unchanged corpus");
-        return CBM_NOT_FOUND;
+            file_node ? "the exact File atom source hash differs from the discovery record used to "
+                        "identify its content defect"
+                      : "the exact File atom was absent while attaching a source-local defect",
+            "repair structure/extraction ordering or source identity before retrying the unchanged "
+            "corpus");
+        return cbm_pipeline_cancel_content_defect(p);
     }
     /* upsert_node may grow and relocate the graph-buffer node array. Copy the
      * stable identity before that mutation; retaining file_node across the
@@ -1685,20 +1701,19 @@ static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     char site_id[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_init(&hash);
-    cbm_pipeline_hash_frame(&hash, file->sha256);
-    cbm_pipeline_hash_frame(&hash, error->code);
-    cbm_pipeline_hash_frame(&hash, error->operation);
-    cbm_pipeline_hash_frame(&hash, error->phase);
+    for (size_t i = 0; i < site_identity_part_count; i++) {
+        cbm_pipeline_hash_frame(&hash, site_identity_parts[i]);
+    }
     cbm_sha256_final(&hash, digest);
     cbm_pipeline_digest_hex(digest, site_id);
 
     size_t qn_length = strlen(file_qn) + strlen(".__content_defect__.") + strlen(site_id) + 1;
     char *defect_qn = (char *)malloc(qn_length);
-    char *escaped_code = cbm_pipeline_json_escape_alloc(error->code);
-    char *escaped_operation = cbm_pipeline_json_escape_alloc(error->operation);
-    char *escaped_phase = cbm_pipeline_json_escape_alloc(error->phase);
-    char *escaped_message = cbm_pipeline_json_escape_alloc(error->message);
-    char *escaped_remediation = cbm_pipeline_json_escape_alloc(error->remediation);
+    char *escaped_code = cbm_pipeline_json_escape_alloc(code);
+    char *escaped_operation = cbm_pipeline_json_escape_alloc(operation);
+    char *escaped_phase = cbm_pipeline_json_escape_alloc(phase);
+    char *escaped_message = cbm_pipeline_json_escape_alloc(message);
+    char *escaped_remediation = cbm_pipeline_json_escape_alloc(remediation);
     if (!defect_qn || !escaped_code || !escaped_operation || !escaped_phase || !escaped_message ||
         !escaped_remediation) {
         free(file_qn);
@@ -1709,11 +1724,11 @@ static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_
         free(escaped_message);
         free(escaped_remediation);
         cbm_pipeline_record_fatal_error(
-            p, "CBM_CONTENT_DEFECT_ALLOC_FAILED", "serialize_content_defect", "extract",
+            p, "CBM_CONTENT_DEFECT_ALLOC_FAILED", "serialize_content_defect", phase,
             file->rel_path, qn_length,
             "the canonical source-local defect atom could not be allocated",
             "free memory or reduce concurrent repository work, then retry the unchanged corpus");
-        return CBM_NOT_FOUND;
+        return cbm_pipeline_cancel_content_defect(p);
     }
     (void)snprintf(defect_qn, qn_length, "%s.__content_defect__.%s", file_qn, site_id);
 
@@ -1728,13 +1743,13 @@ static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_
                                   "\"file_sha256\":\"%s\",\"site_identity\":\"%s\","
                                   "\"requested\":%zu,\"discarded_atom_facts\":%llu,"
                                   "\"discarded_relationship_facts\":%llu,"
-                                  "\"unmeasured_file\":true,\"message\":\"%s\","
+                                  "\"unmeasured_file\":%s,\"message\":\"%s\","
                                   "\"remediation\":\"%s\"}",
                                   escaped_code, escaped_operation, escaped_phase, file->sha256,
-                                  site_id, error->requested,
-                                  (unsigned long long)error->discarded_atom_facts,
-                                  (unsigned long long)error->discarded_relationship_facts,
-                                  escaped_message, escaped_remediation)
+                                  site_id, requested, (unsigned long long)discarded_atom_facts,
+                                  (unsigned long long)discarded_relationship_facts,
+                                  unmeasured_file ? "true" : "false", escaped_message,
+                                  escaped_remediation)
                               : -1;
     free(escaped_code);
     free(escaped_operation);
@@ -1746,30 +1761,29 @@ static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_
         free(defect_qn);
         free(props);
         cbm_pipeline_record_fatal_error(
-            p, "CBM_CONTENT_DEFECT_SERIALIZATION_FAILED", "serialize_content_defect", "extract",
+            p, "CBM_CONTENT_DEFECT_SERIALIZATION_FAILED", "serialize_content_defect", phase,
             file->rel_path, props_capacity,
             "the canonical source-local defect properties were not represented exactly",
             "repair the bounded defect schema before retrying the unchanged corpus");
-        return CBM_NOT_FOUND;
+        return cbm_pipeline_cancel_content_defect(p);
     }
 
-    int64_t defect_id = cbm_gbuf_upsert_node(p->gbuf, "ContentDefect", error->code, defect_qn,
-                                             file->rel_path, 0, 0, props);
+    int64_t defect_id = cbm_gbuf_upsert_node(gbuf, "ContentDefect", code, defect_qn,
+                                              file->rel_path, 0, 0, props);
     int64_t edge_id = defect_id > 0
-                          ? cbm_gbuf_insert_edge(p->gbuf, file_id, defect_id,
-                                                 "HAS_CONTENT_DEFECT",
-                                                 "{\"outcome_class\":\"content_defect\"}")
+                          ? cbm_gbuf_insert_edge(gbuf, file_id, defect_id, "HAS_CONTENT_DEFECT",
+                                                "{\"outcome_class\":\"content_defect\"}")
                           : 0;
     free(file_qn);
     free(defect_qn);
     free(props);
     if (defect_id <= 0 || edge_id <= 0) {
         cbm_pipeline_record_fatal_error(
-            p, "CBM_CONTENT_DEFECT_PERSIST_FAILED", "attach_content_defect", "extract",
+            p, "CBM_CONTENT_DEFECT_PERSIST_FAILED", "attach_content_defect", phase,
             file->rel_path, 0,
             "the source-local defect atom or its typed File relationship could not be retained",
             "inspect the graph-buffer refusal; no partial generation may publish without this fact");
-        return CBM_NOT_FOUND;
+        return cbm_pipeline_cancel_content_defect(p);
     }
 
     cbm_file_error_t *record = cbm_pipeline_reserve_file_error(p);
@@ -1777,31 +1791,58 @@ static int cbm_pipeline_record_content_defect(cbm_pipeline_t *p, const cbm_file_
         return CBM_NOT_FOUND;
     }
     record->path = fe_strdup(file->rel_path);
-    record->reason = fe_strdup(error->message);
-    record->phase = fe_strdup(error->phase);
-    record->outcome_class = cbm_pipeline_file_outcome_class(error->outcome_class);
-    record->code = fe_strdup(error->code);
-    record->operation = fe_strdup(error->operation);
+    record->reason = fe_strdup(message);
+    record->phase = fe_strdup(phase);
+    record->outcome_class = CBM_FILE_OUTCOME_CONTENT_DEFECT;
+    record->code = fe_strdup(code);
+    record->operation = fe_strdup(operation);
     record->file_sha256 = fe_strdup(file->sha256);
-    record->message = fe_strdup(error->message);
-    record->remediation = fe_strdup(error->remediation);
-    record->requested = error->requested;
-    record->discarded_atom_facts = error->discarded_atom_facts;
-    record->discarded_relationship_facts = error->discarded_relationship_facts;
+    record->message = fe_strdup(message);
+    record->remediation = fe_strdup(remediation);
+    record->requested = requested;
+    record->discarded_atom_facts = discarded_atom_facts;
+    record->discarded_relationship_facts = discarded_relationship_facts;
+    record->unmeasured_file = unmeasured_file;
     record->graph_diagnostic_persisted = true;
     if (!record->path || !record->reason || !record->phase || !record->code ||
         !record->operation || !record->file_sha256 || !record->message || !record->remediation) {
         cbm_file_error_clear(record);
         cbm_pipeline_record_fatal_error(
-            p, "CBM_CONTENT_DEFECT_INVENTORY_ALLOC_FAILED", "retain_content_defect", "extract",
+            p, "CBM_CONTENT_DEFECT_INVENTORY_ALLOC_FAILED", "retain_content_defect", phase,
             file->rel_path, 0,
             "the graph defect was created but its response/recount inventory could not be retained",
             "free memory and retry; the uncommitted graph generation must remain unpublished");
-        return CBM_NOT_FOUND;
+        return cbm_pipeline_cancel_content_defect(p);
     }
     p->file_errors_count++;
-    error->content_defect_recorded = true;
     return 0;
+}
+
+static int cbm_pipeline_record_extraction_content_defect(cbm_pipeline_t *p,
+                                                          const cbm_file_info_t *file,
+                                                          CBMExtractionError *error) {
+    if (!error || error->outcome_class != CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT) {
+        cbm_pipeline_record_fatal_error(
+            p, "CBM_CONTENT_DEFECT_INPUT_INVALID", "record_extraction_content_defect", "extract",
+            file && file->rel_path ? file->rel_path : "", 0,
+            "the extraction defect handoff did not carry the content-defect outcome class",
+            "repair the typed extraction outcome before retrying the unchanged corpus");
+        return cbm_pipeline_cancel_content_defect(p);
+    }
+    if (error->content_defect_recorded) {
+        return 0;
+    }
+    const char *site_identity_parts[] = {file ? file->sha256 : NULL, error->code,
+                                         error->operation, error->phase};
+    int rc = cbm_pipeline_materialize_content_defect(
+        p, p ? p->gbuf : NULL, file, error->code, error->operation, error->phase, error->message,
+        error->remediation, error->requested, error->discarded_atom_facts,
+        error->discarded_relationship_facts, true, site_identity_parts,
+        sizeof(site_identity_parts) / sizeof(site_identity_parts[0]));
+    if (rc == 0) {
+        error->content_defect_recorded = true;
+    }
+    return rc;
 }
 
 int cbm_pipeline_reject_file_failures(cbm_pipeline_t *p, const cbm_file_info_t *files,
@@ -1840,7 +1881,7 @@ int cbm_pipeline_reject_file_failures(cbm_pipeline_t *p, const cbm_file_info_t *
         if (result && result->has_error) {
             CBMExtractionError *error = &result->error;
             if (error->outcome_class == CBM_EXTRACTION_OUTCOME_CONTENT_DEFECT) {
-                if (cbm_pipeline_record_content_defect(p, &files[i], error) != 0) {
+                if (cbm_pipeline_record_extraction_content_defect(p, &files[i], error) != 0) {
                     return CBM_NOT_FOUND;
                 }
                 continue;

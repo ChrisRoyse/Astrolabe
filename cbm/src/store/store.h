@@ -604,6 +604,8 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project);
 /* Narrow indexed recounts for persisted typed outcomes. These open only the
  * nodes(project,label) / edges(project,type) ranges and never scan row bodies. */
 int cbm_store_count_nodes_by_label(cbm_store_t *s, const char *project, const char *label);
+int cbm_store_count_nodes_by_label_and_name(cbm_store_t *s, const char *project, const char *label,
+                                            const char *name);
 
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
 

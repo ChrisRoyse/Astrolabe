@@ -289,13 +289,27 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  * fallback. Angle-bracket includes remain external unless a future captured
  * compilation context supplies their exact include root.
  *
- * `namespace_map` may be NULL (skips step 3).  `source_file_qn` is the importing
- * file's __file__ QN, used to avoid self-imports in step 4. */
+ * `namespace_map` may be NULL (skips step 3). `source_file` is the exact
+ * discovery record for the importing file; carrying it through this existing
+ * loop makes content-defect identity and source SHA available without a second
+ * corpus lookup. `source_file_qn` is its __file__ QN, used to avoid self-imports
+ * in step 4. */
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
-                                                        const char *source_rel,
+                                                        const cbm_file_info_t *source_file,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
+                                                        const CBMImport *imp, size_t import_ordinal,
                                                         CBMHashTable *namespace_map);
+
+/* Persist one typed source-local content defect in the current unpublished
+ * graph transaction. The File atom, ContentDefect atom, HAS_CONTENT_DEFECT
+ * edge, and response/recount inventory are one fail-closed outcome. Callers
+ * supply the complete ordered site-identity tuple; no path lookup or corpus
+ * scan is performed here (PC-32/PC-35/PC-37/PC-38/PC-41). */
+int cbm_pipeline_materialize_content_defect(
+    cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const cbm_file_info_t *file, const char *code,
+    const char *operation, const char *phase, const char *message, const char *remediation,
+    size_t requested, uint64_t discarded_atom_facts, uint64_t discarded_relationship_facts,
+    bool unmeasured_file, const char *const *site_identity_parts, size_t site_identity_part_count);
 
 /* Serialize and validate the identity properties for one resolved IMPORTS
  * edge. The returned JSON document is heap-owned. Invalid local/resource

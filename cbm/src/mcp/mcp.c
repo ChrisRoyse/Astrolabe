@@ -7550,6 +7550,7 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 errs[i].discarded_atom_facts);
         yyjson_mut_obj_add_uint(doc, fe, "discarded_relationship_facts",
                                 errs[i].discarded_relationship_facts);
+        yyjson_mut_obj_add_bool(doc, fe, "unmeasured_file", errs[i].unmeasured_file);
         yyjson_mut_obj_add_bool(doc, fe, "graph_diagnostic_persisted",
                                 errs[i].graph_diagnostic_persisted);
         yyjson_mut_arr_add_val(files, fe);
@@ -7828,47 +7829,213 @@ static char *build_browser_runtime_diagnostics_response_error(const char *projec
                       "\"source_family_preserved\":true}");
 }
 
-/* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
- * was skipped (no logfile on a clean run). Location:
+static bool write_skip_log_json_line(FILE *file, yyjson_mut_doc *doc) {
+    char *line = yyjson_mut_write(doc, 0, NULL);
+    if (!line) {
+        return false;
+    }
+    size_t length = strlen(line);
+    bool written = fwrite(line, 1, length, file) == length && fputc('\n', file) != EOF;
+    free(line);
+    return written;
+}
+
+/* Write the FULL (uncapped) typed outcome inventory as JSONL — ONLY when >=1
+ * file was skipped (no logfile on a clean run). Location:
  *   $CBM_INDEX_LOG (override) else <cache_dir>/logs/<project>-<epoch>.log
- * Returns true and fills out_path on success. */
+ *
+ * The first record binds the report/project/count. Every following record carries
+ * the complete typed outcome, including the stable code/operation and exact
+ * diagnostic message. JSON escaping is load-bearing: arbitrary repository paths
+ * may contain tabs or newlines, so the old tab-separated report could not be
+ * parsed losslessly. Returns true and fills out_path on durable close success. */
 static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs, int count,
                                char *out_path, size_t out_sz) {
-    if (!errs || count <= 0) {
+    if (!errs || count <= 0 || !out_path || out_sz == 0) {
+        cbm_log_error("index.logfile_contract_fail", "code",
+                      "CBM_INDEX_SKIP_LOG_INPUT_INVALID", "message",
+                      "the typed outcome log request lacks outcomes or a reportable path buffer",
+                      "remediation", "repair the index response contract before retrying");
         return false;
     }
     char path[CBM_SZ_1K];
     const char *override = getenv("CBM_INDEX_LOG");
     if (override && override[0]) {
-        snprintf(path, sizeof(path), "%s", override);
+        int path_length = snprintf(path, sizeof(path), "%s", override);
+        if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+            cbm_log_error("index.logfile_path_fail", "code",
+                          "CBM_INDEX_SKIP_LOG_PATH_INVALID", "message",
+                          "CBM_INDEX_LOG cannot be represented without truncation", "remediation",
+                          "shorten CBM_INDEX_LOG and retry the unchanged corpus");
+            return false;
+        }
     } else {
         const char *cdir = cbm_resolve_cache_dir();
         if (!cdir) {
+            cbm_log_error("index.logfile_cache_fail", "code",
+                          "CBM_INDEX_SKIP_LOG_CACHE_UNAVAILABLE", "message",
+                          "the cache directory for the typed outcome log is unavailable",
+                          "remediation", "restore the configured cache directory and retry");
             return false;
         }
         char logdir[CBM_SZ_1K];
-        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
-        snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
-                 (long long)time(NULL));
+        int logdir_length = snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        if (logdir_length < 0 || (size_t)logdir_length >= sizeof(logdir) ||
+            !cbm_mkdir_p(logdir, 0755)) {
+            cbm_log_error("index.logfile_directory_fail", "code",
+                          "CBM_INDEX_SKIP_LOG_DIRECTORY_FAILED", "message",
+                          "the typed outcome log directory could not be represented or created",
+                          "remediation", "restore the configured cache directory and retry");
+            return false;
+        }
+        int path_length =
+            snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir,
+                     project ? project : "index", (long long)time(NULL));
+        if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+            cbm_log_error("index.logfile_path_fail", "code",
+                          "CBM_INDEX_SKIP_LOG_PATH_INVALID", "message",
+                          "the generated typed outcome log path cannot be represented without "
+                          "truncation",
+                          "remediation", "shorten the project or cache path and retry");
+            return false;
+        }
+    }
+    int reported_path_length = snprintf(out_path, out_sz, "%s", path);
+    if (reported_path_length < 0 || (size_t)reported_path_length >= out_sz) {
+        cbm_log_error("index.logfile_response_path_fail", "code",
+                      "CBM_INDEX_SKIP_LOG_RESPONSE_PATH_INVALID", "path", path, "message",
+                      "the typed outcome log path cannot be returned without truncation",
+                      "remediation", "enlarge the response path contract and retry");
+        return false;
     }
     FILE *f = cbm_fopen(path, "wb");
     if (!f) {
-        cbm_log_warn("index.logfile_open_fail", "path", path);
+        cbm_log_error("index.logfile_open_fail", "code", "CBM_INDEX_SKIP_LOG_OPEN_FAILED",
+                      "path", path, "message", "the uncapped typed outcome log could not open",
+                      "remediation", "restore write access to the index log directory and retry");
         return false;
     }
-    (void)fprintf(f, "# codebase-memory-mcp index skip report\n");
-    (void)fprintf(f, "# project=%s skipped=%d\n", project ? project : "", count);
-    (void)fprintf(f, "# columns: phase\treason\tpath\n");
+    bool complete = true;
+    yyjson_mut_doc *header_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *header = header_doc ? yyjson_mut_obj(header_doc) : NULL;
+    if (!header_doc || !header) {
+        complete = false;
+    } else {
+        yyjson_mut_doc_set_root(header_doc, header);
+        complete = yyjson_mut_obj_add_str(header_doc, header, "schema",
+                                          "cbm.index-skip-report.v2") &&
+                   yyjson_mut_obj_add_strcpy(header_doc, header, "project",
+                                             project ? project : "") &&
+                   yyjson_mut_obj_add_int(header_doc, header, "skipped_count", count) &&
+                   write_skip_log_json_line(f, header_doc);
+    }
+    if (header_doc) {
+        yyjson_mut_doc_free(header_doc);
+    }
     for (int i = 0; i < count; i++) {
-        (void)fprintf(f, "%s\t%s\t%s\n", errs[i].phase ? errs[i].phase : "",
-                      errs[i].reason ? errs[i].reason : "", errs[i].path ? errs[i].path : "");
+        yyjson_mut_doc *row_doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *row = row_doc ? yyjson_mut_obj(row_doc) : NULL;
+        if (!complete || !row_doc || !row) {
+            complete = false;
+            if (row_doc) {
+                yyjson_mut_doc_free(row_doc);
+            }
+            break;
+        }
+        yyjson_mut_doc_set_root(row_doc, row);
+        const char *outcome_class =
+            errs[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT
+                ? "content_defect"
+                : errs[i].outcome_class == CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL
+                      ? "infrastructure_fatal"
+                      : "unclassified";
+        complete =
+            yyjson_mut_obj_add_str(row_doc, row, "schema", "cbm.index-source-outcome.v1") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "outcome_class", outcome_class) &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "code", errs[i].code ? errs[i].code : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "operation",
+                                      errs[i].operation ? errs[i].operation : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "phase",
+                                      errs[i].phase ? errs[i].phase : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "path", errs[i].path ? errs[i].path : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "file_sha256",
+                                      errs[i].file_sha256 ? errs[i].file_sha256 : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "message",
+                                      errs[i].message ? errs[i].message : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "remediation",
+                                      errs[i].remediation ? errs[i].remediation : "") &&
+            yyjson_mut_obj_add_uint(row_doc, row, "requested", (uint64_t)errs[i].requested) &&
+            yyjson_mut_obj_add_uint(row_doc, row, "discarded_atom_facts",
+                                    errs[i].discarded_atom_facts) &&
+            yyjson_mut_obj_add_uint(row_doc, row, "discarded_relationship_facts",
+                                    errs[i].discarded_relationship_facts) &&
+            yyjson_mut_obj_add_bool(row_doc, row, "unmeasured_file",
+                                    errs[i].unmeasured_file) &&
+            yyjson_mut_obj_add_bool(row_doc, row, "graph_diagnostic_persisted",
+                                    errs[i].graph_diagnostic_persisted) &&
+            write_skip_log_json_line(f, row_doc);
+        yyjson_mut_doc_free(row_doc);
+        if (!complete) {
+            break;
+        }
     }
-    (void)fclose(f);
-    if (out_path && out_sz) {
-        snprintf(out_path, out_sz, "%s", path);
+    if (fflush(f) != 0 || ferror(f)) {
+        complete = false;
     }
-    return true;
+    if (fclose(f) != 0) {
+        complete = false;
+    }
+    if (!complete) {
+        cbm_log_error(
+            "index.logfile_write_fail", "code", "CBM_INDEX_SKIP_LOG_WRITE_FAILED", "path", path,
+            "message", "the uncapped typed outcome log was not written and closed completely",
+            "remediation", "preserve the partial log, restore storage, and retry the unchanged corpus");
+    }
+    return complete;
+}
+
+static char *build_skip_log_persist_error(const char *project_name, const char *logfile_path,
+                                          int outcome_count) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return heap_strdup(
+            "{\"status\":\"error\",\"code\":\"CBM_INDEX_SKIP_LOG_PERSIST_FAILED\","
+            "\"operation\":\"write_skip_logfile\",\"phase\":\"postcondition\","
+            "\"message\":\"the complete typed outcome log could not be persisted\","
+            "\"remediation\":\"inspect the structured worker diagnostic and preserve any partial "
+            "log before retrying the unchanged corpus\",\"sqlite_publication_started\":true}");
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    bool complete =
+        yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+        yyjson_mut_obj_add_str(doc, root, "code", "CBM_INDEX_SKIP_LOG_PERSIST_FAILED") &&
+        yyjson_mut_obj_add_str(doc, root, "operation", "write_skip_logfile") &&
+        yyjson_mut_obj_add_str(doc, root, "phase", "postcondition") &&
+        yyjson_mut_obj_add_strcpy(doc, root, "project", project_name ? project_name : "") &&
+        yyjson_mut_obj_add_strcpy(doc, root, "logfile_attempted_path",
+                                  logfile_path ? logfile_path : "") &&
+        yyjson_mut_obj_add_int(doc, root, "outcome_count", outcome_count) &&
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            "the graph generation completed but its complete typed outcome log could not be "
+            "persisted and closed durably") &&
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            "inspect the structured worker diagnostic, preserve any partial log, restore the "
+            "declared storage path, and retry the unchanged corpus") &&
+        yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", true);
+    char *json = complete ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    yyjson_mut_doc_free(doc);
+    return json ? json
+                : heap_strdup(
+                      "{\"status\":\"error\",\"code\":"
+                      "\"CBM_INDEX_SKIP_LOG_PERSIST_FAILED\",\"operation\":"
+                      "\"write_skip_logfile\",\"phase\":\"postcondition\","
+                      "\"sqlite_publication_started\":true}");
 }
 
 static char *build_index_state_mismatch_error(const char *project_name, int expected_nodes,
@@ -7902,8 +8069,11 @@ static char *build_index_state_mismatch_error(const char *project_name, int expe
 }
 
 static char *build_content_defect_readback_error(const char *project_name, int observed_this_run,
-                                                 int persisted_nodes, int persisted_edges,
-                                                 bool full_generation) {
+                                                  int persisted_nodes, int persisted_edges,
+                                                  int dangling_observed_this_run,
+                                                  int persisted_dangling_nodes,
+                                                  uint_least64_t reported_dangling_skips,
+                                                  bool full_generation) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return heap_strdup(
@@ -7924,6 +8094,12 @@ static char *build_content_defect_readback_error(const char *project_name, int o
     yyjson_mut_obj_add_int(doc, root, "observed_this_run", observed_this_run);
     yyjson_mut_obj_add_int(doc, root, "persisted_nodes", persisted_nodes);
     yyjson_mut_obj_add_int(doc, root, "persisted_edges", persisted_edges);
+    yyjson_mut_obj_add_int(doc, root, "dangling_rust_module_defects_observed_this_run",
+                           dangling_observed_this_run);
+    yyjson_mut_obj_add_int(doc, root, "persisted_dangling_rust_module_defects",
+                           persisted_dangling_nodes);
+    yyjson_mut_obj_add_uint(doc, root, "reported_dangling_rust_module_skips",
+                            (uint64_t)reported_dangling_skips);
     yyjson_mut_obj_add_bool(doc, root, "full_generation", full_generation);
     yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
     char *json = yyjson_mut_write(doc, 0, NULL);
@@ -8362,8 +8538,11 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
         cbm_store_count_nodes_by_label(store, project_name, "ContentDefect");
     int content_defect_edges =
         cbm_store_count_edges_by_type(store, project_name, "HAS_CONTENT_DEFECT");
+    int dangling_rust_module_defects = cbm_store_count_nodes_by_label_and_name(
+        store, project_name, "ContentDefect", "CBM_IMPORT_RUST_MODULE_MISSING");
     bool current_outcomes_valid = true;
     int content_defects_observed_this_run = 0;
+    int dangling_rust_module_defects_observed_this_run = 0;
     for (int i = 0; i < file_error_count; i++) {
         bool valid = file_errors[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT &&
                      file_errors[i].graph_diagnostic_persisted && file_errors[i].code &&
@@ -8372,6 +8551,9 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
         current_outcomes_valid = current_outcomes_valid && valid;
         if (valid) {
             content_defects_observed_this_run++;
+            if (strcmp(file_errors[i].code, "CBM_IMPORT_RUST_MODULE_MISSING") == 0) {
+                dangling_rust_module_defects_observed_this_run++;
+            }
         }
     }
     cbm_pipeline_execution_route_t content_route = cbm_pipeline_get_execution_route(p);
@@ -8380,11 +8562,20 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                                 content_defect_nodes == content_defect_edges &&
                                 content_defects_observed_this_run <= content_defect_nodes &&
                                 (!full_generation ||
-                                 content_defects_observed_this_run == content_defect_nodes);
-    if (!current_outcomes_valid || !content_counts_valid) {
+                                  content_defects_observed_this_run == content_defect_nodes);
+    uint_least64_t dangling_rust_module_skips = cbm_pipeline_get_dangling_rust_module_skips(p);
+    bool dangling_counts_valid =
+        dangling_rust_module_defects >= 0 &&
+        dangling_rust_module_defects_observed_this_run <= dangling_rust_module_defects &&
+        dangling_rust_module_skips ==
+            (uint_least64_t)dangling_rust_module_defects_observed_this_run &&
+        (!full_generation ||
+         dangling_rust_module_defects_observed_this_run == dangling_rust_module_defects);
+    if (!current_outcomes_valid || !content_counts_valid || !dangling_counts_valid) {
         return build_content_defect_readback_error(
             project_name, content_defects_observed_this_run, content_defect_nodes,
-            content_defect_edges, full_generation);
+            content_defect_edges, dangling_rust_module_defects_observed_this_run,
+            dangling_rust_module_defects, dangling_rust_module_skips, full_generation);
     }
     yyjson_mut_obj_add_int(doc, root, "content_defect_count", content_defect_nodes);
     yyjson_mut_obj_add_int(doc, root, "content_defect_relationship_count", content_defect_edges);
@@ -8392,6 +8583,10 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                            content_defects_observed_this_run);
     yyjson_mut_obj_add_str(doc, root, "content_defect_source_of_truth",
                            "sqlite.nodes(ContentDefect)+edges(HAS_CONTENT_DEFECT)");
+    yyjson_mut_obj_add_int(doc, root, "dangling_rust_module_defect_count",
+                           dangling_rust_module_defects);
+    yyjson_mut_obj_add_int(doc, root, "dangling_rust_module_defects_observed_this_run",
+                           dangling_rust_module_defects_observed_this_run);
 
     cbm_project_t persisted_project = {0};
     int project_rc = cbm_store_get_project(store, project_name, &persisted_project);
@@ -8517,7 +8712,6 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
      * to guess, no wrong edge to invent. The declaration resolves to nothing
      * instead of refusing the whole corpus, so the count is always emitted,
      * including 0, and a degraded index can never read as a clean one. */
-    uint_least64_t dangling_rust_module_skips = cbm_pipeline_get_dangling_rust_module_skips(p);
     yyjson_mut_obj_add_uint(doc, root, "dangling_rust_module_skips",
                             (uint64_t)dangling_rust_module_skips);
     if (dangling_rust_module_skips > 0) {
@@ -9417,15 +9611,24 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     char *postcondition_error = post_run_close_error;
     if (rc == 0 && !postcondition_error) {
-        /* Write the per-run logfile ONLY when there were skips (no logfile on a
-         * clean run). The FULL list goes to the file; the JSON caps at 50. */
+        /* Write the per-run logfile ONLY when there were typed outcomes (no
+         * logfile on a clean run). The FULL list goes to the file; the JSON caps
+         * at 50. A required log that cannot be persisted is a postcondition
+         * failure, never an unlabeled successful generation. */
         char logfile_path[CBM_SZ_1K];
         logfile_path[0] = '\0';
-        bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
-                                              logfile_path, sizeof(logfile_path));
-        postcondition_error = build_index_success_response(
-            srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
-            file_errors, file_error_count, has_logfile ? logfile_path : NULL);
+        bool has_logfile =
+            file_error_count > 0 && write_skip_logfile(project_name, file_errors, file_error_count,
+                                                       logfile_path, sizeof(logfile_path));
+        if (file_error_count > 0 && !has_logfile) {
+            postcondition_error =
+                build_skip_log_persist_error(project_name, logfile_path, file_error_count);
+        } else {
+            postcondition_error = build_index_success_response(
+                srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs,
+                excluded_count, file_errors, file_error_count,
+                has_logfile ? logfile_path : NULL);
+        }
     } else if (rc == CBM_PIPELINE_EMPTY_SOURCE_CORPUS) {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "code", "CBM_PIPELINE_EMPTY_SOURCE_CORPUS");

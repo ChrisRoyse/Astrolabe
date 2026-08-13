@@ -2202,8 +2202,10 @@ allocation_failed:
  * prevents the live pipeline and historical closure from re-deriving different
  * crate-root or inline-module rules. */
 static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_t *ctx,
-                                                         const char *source_rel,
-                                                         const char *module_path) {
+                                                         const cbm_file_info_t *source_file,
+                                                         const char *module_path,
+                                                         size_t import_ordinal) {
+    const char *source_rel = source_file ? source_file->rel_path : NULL;
     if (!ctx || !source_rel || !source_rel[0] || !module_path || !module_path[0]) {
         return NULL;
     }
@@ -2270,6 +2272,56 @@ static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_
          * as ordinary files, downstream references through this path stay
          * unresolved (which they are), and the skip is counted and labelled so
          * the loss is disclosed, never silent (standing invariant 3). */
+        const char *defect_message_format =
+            "a Rust module declaration names no source at either compiler-defined path; "
+            "source_file=%s module=%s candidate_1_path=%s candidate_2_path=%s; no IMPORTS "
+            "edge was fabricated and the containing file remains measured";
+        const char *defect_remediation =
+            "create the declared module at one of the probed candidate paths, delete the dangling "
+            "`mod` declaration, or bind it explicitly with #[path = \"...\"]";
+        int defect_message_length = snprintf(NULL, 0, defect_message_format, source_rel, module_path,
+                                             cands[0], cands[1]);
+        char *defect_message =
+            defect_message_length >= 0 ? malloc((size_t)defect_message_length + SKIP_ONE) : NULL;
+        if (!defect_message ||
+            snprintf(defect_message, (size_t)defect_message_length + SKIP_ONE,
+                     defect_message_format, source_rel, module_path, cands[0], cands[1]) !=
+                defect_message_length) {
+            free(defect_message);
+            pkgmap_resolver_fault(
+                ctx, "pkgmap.rust_module_diagnostic_failed",
+                "CBM_IMPORT_RUST_MODULE_DIAGNOSTIC_FAILED",
+                "pkgmap.rust_module_diagnostic", source_rel, module_path,
+                "the exact dangling-module diagnostic could not be represented without truncation",
+                "free memory or shorten the repository path, then retry the unchanged corpus");
+            free(cands[0]);
+            free(cands[1]);
+            return NULL;
+        }
+        char import_ordinal_text[CBM_SZ_32];
+        (void)snprintf(import_ordinal_text, sizeof(import_ordinal_text), "%zu", import_ordinal);
+        /* Extraction order is source order, not worker-finish order. The
+         * ordinal distinguishes repeated identical declarations inside the
+         * same immutable file; file_sha256 already changes whenever source
+         * ordering changes. */
+        const char *site_identity_parts[] = {source_file->sha256, source_rel, module_path, cands[0],
+                                             cands[1], import_ordinal_text};
+        if (cbm_pipeline_materialize_content_defect(
+                ctx->pipeline, ctx->gbuf, source_file, "CBM_IMPORT_RUST_MODULE_MISSING",
+                 "pkgmap.rust_module_resolve", "graph", defect_message, defect_remediation, 0, 0,
+                 1, false, site_identity_parts,
+                 sizeof(site_identity_parts) / sizeof(site_identity_parts[0])) != 0) {
+            free(defect_message);
+            free(cands[0]);
+            free(cands[1]);
+            if (ctx->cancelled) {
+                atomic_store(ctx->cancelled, SKIP_ONE);
+            }
+            return NULL;
+        }
+        /* The public counter is the last mutation in this outcome transaction:
+         * it cannot claim a skipped relationship until the canonical node,
+         * typed edge, and independent recount inventory all exist. */
         uint_least64_t skips = cbm_pipeline_note_dangling_rust_module_skip(ctx->pipeline);
         char skip_buf[CBM_SZ_32];
         char invalid_buf[CBM_SZ_32];
@@ -2279,14 +2331,15 @@ static const cbm_gbuf_node_t *resolve_rust_module_source(const cbm_pipeline_ctx_
             "pkgmap.rust_module_dangling", "code", "CBM_IMPORT_RUST_MODULE_MISSING", "component",
             "pipeline.pkgmap", "operation", "pkgmap.rust_module_resolve", "source", source_rel,
             "module", module_path, "candidate_1_path", cands[0], "candidate_2_path", cands[1],
-            "structurally_invalid_candidates", invalid_buf, "disposition", "import_edge_skipped",
+            "import_ordinal", import_ordinal_text, "structurally_invalid_candidates", invalid_buf,
+            "disposition", "import_edge_skipped",
             "dangling_rust_module_skips", skip_buf, "message",
             "a Rust module declaration names no source at either compiler-defined path; the "
             "declaration resolves to nothing, its IMPORTS edge is skipped and counted, and the "
             "corpus still publishes",
             "remediation",
-            "create the declared module at one of the probed candidate paths, delete the dangling "
-            "`mod` declaration, or bind it explicitly with #[path = \"...\"]");
+            defect_remediation);
+        free(defect_message);
         free(cands[0]);
         free(cands[1]);
         return NULL;
@@ -2756,13 +2809,15 @@ static const cbm_gbuf_node_t *resolve_browser_module_request(
 }
 
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
-                                                        const char *source_rel,
+                                                        const cbm_file_info_t *source_file,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
+                                                        const CBMImport *imp, size_t import_ordinal,
                                                         CBMHashTable *namespace_map) {
-    if (!ctx || !imp || !imp->module_path) {
+    if (!ctx || !source_file || !source_file->rel_path || !source_file->rel_path[0] || !imp ||
+        !imp->module_path) {
         return NULL;
     }
+    const char *source_rel = source_file->rel_path;
 
     /* Angle-bracket C-family includes identify an external/include-root search
      * domain. The extractor has no compile-command include roots, so binding one
@@ -2786,7 +2841,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     }
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_RUST_MODULE) {
-        return resolve_rust_module_source(ctx, source_rel, imp->module_path);
+        return resolve_rust_module_source(ctx, source_file, imp->module_path, import_ordinal);
     }
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_ES_SOURCE) {
