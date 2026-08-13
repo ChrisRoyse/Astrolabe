@@ -27,7 +27,9 @@ typedef struct {
 } CBMDumpNode;
 
 typedef struct {
-    int64_t id; // sequential ID (1..M), assigned by Go
+    /* Stable sequential ID (1..M), assigned after canonical persisted-identity
+     * ordering by the graph buffer. Worker arrival order is never observable. */
+    int64_t id;
     const char *project;
     int64_t source_id; // final sequential ID (1..N)
     int64_t target_id; // final sequential ID (1..N)

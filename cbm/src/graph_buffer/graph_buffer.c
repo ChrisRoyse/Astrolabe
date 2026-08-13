@@ -3551,8 +3551,72 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
     return dump_nodes;
 }
 
-/* Build dump-ready edge array with remapped IDs. Returns generated-column
- * source strings (heap arrays owned by the caller) via out params. */
+static int compare_i64_ascending(int64_t left, int64_t right) {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/* This is the complete persisted edge-identity tuple from graph schema v5.
+ * It deliberately excludes the graph-buffer insertion ID: that ID records
+ * worker arrival order, while this tuple is invariant for a completed graph. */
+static int compare_dump_edge_identity(const void *left_raw, const void *right_raw) {
+    const CBMDumpEdge *left = left_raw;
+    const CBMDumpEdge *right = right_raw;
+    int order = compare_i64_ascending(left->source_id, right->source_id);
+    if (order != 0) {
+        return order;
+    }
+    order = compare_i64_ascending(left->target_id, right->target_id);
+    if (order != 0) {
+        return order;
+    }
+    order = strcmp(canonical_identity_text(left->type), canonical_identity_text(right->type));
+    if (order != 0) {
+        return order;
+    }
+    order = strcmp(canonical_identity_text(left->local_name),
+                   canonical_identity_text(right->local_name));
+    if (order != 0) {
+        return order;
+    }
+    return strcmp(canonical_identity_text(left->preprocess_context_id),
+                  canonical_identity_text(right->preprocess_context_id));
+}
+
+static bool canonicalize_dump_edge_ids(cbm_gbuf_t *gb, CBMDumpEdge *edges, int edge_count) {
+    CBM_PROF_START(t_edge_identity);
+    if (edge_count > 1) {
+        qsort(edges, (size_t)edge_count, sizeof(*edges), compare_dump_edge_identity);
+    }
+    for (int i = 0; i < edge_count; i++) {
+        if (i > 0 && compare_dump_edge_identity(&edges[i - 1], &edges[i]) == 0) {
+            char source_id[CBM_SZ_32];
+            char target_id[CBM_SZ_32];
+            snprintf(source_id, sizeof(source_id), "%lld", (long long)edges[i].source_id);
+            snprintf(target_id, sizeof(target_id), "%lld", (long long)edges[i].target_id);
+            gbuf_fail_resolution_code(gb, "CBM_DUMP_EDGE_IDENTITY_DUPLICATE",
+                                      "graph_buffer.canonicalize_dump_edge_ids", NULL, NULL);
+            cbm_log_error(
+                "gbuf.dump.edge_identity_duplicate", "code", "CBM_DUMP_EDGE_IDENTITY_DUPLICATE",
+                "source_id", source_id, "target_id", target_id, "type",
+                canonical_identity_text(edges[i].type), "local_name_gen",
+                canonical_identity_text(edges[i].local_name), "preprocess_context_id_gen",
+                canonical_identity_text(edges[i].preprocess_context_id), "message",
+                "two dump rows have the same complete schema-v5 edge identity", "remediation",
+                "repair graph-buffer edge deduplication; no row-sink or store publication was "
+                "attempted");
+            CBM_PROF_END_N("dump", "3a_edge_identity_canonicalize", t_edge_identity, edge_count);
+            return false;
+        }
+        edges[i].id = (int64_t)i + SKIP_ONE;
+    }
+    CBM_PROF_END_N("dump", "3a_edge_identity_canonicalize", t_edge_identity, edge_count);
+    return true;
+}
+
+/* Build dump-ready edge array with remapped endpoint IDs, order it by the
+ * complete persisted identity, and only then assign stable edge IDs. Returns
+ * generated-column source strings (heap arrays owned by the caller) via out
+ * params. */
 static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_final,
                                      int64_t max_temp_id, int *out_count, char ***out_url_paths,
                                      char ***out_local_names, char ***out_context_ids) {
@@ -3615,7 +3679,7 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
 
         const char *props = canonical_properties_json(e->properties_json);
         dump_edges[idx] = (CBMDumpEdge){
-            .id = idx + SKIP_ONE,
+            .id = 0,
             .project = gb->project,
             .source_id = src,
             .target_id = tgt,
@@ -3626,6 +3690,23 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
             .preprocess_context_id = context_id ? context_id : "",
         };
         idx++;
+    }
+
+    if (!canonicalize_dump_edge_ids(gb, dump_edges, idx)) {
+        for (int i = 0; i < idx; i++) {
+            free(url_paths[i]);
+            free(local_names[i]);
+            free(context_ids[i]);
+        }
+        free(dump_edges);
+        free(url_paths);
+        free(local_names);
+        free(context_ids);
+        *out_count = 0;
+        *out_url_paths = NULL;
+        *out_local_names = NULL;
+        *out_context_ids = NULL;
+        return NULL;
     }
 
     *out_count = idx;
