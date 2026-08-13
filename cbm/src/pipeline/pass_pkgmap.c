@@ -2790,24 +2790,6 @@ static const cbm_gbuf_node_t *persist_browser_module_request(
     return request;
 }
 
-static const cbm_gbuf_node_t *resolve_browser_module_request(
-    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *module_path) {
-    bool exact_relative =
-        module_path &&
-        ((module_path[0] == '.' && module_path[1] == '/') ||
-         (module_path[0] == '.' && module_path[1] == '.' && module_path[2] == '/')) &&
-        !strpbrk(module_path, "?#%\\");
-    if (exact_relative) {
-        const cbm_gbuf_node_t *source_target =
-            resolve_sibling_file(ctx, source_rel, module_path, true);
-        if (source_target || cbm_gbuf_resolution_failed(ctx->gbuf) ||
-            (ctx->cancelled && atomic_load(ctx->cancelled))) {
-            return source_target;
-        }
-    }
-    return persist_browser_module_request(ctx, source_rel, module_path);
-}
-
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const cbm_file_info_t *source_file,
                                                         const char *source_file_qn,
@@ -2837,7 +2819,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     }
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_BROWSER_URL) {
-        return resolve_browser_module_request(ctx, source_rel, imp->module_path);
+        return persist_browser_module_request(ctx, source_rel, imp->module_path);
     }
 
     if (imp->resolution == CBM_IMPORT_RESOLVE_RUST_MODULE) {
