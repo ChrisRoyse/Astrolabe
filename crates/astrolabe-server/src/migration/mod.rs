@@ -75,7 +75,7 @@ use astrolabe_weave::{
 use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range, slot_key};
 use calyx_aster::ledger_view::{LedgerPointReadTrace, parse_aster_ledger_seq};
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{Clock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};
+use calyx_core::{Clock, FixedClock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value, json};
@@ -92,6 +92,9 @@ pub(crate) use tool_fault::{
     TOOL_FAULT_SCHEMA, ToolFault as ActivationToolFault, tool_fault_from_error,
     tool_fault_result_from_error,
 };
+
+mod generation_clock;
+use generation_clock::*;
 
 mod config_store;
 use config_store::*;

@@ -1337,10 +1337,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_phase_probe_t load_probe = cbm_pipeline_phase_probe_start(p, "incr_load_db");
     cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
     if (!existing || cbm_gbuf_set_index_mode(existing, (cbm_index_mode_t)cbm_pipeline_get_mode(p)) !=
-                         0) {
+                         0 ||
+        cbm_gbuf_set_generation_observed_at_ms(
+            existing, cbm_pipeline_generation_observed_at_ms(p)) != 0) {
         cbm_pipeline_record_fatal_error(
-            p, "CBM_INCREMENTAL_INDEX_MODE_BIND_FAILED", "bind_incremental_index_mode", "graph",
-            db_path, 0, "the incremental graph buffer could not retain the requested index mode",
+            p, "CBM_INCREMENTAL_GENERATION_CONTRACT_BIND_FAILED",
+            "bind_incremental_generation_contract", "graph", db_path, 0,
+            "the incremental graph buffer could not retain the requested index mode and "
+            "generation clock",
             "inspect the graph-buffer diagnostic and retry the complete index");
         cbm_gbuf_free(existing);
         free(changed_files);

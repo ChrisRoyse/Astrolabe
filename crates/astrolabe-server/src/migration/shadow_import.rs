@@ -52,6 +52,10 @@ pub(crate) const SHADOW_PUBLICATION_GENERATION_KEY: &str = "shadow_publication_g
 /// while atomically advancing the action-derived metadata that was proven over it.
 pub(crate) const SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY: &str =
     "index_admission_publication_generation";
+/// Exact generation-scoped observation carried through CBM and Calyx (#1113).
+pub(crate) const GENERATION_OBSERVED_AT_MS_KEY: &str = "generation_observed_at_ms";
+/// Frozen semantic contract for [`GENERATION_OBSERVED_AT_MS_KEY`].
+pub(crate) const GENERATION_CLOCK_CONTRACT_KEY: &str = "generation_clock_contract";
 /// Versioned immutable ledger-prefix witness owned by one published shadow generation.
 ///
 /// This is deliberately not the mutable vault head: kernel, guard, optimizer, and other
@@ -155,6 +159,9 @@ pub(crate) struct ShadowImportOutcome {
     /// Machine-readable reason for either publishing the staged generation or
     /// proving that the existing live generation can be retained unchanged.
     pub(crate) publication_reason: &'static str,
+    pub(crate) generation_observed_at_ms: u64,
+    pub(crate) generation_clock_contract: String,
+    pub(crate) generation_clock_provenance: Value,
     pub(crate) vault_dir: PathBuf,
     pub(crate) vault_id: String,
     pub(crate) vault_salt: String,
@@ -271,6 +278,36 @@ fn provenance_with_git_source(
         object.insert("git_source".to_string(), source);
     }
     Ok(provenance)
+}
+
+fn provenance_with_generation_clock(
+    mut provenance: Value,
+    generation_clock: GenerationClock,
+) -> Result<Value, DynError> {
+    let object = provenance.as_object_mut().ok_or_else(|| -> DynError {
+        "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: provenance surface is not a JSON object; remediation: preserve the staged generation and inspect the row-sink provenance producer"
+            .into()
+    })?;
+    object.insert(
+        "generation_clock".to_string(),
+        generation_clock.provenance(),
+    );
+    Ok(provenance)
+}
+
+fn validate_generation_clock_provenance(
+    project: &str,
+    provenance: &Value,
+    generation_clock: GenerationClock,
+) -> Result<(), DynError> {
+    if provenance.get("generation_clock") == Some(&generation_clock.provenance()) {
+        return Ok(());
+    }
+    Err(format!(
+        "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: project {project:?} persisted provenance does not bind contract {GENERATION_CLOCK_CONTRACT:?} at observed_at_ms={}; remediation: preserve the generation and rebuild it from authoritative source",
+        generation_clock.observed_at_ms()
+    )
+    .into())
 }
 
 fn validate_git_source_provenance(
@@ -976,6 +1013,7 @@ fn index_time_signal_cards_summary<C>(
     vault: &AsterVault<C>,
     project: &str,
     vault_dir: &Path,
+    generation_clock: GenerationClock,
 ) -> Value
 where
     C: Clock,
@@ -1023,10 +1061,7 @@ where
             });
         }
     };
-    let produced_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let produced_at = generation_clock.observed_at_seconds();
 
     let mut axes = Vec::new();
     let mut cards_persisted = 0usize;
@@ -1777,6 +1812,7 @@ pub(crate) fn shadow_index_admission_identity(
             "shadow_watermark_version": SHADOW_WATERMARK_VERSION,
             "shadow_ledger_checkpoint_schema": SHADOW_LEDGER_CHECKPOINT_SCHEMA,
             "shadow_ledger_tip_hash_algorithm": SHADOW_LEDGER_TIP_HASH_ALGORITHM,
+            "generation_clock_contract": GENERATION_CLOCK_CONTRACT,
         },
         "producer_executable_sha256": producer_executable_sha256,
     });
@@ -2049,6 +2085,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     search_scale_settings: &SearchScaleSettings,
     repo: Option<&Path>,
     action_policy: &ShadowIndexActionPolicy,
+    generation_clock: GenerationClock,
 ) -> Result<ShadowImportOutcome, DynError> {
     fs::create_dir_all(cache_dir)?;
     let sqlite_path = sqlite_path(cache_dir, project);
@@ -2075,7 +2112,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     fs::create_dir_all(&vault_dir)?;
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID)?;
     let vault_salt = vault_salt(project);
-    let vault = AsterVault::new_durable(
+    let vault = AsterVault::new_durable_with_clock(
         &vault_dir,
         vault_id,
         vault_salt.as_bytes().to_vec(),
@@ -2088,6 +2125,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             restore_mvcc_rows: false,
             ..VaultOptions::default()
         },
+        FixedClock::new(generation_clock.observed_at_ms()),
     )?;
     // Gate every git-dependent step on the corpus actually being a git work tree
     // (#406): `dispatch.rs` passes `repo = Some(dir)` for ANY indexed directory, so a
@@ -2221,6 +2259,44 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?;
     let persisted_symbol_canonical_schema =
         read_config_value(cache_dir, &metadata_key(project, "symbol_canonical_schema"))?;
+    let persisted_generation_clock_contract = read_config_value(
+        cache_dir,
+        &metadata_key(project, GENERATION_CLOCK_CONTRACT_KEY),
+    )?;
+    let persisted_generation_observed_at_ms = read_config_value(
+        cache_dir,
+        &metadata_key(project, GENERATION_OBSERVED_AT_MS_KEY),
+    )?;
+    let persisted_generation_clock = match (
+        persisted_generation_clock_contract.as_deref(),
+        persisted_generation_observed_at_ms.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(contract), Some(raw)) if contract == GENERATION_CLOCK_CONTRACT => {
+            let observed_at_ms = raw.parse::<u64>().map_err(|error| -> DynError {
+                format!(
+                    "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: project {project:?} persisted generation_observed_at_ms {raw:?} is not an unsigned integer: {error}; remediation: preserve the generation and rebuild it from authoritative source"
+                )
+                .into()
+            })?;
+            Some(
+                GenerationClock::from_persisted(observed_at_ms)
+                    .map_err(|fault| -> DynError { Box::new(fault) })?,
+            )
+        }
+        (Some(contract), Some(_)) => {
+            return Err(format!(
+                "ASTRO_GENERATION_CLOCK_CONTRACT_INCOMPATIBLE: project {project:?} persists generation clock contract {contract:?}, but this executable requires {GENERATION_CLOCK_CONTRACT:?}; remediation: preserve the generation and migrate the clock contract explicitly before retrying"
+            )
+            .into());
+        }
+        state => {
+            return Err(format!(
+                "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: project {project:?} has a partial persisted generation clock tuple {state:?}; remediation: preserve the incomplete generation and rebuild it from authoritative source"
+            )
+            .into());
+        }
+    };
     let symbol_canonical_contract_current = match persisted_symbol_canonical_schema.as_deref() {
         Some(persisted) if persisted == SYMBOL_CANONICAL_TAG => true,
         None => false,
@@ -2257,8 +2333,13 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         && !import_changed
         && git_source_identity_unchanged
         && symbol_canonical_contract_current
+        && persisted_generation_clock.is_some()
         && action_policy.permits_content_noop();
     if exact_noop {
+        let persisted_generation_clock = persisted_generation_clock.ok_or_else(|| -> DynError {
+            "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: exact no-op admission reached without a complete persisted generation clock; remediation: rebuild the generation from authoritative source"
+                .into()
+        })?;
         let persisted_content_sha256 = match persisted_content_watermark.as_deref() {
             None => {
                 return Err(format!(
@@ -2349,6 +2430,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             read_required_shadow_json(cache_dir, project, "skill_tree_json")?
         };
         let provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+        validate_generation_clock_provenance(project, &provenance, persisted_generation_clock)?;
         if let (Some(snapshot), Some(repo_path)) =
             (git_snapshot.as_ref(), git_source_repo_path.as_deref())
         {
@@ -2387,6 +2469,9 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             } else {
                 "unchanged"
             },
+            generation_observed_at_ms: persisted_generation_clock.observed_at_ms(),
+            generation_clock_contract: GENERATION_CLOCK_CONTRACT.to_string(),
+            generation_clock_provenance: persisted_generation_clock.provenance(),
             vault_dir,
             vault_id: SHADOW_VAULT_ID.to_string(),
             vault_salt,
@@ -2487,7 +2572,13 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
                     .into()
             })?;
             git_archaeology_summary(&run_git_archaeology(
-                repo, project, cache_dir, &vault, mode, history,
+                repo,
+                project,
+                cache_dir,
+                &vault,
+                mode,
+                history,
+                generation_clock.observed_at_seconds(),
             )?)?
         }
         None => json!({
@@ -2568,7 +2659,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // Best-effort telemetry: a labeled degradation in the summary, never an index
     // failure. (Shares shadow_import.rs with lane D/E/F index-time hooks — keep
     // this to exactly this one call.)
-    let signal_cards = index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir);
+    let signal_cards =
+        index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir, generation_clock);
     shadow_phase!("signal_cards");
     // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
     // propagation. ── EXACT INSERTION POINT ── one post-import call, placed
@@ -2633,6 +2725,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         &shadow_ledger_head,
         &verify,
     );
+    let provenance = provenance_with_generation_clock(provenance, generation_clock)?;
     let provenance = provenance_with_git_source(
         provenance,
         git_snapshot.as_ref(),
@@ -2648,6 +2741,9 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         publication_required: true,
         metadata_publication_required: false,
         publication_reason: "source_or_derived_changed",
+        generation_observed_at_ms: generation_clock.observed_at_ms(),
+        generation_clock_contract: GENERATION_CLOCK_CONTRACT.to_string(),
+        generation_clock_provenance: generation_clock.provenance(),
         vault_dir,
         vault_id: SHADOW_VAULT_ID.to_string(),
         vault_salt,
@@ -5010,6 +5106,42 @@ pub(crate) fn try_shadow_index_noop_admission(
 
     let config_rows_before = shadow_project_config_rows(cache_dir, project)?;
     let config_rows_sha256 = hex_lower(&Sha256::digest(serde_json::to_vec(&config_rows_before)?));
+    let generation_contract_key = metadata_key(project, GENERATION_CLOCK_CONTRACT_KEY);
+    let generation_observed_key = metadata_key(project, GENERATION_OBSERVED_AT_MS_KEY);
+    let persisted_generation_contract = config_rows_before
+        .iter()
+        .find_map(|(key, value)| (key == &generation_contract_key).then_some(value.as_str()))
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: project {project:?} no-op generation omits {generation_contract_key:?}; remediation: preserve the incomplete generation and rebuild from authoritative source"
+            )
+            .into()
+        })?;
+    if persisted_generation_contract != GENERATION_CLOCK_CONTRACT {
+        return Err(format!(
+            "ASTRO_GENERATION_CLOCK_CONTRACT_INCOMPATIBLE: project {project:?} no-op generation carries {persisted_generation_contract:?}, expected {GENERATION_CLOCK_CONTRACT:?}; remediation: preserve the generation and migrate its clock contract explicitly"
+        )
+        .into());
+    }
+    let persisted_generation_observed_at_ms = config_rows_before
+        .iter()
+        .find_map(|(key, value)| (key == &generation_observed_key).then_some(value.as_str()))
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: project {project:?} no-op generation omits {generation_observed_key:?}; remediation: preserve the incomplete generation and rebuild from authoritative source"
+            )
+            .into()
+        })?
+        .parse::<u64>()
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_GENERATION_CLOCK_PROVENANCE_INVALID: project {project:?} no-op generation has a malformed observation: {error}; remediation: preserve the incomplete generation and rebuild from authoritative source"
+            )
+            .into()
+        })?;
+    let persisted_generation_clock =
+        GenerationClock::from_persisted(persisted_generation_observed_at_ms)
+            .map_err(|fault| -> DynError { Box::new(fault) })?;
 
     let source_path = sqlite_path(cache_dir, project);
     if !source_path.exists() {
@@ -5285,6 +5417,11 @@ pub(crate) fn try_shadow_index_noop_admission(
     let anomalies =
         compact_persisted_surface_ref(cache_dir, project, "anomalies", "anomaly_report_json")?;
     let persisted_provenance = read_required_shadow_json(cache_dir, project, "provenance_json")?;
+    validate_generation_clock_provenance(
+        project,
+        &persisted_provenance,
+        persisted_generation_clock,
+    )?;
     validate_git_source_provenance(
         project,
         &persisted_provenance,
@@ -5336,6 +5473,10 @@ pub(crate) fn try_shadow_index_noop_admission(
             (
                 "publication_generation".to_string(),
                 Value::String(publication_generation.clone()),
+            ),
+            (
+                "generation_clock".to_string(),
+                persisted_generation_clock.provenance(),
             ),
             (
                 "git_source_fingerprint_before".to_string(),
@@ -5486,6 +5627,7 @@ pub(crate) fn try_shadow_index_noop_admission(
         "expected_edges": sqlite_edges,
         "skipped_count": 0,
         "calyx": "shadow",
+        "generation_clock": persisted_generation_clock.provenance(),
         "vault_fingerprint": persisted_watermark,
         "grounding_summary": grounding,
         "index_admission": {
@@ -5699,6 +5841,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Result<Value, 
         "artifact_writes_skipped": !outcome.publication_required,
         "action_metadata_written": outcome.metadata_publication_required,
         "publication_reason": outcome.publication_reason,
+        "generation_clock": outcome.generation_clock_provenance,
         "sqlite_nodes": outcome.sqlite_nodes,
         "sqlite_edges": outcome.sqlite_edges,
         "constellation_inputs": outcome.constellation_inputs,
@@ -6097,6 +6240,17 @@ pub(crate) fn persist_shadow_publication_at(
         staged_config_rows,
         publication_generation,
     } = commit;
+    if outcome.generation_clock_contract != GENERATION_CLOCK_CONTRACT {
+        return Err(format!(
+            "ASTRO_GENERATION_CLOCK_CONTRACT_INCOMPATIBLE: publication outcome carries generation clock contract {:?}, expected {GENERATION_CLOCK_CONTRACT:?}; remediation: preserve the staged generation and repair the generation-clock producer",
+            outcome.generation_clock_contract
+        )
+        .into());
+    }
+    let published_generation_clock =
+        GenerationClock::from_persisted(outcome.generation_observed_at_ms)
+            .map_err(|fault| -> DynError { Box::new(fault) })?;
+    validate_generation_clock_provenance(project, &outcome.provenance, published_generation_clock)?;
     match (
         outcome.git_history_state.as_ref(),
         outcome.git_source_fingerprint.as_deref(),
@@ -6233,6 +6387,14 @@ pub(crate) fn persist_shadow_publication_at(
             outcome.shadow_ledger_checkpoint.record_json()?,
         ),
         ("panel_version", SHADOW_PANEL_VERSION.to_string()),
+        (
+            GENERATION_CLOCK_CONTRACT_KEY,
+            outcome.generation_clock_contract.clone(),
+        ),
+        (
+            GENERATION_OBSERVED_AT_MS_KEY,
+            outcome.generation_observed_at_ms.to_string(),
+        ),
         ("symbol_canonical_schema", SYMBOL_CANONICAL_TAG.to_string()),
         ("structural_only", outcome.structural_only.to_string()),
         ("new_cx_ids", outcome.new_cx_ids.to_string()),

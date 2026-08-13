@@ -509,11 +509,29 @@ pub(crate) fn handle_index_repository(
             astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG
         ));
     }
+    if args_obj.contains_key(GENERATION_OBSERVED_AT_MS_PRIVATE_ARG) {
+        return ToolFault::new(
+            "ASTRO_GENERATION_CLOCK_PRIVATE_ARG_COLLISION",
+            format!(
+                "caller supplied reserved argument {GENERATION_OBSERVED_AT_MS_PRIVATE_ARG:?}"
+            ),
+            "remove the private transport field and use generation_observed_at_ms for an explicit reproducible generation",
+        )
+        .with_detail(
+            "argument",
+            Value::String(GENERATION_OBSERVED_AT_MS_PRIVATE_ARG.to_string()),
+        )
+        .into_result();
+    }
     if args_obj.contains_key("name") {
         return tool_error_result(
             "CBM_PROJECT_NAME_OVERRIDE_REFUSED: project storage identity is derived only from the canonical repository root; remove the name argument and use the project returned by index_repository",
         );
     }
+    let generation_clock_request = match GenerationClockRequest::parse(args_obj) {
+        Ok(request) => request,
+        Err(fault) => return fault.into_result(),
+    };
     let activation_fence = crate::activation_epoch::require_active_generation("index_repository")?;
 
     let search_scale_override = match parse_search_scale_override(args_obj) {
@@ -554,6 +572,10 @@ pub(crate) fn handle_index_repository(
         }
         if let (Some(project), Some(repo_path)) = (project.as_deref(), repo_path.as_deref()) {
             let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+            let generation_clock = match generation_clock_request.resolve() {
+                Ok(clock) => clock,
+                Err(fault) => return fault.into_result(),
+            };
             return run_project_index_transition(
                 runner,
                 &cache_dir,
@@ -562,14 +584,20 @@ pub(crate) fn handle_index_repository(
                 |transition_grant| {
                     run_supervised_index_with_transition(
                         runner,
-                        args_json,
+                        &sanitized_args,
                         &cache_dir,
                         transition_grant,
+                        generation_clock,
                     )
                 },
             );
         }
-        return Ok(runner.handle_tool_raw("index_repository", args_json)?);
+        let generation_clock = match generation_clock_request.resolve() {
+            Ok(clock) => clock,
+            Err(fault) => return fault.into_result(),
+        };
+        let worker_args = generation_clock.bind_worker_arg(&sanitized_args)?;
+        return Ok(runner.handle_tool_raw("index_repository", &worker_args)?);
     }
 
     let skills = skill_discovery_config(skill_discovery_override.as_ref());
@@ -600,6 +628,10 @@ pub(crate) fn handle_index_repository(
         let result =
             if let (Some(project), Some(repo_path)) = (project.as_deref(), repo_path.as_deref()) {
                 let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+                let generation_clock = match generation_clock_request.resolve() {
+                    Ok(clock) => clock,
+                    Err(fault) => return fault.into_result(),
+                };
                 run_project_index_transition(
                     runner,
                     &cache_dir,
@@ -611,11 +643,17 @@ pub(crate) fn handle_index_repository(
                             &sanitized_args,
                             &cache_dir,
                             transition_grant,
+                            generation_clock,
                         )
                     },
                 )?
             } else {
-                runner.handle_tool_raw("index_repository", &sanitized_args)?
+                let generation_clock = match generation_clock_request.resolve() {
+                    Ok(clock) => clock,
+                    Err(fault) => return fault.into_result(),
+                };
+                let worker_args = generation_clock.bind_worker_arg(&sanitized_args)?;
+                runner.handle_tool_raw("index_repository", &worker_args)?
             };
         if let Some(project) = project
             .or_else(|| project_from_tool_result(&result))
@@ -707,6 +745,13 @@ pub(crate) fn handle_index_repository(
     {
         return tool_error_result(error.to_string());
     }
+    // Resolve only after a pre-seed no-op miss, but before the project
+    // transition or staged publication mutates durable state. One immutable
+    // value is then carried through CBM, archaeology, assay, and Calyx.
+    let generation_clock = match generation_clock_request.resolve() {
+        Ok(clock) => clock,
+        Err(fault) => return fault.into_result(),
+    };
     let transition_root = repo_path.as_deref().ok_or_else(|| -> DynError {
         "ASTRO_PROJECT_TRANSITION_ROOT_REQUIRED: shadow indexing requires repo_path for exact transition identity; remediation: pass the canonical repository root".into()
     })?;
@@ -732,6 +777,7 @@ pub(crate) fn handle_index_repository(
                 repo_path.as_deref(),
                 &index_admission_identity,
                 PUBLICATION_SCHEMA,
+                generation_clock,
             ) {
                 Ok(fingerprint) => Some(fingerprint),
                 Err(error) => {
@@ -745,6 +791,7 @@ pub(crate) fn handle_index_repository(
                 &sanitized_args,
                 publication.stage_cache(),
                 transition_grant,
+                generation_clock,
             ) {
                 Ok(args) => args,
                 Err(error) => return Err(publication.abort("worker argument binding", error)),
@@ -889,6 +936,7 @@ pub(crate) fn handle_index_repository(
                     &search_scale_settings,
                     repo_path.as_deref(),
                     &action_policy,
+                    generation_clock,
                 )?;
                 Ok((result, outcome))
             })();
@@ -953,6 +1001,7 @@ pub(crate) fn handle_index_repository(
                 &result,
                 json!({
                     "calyx": "shadow",
+                    "generation_clock": outcome.generation_clock_provenance.clone(),
                     "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
                     "grounding_summary": grounding_summary(&outcome)?,
                     "post_publish_verification": post_publish_verification,
@@ -969,8 +1018,10 @@ fn supervised_index_worker_args(
     args_json: &str,
     worker_cache: &Path,
     transition_grant: &ProjectTransitionWorkerGrant,
+    generation_clock: GenerationClock,
 ) -> Result<String, DynError> {
-    let mut value: Value = serde_json::from_str(args_json)?;
+    let clock_bound_args = generation_clock.bind_worker_arg(args_json)?;
+    let mut value: Value = serde_json::from_str(&clock_bound_args)?;
     let object = value.as_object_mut().ok_or_else(|| -> DynError {
         "ASTRO_INDEX_WORKER_ARGS_OBJECT_REQUIRED: sanitized index arguments must remain a JSON object"
             .into()
@@ -1148,8 +1199,10 @@ fn run_supervised_index_with_transition(
     args_json: &str,
     worker_cache: &Path,
     transition_grant: &ProjectTransitionWorkerGrant,
+    generation_clock: GenerationClock,
 ) -> Result<String, DynError> {
-    let worker_args = supervised_index_worker_args(args_json, worker_cache, transition_grant)?;
+    let worker_args =
+        supervised_index_worker_args(args_json, worker_cache, transition_grant, generation_clock)?;
     Ok(runner.handle_index_repository_supervised(&worker_args)?)
 }
 

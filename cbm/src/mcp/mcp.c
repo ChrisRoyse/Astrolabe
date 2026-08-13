@@ -39,6 +39,9 @@ enum {
 #define MCP_STRINGIFY_INNER(value) #value
 #define MCP_STRINGIFY(value) MCP_STRINGIFY_INNER(value)
 #define ASTRO_COMPILATION_CONTEXT_ARG "_astrolabe_compilation_context_json"
+#define ASTRO_GENERATION_CLOCK_ARG "generation_observed_at_ms"
+#define ASTRO_GENERATION_CLOCK_PRIVATE_ARG "_astrolabe_generation_observed_at_ms"
+#define CBM_GENERATION_CLOCK_MAX_MS UINT64_C(253402300799000)
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
@@ -728,6 +731,11 @@ static const tool_def_t TOOLS[] = {
      "\"target_projects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Projects to search for cross-repo links (cross-repo-intelligence mode). "
      "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
+     "\"generation_observed_at_ms\":{\"type\":\"integer\",\"minimum\":1,"
+     "\"maximum\":253402300799000,\"multipleOf\":1000,\"description\":"
+     "\"Optional reproducible generation observation in Unix milliseconds. Must be nonzero "
+     "and exactly representable by the Project row's UTC-seconds field. Omit to observe the "
+     "real pipeline-admission boundary once.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
@@ -1403,6 +1411,132 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
         result = yyjson_get_bool(val);
     }
     yyjson_doc_free(doc);
+    return result;
+}
+
+typedef struct {
+    bool present;
+    uint64_t observed_at_ms;
+    const char *code;
+    const char *message;
+    const char *remediation;
+    const char *argument;
+} cbm_generation_clock_arg_t;
+
+static bool parse_generation_clock_arg(const char *args_json,
+                                       cbm_generation_clock_arg_t *out) {
+    memset(out, 0, sizeof(*out));
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        out->code = "CBM_GENERATION_CLOCK_ARGS_INVALID";
+        out->message = "index_repository arguments are not valid JSON";
+        out->remediation = "pass one valid JSON object matching the index_repository schema";
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *public_value =
+        yyjson_is_obj(root) ? yyjson_obj_get(root, ASTRO_GENERATION_CLOCK_ARG) : NULL;
+    yyjson_val *private_value =
+        yyjson_is_obj(root) ? yyjson_obj_get(root, ASTRO_GENERATION_CLOCK_PRIVATE_ARG) : NULL;
+    if (public_value && private_value) {
+        out->code = "CBM_GENERATION_CLOCK_TRANSPORT_COLLISION";
+        out->message = "public and private generation clock fields were both supplied";
+        out->remediation =
+            "remove the private transport field; callers use only generation_observed_at_ms";
+        out->argument = ASTRO_GENERATION_CLOCK_PRIVATE_ARG;
+        yyjson_doc_free(doc);
+        return false;
+    }
+    yyjson_val *value = private_value ? private_value : public_value;
+    if (!value) {
+        yyjson_doc_free(doc);
+        return true;
+    }
+    out->present = true;
+    out->argument = private_value ? ASTRO_GENERATION_CLOCK_PRIVATE_ARG : ASTRO_GENERATION_CLOCK_ARG;
+    uint64_t parsed = 0;
+    if (yyjson_is_uint(value)) {
+        parsed = yyjson_get_uint(value);
+    } else if (yyjson_is_sint(value) && yyjson_get_sint(value) >= 0) {
+        parsed = (uint64_t)yyjson_get_sint(value);
+    } else {
+        out->code = yyjson_is_sint(value) ? "CBM_GENERATION_CLOCK_RANGE_INVALID"
+                                          : "CBM_GENERATION_CLOCK_TYPE_INVALID";
+        out->message = yyjson_is_sint(value)
+                           ? "generation_observed_at_ms cannot be negative"
+                           : "generation_observed_at_ms must be an unsigned integer";
+        out->remediation =
+            "pass a nonzero Unix-millisecond integer exactly divisible by 1000";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (parsed == 0) {
+        out->code = "CBM_GENERATION_CLOCK_ZERO";
+        out->message = "generation_observed_at_ms must be nonzero";
+        out->remediation =
+            "pass a nonzero Unix-millisecond integer exactly divisible by 1000";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (parsed > CBM_GENERATION_CLOCK_MAX_MS) {
+        out->code = "CBM_GENERATION_CLOCK_RANGE_INVALID";
+        out->message = "generation_observed_at_ms exceeds the UTC Project-row range";
+        out->remediation = "pass a value no later than 9999-12-31T23:59:59Z";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (parsed % UINT64_C(1000) != 0) {
+        out->code = "CBM_GENERATION_CLOCK_SECOND_INEXACT";
+        out->message =
+            "generation_observed_at_ms cannot be represented exactly by the UTC-seconds "
+            "Project field";
+        out->remediation =
+            "pass a Unix-millisecond value exactly divisible by 1000; CBM never rounds an "
+            "explicit observation";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    out->observed_at_ms = parsed;
+    yyjson_doc_free(doc);
+    return true;
+}
+
+static char *generation_clock_error_result(const cbm_generation_clock_arg_t *error) {
+    cbm_log_error("index.generation_clock_refused", "code", error->code, "argument",
+                  error->argument ? error->argument : "", "message", error->message,
+                  "remediation", error->remediation);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return cbm_mcp_text_result(
+            "CBM_GENERATION_CLOCK_ERROR_SERIALIZE_FAILED: the exact generation-clock refusal "
+            "could not be serialized; inspect the structured native log",
+            true);
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root || !yyjson_mut_obj_add_str(doc, root, "schema", "cbm.tool_fault/v1") ||
+        !yyjson_mut_obj_add_str(doc, root, "status", "error") ||
+        !yyjson_mut_obj_add_str(doc, root, "code", error->code) ||
+        !yyjson_mut_obj_add_str(doc, root, "message", error->message) ||
+        !yyjson_mut_obj_add_str(doc, root, "remediation", error->remediation) ||
+        (error->argument &&
+         !yyjson_mut_obj_add_str(doc, root, "argument", error->argument))) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result(
+            "CBM_GENERATION_CLOCK_ERROR_SERIALIZE_FAILED: the exact generation-clock refusal "
+            "could not be serialized; inspect the structured native log",
+            true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return cbm_mcp_text_result(
+            "CBM_GENERATION_CLOCK_ERROR_SERIALIZE_FAILED: the exact generation-clock refusal "
+            "could not be serialized; inspect the structured native log",
+            true);
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
     return result;
 }
 
@@ -9233,6 +9367,10 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    cbm_generation_clock_arg_t generation_clock_arg;
+    if (!parse_generation_clock_arg(args, &generation_clock_arg)) {
+        return generation_clock_error_result(&generation_clock_arg);
+    }
     /* Supervisor gate: a real host runs the index once in an isolated worker.
      * Spawn/process/response failure is terminal; it never authorizes an
      * in-process retry or a changed corpus. */
@@ -9388,10 +9526,22 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
 
-    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+    cbm_pipeline_t *p = generation_clock_arg.present
+                            ? cbm_pipeline_new_at(repo_path, NULL, mode,
+                                                  generation_clock_arg.observed_at_ms)
+                            : cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
         free(compilation_context);
         free(repo_path);
+        if (generation_clock_arg.present) {
+            generation_clock_arg.code = "CBM_GENERATION_CLOCK_INSTALL_FAILED";
+            generation_clock_arg.message =
+                "the native pipeline could not bind the validated generation observation";
+            generation_clock_arg.remediation =
+                "inspect the preceding structured pipeline diagnostic and pass a Unix time "
+                "supported by this native runtime";
+            return generation_clock_error_result(&generation_clock_arg);
+        }
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
     if (compilation_context &&

@@ -34,6 +34,7 @@ enum {
     PL_ERROR_DETAIL_VALUE = 512,
     PL_PARALLEL_DISPATCH_CAPACITY = 64
 };
+#define CBM_GENERATION_CLOCK_MAX_MS UINT64_C(253402300799000)
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
@@ -204,6 +205,7 @@ struct cbm_pipeline {
     cbm_git_context_t git_ctx;
     char *branch_qn;
     cbm_index_mode_t mode;
+    uint64_t generation_observed_at_ms;
     atomic_int cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     cbm_pipeline_row_sink_v2_t row_sink;
@@ -878,10 +880,28 @@ static void log_phase_mem(const char *phase) {
                  itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)));
 }
 
+static int bind_generation_observed_at_ms(cbm_pipeline_t *p, uint64_t observed_at_ms);
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
                                  cbm_index_mode_t mode) {
+    time_t admitted_at = time(NULL);
+    if (admitted_at <= 0 ||
+        (uint64_t)admitted_at > CBM_GENERATION_CLOCK_MAX_MS / UINT64_C(1000)) {
+        cbm_log_error("pipeline.create_failed", "code", "CBM_GENERATION_CLOCK_UNAVAILABLE",
+                      "operation", "observe_pipeline_admission", "message",
+                      "the pipeline could not observe one nonzero UTC-seconds instant at "
+                      "construction",
+                      "remediation", "repair the host wall clock and retry the unchanged request");
+        return NULL;
+    }
+    return cbm_pipeline_new_at(repo_path, db_path, mode,
+                               (uint64_t)admitted_at * UINT64_C(1000));
+}
+
+cbm_pipeline_t *cbm_pipeline_new_at(const char *repo_path, const char *db_path,
+                                    cbm_index_mode_t mode, uint64_t observed_at_ms) {
     if (!repo_path) {
         return NULL;
     }
@@ -928,8 +948,48 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->compile_context_authority = "not_applicable";
     atomic_init(&p->dangling_rust_module_skips, 0);
     atomic_init(&p->cancelled, 0);
+    if (bind_generation_observed_at_ms(p, observed_at_ms) != 0) {
+        cbm_log_error("pipeline.create_failed", "code", "CBM_GENERATION_CLOCK_UNAVAILABLE",
+                      "operation", "bind_pipeline_admission", "path", p->repo_path, "message",
+                      "the pipeline could not bind its supplied generation observation",
+                      "remediation", "repair the caller's generation-clock binding and retry");
+        cbm_pipeline_free(p);
+        return NULL;
+    }
 
     return p;
+}
+
+static int bind_generation_observed_at_ms(cbm_pipeline_t *p, uint64_t observed_at_ms) {
+    if (!p || observed_at_ms == 0 || observed_at_ms > CBM_GENERATION_CLOCK_MAX_MS ||
+        observed_at_ms % UINT64_C(1000) != 0) {
+        char observed[CBM_SZ_32];
+        (void)snprintf(observed, sizeof(observed), "%llu",
+                       (unsigned long long)observed_at_ms);
+        cbm_log_error("pipeline.generation_clock_refused", "code",
+                      "CBM_GENERATION_CLOCK_INVALID", "observed_at_ms", observed, "message",
+                      "the requested generation clock is zero, out of range, or not exactly "
+                      "representable as UTC seconds",
+                      "remediation",
+                      "pass one nonzero Unix-millisecond integer divisible by 1000");
+        return CBM_NOT_FOUND;
+    }
+    uint64_t seconds = observed_at_ms / UINT64_C(1000);
+    time_t timestamp = (time_t)seconds;
+    struct tm tm_buf;
+    char indexed_at[CBM_SZ_64];
+    if (timestamp < 0 || (uint64_t)timestamp != seconds ||
+        !cbm_gmtime_r(&timestamp, &tm_buf) ||
+        strftime(indexed_at, sizeof(indexed_at), "%Y-%m-%dT%H:%M:%SZ", &tm_buf) == 0) {
+        cbm_log_error("pipeline.generation_clock_refused", "code",
+                      "CBM_GENERATION_CLOCK_PLATFORM_RANGE_INVALID", "message",
+                      "the requested generation observation cannot be represented by this "
+                      "platform's UTC Project timestamp",
+                      "remediation", "pass an earlier exactly-second-representable Unix time");
+        return CBM_NOT_FOUND;
+    }
+    p->generation_observed_at_ms = observed_at_ms;
+    return 0;
 }
 
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
@@ -1120,6 +1180,10 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
+}
+
+uint64_t cbm_pipeline_generation_observed_at_ms(const cbm_pipeline_t *p) {
+    return p ? p->generation_observed_at_ms : 0;
 }
 
 const char *cbm_pipeline_source_root(const cbm_pipeline_t *p) {
@@ -5342,10 +5406,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
-    if (!p->gbuf || cbm_gbuf_set_index_mode(p->gbuf, p->mode) != 0) {
+    if (!p->gbuf || cbm_gbuf_set_index_mode(p->gbuf, p->mode) != 0 ||
+        cbm_gbuf_set_generation_observed_at_ms(p->gbuf, p->generation_observed_at_ms) != 0) {
         cbm_pipeline_record_fatal_error(
-            p, "CBM_PIPELINE_INDEX_MODE_BIND_FAILED", "bind_graph_buffer_index_mode", "graph",
-            p->repo_path, 0, "the graph buffer could not retain the requested index mode",
+            p, "CBM_PIPELINE_GENERATION_CONTRACT_BIND_FAILED",
+            "bind_graph_buffer_generation_contract", "graph", p->repo_path, 0,
+            "the graph buffer could not retain the requested index mode and generation clock",
             "inspect the graph-buffer diagnostic and retry the complete index");
         rc = CBM_NOT_FOUND;
         goto cleanup;

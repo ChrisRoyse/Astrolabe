@@ -846,6 +846,7 @@ enum { CBM_INCREMENTAL_REBUILD_REQUIRED = 2 };
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+uint64_t cbm_pipeline_generation_observed_at_ms(const cbm_pipeline_t *p);
 const char *cbm_pipeline_source_root(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 cbm_compile_context_index_t *cbm_pipeline_compile_contexts(const cbm_pipeline_t *p);

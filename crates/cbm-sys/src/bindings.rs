@@ -4023,6 +4023,14 @@ unsafe extern "C" {
     ) -> *mut cbm_pipeline_t;
 }
 unsafe extern "C" {
+    pub fn cbm_pipeline_new_at(
+        repo_path: *const ::std::os::raw::c_char,
+        db_path: *const ::std::os::raw::c_char,
+        mode: cbm_index_mode_t,
+        observed_at_ms: u64,
+    ) -> *mut cbm_pipeline_t;
+}
+unsafe extern "C" {
     pub fn cbm_pipeline_set_embedded_compilation_context(
         p: *mut cbm_pipeline_t,
         bytes: *const u8,

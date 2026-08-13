@@ -161,6 +161,11 @@ enum { CBM_PIPELINE_EMPTY_SOURCE_CORPUS = -2001 };
 /* Create a new pipeline. Caller owns the result. */
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
+/* Create a pipeline with an already-resolved generation observation. Unlike
+ * cbm_pipeline_new, this path never samples the wall clock. */
+cbm_pipeline_t *cbm_pipeline_new_at(const char *repo_path, const char *db_path,
+                                    cbm_index_mode_t mode, uint64_t observed_at_ms);
+
 /* Bind the exact artifact- or repository-derived compilation context. The
  * pipeline copies and owns the bytes through cbm_pipeline_free; the caller may
  * release its source buffer immediately. The document must be an immutable

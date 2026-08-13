@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const PRESERVED_STAGE_DIR: &str = ".astrolabe-shadow-preserved-stage";
 const PRESERVED_STAGE_MANIFEST: &str = "preserved-stage.json";
-const PRESERVED_STAGE_SCHEMA: &str = "astrolabe.shadow-preserved-stage.v2";
-const PRESERVED_STAGE_FINGERPRINT_SCHEMA: &str = "astrolabe.shadow-preserved-stage.fingerprint.v2";
-const PERSISTED_STAGE_ARMING_SCHEMA: &str = "astrolabe.shadow-stage-arming.v2";
+const PRESERVED_STAGE_SCHEMA: &str = "astrolabe.shadow-preserved-stage.v3";
+const PRESERVED_STAGE_FINGERPRINT_SCHEMA: &str = "astrolabe.shadow-preserved-stage.fingerprint.v3";
+const PERSISTED_STAGE_ARMING_SCHEMA: &str = "astrolabe.shadow-stage-arming.v3";
 
 /// Registry-declared retention: at most this many preserved stages per project.
 /// A preserved stage is a full CBM store (multi-GB), so the replacement is a
@@ -118,6 +118,8 @@ pub(crate) struct PreservedStageFingerprint {
     pub(crate) symbol_canonical_schema: String,
     pub(crate) panel_version: u32,
     pub(crate) publication_schema: String,
+    pub(crate) generation_clock_contract: String,
+    pub(crate) generation_observed_at_ms: u64,
 }
 
 impl PreservedStageFingerprint {
@@ -126,6 +128,7 @@ impl PreservedStageFingerprint {
         repo: Option<&Path>,
         identity: &ShadowIndexAdmissionIdentity,
         publication_schema: &str,
+        generation_clock: GenerationClock,
     ) -> Result<Self, DynError> {
         let repo = repo
             .filter(|repo| astrolabe_anchors::archaeology::is_git_work_tree(repo))
@@ -155,6 +158,8 @@ impl PreservedStageFingerprint {
             symbol_canonical_schema: SYMBOL_CANONICAL_TAG.to_string(),
             panel_version: SHADOW_PANEL_VERSION,
             publication_schema: publication_schema.to_string(),
+            generation_clock_contract: GENERATION_CLOCK_CONTRACT.to_string(),
+            generation_observed_at_ms: generation_clock.observed_at_ms(),
         })
     }
 
@@ -162,7 +167,7 @@ impl PreservedStageFingerprint {
     pub(crate) fn token_sha256(&self) -> Result<String, DynError> {
         let bytes = serde_json::to_vec(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"astrolabe.shadow-preserved-stage.fingerprint.v2\0");
+        hasher.update(b"astrolabe.shadow-preserved-stage.fingerprint.v3\0");
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
         Ok(hex_lower(&hasher.finalize()))

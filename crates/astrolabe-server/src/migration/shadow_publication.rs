@@ -1657,6 +1657,8 @@ fn publication_recovery_relevant_config_rows(
     let mut keys = action_metadata_keys(project);
     keys.push(metadata_key(project, SHADOW_PUBLICATION_GENERATION_KEY));
     keys.push(metadata_key(project, SHADOW_LEDGER_CHECKPOINT_KEY));
+    keys.push(metadata_key(project, GENERATION_CLOCK_CONTRACT_KEY));
+    keys.push(metadata_key(project, GENERATION_OBSERVED_AT_MS_KEY));
     keys.push(metadata_key(project, "ledger_seq"));
     keys.push(metadata_key(project, "ledger_rows"));
     keys.sort();

@@ -165,6 +165,10 @@ pub(crate) fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynEr
     // #198: an Astrolabe-side knob, never forwarded to the CBM tool, which would reject it as
     // an unknown argument.
     sanitized.remove("calyx_skills");
+    // #1113: the public request is validated at the Astrolabe admission
+    // boundary and replaced with one private, immutable worker transport. It
+    // is generation provenance, not a caller action/cache identity.
+    sanitized.remove(GENERATION_OBSERVED_AT_MS_ARG);
     Ok(serde_json::to_string(&Value::Object(sanitized))?)
 }
 

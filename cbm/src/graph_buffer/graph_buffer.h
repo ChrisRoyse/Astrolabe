@@ -59,6 +59,11 @@ typedef struct {
 /* Create a new graph buffer for a project. */
 cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path);
 
+/* Bind the one generation-admission observation used by the Project row.
+ * Value is Unix milliseconds, nonzero, and exactly UTC-second representable.
+ * Rebinding to a different value is refused. */
+int cbm_gbuf_set_generation_observed_at_ms(cbm_gbuf_t *gb, uint64_t observed_at_ms);
+
 /* Create a graph buffer with a shared atomic ID source.
  * IDs are allocated via atomic_fetch_add on *id_source.
  * Used for parallel extraction where multiple gbufs need unique IDs.
@@ -403,7 +408,7 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
 
 /* Dump the entire buffer to a SQLite file using the direct page writer.
  * Assigns sequential final IDs and remaps edge references.
- * Returns 0 on success, -1 on error. */
+ * Requires a bound generation observation; returns 0 on success, -1 on error. */
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 
 /* Flush the buffer to an existing store via the store API.

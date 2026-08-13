@@ -463,7 +463,14 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     vault: &AsterVault<C>,
     mode: GitMineMode,
     history: &GitHistoryState,
+    generation_observed_at_seconds: u64,
 ) -> Result<GitArchaeologyImportReport, DynError> {
+    if generation_observed_at_seconds == 0 {
+        return Err(
+            "ASTRO_GENERATION_CLOCK_ZERO: git archaeology requires the nonzero generation admission observation; remediation: repair the index_repository clock binding and retry before publication"
+                .into(),
+        );
+    }
     let mode_name = match &mode {
         GitMineMode::Full => "full",
         GitMineMode::Since { .. } => "incremental",
@@ -590,7 +597,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             label: "reverted",
         });
     }
-    let force_observed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let force_observed_at = generation_observed_at_seconds;
     // #440 mass-change cap on the force_removed path: mirror the #434 fix/revert caps
     // that `mine_git_archaeology` already applies. `changed_new_ranges(repo, removed)`
     // below generates the WHOLE-commit `git diff --unified=0` for each force-removed

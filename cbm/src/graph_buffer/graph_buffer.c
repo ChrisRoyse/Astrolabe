@@ -55,6 +55,7 @@ static inline void *intptr_to_ptr(intptr_t v) {
 }
 
 #define AMBIGUOUS_QN intptr_to_ptr(1)
+#define CBM_GENERATION_CLOCK_MAX_MS UINT64_C(253402300799000)
 
 static void hash_frame(cbm_sha256_ctx *ctx, const void *data, size_t len) {
     uint8_t n[8];
@@ -220,6 +221,9 @@ struct cbm_gbuf {
     char *root_path;
     int64_t next_id;
     _Atomic int64_t *shared_ids; /* NULL = use next_id, non-NULL = atomic source */
+    uint64_t generation_observed_at_ms;
+    char generation_indexed_at[CBM_SZ_64];
+    bool generation_clock_bound;
 
     /* Node storage: array of pointers to individually heap-allocated nodes.
      * This ensures pointers stored in hash tables remain valid when the
@@ -1002,6 +1006,56 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
         gb->shared_ids = id_source;
     }
     return gb;
+}
+
+int cbm_gbuf_set_generation_observed_at_ms(cbm_gbuf_t *gb, uint64_t observed_at_ms) {
+    if (!gb || observed_at_ms == 0 || observed_at_ms > CBM_GENERATION_CLOCK_MAX_MS ||
+        observed_at_ms % UINT64_C(1000) != 0) {
+        char observed[CBM_SZ_32];
+        (void)snprintf(observed, sizeof(observed), "%llu",
+                       (unsigned long long)observed_at_ms);
+        cbm_log_error("gbuf.generation_clock_refused", "code",
+                      "CBM_GENERATION_CLOCK_INVALID", "observed_at_ms", observed, "message",
+                      "the graph generation clock is zero, out of range, or not exactly "
+                      "representable as UTC seconds",
+                      "remediation",
+                      "bind one nonzero Unix-millisecond value divisible by 1000 before "
+                      "building the graph");
+        return GB_ERR;
+    }
+    if (gb->generation_clock_bound && gb->generation_observed_at_ms != observed_at_ms) {
+        cbm_log_error("gbuf.generation_clock_refused", "code",
+                      "CBM_GENERATION_CLOCK_REBIND_REFUSED", "message",
+                      "one graph buffer cannot represent two generation observation instants",
+                      "remediation", "create a fresh graph buffer for the new generation");
+        return GB_ERR;
+    }
+    uint64_t seconds = observed_at_ms / UINT64_C(1000);
+    time_t timestamp = (time_t)seconds;
+    if (timestamp < 0 || (uint64_t)timestamp != seconds) {
+        cbm_log_error("gbuf.generation_clock_refused", "code",
+                      "CBM_GENERATION_CLOCK_PLATFORM_RANGE_INVALID", "message",
+                      "the generation observation is outside this platform's UTC conversion "
+                      "range",
+                      "remediation", "pass an earlier exactly-second-representable Unix time");
+        return GB_ERR;
+    }
+    struct tm tm_buf;
+    struct tm *tm_val = cbm_gmtime_r(&timestamp, &tm_buf);
+    char indexed_at[CBM_SZ_64];
+    if (!tm_val || strftime(indexed_at, sizeof(indexed_at), "%Y-%m-%dT%H:%M:%SZ", tm_val) == 0) {
+        cbm_log_error("gbuf.generation_clock_refused", "code",
+                      "CBM_GENERATION_CLOCK_FORMAT_FAILED", "message",
+                      "the generation observation could not be formatted as an exact UTC "
+                      "Project timestamp",
+                      "remediation", "pass a Unix time supported by this native runtime");
+        return GB_ERR;
+    }
+    gb->generation_observed_at_ms = observed_at_ms;
+    (void)snprintf(gb->generation_indexed_at, sizeof(gb->generation_indexed_at), "%s",
+                   indexed_at);
+    gb->generation_clock_bound = true;
+    return 0;
 }
 
 int cbm_gbuf_set_index_mode(cbm_gbuf_t *gb, cbm_index_mode_t mode) {
@@ -3969,15 +4023,6 @@ static int validate_dump_edge_endpoints(cbm_gbuf_t *gb, const int64_t *temp_to_f
     return CBM_NOT_FOUND;
 }
 
-static void generate_iso_timestamp(char *buf, size_t buf_size) {
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    struct tm *tm_val = cbm_gmtime_r(&now, &tm_buf);
-    if (strftime(buf, buf_size, "%Y-%m-%dT%H:%M:%SZ", tm_val) == 0) {
-        snprintf(buf, buf_size, "1970-01-01T00:00:00Z");
-    }
-}
-
 /* Release lookup indexes then remap+sort+dedup vectors for the B-tree writer. */
 static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_final,
                                       int64_t max_temp_id) {
@@ -3995,6 +4040,14 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
                       "an earlier canonical identity or reference-resolution operation failed; no "
                       "store or row-sink mutation was attempted",
                       "remediation", "inspect the preceding structured graph-buffer error");
+        return CBM_NOT_FOUND;
+    }
+    if (!gb->generation_clock_bound) {
+        cbm_log_error("gbuf.dump_refused", "code", "CBM_GENERATION_CLOCK_UNBOUND", "message",
+                      "the graph has no generation-admission observation; no store or row-sink "
+                      "mutation was attempted",
+                      "remediation",
+                      "bind the pipeline generation clock before graph construction and retry");
         return CBM_NOT_FOUND;
     }
     CBM_PROF_START(t_count);
@@ -4047,9 +4100,6 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         free(src_nodes);
         return CBM_NOT_FOUND;
     }
-
-    char indexed_at[CBM_SZ_64];
-    generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
     int edge_idx = 0;
     char **url_paths = NULL;
@@ -4152,7 +4202,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * called so the writer handle is released and the file descriptor closed even
      * on the edge-build-failed path (the resulting file is unlinked below). */
     CBM_PROF_START(t_finalize);
-    int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, &capability,
+    int frc = cbm_writer_finalize(w, gb->project, gb->root_path, gb->generation_indexed_at,
+                                  &capability,
                                   dump_nodes, node_idx, dump_edges, edge_idx, gb->dump_vectors,
                                   gb->dump_vector_count, gb->dump_token_vecs,
                                   gb->dump_token_vec_count);
