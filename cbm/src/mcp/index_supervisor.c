@@ -25,6 +25,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -111,6 +112,7 @@ int cbm_index_worker_progress_complete(void) {
 /* #845: opt-in host mark — see the header. Set once from the real binary's
  * main(); embedders never set it, so should_wrap() stays false for them. */
 static bool g_host_marked = false;
+static atomic_bool g_supervisor_cancel_requested = false;
 
 void cbm_index_supervisor_mark_host(void) {
     g_host_marked = true;
@@ -124,6 +126,15 @@ bool cbm_index_supervisor_should_wrap(void) {
         return false; /* I am the worker — run in-process, never re-supervise */
     }
     return true;
+}
+
+void cbm_index_supervisor_request_cancel(void) {
+    atomic_store_explicit(&g_supervisor_cancel_requested, true, memory_order_release);
+}
+
+static bool supervisor_cancel_requested(void *ud) {
+    (void)ud;
+    return atomic_load_explicit(&g_supervisor_cancel_requested, memory_order_acquire);
 }
 
 /* Quiet-timeout (ms) for a supervised worker. Only a validated forward cursor
@@ -327,6 +338,11 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     result->progress_completed = 0;
     result->progress_total = 0;
 
+    if (supervisor_cancel_requested(NULL)) {
+        result->outcome = CBM_PROC_CANCELLED;
+        return 0;
+    }
+
     char self[1024] = {0};
     if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
         cbm_log_error("index.supervisor.no_self_path", "action", "fail_closed");
@@ -425,6 +441,7 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
     opts.log_file = log_path;
     opts.on_progress = worker_progress_poll;
     opts.progress_ud = progress_reader;
+    opts.should_cancel = supervisor_cancel_requested;
     opts.quiet_timeout_ms = worker_quiet_timeout_ms();
     /* We manage log deletion ourselves after reaping (below): keep it on failure
      * for post-mortem, delete it only on a clean run. See the observability

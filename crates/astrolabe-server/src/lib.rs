@@ -367,10 +367,14 @@ fn run_server() -> Result<i32, DynError> {
     let _verify_chain_loop = background_eligible
         .then(VerifyChainLoop::start)
         .transpose()?;
-    let _incremental_watcher_loop = background_eligible.then(IncrementalWatcherLoop::start);
+    let mut incremental_watcher_loop = background_eligible.then(IncrementalWatcherLoop::start);
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
-    serve_resident_jsonrpc(&runner)?;
+    let resident_result = serve_resident_jsonrpc(&runner);
+    if let Some(watcher) = incremental_watcher_loop.as_mut() {
+        watcher.stop();
+    }
+    resident_result?;
     tracing::info!("server.shutdown");
     Ok(0)
 }
@@ -1340,14 +1344,25 @@ impl IncrementalWatcherLoop {
             handle: Some(handle),
         }
     }
+
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        astrolabe_bridge::request_supervised_index_shutdown();
+        if let Some(handle) = self.handle.take()
+            && let Err(error) = handle.join()
+        {
+            tracing::error!(
+                code = "ASTRO_INCREMENTAL_WATCHER_JOIN_FAILED",
+                panic = ?error,
+                "incremental_watcher.join_failed"
+            );
+        }
+    }
 }
 
 impl Drop for IncrementalWatcherLoop {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.stop();
     }
 }
 

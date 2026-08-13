@@ -212,6 +212,11 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path);
  * NEVER degrades to an in-process run. */
 char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const char *args);
 
+/* Process-shutdown boundary for an Astrolabe embedder. Cancels the exact
+ * supervised child, if any, and makes later child admission in this dying
+ * process refuse rather than starting new mutation work. */
+void cbm_mcp_index_supervisor_request_cancel(void);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Close the currently cached project connection without retrying and copy the

@@ -8913,19 +8913,24 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     const char *code =
         outcome == CBM_PROC_HANG              ? "CBM_INDEX_WORKER_HUNG"
         : outcome == CBM_PROC_CRASH           ? "CBM_INDEX_WORKER_CRASHED"
+        : outcome == CBM_PROC_CANCELLED       ? "CBM_INDEX_WORKER_CANCELLED"
         : outcome == CBM_PROC_PROGRESS_FAILED ? "CBM_INDEX_WORKER_PROGRESS_PROTOCOL_FAILED"
-                                              : "CBM_INDEX_WORKER_FAILED";
+                                               : "CBM_INDEX_WORKER_FAILED";
     yyjson_mut_obj_add_str(doc, root, "code", code);
     yyjson_mut_obj_add_str(
         doc, root, "message",
         outcome == CBM_PROC_HANG
             ? "the isolated index worker stopped making semantic progress"
+        : outcome == CBM_PROC_CANCELLED
+            ? "the exact owning host cancelled the isolated index worker during shutdown before publication"
         : outcome == CBM_PROC_PROGRESS_FAILED
             ? "the isolated index worker semantic-progress stream failed validation"
             : "the isolated index worker terminated before a complete graph was committed");
     yyjson_mut_obj_add_str(
         doc, root, "remediation",
-        outcome == CBM_PROC_PROGRESS_FAILED
+        outcome == CBM_PROC_CANCELLED
+            ? "start a fresh resident connection; the unchanged watcher baseline remains pending and no partial child result was accepted"
+        : outcome == CBM_PROC_PROGRESS_FAILED
             ? "preserve the worker workspace and repair the exact progress producer/consumer "
               "diagnostic before retrying the unchanged repository"
             : "inspect the worker exit code, response tail, persisted log, and source path; fix "
@@ -9168,6 +9173,10 @@ char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const ch
             "run with out-of-process crash isolation");
     }
     return index_run_supervised(srv, args);
+}
+
+void cbm_mcp_index_supervisor_request_cancel(void) {
+    cbm_index_supervisor_request_cancel();
 }
 
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and

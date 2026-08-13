@@ -3840,6 +3840,9 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    pub fn cbm_mcp_index_supervisor_request_cancel();
+}
+unsafe extern "C" {
     pub fn cbm_mcp_server_close_cached_project_store(
         srv: *mut cbm_mcp_server_t,
         result: *mut cbm_store_close_result_t,

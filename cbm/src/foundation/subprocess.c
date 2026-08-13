@@ -102,6 +102,8 @@ const char *cbm_proc_outcome_str(cbm_proc_outcome_t o) {
         return "hang";
     case CBM_PROC_KILLED:
         return "killed";
+    case CBM_PROC_CANCELLED:
+        return "cancelled";
     case CBM_PROC_PROGRESS_FAILED:
         return "progress_failed";
     case CBM_PROC_SPAWN_FAILED:
@@ -414,6 +416,7 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
+    bool cancelled = false;
     bool progress_failed = false;
     for (;;) {
         DWORD w = WaitForSingleObject(pi.hProcess, 200);
@@ -435,6 +438,15 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
             }
         }
         if (done) {
+            break;
+        }
+        if (opts->should_cancel && opts->should_cancel(opts->cancel_ud)) {
+            (void)TerminateProcess(pi.hProcess, 1);
+            (void)WaitForSingleObject(pi.hProcess, INFINITE);
+            if (opts->on_progress) {
+                (void)opts->on_progress(true, opts->progress_ud);
+            }
+            cancelled = true;
             break;
         }
         if (opts->quiet_timeout_ms > 0 &&
@@ -460,8 +472,9 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
     out->exit_code = (int)code;
     out->term_signal = 0;
-    out->outcome = progress_failed ? CBM_PROC_PROGRESS_FAILED
-                                   : cbm_proc_classify(true, (int)code, 0, timed_out);
+    out->outcome = cancelled       ? CBM_PROC_CANCELLED
+                   : progress_failed ? CBM_PROC_PROGRESS_FAILED
+                                     : cbm_proc_classify(true, (int)code, 0, timed_out);
     return 0;
 }
 
@@ -505,6 +518,7 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
+    bool cancelled = false;
     bool progress_failed = false;
     int wstatus = 0;
     for (;;) {
@@ -535,6 +549,17 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         if (done) {
             break;
         }
+        if (opts->should_cancel && opts->should_cancel(opts->cancel_ud)) {
+            (void)kill(pid, SIGKILL);
+            do {
+                wr = waitpid(pid, &wstatus, 0);
+            } while (wr < 0 && errno == EINTR);
+            if (opts->on_progress) {
+                (void)opts->on_progress(true, opts->progress_ud);
+            }
+            cancelled = true;
+            break;
+        }
         if (opts->quiet_timeout_ms > 0 &&
             (cbm_now_ms() - last_activity) >= (uint64_t)opts->quiet_timeout_ms) {
             kill(pid, SIGKILL);
@@ -555,7 +580,11 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         (void)unlink(opts->log_file);
     }
 
-    if (progress_failed) {
+    if (cancelled) {
+        out->exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+        out->term_signal = WIFSIGNALED(wstatus) ? WTERMSIG(wstatus) : 0;
+        out->outcome = CBM_PROC_CANCELLED;
+    } else if (progress_failed) {
         out->exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
         out->term_signal = WIFSIGNALED(wstatus) ? WTERMSIG(wstatus) : 0;
         out->outcome = CBM_PROC_PROGRESS_FAILED;

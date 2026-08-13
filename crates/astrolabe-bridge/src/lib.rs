@@ -25,6 +25,17 @@ fn initialize_cbm_allocator() -> Result<(), BridgeError> {
         .map_err(|error| envelope(error.code, error.message, error.remediation))
 }
 
+/// Make process shutdown visible to the exact supervised index child, if one
+/// exists. This signal is intentionally sticky: callers use it only while the
+/// owning MCP worker is terminating, so no later mutation may be admitted in
+/// the same process generation.
+pub fn request_supervised_index_shutdown() {
+    // SAFETY: the native entry has no pointer arguments and performs one atomic
+    // store. It is explicitly callable from a thread other than the runner's
+    // thread so a lifecycle owner can cancel a blocking supervised call.
+    unsafe { cbm_sys::cbm_mcp_index_supervisor_request_cancel() };
+}
+
 /// The C-side reserved store-dir sidecar suffix, re-exported from the
 /// bindgen-surfaced libcbm macro (`CBM_ASTRO_LOWERED_DB_SUFFIX` in
 /// `cbm/src/mcp/mcp.h`). The value is a NUL-terminated byte array

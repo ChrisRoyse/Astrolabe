@@ -56,6 +56,11 @@ void cbm_index_supervisor_mark_host(void);
  * binary, not an embedder) and is not itself a worker. */
 bool cbm_index_supervisor_should_wrap(void);
 
+/* Request bounded cancellation of the exact supervised child owned by this
+ * process. Sticky by design: this is a process-shutdown signal, not a reusable
+ * per-request toggle. */
+void cbm_index_supervisor_request_cancel(void);
+
 typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */
     int exit_code;              /* worker exit code (-1 if signalled) */

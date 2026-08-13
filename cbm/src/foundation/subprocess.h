@@ -32,6 +32,7 @@ typedef enum {
                             * or a GCC/MinGW SEH C++ exception marker */
     CBM_PROC_HANG,         /* made no progress within the quiet-timeout; we killed it */
     CBM_PROC_KILLED,       /* terminated by a non-fault signal we did not initiate */
+    CBM_PROC_CANCELLED,    /* exact owning host requested bounded shutdown */
     CBM_PROC_PROGRESS_FAILED, /* semantic progress stream was invalid/unreadable */
     CBM_PROC_SPAWN_FAILED  /* fork/exec/CreateProcess failed — no child ever ran */
 } cbm_proc_outcome_t;
@@ -56,6 +57,11 @@ typedef enum {
  * INVALID terminates a still-live child and classifies it as PROGRESS_FAILED. */
 typedef cbm_proc_progress_result_t (*cbm_proc_progress_cb)(bool terminal, void *ud);
 
+/* Read one caller-owned cancellation source. Cancellation is sticky for the
+ * supervised operation: true terminates the exact child and classifies it as
+ * CANCELLED, never HANG/CRASH or a successful partial result. */
+typedef bool (*cbm_proc_cancel_cb)(void *ud);
+
 /* Called once, immediately after the child is successfully spawned, with the
  * child's OS process id (POSIX pid / Windows PID). Lets a supervisor record the
  * live child for out-of-band control — e.g. the UI "kill job" endpoint validating
@@ -71,6 +77,8 @@ typedef struct {
     void *log_ud;                /* user data for on_log_line */
     cbm_proc_progress_cb on_progress; /* required when quiet_timeout_ms > 0 */
     void *progress_ud;                /* user data for on_progress */
+    cbm_proc_cancel_cb should_cancel; /* optional exact-owner shutdown observation */
+    void *cancel_ud;                  /* user data for should_cancel */
     cbm_proc_spawn_cb on_spawn;  /* optional: called with the child PID right after spawn */
     void *spawn_ud;              /* user data for on_spawn */
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many

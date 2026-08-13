@@ -145,13 +145,16 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
     let runner = Rc::new(CbmToolRunner::new_default()?);
     let callback_runner = Rc::clone(&runner);
     let callback_cache = cache_dir.clone();
+    let callback_shutdown = Arc::clone(&shutdown);
     let mut watcher = CbmWatcher::new_for_polling(move |project, root, trigger_code| {
+        refuse_watcher_work_during_shutdown(&callback_shutdown, project, "callback_entry")?;
         run_watcher_index_tick(
             &callback_runner,
             &callback_cache,
             project,
             root,
             trigger_code,
+            &callback_shutdown,
         )
         .map_err(watcher_bridge_error)
     })?;
@@ -1844,7 +1847,10 @@ fn run_watcher_index_tick(
     project: &str,
     root: &str,
     trigger_code: &str,
+    shutdown: &AtomicBool,
 ) -> Result<(), DynError> {
+    refuse_watcher_work_during_shutdown(shutdown, project, "tick_entry")
+        .map_err(|error| -> DynError { error.to_string().into() })?;
     if trigger_code == CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED {
         return persist_native_watcher_observation_recovery(cache_dir, project, root);
     }
@@ -1997,6 +2003,8 @@ fn run_watcher_index_tick(
     }
     let started = Instant::now();
     let worker_started = preflight_response.is_none();
+    refuse_watcher_work_during_shutdown(shutdown, project, "before_index")
+        .map_err(|error| -> DynError { error.to_string().into() })?;
     let response = match preflight_response {
         Some(response) => response,
         None => match handle_index_repository(runner, &normalized_args) {
@@ -2018,6 +2026,8 @@ fn run_watcher_index_tick(
             }
         },
     };
+    refuse_watcher_work_during_shutdown(shutdown, project, "after_index")
+        .map_err(|error| -> DynError { error.to_string().into() })?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let raw_response_sha256 = hex_lower(&Sha256::digest(response.as_bytes()));
     let response_value: Value = match serde_json::from_str(&response) {
@@ -2264,6 +2274,23 @@ fn run_watcher_index_tick(
     });
     persist_watcher_status(cache_dir, project, &status)?;
     Ok(())
+}
+
+fn refuse_watcher_work_during_shutdown(
+    shutdown: &AtomicBool,
+    project: &str,
+    stage: &'static str,
+) -> Result<(), BridgeError> {
+    if !shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    Err(BridgeError::new(ErrorEnvelope::new(
+        "ASTRO_WATCHER_SHUTDOWN_IN_PROGRESS",
+        format!(
+            "the exact watcher owner began shutdown before project {project:?} could enter stage {stage:?}"
+        ),
+        "Start a fresh resident connection; the unchanged watcher baseline remains pending and no partial index result was accepted.",
+    )))
 }
 
 fn persist_native_watcher_observation_recovery(
