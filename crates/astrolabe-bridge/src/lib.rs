@@ -5360,6 +5360,22 @@ impl CbmToolRunner {
         }
     }
 
+    /// Return the complete immutable CBM tool registry as one JSON object.
+    ///
+    /// The Astrolabe host owns the public MCP roster: it composes this complete
+    /// registry with its Rust-native definitions before serving `tools/list`.
+    /// Calling the unpaginated registry export here prevents either registry
+    /// from being stranded behind the other implementation's cursor boundary.
+    /// Production N is 14 CBM definitions (measured 2026-08-13, #1110); this is
+    /// O(N) over generation-immutable schema bytes and opens no project store.
+    pub fn tool_definitions_raw(&self) -> Result<String, BridgeError> {
+        self.ensure_owner_thread()?;
+        // SAFETY: `cbm_mcp_tools_list` returns one allocator-owned,
+        // NUL-terminated string. `take_c_string` copies and releases it through
+        // the allocator selected inside libcbm.
+        unsafe { take_c_string(cbm_sys::cbm_mcp_tools_list()) }
+    }
+
     pub fn handle_tool_raw(&self, tool_name: &str, args_json: &str) -> Result<String, BridgeError> {
         self.ensure_owner_thread()?;
         let bound_args = if tool_name == "index_repository" {

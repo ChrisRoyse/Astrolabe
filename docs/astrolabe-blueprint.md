@@ -1509,7 +1509,9 @@ Implementation status: `optimizer_status` runs a cooperative janitor tick over t
 
 # 15 â€” The MCP Tool Surface
 
-Design constraints: (a) 100% behavioral compatibility for the 14 existing CBM tools (agents already installed keep working); (b) new capabilities consolidated by *mode parameters* to keep tool-count/token-cost sane (~29 total, paginated `tools/list` already supported); (c) every response carries `trust`, `freshness`, `provenance`; (d) every tool also invokable via `astrolabe cli <tool> '<json>'`.
+Design constraints: (a) 100% behavioral compatibility for the 14 existing CBM tools (agents already installed keep working); (b) new capabilities consolidated by *mode parameters* to keep tool-count/token-cost sane (~29 total); (c) every response carries `trust`, `freshness`, `provenance`; (d) every tool also invokable via `astrolabe cli <tool> '<json>'`.
+
+**Code-domain correction (#1110, 2026-08-13).** The earlier claim that paginated `tools/list` already handled the count was false for the production Codex/Claude consumers: direct readback proved that the host appended all Rust-native intelligence definitions only to CBM's final page while the connected client exposed only the first page. For the measured generation-bounded roster (38 unique definitions: 14 CBM + 24 native), the host now owns one deterministic complete registry response with no cursor. This is a bounded `O(N)` control-plane read over immutable schema bytes, not corpus data. Any future registry that can grow without a fixed generation bound must introduce measured host-owned pagination over the *union* and prove the production clients consume it before changing this rule; split-registry pagination is forbidden.
 
 ## 1. Retained tools (14) â€” compatibility + upgrades
 

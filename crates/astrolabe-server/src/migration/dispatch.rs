@@ -215,42 +215,112 @@ pub(crate) fn handle_tools_list_jsonrpc(
     runner: &CbmToolRunner,
     request_json: &str,
 ) -> Result<Option<String>, DynError> {
-    let Some(response) = runner.handle_jsonrpc_raw(request_json)? else {
-        return Ok(None);
+    let request: Value = serde_json::from_str(request_json)?;
+    let Some(request) = request.as_object() else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
-    Ok(Some(augment_tools_list_response(&response)?))
-}
+    let Some(id) = request
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number() || id.is_null())
+        .cloned()
+    else {
+        // Preserve JSON-RPC notification/invalid-id behavior in the native
+        // owner rather than manufacturing a response for a request with no
+        // response identity.
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
 
-pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> {
-    let mut response: Value = serde_json::from_str(response_json)?;
-    let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) else {
-        return Ok(response_json.to_string());
-    };
-    let is_final_page = !result.contains_key("nextCursor");
-    let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
-        return Ok(response_json.to_string());
-    };
-    // Astrolabe's own tools are appended only on the final page so a client
-    // walking cursors sees each tool exactly once.
-    if is_final_page {
-        for definition in astrolabe_tool_definitions() {
-            let Some(name) = definition.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            if !tools
-                .iter()
-                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-            {
-                tools.push(definition);
+    if let Some(params) = request.get("params") {
+        let Some(params) = params.as_object() else {
+            let fault = ToolFault::new(
+                "ASTRO_MCP_TOOLS_LIST_PARAMS_INVALID",
+                "tools/list params must be a JSON object when present",
+                "send tools/list with params={} or omit params; no cursor is required because this executable publishes its complete bounded roster in one response",
+            )
+            .with_argument("params", "object or omitted", params);
+            tracing::warn!(
+                code = fault.code(),
+                actual_type = json_type_name(params),
+                "mcp.tools_list_invalid_params"
+            );
+            return Ok(Some(tools_list_invalid_params_response(id, fault)?));
+        };
+        if let Some(cursor) = params.get("cursor") {
+            let mut fault = ToolFault::new(
+                "ASTRO_MCP_TOOLS_CURSOR_INVALID",
+                "this executable did not issue a tools/list cursor",
+                "discard the stale or foreign cursor and issue tools/list without cursor; the complete bounded roster is returned in one response",
+            )
+            .with_argument("cursor", "omitted (no nextCursor was issued)", cursor);
+            if let Some(cursor) = cursor.as_str() {
+                fault = fault.with_detail("received_cursor", cursor);
             }
+            tracing::warn!(
+                code = fault.code(),
+                actual_type = json_type_name(cursor),
+                "mcp.tools_list_invalid_cursor"
+            );
+            return Ok(Some(tools_list_invalid_params_response(id, fault)?));
         }
     }
+
+    let cbm_registry = runner.tool_definitions_raw()?;
+    let result = compose_complete_tool_roster(&cbm_registry)?;
+    let tool_count = result
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .map_or(0, |tools| tools.len());
+    tracing::info!(tool_count, "mcp.tools_list_complete_roster");
+    Ok(Some(jsonrpc_result_response(
+        id,
+        &serde_json::to_string(&result)?,
+    )?))
+}
+
+/// Compose the one authoritative public roster from both immutable registries.
+///
+/// #1110 / #1064 PC-35 + PC-38: production N is 38 definitions (14 CBM + 24
+/// Rust-native, measured 2026-08-13). This performs one deterministic O(N)
+/// pass over generation-invariant schema values, opens no project/vault store,
+/// and writes no state. CBM order comes first for legacy compatibility; a name
+/// present in both registries keeps the CBM definition, after which Astrolabe's
+/// explicit schema overlays are applied. Duplicate names *within* the CBM
+/// registry are a frozen-contract defect and fail closed.
+pub(crate) fn compose_complete_tool_roster(cbm_registry_json: &str) -> Result<Value, DynError> {
+    let mut result: Value = serde_json::from_str(cbm_registry_json)?;
+    let Some(result_object) = result.as_object_mut() else {
+        return Err("ASTRO_MCP_CBM_TOOL_REGISTRY_INVALID: the complete CBM tool registry was not a JSON object; remediation: repair cbm_mcp_tools_list before serving tools/list".into());
+    };
+    if result_object.contains_key("nextCursor") {
+        return Err("ASTRO_MCP_CBM_TOOL_REGISTRY_PAGINATED: the complete CBM registry export unexpectedly carried nextCursor; remediation: bind the host to cbm_mcp_tools_list, never the paginated request path".into());
+    }
+    let Some(tools) = result_object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return Err("ASTRO_MCP_CBM_TOOL_REGISTRY_INVALID: the complete CBM tool registry did not contain a tools array; remediation: repair cbm_mcp_tools_list before serving tools/list".into());
+    };
+
+    let mut names = BTreeSet::new();
+    for definition in tools.iter() {
+        let name = tool_definition_name(definition, "CBM")?;
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "ASTRO_MCP_TOOL_REGISTRY_DUPLICATE: CBM registered tool '{name}' more than once; remediation: keep exactly one immutable definition for each public tool name"
+            )
+            .into());
+        }
+    }
+    for definition in astrolabe_tool_definitions() {
+        let name = tool_definition_name(&definition, "Astrolabe-native")?;
+        // Explicit precedence rule: a legacy CBM definition owns a shared name;
+        // the overlays below add only Astrolabe's declared extensions.
+        if names.insert(name.to_string()) {
+            tools.push(definition);
+        }
+    }
+
     // #328: overlay the Astrolabe-side extensions onto the CBM `search_graph`
     // schema so MCP clients can discover propagated_label + fusion from tools/list.
-    // The overlay must apply on WHATEVER page `search_graph` appears: CBM
-    // paginates tools/list and serves `search_graph` on a non-final page, so
-    // gating the whole augmentation on the final page served the bare legacy
-    // schema (found by the #328 live-binary readback FSV).
+    // The overlay runs only after the full registry union so there is exactly
+    // one public definition to extend.
     for tool in tools.iter_mut() {
         match tool.get("name").and_then(Value::as_str) {
             Some("search_graph") => overlay_search_graph_extensions(tool),
@@ -263,7 +333,32 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
             _ => {}
         }
     }
-    Ok(serde_json::to_string(&response)?)
+    Ok(result)
+}
+
+fn tool_definition_name<'a>(definition: &'a Value, registry: &str) -> Result<&'a str, DynError> {
+    definition
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "ASTRO_MCP_TOOL_DEFINITION_NAME_MISSING: {registry} registry contains a tool definition without a non-empty name; remediation: repair the frozen registry definition before serving tools/list"
+            )
+            .into()
+        })
+}
+
+fn tools_list_invalid_params_response(id: Value, fault: ToolFault) -> Result<String, DynError> {
+    Ok(serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32602,
+            "message": "Invalid params",
+            "data": fault.envelope(),
+        }
+    }))?)
 }
 
 /// #328: merge the Astrolabe `search_graph` extension properties into the CBM
