@@ -3254,11 +3254,13 @@ static void parse_css_imports(CBMExtractCtx *ctx) {
 }
 
 // --- HTML imports ---
-// `<script src="app.js">` and `<link href="style.css">` reference sibling
-// files. tree-sitter-html exposes these as `start_tag` -> `attribute`
-// (attribute_name src/href) -> quoted_attribute_value -> attribute_value. DFS
-// for start_tags and emit one import per src/href value. (Embedded <script>
-// bodies are still handled separately by parse_embedded_imports.)
+// `<script src="app.js">` and `<link href="style.css">` carry URLs resolved
+// against the document base URL; a relative spelling is not an exact
+// repository-path assertion. tree-sitter-html exposes these as `start_tag` ->
+// `attribute` (attribute_name src/href) -> quoted_attribute_value ->
+// attribute_value. DFS for start_tags and emit one import per src/href value.
+// (Embedded <script> bodies are still handled separately by
+// parse_embedded_imports.)
 static void html_extract_tag_src(CBMExtractCtx *ctx, TSNode tag) {
     CBMArena *a = ctx->arena;
     uint32_t nc = ts_node_named_child_count(tag);
@@ -3296,7 +3298,7 @@ static void html_extract_tag_src(CBMExtractCtx *ctx, TSNode tag) {
                 .local_name = NULL,
                 .module_path = path,
                 .resource_kind = resource_kind,
-                .resolution = CBM_IMPORT_RESOLVE_EXACT_SOURCE,
+                .resolution = CBM_IMPORT_RESOLVE_BROWSER_URL,
                 .binding = CBM_IMPORT_BINDING_RESOURCE,
             };
             if (!cbm_imports_push(&ctx->result->imports, a, imp)) {
