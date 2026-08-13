@@ -240,9 +240,18 @@ impl ShadowPublication {
             ));
         }
         if project_root.exists() && fs::read_dir(&project_root)?.next().is_some() {
-            return Err(format!(
-                "ASTRO_SHADOW_PUBLICATION_INCOMPLETE: an unfinished shadow publication exists for project {project:?} under {}; live state is not safe to mutate. Remediation: inspect transaction.json and the backup/stage hashes, restore or finalize that exact transaction, then retry",
-                project_root.display()
+            return Err(ToolFault::new(
+                "ASTRO_SHADOW_PUBLICATION_INCOMPLETE",
+                format!(
+                    "an unfinished shadow publication exists for project {project:?} under {}; live state is not safe to mutate",
+                    project_root.display()
+                ),
+                "preserve every byte; inspect transaction.json and its backup/stage hashes, then restore or finalize only that exact transaction before retrying",
+            )
+            .with_detail("project", Value::String(project.to_string()))
+            .with_detail(
+                "transaction_root",
+                Value::String(project_root.display().to_string()),
             )
             .into());
         }
@@ -2767,41 +2776,74 @@ fn classify_publication_owner(owner: &PublicationOwner) -> Result<PublicationOwn
 }
 
 fn publication_owner_live_error(pid: u32, process_start_utc_ticks: u64) -> DynError {
-    format!(
-        "ASTRO_SHADOW_PUBLICATION_OWNER_LIVE: exact owner ({pid},{process_start_utc_ticks}) is still live; remediation: wait for that exact generation to finish and never recover or remove its transaction"
+    ToolFault::new(
+        "ASTRO_SHADOW_PUBLICATION_OWNER_LIVE",
+        format!("exact owner ({pid},{process_start_utc_ticks}) is still live"),
+        "wait for that exact generation to finish and never recover or remove its transaction",
+    )
+    .with_detail("owner_pid", Value::from(pid))
+    .with_detail(
+        "owner_process_start_utc_ticks",
+        Value::from(process_start_utc_ticks),
     )
     .into()
 }
 
 fn read_publication_journal(path: &Path) -> Result<PublicationJournal, DynError> {
     let bytes = fs::read(path).map_err(|error| {
-        format!(
-            "ASTRO_SHADOW_PUBLICATION_JOURNAL_UNREADABLE: read {}: {error}",
-            path.display()
+        ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_UNREADABLE",
+            format!(
+                "publication journal {} could not be read: {error}",
+                path.display()
+            ),
+            "preserve the transaction and every staged byte; restore or inspect the exact transaction.json before retrying",
         )
+        .with_detail("journal_path", Value::String(path.display().to_string()))
+        .with_detail("io_error_kind", Value::String(format!("{:?}", error.kind())))
     })?;
     decode_publication_journal(&bytes, path)
 }
 
 fn decode_publication_journal(bytes: &[u8], path: &Path) -> Result<PublicationJournal, DynError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
-        format!(
-            "ASTRO_SHADOW_PUBLICATION_JOURNAL_MALFORMED: parse {}: {error}; remediation: preserve the transaction and inspect the exact journal bytes",
-            path.display()
+        ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_MALFORMED",
+            format!(
+                "publication journal {} is not valid JSON: {error}",
+                path.display()
+            ),
+            "preserve the transaction and inspect the exact journal bytes before any recovery attempt",
         )
+        .with_detail("journal_path", Value::String(path.display().to_string()))
     })?;
     if value.get("schema").and_then(Value::as_str) != Some(PUBLICATION_SCHEMA) {
-        return Err(format!(
-            "ASTRO_SHADOW_PUBLICATION_LEGACY_PRESERVED: journal {} does not name schema {PUBLICATION_SCHEMA:?}; remediation: preserve every byte and recover the legacy transaction only through a separately specified migration",
-            path.display()
+        return Err(ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_LEGACY_PRESERVED",
+            format!(
+                "publication journal {} does not name schema {PUBLICATION_SCHEMA:?}",
+                path.display()
+            ),
+            "preserve every byte and recover the legacy transaction only through a separately specified migration",
+        )
+        .with_detail("journal_path", Value::String(path.display().to_string()))
+        .with_detail("expected_schema", Value::String(PUBLICATION_SCHEMA.to_string()))
+        .with_detail(
+            "actual_schema",
+            value.get("schema").cloned().unwrap_or(Value::Null),
         )
         .into());
     }
-    serde_json::from_value(value).map_err(|error| {
-        format!(
-            "ASTRO_SHADOW_PUBLICATION_JOURNAL_FIELDS: strict {PUBLICATION_SCHEMA:?} decode of {} failed: {error}; remediation: preserve every byte and repair the named journal field",
-            path.display()
+    serde_json::from_value(value).map_err(|error| -> DynError {
+        ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_JOURNAL_FIELDS",
+            format!(
+                "strict {PUBLICATION_SCHEMA:?} decode of {} failed: {error}",
+                path.display()
+            ),
+            "preserve every byte and repair the named journal field before any recovery attempt",
         )
+        .with_detail("journal_path", Value::String(path.display().to_string()))
         .into()
     })
 }
@@ -2817,9 +2859,17 @@ fn validate_publication_journal_identity(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| -> DynError {
-            format!(
-                "ASTRO_SHADOW_PUBLICATION_TRANSACTION_NAME_INVALID: transaction path {} has no UTF-8 generation name; remediation: preserve the transaction",
-                transaction.display()
+            ToolFault::new(
+                "ASTRO_SHADOW_PUBLICATION_TRANSACTION_NAME_INVALID",
+                format!(
+                    "transaction path {} has no UTF-8 generation name",
+                    transaction.display()
+                ),
+                "preserve the transaction and repair or migrate its exact generation identity before retrying",
+            )
+            .with_detail(
+                "transaction_path",
+                Value::String(transaction.display().to_string()),
             )
             .into()
         })?;
@@ -2831,17 +2881,32 @@ fn validate_publication_journal_identity(
         || journal.backup_dir != transaction.join("backup")
         || transaction.parent() != Some(project_root)
     {
-        return Err(format!(
-            "ASTRO_SHADOW_PUBLICATION_RECOVERY_IDENTITY_MISMATCH: journal identity/path fields do not exactly bind transaction {}; remediation: preserve every byte and inspect schema/project/live/stage/backup/generation fields",
-            transaction.display()
+        return Err(ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_IDENTITY_MISMATCH",
+            format!(
+                "journal identity/path fields do not exactly bind transaction {}",
+                transaction.display()
+            ),
+            "preserve every byte and inspect the schema, project, live, stage, backup, and generation fields before any recovery attempt",
         )
+        .with_detail(
+            "transaction_path",
+            Value::String(transaction.display().to_string()),
+        )
+        .with_detail("project", Value::String(project.to_string()))
         .into());
     }
     if journal.recovery_manifest.is_some() && journal.metadata_acknowledgement.is_some() {
-        return Err(
-            "ASTRO_SHADOW_PUBLICATION_RECOVERY_MANIFEST_AMBIGUOUS: transaction binds both artifact replacement and metadata-only recovery; remediation: preserve every byte and inspect the journal producer"
-                .into(),
-        );
+        return Err(ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_RECOVERY_MANIFEST_AMBIGUOUS",
+            "transaction binds both artifact replacement and metadata-only recovery",
+            "preserve every byte and inspect the journal producer before any recovery attempt",
+        )
+        .with_detail(
+            "transaction_path",
+            Value::String(transaction.display().to_string()),
+        )
+        .into());
     }
     Ok(())
 }
