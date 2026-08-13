@@ -22,10 +22,29 @@ typedef struct cbm_watcher cbm_watcher_t;
 
 /* ── Index callback ─────────────────────────────────────────────── */
 
-/* Called when file changes are detected. Return 0 on success, -1 on error.
+/* Stable callback triggers. Keep these in the public FFI contract so the C
+ * watcher, standalone server, generated Rust binding, and resident lane cannot
+ * silently assign different meanings to the same callback. */
+#define CBM_WATCHER_SOURCE_CHANGED "CBM_WATCHER_SOURCE_CHANGED"
+#define CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED "CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED"
+#define CBM_WATCHER_GIT_CONTEXT_FAILED "CBM_WATCHER_GIT_CONTEXT_FAILED"
+#define CBM_WATCHER_GIT_STATUS_FAILED "CBM_WATCHER_GIT_STATUS_FAILED"
+#define CBM_WATCHER_GIT_IDENTITY_INVALID "CBM_WATCHER_GIT_IDENTITY_INVALID"
+#define CBM_WATCHER_UNTRACKED_ALLOC_FAILED "CBM_WATCHER_UNTRACKED_ALLOC_FAILED"
+#define CBM_WATCHER_UNTRACKED_READ_FAILED "CBM_WATCHER_UNTRACKED_READ_FAILED"
+#define CBM_WATCHER_GIT_DIFF_FAILED "CBM_WATCHER_GIT_DIFF_FAILED"
+
+/* Called when file changes or a fail-closed source-observation fault is detected.
+ * trigger_code is CBM_WATCHER_SOURCE_CHANGED for an ordinary source delta,
+ * CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED after a prior observation fault
+ * becomes readable without a source delta, and a stable CBM_WATCHER_* failure
+ * code otherwise. Return 0 only after the trigger has been durably handled; the
+ * watcher advances its source baseline only for CBM_WATCHER_SOURCE_CHANGED.
+ * Return -1 on error.
  * project_name: project identifier
  * root_path: absolute path to the repository root */
-typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
+typedef int (*cbm_index_fn)(const char *project_name, const char *root_path,
+                            const char *trigger_code, void *user_data);
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 

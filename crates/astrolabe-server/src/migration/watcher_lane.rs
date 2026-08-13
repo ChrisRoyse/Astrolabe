@@ -19,6 +19,8 @@ pub(crate) const WATCHER_REGISTRATION_FAULT_STATUS_KEY: &str = "watcher_registra
 pub(crate) const WATCHER_ROOT_FAULT_STATUS_KEY: &str = "watcher_root_fault_json";
 const WATCHER_INDEX_OPERATION: &str = "index_repository";
 const WATCHER_INDEX_PHASE: &str = "watcher_index_worker";
+const CBM_WATCHER_SOURCE_CHANGED: &str = "CBM_WATCHER_SOURCE_CHANGED";
+const CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED: &str = "CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct WatchRegistration {
@@ -143,9 +145,15 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
     let runner = Rc::new(CbmToolRunner::new_default()?);
     let callback_runner = Rc::clone(&runner);
     let callback_cache = cache_dir.clone();
-    let mut watcher = CbmWatcher::new_for_polling(move |project, root| {
-        run_watcher_index_tick(&callback_runner, &callback_cache, project, root)
-            .map_err(watcher_bridge_error)
+    let mut watcher = CbmWatcher::new_for_polling(move |project, root, trigger_code| {
+        run_watcher_index_tick(
+            &callback_runner,
+            &callback_cache,
+            project,
+            root,
+            trigger_code,
+        )
+        .map_err(watcher_bridge_error)
     })?;
     let mut registered = BTreeMap::<String, String>::new();
     let mut missing_root_observations = BTreeMap::<String, MissingRootObservation>::new();
@@ -1835,7 +1843,13 @@ fn run_watcher_index_tick(
     cache_dir: &Path,
     project: &str,
     root: &str,
+    trigger_code: &str,
 ) -> Result<(), DynError> {
+    if trigger_code == CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED {
+        return persist_native_watcher_observation_recovery(cache_dir, project, root);
+    }
+    let native_observation_failure =
+        (trigger_code != CBM_WATCHER_SOURCE_CHANGED).then_some(trigger_code);
     let fault_key = metadata_key(project, WATCHER_FAULT_STATUS_KEY);
     let prior_fault = read_config_value(cache_dir, &fault_key)?
         .map(|raw| serde_json::from_str::<Value>(&raw))
@@ -1852,6 +1866,7 @@ fn run_watcher_index_tick(
                     prior_fault
                         .as_ref()
                         .and_then(|fault| fault.get("observation")),
+                    native_observation_failure,
                 );
                 let observation_sha256 = persisted_json_sha256(&observation)?;
                 let response_sha256 = persisted_json_sha256(&failure.response)?;
@@ -1887,38 +1902,69 @@ fn run_watcher_index_tick(
     let prior_observation = prior_fault
         .as_ref()
         .and_then(|fault| fault.get("observation"));
-    let (observation, preflight_response) = match watcher_observation(
-        cache_dir,
-        project,
-        root,
-        &index_args_observation,
-        prior_observation,
-    ) {
-        Ok(observation) => (observation, None),
-        Err(error) => {
-            let message = error.to_string();
-            let response = json!({
-                "content": [{"type": "text", "text": format!("ASTRO_WATCHER_OBSERVATION_FAILED: {message}")}],
-                "isError": true,
-                "structuredContent": {
-                    "code": "ASTRO_WATCHER_OBSERVATION_FAILED",
-                    "operation": "observe_watcher_source_of_truth",
-                    "phase": "watcher_preflight",
-                    "message": message,
-                    "remediation": "restore readable source/store/executable state; retries are bounded for this exact observation",
-                },
-                "watcher_preflight_error": true,
-            });
-            (
-                watcher_observation_resilient(
-                    cache_dir,
-                    project,
-                    root,
-                    &index_args_observation,
-                    prior_observation,
-                ),
-                Some(serde_json::to_string(&response)?),
-            )
+    let (observation, preflight_response) = if let Some(native_code) = native_observation_failure {
+        let message = format!(
+            "native watcher refused the exact registered Git source observation with {native_code}"
+        );
+        let response = json!({
+            "content": [{"type": "text", "text": format!("ASTRO_WATCHER_OBSERVATION_FAILED: {message}")}],
+            "isError": true,
+            "structuredContent": {
+                "code": "ASTRO_WATCHER_OBSERVATION_FAILED",
+                "native_code": native_code,
+                "operation": "observe_watcher_source_of_truth",
+                "phase": "watcher_preflight",
+                "message": message,
+                "remediation": "repair the direct .git entry and exact registered Git repository; parent-repository discovery is never used",
+            },
+            "watcher_preflight_error": true,
+        });
+        (
+            watcher_observation_resilient(
+                cache_dir,
+                project,
+                root,
+                &index_args_observation,
+                prior_observation,
+                Some(native_code),
+            ),
+            Some(serde_json::to_string(&response)?),
+        )
+    } else {
+        match watcher_observation(
+            cache_dir,
+            project,
+            root,
+            &index_args_observation,
+            prior_observation,
+        ) {
+            Ok(observation) => (observation, None),
+            Err(error) => {
+                let message = error.to_string();
+                let response = json!({
+                    "content": [{"type": "text", "text": format!("ASTRO_WATCHER_OBSERVATION_FAILED: {message}")}],
+                    "isError": true,
+                    "structuredContent": {
+                        "code": "ASTRO_WATCHER_OBSERVATION_FAILED",
+                        "operation": "observe_watcher_source_of_truth",
+                        "phase": "watcher_preflight",
+                        "message": message,
+                        "remediation": "restore readable source/store/executable state; retries are bounded for this exact observation",
+                    },
+                    "watcher_preflight_error": true,
+                });
+                (
+                    watcher_observation_resilient(
+                        cache_dir,
+                        project,
+                        root,
+                        &index_args_observation,
+                        prior_observation,
+                        None,
+                    ),
+                    Some(serde_json::to_string(&response)?),
+                )
+            }
         }
     };
     let observation_sha256 = persisted_json_sha256(&observation)?;
@@ -2220,6 +2266,97 @@ fn run_watcher_index_tick(
     Ok(())
 }
 
+fn persist_native_watcher_observation_recovery(
+    cache_dir: &Path,
+    project: &str,
+    root: &str,
+) -> Result<(), DynError> {
+    let (_, index_args_observation) = match prepare_watcher_index_args(cache_dir, project, root)? {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            return Err(format!(
+                "ASTRO_WATCHER_OBSERVATION_RECOVERY_CONTEXT_INVALID: exact native Git observation recovered for {project:?}, but persisted index arguments remain unusable: {}; remediation: repair the named config row before recovery can commit",
+                failure
+                    .evidence
+                    .classification_error
+                    .as_deref()
+                    .unwrap_or("watcher index arguments were not usable")
+            )
+            .into());
+        }
+    };
+    let fault_key = metadata_key(project, WATCHER_FAULT_STATUS_KEY);
+    let tick_key = metadata_key(project, WATCHER_TICK_STATUS_KEY);
+    let [prior_fault_raw, prior_tick_raw] =
+        read_config_values(cache_dir, &[fault_key.clone(), tick_key.clone()])?
+            .try_into()
+            .map_err(|_| {
+                "ASTRO_WATCHER_OBSERVATION_RECOVERY_READBACK_INVALID: exact two-key config read returned the wrong cardinality"
+            })?;
+    let prior_fault = prior_fault_raw
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    let prior_tick = prior_tick_raw
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    let prior_observation = prior_fault
+        .as_ref()
+        .and_then(|fault| fault.get("observation"));
+    let observation = watcher_observation(
+        cache_dir,
+        project,
+        root,
+        &index_args_observation,
+        prior_observation,
+    )?;
+    let observation_sha256 = persisted_json_sha256(&observation)?;
+    let status = json!({
+        "schema": "astrolabe-watcher-tick-v2",
+        "status": "source_observation_recovered",
+        "project": project,
+        "root": root,
+        "native_trigger_code": CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED,
+        "prior_fault_code": prior_fault.as_ref().and_then(|value| value.get("fault_code")),
+        "prior_source_error_code": prior_tick.as_ref().and_then(|value| value.get("source_error_code")),
+        "observation": observation,
+        "observation_sha256": observation_sha256,
+        "freshness": "fresh",
+        "trust": "verified",
+        "worker_started": false,
+        "remediation": "none; the exact registered Git source is readable again and no source delta was present",
+    });
+    let status_json = serde_json::to_string(&status)?;
+
+    let mut connection = open_config(cache_dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute("DELETE FROM config WHERE key = ?1", params![fault_key])?;
+    transaction.execute(
+        "INSERT INTO config (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+         WHERE config.value <> excluded.value",
+        params![tick_key, status_json],
+    )?;
+    transaction.commit()?;
+
+    let readback = read_config_values(cache_dir, &[fault_key.clone(), tick_key.clone()])?;
+    if readback != vec![None, Some(status_json)] {
+        return Err(format!(
+            "ASTRO_WATCHER_OBSERVATION_RECOVERY_COMMIT_MISMATCH: recovery for {project:?} did not read back fault-absent/status-present; remediation: preserve the config database and inspect its WAL"
+        )
+        .into());
+    }
+    tracing::info!(
+        project,
+        root,
+        observation_sha256,
+        "incremental_watcher.source_observation_recovered"
+    );
+    Ok(())
+}
+
 fn rearm_changed_faults(
     cache_dir: &Path,
     registered: &BTreeMap<String, String>,
@@ -2307,12 +2444,19 @@ fn watcher_observation_resilient(
     root: &str,
     index_args_observation: &Value,
     prior: Option<&Value>,
+    native_source_error: Option<&str>,
 ) -> Value {
-    let source_fingerprint =
-        match astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(root)) {
+    let source_fingerprint = match native_source_error {
+        Some(code) => json!({
+            "state": "read_error",
+            "code": code,
+            "source": "native_exact_git_context",
+        }),
+        None => match astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(root)) {
             Ok(value) => json!({"state": "observed", "value": value}),
             Err(error) => json!({"state": "read_error", "error": error.to_string()}),
-        };
+        },
+    };
     let canonical_root = match fs::canonicalize(root) {
         Ok(path) => json!({"state": "observed", "path": path}),
         Err(error) => json!({"state": "read_error", "error": error.to_string()}),

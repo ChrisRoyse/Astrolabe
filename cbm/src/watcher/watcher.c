@@ -43,12 +43,17 @@
 typedef struct {
     char *project_name;
     char *root_path;
+    char *git_dir_arg;   /* explicit --git-dir=... disables parent discovery */
+    char *work_tree_arg; /* exact --work-tree=... paired with git_dir_arg */
+    char *git_work_tree; /* absolute path used to open porcelain-named files */
     char source_sha256[CBM_SHA256_HEX_LEN + 1]; /* last successfully indexed Git source state */
-    bool is_git;                                  /* false → skip polling */
-    bool baseline_done;                           /* true after first poll */
-    int file_count;            /* approximate, for interval calc */
-    int interval_ms;           /* adaptive poll interval */
-    int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    bool is_git;                                /* false → skip polling */
+    bool git_context_ready;                     /* exact repository context was resolved */
+    bool observation_failed;                    /* a native source read has not yet recovered */
+    bool baseline_done;                         /* true after first poll */
+    int file_count;                             /* approximate, for interval calc */
+    int interval_ms;                            /* adaptive poll interval */
+    int64_t next_poll_ns;                       /* next poll time (monotonic ns) */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -129,33 +134,148 @@ static void watcher_log_spawn_failure(const char *event, const cbm_spawn_error_t
 #endif
 #endif
 
-static bool is_git_repo(const char *root_path) {
-#ifdef ASTRO_SPAWN
-    const char *const argv[] = {"git", "-C", root_path, "rev-parse", "--git-dir", NULL};
-    char *data = NULL;
-    size_t len = 0;
-    cbm_spawn_error_t err;
-    int rc = cbm_spawn_capture(argv, &data, &len, &err);
-    if (rc != 0) {
-        watcher_log_spawn_failure("watcher.is_git_repo.spawn_failed", &err);
-#else
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --git-dir 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+typedef enum {
+    GIT_CONTEXT_NOT_REPOSITORY = 0,
+    GIT_CONTEXT_READY = 1,
+    GIT_CONTEXT_FAILED = 2,
+} git_context_result_t;
+
+static char *watcher_prefixed_arg(const char *prefix, const char *value) {
+    size_t prefix_len = strlen(prefix);
+    size_t value_len = strlen(value);
+    if (prefix_len > SIZE_MAX - value_len - 1) {
+        return NULL;
+    }
+    char *arg = malloc(prefix_len + value_len + 1);
+    if (!arg) {
+        return NULL;
+    }
+    memcpy(arg, prefix, prefix_len);
+    memcpy(arg + prefix_len, value, value_len + 1);
+    return arg;
+}
+
+/* Copy exactly one non-empty line from a Git path query. Paths containing a
+ * newline cannot be represented by the option contract and therefore refuse
+ * instead of being truncated or reinterpreted. */
+static char *watcher_git_path_line(const char *data, size_t len) {
+    if (!data) {
+        return NULL;
+    }
+    while (len > 0 && (data[len - 1] == '\n' || data[len - 1] == '\r')) {
+        len--;
+    }
+    if (len == 0 || memchr(data, '\0', len) || memchr(data, '\n', len) || memchr(data, '\r', len)) {
+        return NULL;
+    }
+    char *copy = malloc(len + 1);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, data, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static bool watcher_bind_git_context(project_state_t *s, const char *git_dir,
+                                     const char *work_tree) {
+    char *git_dir_arg = watcher_prefixed_arg("--git-dir=", git_dir);
+    char *work_tree_arg = watcher_prefixed_arg("--work-tree=", work_tree);
+    char *work_tree_copy = strdup(work_tree);
+    if (!git_dir_arg || !work_tree_arg || !work_tree_copy) {
+        free(git_dir_arg);
+        free(work_tree_arg);
+        free(work_tree_copy);
         return false;
-#endif
     }
-#ifdef ASTRO_SPAWN
-    free(data);
-#else
-    /* Drain output so pclose gets a clean exit status. */
-    char drain[CBM_SZ_128];
-    while (fgets(drain, (int)sizeof(drain), fp)) { /* discard */
+    free(s->git_dir_arg);
+    free(s->work_tree_arg);
+    free(s->git_work_tree);
+    s->git_dir_arg = git_dir_arg;
+    s->work_tree_arg = work_tree_arg;
+    s->git_work_tree = work_tree_copy;
+    s->git_context_ready = true;
+    return true;
+}
+
+/* Resolve repository identity once at watch admission, then pass it explicitly
+ * to every poll child. Git documents that --git-dir disables parent discovery;
+ * this prevents a malformed nested repository from silently observing an
+ * enclosing checkout. A direct .git entry is resolved with --resolve-git-dir,
+ * which supports both ordinary repositories and linked-worktree gitfiles. A
+ * configured watch is a repository-root contract: a missing direct .git entry
+ * is a coded observation failure, never permission to discover a parent. */
+static git_context_result_t watcher_resolve_git_context(project_state_t *s) {
+    size_t root_len = strlen(s->root_path);
+    if (root_len > SIZE_MAX - sizeof("/.git")) {
+        cbm_log_warn("watcher.git_context.path_overflow", "code", CBM_WATCHER_GIT_CONTEXT_FAILED,
+                     "project", s->project_name, "remediation",
+                     "use a repository path representable by the native runtime");
+        return GIT_CONTEXT_FAILED;
     }
-    int rc = cbm_pclose(fp);
-#endif
-    return rc == 0;
+    char *git_entry = malloc(root_len + sizeof("/.git"));
+    if (!git_entry) {
+        cbm_log_warn("watcher.git_context.alloc_failed", "code", CBM_WATCHER_GIT_CONTEXT_FAILED,
+                     "project", s->project_name, "remediation",
+                     "free memory before watcher registration");
+        return GIT_CONTEXT_FAILED;
+    }
+    memcpy(git_entry, s->root_path, root_len);
+    memcpy(git_entry + root_len, "/.git", sizeof("/.git"));
+
+    struct stat entry_stat;
+    bool direct_entry = stat(git_entry, &entry_stat) == 0;
+    if (!direct_entry) {
+        char errno_text[CBM_SZ_64];
+        snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_warn(
+            errno == ENOENT ? "watcher.git_context.entry_missing"
+                            : "watcher.git_context.entry_unreadable",
+            "code", CBM_WATCHER_GIT_CONTEXT_FAILED, "project", s->project_name, "path", git_entry,
+            "errno", errno_text, "remediation",
+            "restore the direct .git directory or gitfile at the registered repository root");
+        free(git_entry);
+        return GIT_CONTEXT_FAILED;
+    }
+
+    char *git_dir_data = NULL;
+    size_t git_dir_len = 0;
+    cbm_spawn_error_t git_dir_error;
+    int git_dir_rc;
+    const char *const argv[] = {"git", "rev-parse", "--resolve-git-dir", git_entry, NULL};
+    git_dir_rc = cbm_spawn_capture(argv, &git_dir_data, &git_dir_len, &git_dir_error);
+    if (git_dir_rc != 0) {
+        cbm_log_warn("watcher.git_context.resolve_failed", "code", CBM_WATCHER_GIT_CONTEXT_FAILED,
+                     "project", s->project_name, "spawn_code", git_dir_error.code_name, "message",
+                     git_dir_error.message, "remediation",
+                     "repair the exact registered .git entry; parent repositories are never used");
+        free(git_dir_data);
+        free(git_entry);
+        return GIT_CONTEXT_FAILED;
+    }
+    char *git_dir = watcher_git_path_line(git_dir_data, git_dir_len);
+    free(git_dir_data);
+    if (!git_dir) {
+        cbm_log_warn("watcher.git_context.git_dir_invalid", "code", CBM_WATCHER_GIT_CONTEXT_FAILED,
+                     "project", s->project_name, "remediation",
+                     "inspect git rev-parse repository-path output");
+        free(git_entry);
+        return GIT_CONTEXT_FAILED;
+    }
+
+    char *work_tree = strdup(s->root_path);
+    free(git_entry);
+    if (!work_tree || !watcher_bind_git_context(s, git_dir, work_tree)) {
+        cbm_log_warn("watcher.git_context.bind_failed", "code", CBM_WATCHER_GIT_CONTEXT_FAILED,
+                     "project", s->project_name, "remediation",
+                     "free memory and retry watcher registration");
+        free(work_tree);
+        free(git_dir);
+        return GIT_CONTEXT_FAILED;
+    }
+    free(work_tree);
+    free(git_dir);
+    return GIT_CONTEXT_READY;
 }
 
 typedef struct {
@@ -235,26 +355,49 @@ static bool git_status_identity(const char *data, size_t len, git_status_identit
  * extra HEAD process: branch/OID identity, index/worktree names and states,
  * exact untracked bytes, and the complete tracked patch. The first-commit
  * (initial) form diffs worktree against index because no HEAD tree exists. */
-static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HEX_LEN + 1]) {
+static bool git_source_fingerprint(const project_state_t *s, char out[CBM_SHA256_HEX_LEN + 1],
+                                   const char **failure_code) {
+    if (failure_code) {
+        *failure_code = NULL;
+    }
+    if (!s || !s->git_context_ready || !s->git_dir_arg || !s->work_tree_arg || !s->git_work_tree) {
+        if (failure_code) {
+            *failure_code = CBM_WATCHER_GIT_CONTEXT_FAILED;
+        }
+        return false;
+    }
     cbm_sha256_ctx hash;
     cbm_sha256_init(&hash);
 #ifdef ASTRO_SPAWN
-    const char *const argv[] = {"git",    "--no-optional-locks", "-C", root_path,
-                                "status", "--porcelain=v2",      "--branch", "-z",
+    const char *const argv[] = {"git",
+                                "--no-optional-locks",
+                                s->git_dir_arg,
+                                s->work_tree_arg,
+                                "status",
+                                "--porcelain=v2",
+                                "--branch",
+                                "-z",
                                 "--untracked-files=all",
                                 NULL};
     char *data = NULL;
     size_t len = 0;
     cbm_spawn_error_t err;
     if (cbm_spawn_capture(argv, &data, &len, &err) != 0) {
-        watcher_log_spawn_failure("watcher.git_status.spawn_failed", &err);
+        cbm_log_warn(
+            "watcher.git_status.failed", "code", CBM_WATCHER_GIT_STATUS_FAILED, "project",
+            s->project_name, "path", s->root_path, "spawn_code", err.code_name, "message",
+            err.message, "remediation",
+            "repair the exact registered Git directory; parent repositories are never used");
+        if (failure_code) {
+            *failure_code = CBM_WATCHER_GIT_STATUS_FAILED;
+        }
         free(data);
 #else
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C \"%s\" status --porcelain=v2 --branch "
              "--untracked-files=all 2>%s",
-             root_path, WATCHER_NULDEV);
+             s->root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
 #endif
@@ -263,8 +406,13 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
 #ifdef ASTRO_SPAWN
     git_status_identity_t identity;
     if (!git_status_identity(data, len, &identity)) {
-        cbm_log_warn("watcher.git_status.identity_invalid", "remediation",
+        cbm_log_warn("watcher.git_status.identity_invalid", "code",
+                     CBM_WATCHER_GIT_IDENTITY_INVALID, "project", s->project_name, "path",
+                     s->root_path, "remediation",
                      "inspect git status --porcelain=v2 --branch and repair HEAD before polling");
+        if (failure_code) {
+            *failure_code = CBM_WATCHER_GIT_IDENTITY_INVALID;
+        }
         free(data);
         return false;
     }
@@ -279,15 +427,20 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
         }
         if (end >= offset + 2 && data[offset] == '?' && data[offset + 1] == ' ') {
             size_t path_len = end - (offset + 2);
-            size_t root_len = strlen(root_path);
+            size_t root_len = strlen(s->git_work_tree);
             char *path = malloc(root_len + path_len + 2);
             if (!path) {
-                cbm_log_warn("watcher.git_status.untracked_alloc_failed", "remediation",
+                cbm_log_warn("watcher.git_status.untracked_alloc_failed", "code",
+                             CBM_WATCHER_UNTRACKED_ALLOC_FAILED, "project", s->project_name, "path",
+                             s->root_path, "remediation",
                              "free memory before polling the complete Git source state");
+                if (failure_code) {
+                    *failure_code = CBM_WATCHER_UNTRACKED_ALLOC_FAILED;
+                }
                 free(data);
                 return false;
             }
-            memcpy(path, root_path, root_len);
+            memcpy(path, s->git_work_tree, root_len);
             path[root_len] = '/';
             memcpy(path + root_len + 1, data + offset + 2, path_len);
             path[root_len + path_len + 1] = '\0';
@@ -295,8 +448,13 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
             if (!untracked) {
                 char errno_text[CBM_SZ_64];
                 snprintf(errno_text, sizeof(errno_text), "%d", errno);
-                cbm_log_warn("watcher.git_status.untracked_read_failed", "path", path, "errno",
-                             errno_text);
+                cbm_log_warn("watcher.git_status.untracked_read_failed", "code",
+                             CBM_WATCHER_UNTRACKED_READ_FAILED, "project", s->project_name, "path",
+                             path, "errno", errno_text, "remediation",
+                             "restore the exact porcelain-named file or change Git source state");
+                if (failure_code) {
+                    *failure_code = CBM_WATCHER_UNTRACKED_READ_FAILED;
+                }
                 free(path);
                 free(data);
                 return false;
@@ -309,8 +467,13 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
             if (ferror(untracked)) {
                 char errno_text[CBM_SZ_64];
                 snprintf(errno_text, sizeof(errno_text), "%d", errno);
-                cbm_log_warn("watcher.git_status.untracked_read_failed", "path", path, "errno",
-                             errno_text);
+                cbm_log_warn("watcher.git_status.untracked_read_failed", "code",
+                             CBM_WATCHER_UNTRACKED_READ_FAILED, "project", s->project_name, "path",
+                             path, "errno", errno_text, "remediation",
+                             "restore the exact porcelain-named file or change Git source state");
+                if (failure_code) {
+                    *failure_code = CBM_WATCHER_UNTRACKED_READ_FAILED;
+                }
                 fclose(untracked);
                 free(path);
                 free(data);
@@ -325,17 +488,33 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
 
     /* Porcelain status contains names/status only. Fold the complete tracked
      * patch in so successive edits to the same dirty path produce new state. */
-    const char *const diff_committed_argv[] = {
-        "git", "--no-optional-locks", "-C", root_path, "diff", "--binary", "--no-ext-diff",
-        "--no-textconv", "--no-renames", "HEAD", "--", NULL};
+    const char *const diff_committed_argv[] = {"git",
+                                               "--no-optional-locks",
+                                               s->git_dir_arg,
+                                               s->work_tree_arg,
+                                               "diff",
+                                               "--binary",
+                                               "--no-ext-diff",
+                                               "--no-textconv",
+                                               "--no-renames",
+                                               "HEAD",
+                                               "--",
+                                               NULL};
     const char *const diff_initial_argv[] = {
-        "git", "--no-optional-locks", "-C", root_path, "diff", "--binary", "--no-ext-diff",
-        "--no-textconv", "--no-renames", "--", NULL};
+        "git",      "--no-optional-locks", s->git_dir_arg,  s->work_tree_arg, "diff",
+        "--binary", "--no-ext-diff",       "--no-textconv", "--no-renames",   "--",
+        NULL};
     const char *const *diff_argv = identity.initial ? diff_initial_argv : diff_committed_argv;
     data = NULL;
     len = 0;
     if (cbm_spawn_capture(diff_argv, &data, &len, &err) != 0) {
-        watcher_log_spawn_failure("watcher.git_diff.spawn_failed", &err);
+        cbm_log_warn("watcher.git_diff.failed", "code", CBM_WATCHER_GIT_DIFF_FAILED, "project",
+                     s->project_name, "path", s->root_path, "spawn_code", err.code_name, "message",
+                     err.message, "remediation",
+                     "repair the exact registered Git directory before watcher retry");
+        if (failure_code) {
+            *failure_code = CBM_WATCHER_GIT_DIFF_FAILED;
+        }
         free(data);
         return false;
     }
@@ -361,7 +540,7 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
     snprintf(diff_cmd, sizeof(diff_cmd),
              "git --no-optional-locks -C \"%s\" diff --binary --no-ext-diff --no-textconv "
              "--no-renames HEAD -- 2>%s",
-             root_path, WATCHER_NULDEV);
+             s->root_path, WATCHER_NULDEV);
     FILE *dfp = cbm_popen(diff_cmd, "r");
     if (!dfp) {
         return false;
@@ -383,9 +562,12 @@ static bool git_source_fingerprint(const char *root_path, char out[CBM_SHA256_HE
 }
 
 /* Count tracked files via git ls-files */
-static int git_file_count(const char *root_path) {
+static int git_file_count(const project_state_t *s) {
 #ifdef ASTRO_SPAWN
-    const char *const argv[] = {"git", "-C", root_path, "ls-files", NULL};
+    if (!s || !s->git_context_ready || !s->git_dir_arg || !s->work_tree_arg) {
+        return 0;
+    }
+    const char *const argv[] = {"git", s->git_dir_arg, s->work_tree_arg, "ls-files", NULL};
     char *data = NULL;
     size_t len = 0;
     cbm_spawn_error_t err;
@@ -394,7 +576,7 @@ static int git_file_count(const char *root_path) {
         free(data);
 #else
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", root_path, WATCHER_NULDEV);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", s->root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
 #endif
@@ -450,6 +632,9 @@ static void state_free(project_state_t *s) {
     }
     free(s->project_name);
     free(s->root_path);
+    free(s->git_dir_arg);
+    free(s->work_tree_arg);
+    free(s->git_work_tree);
     free(s);
 }
 
@@ -632,15 +817,21 @@ static void init_baseline(project_state_t *s) {
         return;
     }
 
-    s->is_git = is_git_repo(s->root_path);
+    git_context_result_t context = watcher_resolve_git_context(s);
+    s->is_git = context != GIT_CONTEXT_NOT_REPOSITORY;
     s->baseline_done = true;
 
-    if (s->is_git) {
-        (void)git_source_fingerprint(s->root_path, s->source_sha256);
-        s->file_count = git_file_count(s->root_path);
+    if (context == GIT_CONTEXT_READY) {
+        const char *failure_code = NULL;
+        (void)git_source_fingerprint(s, s->source_sha256, &failure_code);
+        s->file_count = git_file_count(s);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
+    } else if (context == GIT_CONTEXT_FAILED) {
+        cbm_log_warn("watcher.baseline.refused", "project", s->project_name, "code",
+                     CBM_WATCHER_GIT_CONTEXT_FAILED, "remediation",
+                     "repair the exact registered Git context before watcher retry");
     } else {
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
     }
@@ -651,7 +842,15 @@ static void init_baseline(project_state_t *s) {
 typedef struct {
     char source_sha256[CBM_SHA256_HEX_LEN + 1];
     bool source_observed;
+    const char *failure_code;
 } project_observation_t;
+
+typedef enum {
+    PROJECT_OBSERVATION_FAILED = -1,
+    PROJECT_OBSERVATION_UNCHANGED = 0,
+    PROJECT_OBSERVATION_CHANGED = 1,
+    PROJECT_OBSERVATION_RECOVERED = 2,
+} project_observation_result_t;
 
 /* Observe whether a project has changes without advancing the successful
  * baseline. The exact pre-callback source observation is committed only after the
@@ -659,23 +858,38 @@ typedef struct {
  * identity before a failed callback makes a source change invisible to every
  * later poll, while re-observing after success can swallow bytes that changed
  * during the index generation itself. */
-static bool check_changes(const project_state_t *s, project_observation_t *observation) {
+static project_observation_result_t check_changes(project_state_t *s,
+                                                  project_observation_t *observation) {
     if (!s->is_git) {
-        return false;
+        return PROJECT_OBSERVATION_UNCHANGED;
     }
 
     memset(observation, 0, sizeof(*observation));
 
+    if (!s->git_context_ready && watcher_resolve_git_context(s) != GIT_CONTEXT_READY) {
+        observation->failure_code = CBM_WATCHER_GIT_CONTEXT_FAILED;
+        s->observation_failed = true;
+        return PROJECT_OBSERVATION_FAILED;
+    }
+
     observation->source_observed =
-        git_source_fingerprint(s->root_path, observation->source_sha256);
-    return observation->source_observed &&
-           strcmp(observation->source_sha256, s->source_sha256) != 0;
+        git_source_fingerprint(s, observation->source_sha256, &observation->failure_code);
+    if (!observation->source_observed) {
+        if (!observation->failure_code) {
+            observation->failure_code = CBM_WATCHER_GIT_CONTEXT_FAILED;
+        }
+        s->observation_failed = true;
+        return PROJECT_OBSERVATION_FAILED;
+    }
+    if (strcmp(observation->source_sha256, s->source_sha256) != 0) {
+        return PROJECT_OBSERVATION_CHANGED;
+    }
+    return s->observation_failed ? PROJECT_OBSERVATION_RECOVERED : PROJECT_OBSERVATION_UNCHANGED;
 }
 
 static void commit_observation(project_state_t *s, const project_observation_t *observation) {
     if (observation->source_observed) {
-        snprintf(s->source_sha256, sizeof(s->source_sha256), "%s",
-                 observation->source_sha256);
+        snprintf(s->source_sha256, sizeof(s->source_sha256), "%s", observation->source_sha256);
     }
 }
 
@@ -712,24 +926,44 @@ static void poll_project(const char *key, void *val, void *ud) {
 
     /* Check for changes */
     project_observation_t observation;
-    bool changed = check_changes(s, &observation);
-    if (!changed) {
+    project_observation_result_t observation_result = check_changes(s, &observation);
+    if (observation_result == PROJECT_OBSERVATION_UNCHANGED) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
     }
 
-    /* Trigger reindex */
-    cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
+    const char *trigger_code = observation_result == PROJECT_OBSERVATION_CHANGED
+                                   ? CBM_WATCHER_SOURCE_CHANGED
+                                   : (observation_result == PROJECT_OBSERVATION_RECOVERED
+                                          ? CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED
+                                          : observation.failure_code);
+    if (observation_result == PROJECT_OBSERVATION_CHANGED) {
+        cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
+    } else if (observation_result == PROJECT_OBSERVATION_FAILED) {
+        cbm_log_warn("watcher.observation.refused", "project", s->project_name, "code",
+                     trigger_code, "remediation",
+                     "inspect the preceding Git observation diagnostic and repair the exact "
+                     "registered repository");
+    }
     if (ctx->w->index_fn) {
-        int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
+        int rc = ctx->w->index_fn(s->project_name, s->root_path, trigger_code, ctx->w->user_data);
         if (rc == 0) {
-            ctx->reindexed++;
-            commit_observation(s, &observation);
-            /* Refresh file count for interval */
-            s->file_count = git_file_count(s->root_path);
-            s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+            if (observation_result == PROJECT_OBSERVATION_CHANGED) {
+                ctx->reindexed++;
+                commit_observation(s, &observation);
+                /* Refresh file count for interval */
+                s->file_count = git_file_count(s);
+                s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+            }
+            if (observation_result == PROJECT_OBSERVATION_CHANGED ||
+                observation_result == PROJECT_OBSERVATION_RECOVERED) {
+                s->observation_failed = false;
+            }
         } else {
-            cbm_log_warn("watcher.index.err", "project", s->project_name);
+            if (rc != 0) {
+                cbm_log_warn("watcher.index.err", "project", s->project_name, "trigger_code",
+                             trigger_code);
+            }
         }
     }
 

@@ -20,6 +20,15 @@ pub const CBM_VECTOR_SEARCH_MAX_KEYWORDS: u32 = 32;
 pub const CBM_ASTRO_LOWERED_DB_SUFFIX: &[u8; 22] = b".astrolabe-lowered.db\0";
 pub const CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX: &[u8; 24] = b".astrolabe-archaeology-\0";
 pub const CBM_PIPELINE_ERROR_DETAIL_MAX: u32 = 16;
+pub const CBM_WATCHER_SOURCE_CHANGED: &[u8; 27] = b"CBM_WATCHER_SOURCE_CHANGED\0";
+pub const CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED: &[u8; 41] =
+    b"CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED\0";
+pub const CBM_WATCHER_GIT_CONTEXT_FAILED: &[u8; 31] = b"CBM_WATCHER_GIT_CONTEXT_FAILED\0";
+pub const CBM_WATCHER_GIT_STATUS_FAILED: &[u8; 30] = b"CBM_WATCHER_GIT_STATUS_FAILED\0";
+pub const CBM_WATCHER_GIT_IDENTITY_INVALID: &[u8; 33] = b"CBM_WATCHER_GIT_IDENTITY_INVALID\0";
+pub const CBM_WATCHER_UNTRACKED_ALLOC_FAILED: &[u8; 35] = b"CBM_WATCHER_UNTRACKED_ALLOC_FAILED\0";
+pub const CBM_WATCHER_UNTRACKED_READ_FAILED: &[u8; 34] = b"CBM_WATCHER_UNTRACKED_READ_FAILED\0";
+pub const CBM_WATCHER_GIT_DIFF_FAILED: &[u8; 28] = b"CBM_WATCHER_GIT_DIFF_FAILED\0";
 pub type va_list = *mut ::std::os::raw::c_char;
 pub type uint_least64_t = ::std::os::raw::c_ulonglong;
 #[repr(C)]
@@ -4418,6 +4427,7 @@ pub type cbm_index_fn = ::std::option::Option<
     unsafe extern "C" fn(
         project_name: *const ::std::os::raw::c_char,
         root_path: *const ::std::os::raw::c_char,
+        trigger_code: *const ::std::os::raw::c_char,
         user_data: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int,
 >;

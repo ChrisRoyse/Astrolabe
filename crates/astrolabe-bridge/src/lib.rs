@@ -4912,7 +4912,24 @@ impl Drop for CbmStore {
     }
 }
 
-type WatchCallback = dyn FnMut(&str, &str) -> Result<(), BridgeError>;
+type WatchCallback = dyn FnMut(&str, &str, &str) -> Result<(), BridgeError>;
+
+const CBM_WATCHER_SOURCE_CHANGED: &str = "CBM_WATCHER_SOURCE_CHANGED";
+const CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED: &str = "CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED";
+const CBM_WATCHER_FAILURE_TRIGGERS: &[&str] = &[
+    "CBM_WATCHER_GIT_CONTEXT_FAILED",
+    "CBM_WATCHER_GIT_STATUS_FAILED",
+    "CBM_WATCHER_GIT_IDENTITY_INVALID",
+    "CBM_WATCHER_UNTRACKED_ALLOC_FAILED",
+    "CBM_WATCHER_UNTRACKED_READ_FAILED",
+    "CBM_WATCHER_GIT_DIFF_FAILED",
+];
+
+fn valid_watcher_trigger(trigger_code: &str) -> bool {
+    trigger_code == CBM_WATCHER_SOURCE_CHANGED
+        || trigger_code == CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED
+        || CBM_WATCHER_FAILURE_TRIGGERS.contains(&trigger_code)
+}
 
 struct WatcherCallbackState {
     callback: Box<WatchCallback>,
@@ -4972,7 +4989,7 @@ pub struct CbmWatcher {
 impl CbmWatcher {
     pub fn new_for_polling<F>(callback: F) -> Result<Self, BridgeError>
     where
-        F: FnMut(&str, &str) -> Result<(), BridgeError> + 'static,
+        F: FnMut(&str, &str, &str) -> Result<(), BridgeError> + 'static,
     {
         let store = CbmStore::open_memory()?;
         let callback_state = WatcherCallbackOwner::new(Box::new(callback));
@@ -5121,6 +5138,7 @@ unsafe fn replace_watcher_last_error(
 unsafe extern "C" fn watcher_index_trampoline(
     project_name: *const c_char,
     root_path: *const c_char,
+    trigger_code: *const c_char,
     user_data: *mut c_void,
 ) -> c_int {
     if user_data.is_null() {
@@ -5131,10 +5149,10 @@ unsafe extern "C" fn watcher_index_trampoline(
     // valid until after the C watcher is stopped and freed.
     let state = user_data.cast::<WatcherCallbackState>();
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if project_name.is_null() || root_path.is_null() {
+        if project_name.is_null() || root_path.is_null() || trigger_code.is_null() {
             return Err(envelope(
                 "ASTRO_CBM_NULL_CALLBACK_ARG",
-                "CBM watcher callback received a NULL project name or root path",
+                "CBM watcher callback received a NULL project name, root path, or trigger code",
                 "Treat this as an FFI contract drift and inspect the watcher caller.",
             ));
         }
@@ -5143,10 +5161,19 @@ unsafe extern "C" fn watcher_index_trampoline(
         let project_name = unsafe { CStr::from_ptr(project_name) }.to_str()?;
         // SAFETY: same callback string contract as project_name.
         let root_path = unsafe { CStr::from_ptr(root_path) }.to_str()?;
+        // SAFETY: same callback string contract as project_name.
+        let trigger_code = unsafe { CStr::from_ptr(trigger_code) }.to_str()?;
+        if !valid_watcher_trigger(trigger_code) {
+            return Err(envelope(
+                "ASTRO_CBM_WATCHER_TRIGGER_INVALID",
+                format!("CBM watcher supplied unknown trigger code {trigger_code:?}"),
+                "Regenerate the FFI binding and register the native trigger before consuming it.",
+            ));
+        }
         // SAFETY: C invokes this thread-affine callback synchronously, so this
         // is the only active access to the callback field.
         let callback = unsafe { &mut *ptr::addr_of_mut!((*state).callback) };
-        callback(project_name, root_path)
+        callback(project_name, root_path, trigger_code)
     })) {
         Ok(Ok(())) => CALLBACK_OK,
         Ok(Err(err)) => {

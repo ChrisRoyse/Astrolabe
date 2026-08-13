@@ -160,19 +160,43 @@ static void *http_thread(void *arg) {
 
 static int cli_mcp_result_exit_code(const char *result);
 
-static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
+static int watcher_index_fn(const char *project_name, const char *root_path,
+                            const char *trigger_code, void *user_data) {
     (void)user_data;
 
-    /* Skip indexing if shutdown is in progress */
-    if (atomic_load(&g_shutdown)) {
+    if (trigger_code && strcmp(trigger_code, CBM_WATCHER_SOURCE_OBSERVATION_RECOVERED) == 0) {
+        cbm_log_info("watcher.observation_recovered", "project", project_name, "path", root_path);
         return 0;
     }
+    if (!trigger_code || strcmp(trigger_code, CBM_WATCHER_SOURCE_CHANGED) != 0) {
+        cbm_log_error("watcher.observation_failed", "code",
+                      trigger_code ? trigger_code : "CBM_WATCHER_TRIGGER_INVALID", "project",
+                      project_name, "path", root_path, "remediation",
+                      "repair the exact registered Git repository before watcher retry");
+        return CBM_NOT_FOUND;
+    }
 
-    /* Non-blocking: skip if another pipeline is already running.
-     * Watcher will retry on next poll cycle (5-60s). */
+    /* A skipped callback is not a successful transaction: returning success
+     * would let the watcher commit the observed source fingerprint even though
+     * no index publication occurred. Preserve the baseline so a later live
+     * owner can process this exact change. */
+    if (atomic_load(&g_shutdown)) {
+        cbm_log_warn("watcher.reindex_refused", "code", "CBM_WATCHER_SHUTDOWN_IN_PROGRESS",
+                     "project", project_name, "path", root_path, "message",
+                     "shutdown began before the observed source change could be indexed",
+                     "remediation", "restart the server so the unchanged watcher baseline retries");
+        return CBM_NOT_FOUND;
+    }
+
+    /* Non-blocking admission preserves the observation baseline on contention;
+     * the next ordinary poll observes the same change and retries it. */
     if (!cbm_pipeline_try_lock()) {
-        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
+        cbm_log_warn(
+            "watcher.reindex_refused", "code", "CBM_WATCHER_PIPELINE_BUSY", "project", project_name,
+            "path", root_path, "message", "another pipeline owns the index publication boundary",
+            "remediation",
+            "allow the owning pipeline to finish; the unchanged watcher baseline will retry");
+        return CBM_NOT_FOUND;
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
