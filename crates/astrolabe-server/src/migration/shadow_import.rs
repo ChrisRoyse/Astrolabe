@@ -22,8 +22,18 @@ pub(crate) const ASTRO_SHADOW_SOURCE_OUT_OF_BAND: &str = "ASTRO_SHADOW_SOURCE_OU
 /// fingerprint cannot be recomputed (the source tree was moved/deleted, or git is
 /// unavailable), so freshness cannot be asserted against the real source (#347).
 pub(crate) const ASTRO_SHADOW_GIT_SOURCE_UNREADABLE: &str = "ASTRO_SHADOW_GIT_SOURCE_UNREADABLE";
+pub(crate) const ASTRO_WATCHER_ROOT_MISSING: &str = "ASTRO_WATCHER_ROOT_MISSING";
+pub(crate) const ASTRO_WATCHER_ROOT_IDENTITY_MISMATCH: &str =
+    "ASTRO_WATCHER_ROOT_IDENTITY_MISMATCH";
+pub(crate) const ASTRO_WATCHER_ROOT_IDENTITY_UNEVALUABLE: &str =
+    "ASTRO_WATCHER_ROOT_IDENTITY_UNEVALUABLE";
+pub(crate) const ASTRO_WATCHER_ROOT_IDENTITY_MISSING: &str = "ASTRO_WATCHER_ROOT_IDENTITY_MISSING";
 pub(crate) const SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION: &str = "the git source tree changed out of band (commit or working-tree edit) since the last shadow import; rerun index_repository with calyx=\"shadow\" so the vault, lowered artifact, and row-sink-derived surfaces are rebuilt from the current source. index_status reconciles this automatically when a CBM tool runner is available";
 pub(crate) const SHADOW_GIT_SOURCE_UNREADABLE_REMEDIATION: &str = "the persisted git source path could not be fingerprinted (the source tree was moved/deleted, or git is unavailable); restore the source tree at its indexed path, or rerun index_repository with calyx=\"shadow\" from the current source location";
+pub(crate) const WATCHER_ROOT_MISSING_REMEDIATION: &str = "restore the exact published directory object at the registered path; a replacement identity is refused, and project retirement is a separate explicit operator transaction";
+pub(crate) const WATCHER_ROOT_IDENTITY_MISMATCH_REMEDIATION: &str = "remove the replacement directory and restore the exact published directory object, or explicitly index the replacement to commit a new complete artifact generation";
+pub(crate) const WATCHER_ROOT_IDENTITY_UNEVALUABLE_REMEDIATION: &str = "restore readable Windows identity metadata for the exact registered directory; preserve every committed artifact until the identity observation is evaluable";
+pub(crate) const WATCHER_ROOT_IDENTITY_MISSING_REMEDIATION: &str = "explicitly reindex the readable source root once so its handle-derived identity commits atomically with the complete artifact generation";
 /// Metadata key holding the git working-tree source fingerprint captured at import time.
 pub(crate) const GIT_SOURCE_FINGERPRINT_KEY: &str = "git_source_fingerprint";
 /// Metadata key holding the exact committed-or-unborn Git history state measured
@@ -205,6 +215,9 @@ pub(crate) struct ShadowImportOutcome {
     /// Absolute repo path whose git source fingerprint was recorded, so the read-path
     /// freshness gate can recompute it (#347). `None` when the import had no repo path.
     pub(crate) git_source_repo_path: Option<String>,
+    /// Handle-derived Windows directory identity captured in the same import generation.
+    /// Path equality cannot distinguish an exact restored directory from a replacement.
+    pub(crate) git_source_root_identity: Option<WindowsRootIdentity>,
 }
 
 fn parse_git_history_state(
@@ -1161,6 +1174,15 @@ pub(crate) enum ShadowContentVerdict {
     /// but labeled distinctly so the mismatch is diagnosable as an out-of-band source
     /// change rather than a db drift.
     SourceOutOfBand { expected: String, actual: String },
+    /// The resident watcher durably proved that the registered source root is
+    /// absent, replaced, unevaluable, or lacks its publication-time identity.
+    /// The last committed generation remains readable only as stale/faulted.
+    WatcherRootFault {
+        code: &'static str,
+        message: String,
+        remediation: &'static str,
+        fault: Value,
+    },
     /// The persisted watermark's digest domain is not — or cannot be proven to be — the
     /// domain the gate recomputes, so the two digests are incommensurable and comparing
     /// them is meaningless (#223).
@@ -1223,6 +1245,9 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
     project: &str,
     known_verify: Option<KnownChainVerify<'_>>,
 ) -> Result<ShadowContentVerdict, DynError> {
+    if let Some(verdict) = watcher_root_fault_verdict(cache_dir, project)? {
+        return Ok(verdict);
+    }
     let source_path = sqlite_path(cache_dir, project);
     if !source_path.exists() {
         return Ok(ShadowContentVerdict::Unverifiable {
@@ -1410,6 +1435,92 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
     }
 }
 
+fn watcher_root_fault_verdict(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<ShadowContentVerdict>, DynError> {
+    let key = metadata_key(project, super::watcher_lane::WATCHER_ROOT_FAULT_STATUS_KEY);
+    let Some(raw) = read_config_value(cache_dir, &key)?.filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let fault: Value = serde_json::from_str(&raw).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_WATCHER_ROOT_FAULT_MALFORMED: project {project:?} config key {key:?} is not valid JSON (bytes={}, sha256={}): {error}; remediation: preserve the config database and every project artifact and inspect the root-fault writer",
+            raw.len(),
+            hex_lower(&Sha256::digest(raw.as_bytes())),
+        )
+        .into()
+    })?;
+    if fault.get("schema").and_then(Value::as_str) != Some("astrolabe-watcher-root-fault-v1")
+        || fault.get("project").and_then(Value::as_str) != Some(project)
+        || fault.get("artifacts_preserved").and_then(Value::as_bool) != Some(true)
+        || fault
+            .get("automatic_deletion_authorized")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_INVALID: project {project:?} root fault does not bind the v1 preserving contract; remediation: preserve the config database and every project artifact and inspect the root-fault writer"
+        )
+        .into());
+    }
+    for (field, digest_field) in [
+        ("observation", "observation_sha256"),
+        ("prior_publication", "prior_publication_sha256"),
+    ] {
+        let value = fault.get(field).ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_WATCHER_ROOT_FAULT_INVALID: project {project:?} root fault has no {field}; remediation: preserve every byte and inspect the root-fault writer"
+            )
+            .into()
+        })?;
+        let actual = persisted_json_sha256(value)?;
+        if fault.get(digest_field).and_then(Value::as_str) != Some(actual.as_str()) {
+            return Err(format!(
+                "ASTRO_WATCHER_ROOT_FAULT_HASH_MISMATCH: project {project:?} {field} hashes to {actual}, not its recorded {digest_field}; remediation: preserve every byte and inspect the root-fault writer"
+            )
+            .into());
+        }
+    }
+    let code = fault
+        .get("fault_code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_WATCHER_ROOT_FAULT_INVALID: root fault has no fault_code".into()
+        })?;
+    let (code, remediation) = match code {
+        ASTRO_WATCHER_ROOT_MISSING => {
+            (ASTRO_WATCHER_ROOT_MISSING, WATCHER_ROOT_MISSING_REMEDIATION)
+        }
+        ASTRO_WATCHER_ROOT_IDENTITY_MISMATCH => (
+            ASTRO_WATCHER_ROOT_IDENTITY_MISMATCH,
+            WATCHER_ROOT_IDENTITY_MISMATCH_REMEDIATION,
+        ),
+        ASTRO_WATCHER_ROOT_IDENTITY_UNEVALUABLE => (
+            ASTRO_WATCHER_ROOT_IDENTITY_UNEVALUABLE,
+            WATCHER_ROOT_IDENTITY_UNEVALUABLE_REMEDIATION,
+        ),
+        ASTRO_WATCHER_ROOT_IDENTITY_MISSING => (
+            ASTRO_WATCHER_ROOT_IDENTITY_MISSING,
+            WATCHER_ROOT_IDENTITY_MISSING_REMEDIATION,
+        ),
+        other => {
+            return Err(format!(
+                "ASTRO_WATCHER_ROOT_FAULT_CODE_UNKNOWN: project {project:?} root fault code {other:?} is not registered; remediation: preserve every byte and inspect the root-fault writer"
+            )
+            .into());
+        }
+    };
+    Ok(Some(ShadowContentVerdict::WatcherRootFault {
+        code,
+        message: format!(
+            "{code}: project {project:?} is served only as a preserved last-committed generation because the registered source-root identity is faulted"
+        ),
+        remediation,
+        fault,
+    }))
+}
+
 /// Builds the fail-closed [`ShadowContentVerdict::WatermarkDomainMismatch`] refusal (#223).
 fn watermark_domain_mismatch_verdict(
     code: &'static str,
@@ -1457,6 +1568,7 @@ pub(crate) fn ensure_shadow_import_current_at(
         // that can rebuild the derived surfaces may persist one.
         ShadowContentVerdict::Stale { .. }
         | ShadowContentVerdict::SourceOutOfBand { .. }
+        | ShadowContentVerdict::WatcherRootFault { .. }
         | ShadowContentVerdict::WatermarkDomainMismatch { .. }
         | ShadowContentVerdict::Unverifiable {
             source_missing: false,
@@ -1765,6 +1877,23 @@ pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> V
             "derived_surfaces": "last_known_good_preserved",
             "remediation": SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION,
         }),
+        ShadowContentVerdict::WatcherRootFault {
+            code,
+            message,
+            remediation,
+            fault,
+        } => json!({
+            "status": "last_committed_generation_preserved",
+            "freshness": "stale",
+            "trust": "verified_fault",
+            "verification": "durable_watcher_root_fault",
+            "watermark_format": SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION,
+            "code": code,
+            "message": message,
+            "derived_surfaces": "last_known_good_preserved",
+            "watcher_root_fault": fault,
+            "remediation": remediation,
+        }),
         ShadowContentVerdict::WatermarkDomainMismatch {
             code,
             message,
@@ -1817,6 +1946,7 @@ fn shadow_content_verdict_code(verdict: &ShadowContentVerdict) -> &'static str {
         ),
         ShadowContentVerdict::Stale { .. } => ASTRO_SHADOW_STALE_REINDEX_REQUIRED,
         ShadowContentVerdict::SourceOutOfBand { .. } => ASTRO_SHADOW_SOURCE_OUT_OF_BAND,
+        ShadowContentVerdict::WatcherRootFault { code, .. } => code,
         ShadowContentVerdict::WatermarkDomainMismatch { code, .. }
         | ShadowContentVerdict::Unverifiable { code, .. } => code,
     }
@@ -1841,6 +1971,7 @@ fn shadow_content_verdict_message(
              because the live git source fingerprint differs from the persisted shadow import \
              watermark (expected {expected}, actual {actual})"
         ),
+        ShadowContentVerdict::WatcherRootFault { message, .. } => message.clone(),
         ShadowContentVerdict::WatermarkDomainMismatch { message, .. }
         | ShadowContentVerdict::Unverifiable { message, .. } => message.clone(),
     }
@@ -1853,6 +1984,7 @@ fn shadow_content_verdict_remediation(verdict: &ShadowContentVerdict) -> &'stati
         ),
         ShadowContentVerdict::Stale { .. } => SHADOW_STALE_REMEDIATION,
         ShadowContentVerdict::SourceOutOfBand { .. } => SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION,
+        ShadowContentVerdict::WatcherRootFault { remediation, .. } => remediation,
         ShadowContentVerdict::WatermarkDomainMismatch { remediation, .. }
         | ShadowContentVerdict::Unverifiable { remediation, .. } => remediation,
     }
@@ -1989,6 +2121,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         .as_ref()
         .map(|snapshot| snapshot.history.clone());
     let git_source_repo_path = git_repo.map(|repo| repo.to_string_lossy().into_owned());
+    let git_source_root_identity = git_repo.map(capture_root_identity).transpose()?;
     // Measured host parallelism, not a constant (#23): the corpus-wide import
     // passes (symbol preparation, row encode/reconcile, readback verification)
     // are worker-count-invariant in results, and one worker left the whole
@@ -2299,6 +2432,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             git_source_fingerprint,
             git_history_state,
             git_source_repo_path,
+            git_source_root_identity,
         });
     }
     let git_archaeology = match git_repo {
@@ -2555,6 +2689,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         git_source_fingerprint,
         git_history_state,
         git_source_repo_path,
+        git_source_root_identity,
     })
 }
 
@@ -4810,6 +4945,33 @@ pub(crate) fn try_shadow_index_noop_admission(
     let persisted_history = parse_git_history_state(project, &history_key, &persisted_history_raw)?;
     let persisted_repo_path =
         required_shadow_config_value(cache_dir, project, GIT_SOURCE_REPO_PATH_KEY)?;
+    let root_identity_key = metadata_key(project, GIT_SOURCE_ROOT_IDENTITY_KEY);
+    let Some(persisted_root_identity_raw) =
+        read_config_value(cache_dir, &root_identity_key)?.filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: "published_root_identity_absent".to_string(),
+            action_policy: ShadowIndexActionPolicy::RebuildDerived {
+                reason: "published_root_identity_absent".to_string(),
+            },
+        });
+    };
+    let persisted_root_identity = parse_root_identity(&persisted_root_identity_raw)?;
+    let live_root_identity = capture_root_identity(repo_path)?;
+    if !persisted_root_identity.same_object(&live_root_identity) {
+        return Ok(ShadowIndexNoopAdmission::Miss {
+            reason: format!(
+                "repository_filesystem_identity_changed:requested={}/{} persisted={}/{}",
+                live_root_identity.volume_serial_hex,
+                live_root_identity.file_id_128_hex,
+                persisted_root_identity.volume_serial_hex,
+                persisted_root_identity.file_id_128_hex,
+            ),
+            action_policy: ShadowIndexActionPolicy::RebuildDerived {
+                reason: "repository_filesystem_identity_changed".to_string(),
+            },
+        });
+    }
     let canonical_repo = fs::canonicalize(repo_path).map_err(|error| -> DynError {
         format!(
             "ASTRO_SHADOW_NOOP_REPO_UNRESOLVED: canonicalizing requested repository {} failed: {error}; remediation: restore the exact indexed source root before retrying",
@@ -5939,15 +6101,17 @@ pub(crate) fn persist_shadow_publication_at(
         outcome.git_history_state.as_ref(),
         outcome.git_source_fingerprint.as_deref(),
         outcome.git_source_repo_path.as_deref(),
+        outcome.git_source_root_identity.as_ref(),
     ) {
-        (Some(history), Some(source_fingerprint), Some(repo_path)) => {
+        (Some(history), Some(source_fingerprint), Some(repo_path), Some(root_identity)) => {
+            root_identity.validate()?;
             let snapshot = GitRepositorySnapshot {
                 history: history.clone(),
                 source_fingerprint: source_fingerprint.to_string(),
             };
             validate_git_source_provenance(project, &outcome.provenance, &snapshot, repo_path)?;
         }
-        (None, None, None) => {}
+        (None, None, None, None) => {}
         state => {
             return Err(format!(
                 "ASTRO_GIT_SOURCE_PROVENANCE_INVALID: project {project:?} publication has a partial Git source tuple {state:?}; remediation: preserve the staged generation and inspect source observation wiring"
@@ -6162,6 +6326,18 @@ pub(crate) fn persist_shadow_publication_at(
         params![
             metadata_key(project, GIT_SOURCE_REPO_PATH_KEY),
             outcome.git_source_repo_path.clone().unwrap_or_default()
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
+            metadata_key(project, GIT_SOURCE_ROOT_IDENTITY_KEY),
+            outcome
+                .git_source_root_identity
+                .as_ref()
+                .map(WindowsRootIdentity::record_json)
+                .transpose()?
+                .unwrap_or_default()
         ],
     )?;
     tx.execute(

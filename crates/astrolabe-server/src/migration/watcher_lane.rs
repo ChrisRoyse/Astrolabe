@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use astrolabe_bridge::{BridgeError, CbmWatcher, ErrorEnvelope};
 use astrolabe_domain::knobs::{
-    WATCHER_DEFAULT_POLL_INTERVAL_MS, WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS,
+    WATCHER_DEFAULT_POLL_INTERVAL_MS, WATCHER_DEFAULT_ROOT_MISSING_GRACE_MS,
+    WATCHER_DEFAULT_TRANSIENT_MAX_ATTEMPTS, WATCHER_ROOT_MISSING_GRACE_MS_KNOB, watcher_knob,
 };
 
 use super::dispatch::handle_index_repository;
@@ -15,6 +16,7 @@ use super::dispatch::handle_index_repository;
 pub(crate) const WATCHER_TICK_STATUS_KEY: &str = "watcher_tick_json";
 pub(crate) const WATCHER_FAULT_STATUS_KEY: &str = "watcher_fault_json";
 pub(crate) const WATCHER_REGISTRATION_FAULT_STATUS_KEY: &str = "watcher_registration_fault_json";
+pub(crate) const WATCHER_ROOT_FAULT_STATUS_KEY: &str = "watcher_root_fault_json";
 const WATCHER_INDEX_OPERATION: &str = "index_repository";
 const WATCHER_INDEX_PHASE: &str = "watcher_index_worker";
 
@@ -22,6 +24,22 @@ const WATCHER_INDEX_PHASE: &str = "watcher_index_worker";
 struct WatchRegistration {
     project: String,
     root: String,
+    root_identity_raw: Option<String>,
+    root_missing_grace_ms_raw: Option<String>,
+    root_fault_raw: Option<String>,
+}
+
+#[derive(Debug)]
+struct MissingRootObservation {
+    first_observed_at: Instant,
+    first_observed_unix_ms: u64,
+    observation_count: u64,
+}
+
+#[derive(Debug)]
+enum RootAdmissionDisposition {
+    Exact { prior_root_fault: Option<Value> },
+    Refused,
 }
 
 struct RegistrationRecoveryRefresh<'a> {
@@ -130,6 +148,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             .map_err(watcher_bridge_error)
     })?;
     let mut registered = BTreeMap::<String, String>::new();
+    let mut missing_root_observations = BTreeMap::<String, MissingRootObservation>::new();
     let mut invalid_registration_recovery_observations =
         BTreeMap::<String, InvalidRegistrationRecoveryObservation>::new();
     let mut prior_policy_observation = None::<String>;
@@ -155,6 +174,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
         if activation_changed {
             let released = release_background_lane_ownerships()?;
             unwatch_all(&mut watcher, &mut registered)?;
+            missing_root_observations.clear();
             invalid_registration_recovery_observations.clear();
             match &activation_fence {
                 Ok(_) => tracing::info!(
@@ -212,6 +232,7 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
         if !matches!(policy, Ok(true)) {
             let released = release_background_lane_ownerships()?;
             unwatch_all(&mut watcher, &mut registered)?;
+            missing_root_observations.clear();
             invalid_registration_recovery_observations.clear();
             if released != 0 {
                 tracing::info!(
@@ -239,12 +260,43 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
             let released = release_background_lane_ownership_at(&cache_dir, &stale)?;
             watcher.unwatch(&stale)?;
             registered.remove(&stale);
+            missing_root_observations.remove(&stale);
             invalid_registration_recovery_observations.remove(&stale);
             if released {
                 tracing::info!(project = %stale, "incremental_watcher.project_lane_released");
             }
         }
         for registration in discovered {
+            let prior_root_fault = match registration_root_admission(
+                &cache_dir,
+                &registration,
+                &mut missing_root_observations,
+            ) {
+                Ok(RootAdmissionDisposition::Exact { prior_root_fault }) => prior_root_fault,
+                Ok(RootAdmissionDisposition::Refused) => {
+                    if registered.contains_key(&registration.project) {
+                        watcher.unwatch(&registration.project)?;
+                        registered.remove(&registration.project);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    if registered.contains_key(&registration.project) {
+                        watcher.unwatch(&registration.project)?;
+                        registered.remove(&registration.project);
+                    }
+                    let message = format!("root-identity admission failed: {error}");
+                    if persist_registration_error(&cache_dir, &registration.project, &message)? {
+                        tracing::warn!(
+                            project = %registration.project,
+                            root = %registration.root,
+                            error = %error,
+                            "incremental_watcher.root_identity_admission_refused"
+                        );
+                    }
+                    continue;
+                }
+            };
             if registered.get(&registration.project) == Some(&registration.root) {
                 continue;
             }
@@ -303,7 +355,9 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 }
             };
             invalid_registration_recovery_observations.remove(&registration.project);
-            if let Some(status) = &catch_up {
+            if let Some(status) = &catch_up
+                && prior_root_fault.is_none()
+            {
                 persist_watcher_status(&cache_dir, &registration.project, status)?;
                 tracing::info!(
                     project = %registration.project,
@@ -311,6 +365,14 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                     verification = status.get("verification").and_then(|value| value.as_str()),
                     "incremental_watcher.catch_up_scheduled"
                 );
+            }
+            if let Some(root_fault) = prior_root_fault.as_ref() {
+                clear_resolved_root_fault(
+                    &cache_dir,
+                    &registration,
+                    root_fault,
+                    catch_up.as_ref(),
+                )?;
             }
             watcher.watch(&registration.project, &registration.root)?;
             if catch_up.is_none() {
@@ -429,6 +491,373 @@ fn registration_catch_up_status(
         "worker_started": false,
         "remediation": "allow the enabled resident lane to complete its scheduled failure-atomic index generation; inspect watcher_fault_json if it refuses",
     }))))
+}
+
+fn registration_root_admission(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    missing: &mut BTreeMap<String, MissingRootObservation>,
+) -> Result<RootAdmissionDisposition, DynError> {
+    let grace_ms = root_missing_grace_ms(registration)?;
+    let prior_root_fault = registration
+        .root_fault_raw
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| parse_root_fault(raw, registration))
+        .transpose()?;
+    let expected = match registration
+        .root_identity_raw
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+    {
+        Some(raw) => parse_root_identity(raw)?,
+        None => {
+            missing.remove(&registration.project);
+            let now = unix_epoch_millis();
+            let observation = root_fault_observation(
+                registration,
+                "ASTRO_WATCHER_ROOT_IDENTITY_MISSING",
+                "identity_missing",
+                None,
+                Value::Null,
+                "the published Git source registration has no handle-derived Windows root identity",
+            );
+            persist_root_fault_transition(
+                cache_dir,
+                registration,
+                &observation,
+                now,
+                now,
+                1,
+                grace_ms,
+                "explicitly reindex the readable registered root so its volume serial, 128-bit file ID, and final handle path commit with the artifact generation",
+            )?;
+            return Ok(RootAdmissionDisposition::Refused);
+        }
+    };
+
+    match observe_root_identity(Path::new(&registration.root), &expected) {
+        RootIdentityObservation::Exact(_) => {
+            missing.remove(&registration.project);
+            Ok(RootAdmissionDisposition::Exact { prior_root_fault })
+        }
+        RootIdentityObservation::Missing { message } => {
+            let now = unix_epoch_millis();
+            let state = missing
+                .entry(registration.project.clone())
+                .or_insert_with(|| MissingRootObservation {
+                    first_observed_at: Instant::now(),
+                    first_observed_unix_ms: now,
+                    observation_count: 0,
+                });
+            state.observation_count = state.observation_count.checked_add(1).ok_or_else(|| {
+                "ASTRO_WATCHER_ROOT_OBSERVATION_OVERFLOW: missing-root observation counter overflowed; remediation: preserve the project and restart only after recording the fault"
+            })?;
+            if state.first_observed_at.elapsed().as_millis() < u128::from(grace_ms) {
+                return Ok(RootAdmissionDisposition::Refused);
+            }
+            let observation = root_fault_observation(
+                registration,
+                "ASTRO_WATCHER_ROOT_MISSING",
+                "missing",
+                Some(&expected),
+                Value::Null,
+                &message,
+            );
+            if persist_root_fault_transition(
+                cache_dir,
+                registration,
+                &observation,
+                state.first_observed_unix_ms,
+                now,
+                state.observation_count,
+                grace_ms,
+                "restore the exact directory object at the registered path; a replacement identity is refused, and explicit project retirement is a separate operator transaction",
+            )? {
+                tracing::warn!(
+                    project = %registration.project,
+                    root = %registration.root,
+                    grace_ms,
+                    observation_count = state.observation_count,
+                    "incremental_watcher.root_missing_fault_persisted"
+                );
+            }
+            Ok(RootAdmissionDisposition::Refused)
+        }
+        RootIdentityObservation::Mismatch { actual, message } => {
+            missing.remove(&registration.project);
+            let now = unix_epoch_millis();
+            let observation = root_fault_observation(
+                registration,
+                "ASTRO_WATCHER_ROOT_IDENTITY_MISMATCH",
+                "identity_mismatch",
+                Some(&expected),
+                serde_json::to_value(actual)?,
+                &message,
+            );
+            if persist_root_fault_transition(
+                cache_dir,
+                registration,
+                &observation,
+                now,
+                now,
+                1,
+                grace_ms,
+                "remove the replacement and restore the exact published directory object, or explicitly reindex the replacement to publish a new complete generation",
+            )? {
+                tracing::warn!(
+                    project = %registration.project,
+                    root = %registration.root,
+                    "incremental_watcher.root_identity_mismatch_persisted"
+                );
+            }
+            Ok(RootAdmissionDisposition::Refused)
+        }
+        RootIdentityObservation::Unevaluable { message } => {
+            missing.remove(&registration.project);
+            let now = unix_epoch_millis();
+            let observation = root_fault_observation(
+                registration,
+                "ASTRO_WATCHER_ROOT_IDENTITY_UNEVALUABLE",
+                "identity_unevaluable",
+                Some(&expected),
+                Value::Null,
+                &message,
+            );
+            if persist_root_fault_transition(
+                cache_dir,
+                registration,
+                &observation,
+                now,
+                now,
+                1,
+                grace_ms,
+                "restore readable filesystem identity metadata for the exact registered directory; preserve every artifact until the observation is evaluable",
+            )? {
+                tracing::warn!(
+                    project = %registration.project,
+                    root = %registration.root,
+                    "incremental_watcher.root_identity_unevaluable_persisted"
+                );
+            }
+            Ok(RootAdmissionDisposition::Refused)
+        }
+    }
+}
+
+fn root_missing_grace_ms(registration: &WatchRegistration) -> Result<u64, DynError> {
+    let declaration = watcher_knob(WATCHER_ROOT_MISSING_GRACE_MS_KNOB).ok_or_else(|| {
+        "ASTRO_WATCHER_ROOT_GRACE_KNOB_UNDECLARED: watcher root grace knob is absent from the registry"
+    })?;
+    let Some(raw) = registration.root_missing_grace_ms_raw.as_deref() else {
+        return Ok(WATCHER_DEFAULT_ROOT_MISSING_GRACE_MS);
+    };
+    if raw.is_empty() || raw != raw.trim() {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_GRACE_INVALID: project {:?} persisted {:?}={raw:?}; expected an unsigned base-10 integer with no surrounding whitespace in {}..={}; remediation: repair the exact config row or delete it to select the declared default {}",
+            registration.project,
+            declaration.name,
+            declaration.min,
+            declaration.max,
+            declaration.default,
+        )
+        .into());
+    }
+    let value = raw.parse::<u64>().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_WATCHER_ROOT_GRACE_INVALID: project {:?} persisted {:?}={raw:?}: {error}; remediation: write an unsigned base-10 value in {}..={}",
+            registration.project, declaration.name, declaration.min, declaration.max,
+        )
+        .into()
+    })?;
+    if !(declaration.min..=declaration.max).contains(&value) {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_GRACE_OUT_OF_RANGE: project {:?} persisted {:?}={value}, outside {}..={}; remediation: write a registry-admitted value",
+            registration.project, declaration.name, declaration.min, declaration.max,
+        )
+        .into());
+    }
+    Ok(value)
+}
+
+fn root_fault_observation(
+    registration: &WatchRegistration,
+    fault_code: &str,
+    observation_class: &str,
+    expected: Option<&WindowsRootIdentity>,
+    actual: Value,
+    message: &str,
+) -> Value {
+    json!({
+        "schema": "astrolabe.watcher-root-observation.v1",
+        "fault_code": fault_code,
+        "observation_class": observation_class,
+        "project": registration.project,
+        "registered_root": registration.root,
+        "expected_root_identity": expected,
+        "actual_root_identity": actual,
+        "message": message,
+    })
+}
+
+fn parse_root_fault(raw: &str, registration: &WatchRegistration) -> Result<Value, DynError> {
+    let fault: Value = serde_json::from_str(raw).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_WATCHER_ROOT_FAULT_MALFORMED: durable root fault for {:?} is not valid JSON: {error}; remediation: preserve the config and project artifacts and inspect watcher_root_fault_json",
+            registration.project,
+        )
+        .into()
+    })?;
+    if fault.get("schema").and_then(Value::as_str) != Some("astrolabe-watcher-root-fault-v1")
+        || fault.get("project").and_then(Value::as_str) != Some(&registration.project)
+        || fault.get("registered_root").and_then(Value::as_str) != Some(&registration.root)
+    {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_IDENTITY_MISMATCH: durable root fault does not bind project {:?} and root {:?}; remediation: preserve every byte and inspect the config writer",
+            registration.project, registration.root,
+        )
+        .into());
+    }
+    let observation = fault.get("observation").ok_or_else(|| -> DynError {
+        "ASTRO_WATCHER_ROOT_FAULT_OBSERVATION_MISSING: durable root fault has no observation; remediation: preserve every byte and inspect the config writer".into()
+    })?;
+    let actual = persisted_json_sha256(observation)?;
+    if fault.get("observation_sha256").and_then(Value::as_str) != Some(actual.as_str()) {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_OBSERVATION_HASH_MISMATCH: durable root fault observation hashes to {actual}, not its recorded digest; remediation: preserve every byte and inspect the config writer"
+        )
+        .into());
+    }
+    Ok(fault)
+}
+
+fn prior_publication_evidence(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let fields = [
+        SHADOW_PUBLICATION_GENERATION_KEY,
+        GIT_SOURCE_FINGERPRINT_KEY,
+        GIT_HISTORY_STATE_KEY,
+        GIT_SOURCE_REPO_PATH_KEY,
+        GIT_SOURCE_ROOT_IDENTITY_KEY,
+        "sqlite_path",
+        "vault_fingerprint",
+        "cx_id_set_sha256",
+        SHADOW_LEDGER_CHECKPOINT_KEY,
+        "weave_json",
+        "kernel_context_json",
+        "lowered_sqlite_path",
+        "lowered_artifact_sha256",
+        "lowered_vault_fingerprint_sha256",
+        "lowered_manifest_seq",
+    ];
+    let keys = fields
+        .iter()
+        .map(|field| metadata_key(project, field))
+        .collect::<Vec<_>>();
+    let values = read_config_values(cache_dir, &keys)?;
+    let mut members = Vec::with_capacity(keys.len());
+    for ((field, key), value) in fields.iter().zip(keys).zip(values) {
+        let member = match value {
+            Some(value) => {
+                let semantic = match *field {
+                    "weave_json" | "kernel_context_json" => serde_json::from_str::<Value>(&value)
+                        .ok()
+                        .and_then(|parsed| parsed.get("artifact_sha256").cloned()),
+                    SHADOW_LEDGER_CHECKPOINT_KEY | GIT_SOURCE_ROOT_IDENTITY_KEY => {
+                        serde_json::from_str::<Value>(&value).ok()
+                    }
+                    _ => Some(Value::String(value.clone())),
+                };
+                json!({
+                    "field": field,
+                    "key": key,
+                    "state": "present",
+                    "bytes": value.len(),
+                    "sha256": hex_lower(&Sha256::digest(value.as_bytes())),
+                    "semantic_identity": semantic,
+                })
+            }
+            None => json!({"field": field, "key": key, "state": "absent"}),
+        };
+        members.push(member);
+    }
+    let members = Value::Array(members);
+    Ok(json!({
+        "schema": "astrolabe.watcher-prior-publication.v1",
+        "project": project,
+        "config_members_sha256": persisted_json_sha256(&members)?,
+        "config_members": members,
+        "derived_surfaces": "last_committed_generation_preserved",
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_root_fault_transition(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    observation: &Value,
+    first_observed_unix_ms: u64,
+    last_observed_unix_ms: u64,
+    observation_count: u64,
+    grace_ms: u64,
+    remediation: &str,
+) -> Result<bool, DynError> {
+    let observation_sha256 = persisted_json_sha256(observation)?;
+    if let Some(prior) = registration
+        .root_fault_raw
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| parse_root_fault(raw, registration))
+        .transpose()?
+        && prior.get("observation_sha256").and_then(Value::as_str)
+            == Some(observation_sha256.as_str())
+    {
+        return Ok(false);
+    }
+
+    let prior_publication = prior_publication_evidence(cache_dir, &registration.project)?;
+    let prior_publication_sha256 = persisted_json_sha256(&prior_publication)?;
+    let fault_code = observation
+        .get("fault_code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_WATCHER_ROOT_FAULT_CODE_MISSING: root observation has no fault code".into()
+        })?;
+    let fault = json!({
+        "schema": "astrolabe-watcher-root-fault-v1",
+        "status": "root_identity_refused",
+        "fault_code": fault_code,
+        "project": registration.project,
+        "registered_root": registration.root,
+        "first_observed_unix_ms": first_observed_unix_ms,
+        "last_observed_unix_ms": last_observed_unix_ms,
+        "observation_count": observation_count,
+        "root_missing_grace_ms": grace_ms,
+        "observation": observation,
+        "observation_sha256": observation_sha256,
+        "prior_publication": prior_publication,
+        "prior_publication_sha256": prior_publication_sha256,
+        "freshness": "stale",
+        "trust": "verified",
+        "artifacts_preserved": true,
+        "automatic_deletion_authorized": false,
+        "remediation": remediation,
+    });
+    let status = json!({
+        "schema": "astrolabe-watcher-tick-v3",
+        "status": "root_identity_refused",
+        "project": registration.project,
+        "root": registration.root,
+        "fault_code": fault_code,
+        "observation_sha256": observation_sha256,
+        "prior_publication_sha256": prior_publication_sha256,
+        "freshness": "stale",
+        "trust": "verified",
+        "worker_started": false,
+        "artifacts_preserved": true,
+        "remediation": remediation,
+    });
+    persist_root_fault_and_status_atomic(cache_dir, registration, &fault, &status)?;
+    Ok(true)
 }
 
 fn registration_recovery_disposition(
@@ -1025,13 +1454,50 @@ fn poll_incremental_watcher(watcher: &mut CbmWatcher) {
 }
 
 fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistration>, DynError> {
-    let mut registrations = Vec::new();
+    #[derive(Default)]
+    struct RegistrationRows {
+        root: Option<String>,
+        root_identity_raw: Option<String>,
+        root_missing_grace_ms_raw: Option<String>,
+        root_fault_raw: Option<String>,
+    }
+
+    let mut rows_by_project = BTreeMap::<String, RegistrationRows>::new();
     let source_root_suffix = format!(".{GIT_SOURCE_REPO_PATH_KEY}");
-    for (key, root) in scan_config_prefix(cache_dir, CONFIG_KEY_PREFIX)? {
-        if !key.ends_with(&source_root_suffix) {
+    let root_identity_suffix = format!(".{GIT_SOURCE_ROOT_IDENTITY_KEY}");
+    let root_grace_suffix = format!(".{WATCHER_ROOT_MISSING_GRACE_MS_KNOB}");
+    let root_fault_suffix = format!(".{WATCHER_ROOT_FAULT_STATUS_KEY}");
+    for (key, value) in scan_config_prefix(cache_dir, CONFIG_KEY_PREFIX)? {
+        let (field, suffix) = if key.ends_with(&source_root_suffix) {
+            (GIT_SOURCE_REPO_PATH_KEY, &source_root_suffix)
+        } else if key.ends_with(&root_identity_suffix) {
+            (GIT_SOURCE_ROOT_IDENTITY_KEY, &root_identity_suffix)
+        } else if key.ends_with(&root_grace_suffix) {
+            (WATCHER_ROOT_MISSING_GRACE_MS_KNOB, &root_grace_suffix)
+        } else if key.ends_with(&root_fault_suffix) {
+            (WATCHER_ROOT_FAULT_STATUS_KEY, &root_fault_suffix)
+        } else {
             continue;
+        };
+        let Some(project) = project_from_metadata_key(&key, field) else {
+            return Err(format!(
+                "ASTRO_WATCHER_REGISTRATION_KEY_INVALID: config key {key:?} ends with {suffix:?} but has no valid project identity; remediation: preserve the config store and repair the malformed row"
+            )
+            .into());
+        };
+        let rows = rows_by_project.entry(project).or_default();
+        match field {
+            GIT_SOURCE_REPO_PATH_KEY => rows.root = Some(value),
+            GIT_SOURCE_ROOT_IDENTITY_KEY => rows.root_identity_raw = Some(value),
+            WATCHER_ROOT_MISSING_GRACE_MS_KNOB => rows.root_missing_grace_ms_raw = Some(value),
+            WATCHER_ROOT_FAULT_STATUS_KEY => rows.root_fault_raw = Some(value),
+            _ => unreachable!("registration field classified above"),
         }
-        let Some(project) = project_from_metadata_key(&key, GIT_SOURCE_REPO_PATH_KEY) else {
+    }
+
+    let mut registrations = Vec::new();
+    for (project, rows) in rows_by_project {
+        let Some(root) = rows.root else {
             continue;
         };
         // Registration identity is the atomically published Git source root,
@@ -1058,7 +1524,13 @@ fn discover_watch_registrations(cache_dir: &Path) -> Result<Vec<WatchRegistratio
         if ownership.get("single_owner").and_then(Value::as_bool) != Some(true) {
             continue;
         }
-        registrations.push(WatchRegistration { project, root });
+        registrations.push(WatchRegistration {
+            project,
+            root,
+            root_identity_raw: rows.root_identity_raw,
+            root_missing_grace_ms_raw: rows.root_missing_grace_ms_raw,
+            root_fault_raw: rows.root_fault_raw,
+        });
     }
     Ok(registrations)
 }
@@ -2464,6 +2936,152 @@ fn persist_watcher_status_transition(
         .into());
     }
     Ok(true)
+}
+
+fn persist_root_fault_and_status_atomic(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    fault: &Value,
+    status: &Value,
+) -> Result<(), DynError> {
+    let root_key = metadata_key(&registration.project, WATCHER_ROOT_FAULT_STATUS_KEY);
+    let status_key = metadata_key(&registration.project, WATCHER_TICK_STATUS_KEY);
+    let fault_json = serde_json::to_string(fault)?;
+    let status_json = serde_json::to_string(status)?;
+    let mut connection = open_config(cache_dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current_root_fault = transaction
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![root_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current_root_fault.as_deref() != registration.root_fault_raw.as_deref() {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_PREIMAGE_CHANGED: project {:?} root fault changed between registration scan and atomic publication; remediation: preserve both observations and retry from a fresh config snapshot",
+            registration.project,
+        )
+        .into());
+    }
+    for (key, value) in [(&root_key, &fault_json), (&status_key, &status_json)] {
+        transaction.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        let readback = transaction.query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )?;
+        if readback != *value {
+            return Err(format!(
+                "ASTRO_WATCHER_ROOT_FAULT_TRANSACTION_READBACK_MISMATCH: key {key:?} did not equal its exact candidate inside the transaction; remediation: roll back and inspect the config database"
+            )
+            .into());
+        }
+    }
+    transaction.commit()?;
+    let readback = read_config_values(cache_dir, &[root_key.clone(), status_key.clone()])?;
+    if readback != vec![Some(fault_json), Some(status_json)] {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_COMMIT_READBACK_MISMATCH: project {:?} atomic root-fault/status rows did not read back exactly; remediation: preserve the config database and inspect its WAL before serving the project",
+            registration.project,
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn clear_resolved_root_fault(
+    cache_dir: &Path,
+    registration: &WatchRegistration,
+    prior_fault: &Value,
+    catch_up: Option<&Value>,
+) -> Result<(), DynError> {
+    let expected_identity = registration
+        .root_identity_raw
+        .as_deref()
+        .ok_or_else(|| -> DynError {
+            "ASTRO_WATCHER_ROOT_RESTORE_IDENTITY_MISSING: exact-root recovery has no persisted identity".into()
+        })
+        .and_then(parse_root_identity)?;
+    let status = catch_up.cloned().unwrap_or_else(|| {
+        json!({
+            "schema": "astrolabe-watcher-tick-v3",
+            "status": "root_restored_unchanged",
+            "project": registration.project,
+            "root": registration.root,
+            "root_identity": expected_identity,
+            "prior_fault_code": prior_fault.get("fault_code"),
+            "prior_observation_sha256": prior_fault.get("observation_sha256"),
+            "freshness": "fresh",
+            "trust": "verified",
+            "worker_started": false,
+            "index_work_performed": false,
+            "artifacts_preserved": true,
+        })
+    });
+    let status_json = serde_json::to_string(&status)?;
+    let root_key = metadata_key(&registration.project, WATCHER_ROOT_FAULT_STATUS_KEY);
+    let status_key = metadata_key(&registration.project, WATCHER_TICK_STATUS_KEY);
+    let mut connection = open_config(cache_dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current_raw = transaction
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![root_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| -> DynError {
+            "ASTRO_WATCHER_ROOT_FAULT_CLEAR_PREIMAGE_ABSENT: root fault disappeared before exact-root recovery committed; remediation: preserve the config database and retry from a fresh observation".into()
+        })?;
+    let current = parse_root_fault(&current_raw, registration)?;
+    if &current != prior_fault {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_CLEAR_PREIMAGE_CHANGED: project {:?} root fault changed before exact-root recovery committed; remediation: preserve both observations and retry from a fresh config snapshot",
+            registration.project,
+        )
+        .into());
+    }
+    transaction.execute("DELETE FROM config WHERE key = ?1", params![root_key])?;
+    if transaction
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![root_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(
+            "ASTRO_WATCHER_ROOT_FAULT_CLEAR_TRANSACTION_MISMATCH: root fault remained inside its delete transaction; remediation: roll back and inspect the config database"
+                .into(),
+        );
+    }
+    transaction.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+        params![status_key, status_json],
+    )?;
+    transaction.commit()?;
+    let readback = read_config_values(cache_dir, &[root_key, status_key])?;
+    if readback != vec![None, Some(status_json)] {
+        return Err(format!(
+            "ASTRO_WATCHER_ROOT_FAULT_CLEAR_COMMIT_MISMATCH: project {:?} exact-root recovery did not read back fault-absent/status-present; remediation: preserve the config database and inspect its WAL",
+            registration.project,
+        )
+        .into());
+    }
+    tracing::info!(
+        project = %registration.project,
+        root = %registration.root,
+        catch_up_scheduled = catch_up.is_some(),
+        "incremental_watcher.root_fault_cleared"
+    );
+    Ok(())
 }
 
 fn delete_watcher_fault(cache_dir: &Path, key: &str) -> Result<(), DynError> {

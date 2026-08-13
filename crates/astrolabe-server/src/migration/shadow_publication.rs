@@ -1599,6 +1599,15 @@ fn action_metadata_candidate_rows(
             publication_generation.to_string(),
         ),
         (
+            metadata_key(project, GIT_SOURCE_ROOT_IDENTITY_KEY),
+            outcome
+                .git_source_root_identity
+                .as_ref()
+                .map(WindowsRootIdentity::record_json)
+                .transpose()?
+                .unwrap_or_default(),
+        ),
+        (
             metadata_key(project, "search_scale_json"),
             serde_json::to_string(&outcome.search_scale)?,
         ),
@@ -1624,6 +1633,7 @@ fn action_metadata_keys(project: &str) -> Vec<String> {
         metadata_key(project, SHADOW_INDEX_ARGS_KEY),
         metadata_key(project, SHADOW_INDEX_ADMISSION_IDENTITY_KEY),
         metadata_key(project, SHADOW_INDEX_ADMISSION_PUBLICATION_GENERATION_KEY),
+        metadata_key(project, GIT_SOURCE_ROOT_IDENTITY_KEY),
         metadata_key(project, "search_scale_json"),
         metadata_key(project, "skill_tree_json"),
     ];

@@ -21,7 +21,7 @@ _Static_assert(CBM_ASTRO_STORE_PATH_CAP == CBM_SZ_1K,
                "CBM_ASTRO_STORE_PATH_CAP must equal the CBM_SZ_1K result buffer that "
                "cbm_resolve_cache_dir() and cbm_get_home_dir() publish");
 
-/* Longest environment variable name CBM reads is CBM_WATCHER_PRUNE_GRACE_S (25
+/* Longest environment variable name CBM reads is CBM_UI_MAX_RENDER_NODES (23
  * bytes); 64 leaves headroom without a heap allocation on a refusal path. */
 #define CBM_ASTRO_ENV_NAME_CAP 64
 /* A remediation names the variable and the two byte counts; 512 holds the

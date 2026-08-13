@@ -1620,7 +1620,7 @@ watcher detects (HEAD move / dirty tree, adaptive 5â€“60s poll)
     lowered SQLite artifact refresh (debounced), pack caches invalidated by scope
 ```
 
-Key inherited mechanics, unchanged: CBM's mtime+size classification, deleted-vs-mode-skipped distinction, inbound-edge snapshot keyed by QN (survives re-parse), incremental parallel threshold (>50 files), watcher stale-root pruning, pipeline global lock with watcher try-lock/skip. Key Calyx mechanics: content-address idempotency (unchanged symbols are free), MVCC (readers never blocked by the writer), lazy backfill queues for new lenses.
+Key inherited mechanics, unchanged: CBM's mtime+size classification, deleted-vs-mode-skipped distinction, inbound-edge snapshot keyed by QN (survives re-parse), incremental parallel threshold (>50 files), pipeline global lock with watcher try-lock/skip. Design correction (#960): stale-root pruning is retired because a path-absence observation cannot authorize deletion of one member of a multi-artifact generation. Index publication atomically records the Windows volume serial + 128-bit file ID + final handle path of the source directory; the server-owned watcher validates that identity before C admission, publishes a durable preserving fault after the registry-declared grace window, refuses replacement/unevaluable identities, and clears the fault only when the exact directory object returns. Key Calyx mechanics: content-address idempotency (unchanged symbols are free), MVCC (readers never blocked by the writer), lazy backfill queues for new lenses.
 
 ## 2. Versioning semantics on change
 

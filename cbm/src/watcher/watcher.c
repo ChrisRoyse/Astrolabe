@@ -46,8 +46,6 @@ typedef struct {
     char source_sha256[CBM_SHA256_HEX_LEN + 1]; /* last successfully indexed Git source state */
     bool is_git;                                  /* false → skip polling */
     bool baseline_done;                           /* true after first poll */
-    int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
-    uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
@@ -78,14 +76,6 @@ struct cbm_watcher {
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
-
-/* Stale-root pruning (#286): a watched project whose root directory stays
- * missing is pruned — its cached DB is deleted and the watch entry removed.
- * Deletion is destructive (the DB can hold user-authored data such as the
- * ADR), so it requires BOTH a streak of consecutive missing polls AND a
- * sustained-absence grace window measured from the streak's first miss. */
-#define MISSING_ROOT_DELETE_AFTER 3
-#define PRUNE_GRACE_DEFAULT_S 600 /* 10 min; override: CBM_WATCHER_PRUNE_GRACE_S */
 
 /* Sleep chunk for responsive shutdown (ms) */
 #define SLEEP_CHUNK_MS 500
@@ -485,86 +475,6 @@ static bool defer_state_free(cbm_watcher_t *w, project_state_t *s) {
     return true;
 }
 
-/* ── Stale-root pruning (#286) ──────────────────────────────────── */
-
-bool cbm_watcher_root_missing_errno(int err) {
-    /* Only ENOENT/ENOTDIR mean the root itself is gone. Anything else
-     * (EACCES, EIO, ELOOP, a transient network mount, macOS TCC permission
-     * revocation) is uncertainty: the directory may still exist even though
-     * we cannot see it right now — never treat it as a deletion signal.
-     * Windows (mingw/UCRT) maps ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
-     * to ENOENT, so the same check holds there (same convention as
-     * find_deleted_files in pipeline_incremental.c). */
-    return err == ENOENT || err == ENOTDIR;
-}
-
-typedef enum {
-    ROOT_PRESENT = 0, /* stat succeeded and the root is a directory */
-    ROOT_MISSING,     /* genuinely gone: ENOENT/ENOTDIR (or replaced by a non-directory) */
-    ROOT_UNCERTAIN,   /* any other stat failure — must NOT count toward pruning */
-} root_status_t;
-
-static root_status_t root_status(const char *root_path, int *out_errno) {
-    *out_errno = 0;
-    if (!root_path) {
-        return ROOT_UNCERTAIN;
-    }
-    struct stat st;
-    if (stat(root_path, &st) == 0) {
-        /* Exists but is no longer a directory → the root directory is gone. */
-        return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
-    }
-    *out_errno = errno;
-    return cbm_watcher_root_missing_errno(errno) ? ROOT_MISSING : ROOT_UNCERTAIN;
-}
-
-/* Sustained-absence window (seconds) before a missing root may be pruned.
- * Generous default: 10 minutes. Override with CBM_WATCHER_PRUNE_GRACE_S
- * (>= 0; 0 prunes as soon as the missing-poll streak is reached). Read on
- * each call so tests/operators can adjust via setenv without a restart —
- * same convention as cbm_max_file_bytes in limits.c. */
-static long prune_grace_s(void) {
-    const char *raw = getenv("CBM_WATCHER_PRUNE_GRACE_S");
-    if (raw && raw[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(raw, &end, 10);
-        if (errno == 0 && end != raw && *end == '\0' && v >= 0) {
-            return v;
-        }
-        /* Unparseable / negative → fall through to the safe default. */
-    }
-    return PRUNE_GRACE_DEFAULT_S;
-}
-
-/* Format int to string for logging (poll thread only, one use per call). */
-static const char *itoa_buf(int v) {
-    static CBM_TLS char buf[CBM_SZ_32];
-    snprintf(buf, sizeof(buf), "%d", v);
-    return buf;
-}
-
-static void delete_cached_project_db(const char *project_name) {
-    if (!cbm_validate_project_name(project_name)) {
-        return;
-    }
-
-    const char *cache_dir = cbm_resolve_cache_dir();
-    if (!cache_dir) {
-        return;
-    }
-
-    char path[CBM_SZ_1K];
-    char wal[CBM_SZ_1K];
-    char shm[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project_name);
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
-    (void)cbm_unlink(path);
-    (void)cbm_unlink(wal);
-    (void)cbm_unlink(shm);
-}
-
 /* Hash table foreach callback to free state entries */
 static void free_state_entry(const char *key, void *val, void *ud) {
     (void)key;
@@ -776,76 +686,12 @@ typedef struct {
     int reindexed;
 } poll_ctx_t;
 
-static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
-    if (!w || !s || !s->project_name) {
-        return;
-    }
-
-    char project_name[CBM_SZ_1K];
-    snprintf(project_name, sizeof(project_name), "%s", s->project_name);
-
-    bool removed = false;
-    cbm_mutex_lock(&w->projects_lock);
-    project_state_t *current = cbm_ht_get(w->projects, project_name);
-    /* Deferred free (same discipline as cbm_watcher_unwatch): this state
-     * is referenced by the poll_once snapshot iterating us. On OOM the
-     * watch stays registered and pruning retries on the next cycle. */
-    if (current == s && defer_state_free(w, s)) {
-        delete_cached_project_db(project_name);
-        cbm_ht_delete(w->projects, project_name);
-        removed = true;
-    }
-    cbm_mutex_unlock(&w->projects_lock);
-
-    if (removed) {
-        cbm_log_info("watcher.root_pruned", "project", project_name);
-    }
-}
-
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
     project_state_t *s = val;
     if (!s) {
         return;
-    }
-
-    /* Stale-root pruning (#286): classify the root BEFORE the baseline /
-     * is_git / interval gates so vanished roots are noticed even for
-     * non-git projects and regardless of adaptive backoff. */
-    int stat_errno = 0;
-    root_status_t rs = root_status(s->root_path, &stat_errno);
-    if (rs == ROOT_UNCERTAIN) {
-        /* EACCES / EIO / network blip / TCC revocation — the root may still
-         * exist. Never count toward pruning; restart the streak so only an
-         * uninterrupted run of genuine ENOENT/ENOTDIR observations can
-         * delete user data. */
-        if (s->missing_root_count > 0) {
-            s->missing_root_count = 0;
-            s->first_missing_ms = 0;
-        }
-        cbm_log_warn("watcher.root_stat_error", "project", s->project_name, "path", s->root_path,
-                     "errno", itoa_buf(stat_errno));
-        return;
-    }
-    if (rs == ROOT_MISSING) {
-        uint64_t now_ms = cbm_now_ms();
-        if (s->missing_root_count == 0) {
-            s->first_missing_ms = now_ms;
-        }
-        s->missing_root_count++;
-        cbm_log_warn("watcher.root_missing", "project", s->project_name, "path", s->root_path,
-                     "polls", itoa_buf(s->missing_root_count));
-        if (s->missing_root_count >= MISSING_ROOT_DELETE_AFTER &&
-            now_ms - s->first_missing_ms >= (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC) {
-            prune_missing_project(ctx->w, s);
-        }
-        return;
-    }
-    if (s->missing_root_count > 0) {
-        cbm_log_info("watcher.root_restored", "project", s->project_name, "path", s->root_path);
-        s->missing_root_count = 0;
-        s->first_missing_ms = 0;
     }
 
     /* Initialize baseline on first poll */

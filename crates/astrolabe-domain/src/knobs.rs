@@ -362,15 +362,18 @@ pub fn lower_debounce_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     LOWER_DEBOUNCE_KNOBS.iter().find(|knob| knob.name == name)
 }
 
-/// Registry version for the shipping incremental watcher cadence and retry budget
-/// (#23, #1083).
-pub const WATCHER_KNOB_REGISTRY_VERSION: &str = "astrolabe-watcher-knobs-v2";
+/// Registry version for the shipping incremental watcher cadence, retry budget,
+/// and missing-root observation window (#23, #960, #1083).
+pub const WATCHER_KNOB_REGISTRY_VERSION: &str = "astrolabe-watcher-knobs-v3";
 /// Name of the server-owned Git watcher poll-cadence knob.
 pub const WATCHER_POLL_INTERVAL_MS_KNOB: &str = "watcher_poll_interval_ms";
 /// Name of the maximum number of worker attempts admitted for one unchanged,
 /// explicitly retryable watcher observation.
 pub const WATCHER_TRANSIENT_MAX_ATTEMPTS_KNOB: &str =
     "watcher_transient_max_attempts_per_observation";
+/// Name of the project-scoped sustained-absence window. The watcher treats
+/// absence as an observation and never as deletion authority.
+pub const WATCHER_ROOT_MISSING_GRACE_MS_KNOB: &str = "watcher_root_missing_grace_ms";
 /// Default watcher cadence. This reserves 95% of the five-second convergence
 /// budget for extraction, ingest, weave, and lowering instead of spending the
 /// entire budget waiting to notice the change.
@@ -391,6 +394,13 @@ pub const WATCHER_MIN_TRANSIENT_MAX_ATTEMPTS: u64 = 1;
 /// The hard five-second coordination budget at the fastest legal watcher cadence.
 pub const WATCHER_MAX_TRANSIENT_MAX_ATTEMPTS: u64 =
     PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS / WATCHER_MIN_POLL_INTERVAL_MS;
+/// Compatibility default for the pre-#960 ten-minute missing-root window.
+pub const WATCHER_DEFAULT_ROOT_MISSING_GRACE_MS: u64 = 600_000;
+/// A persisted observation must span at least one shipping watcher cadence.
+pub const WATCHER_MIN_ROOT_MISSING_GRACE_MS: u64 = WATCHER_DEFAULT_POLL_INTERVAL_MS;
+/// Bound accidental indefinite stale-state delay while leaving room for slow
+/// removable/network volumes. This is policy only; no artifact is ever deleted.
+pub const WATCHER_MAX_ROOT_MISSING_GRACE_MS: u64 = 3_600_000;
 /// Bounded writer-admission window for cooperative resident SQLite closure.
 pub const PROJECT_TRANSITION_QUIESCENCE_TIMEOUT_MS: u64 = 5_000;
 
@@ -425,6 +435,16 @@ pub const WATCHER_KNOBS: &[U64KnobDeclaration] = &[
         unit: "worker attempts per unchanged observation",
         source: "ASTROLABE #1083 closed retry authority, bounded by the existing #753 five-second resident coordination window",
         rationale: "only exact registered transient codes consume this budget; twenty 250ms observations span the complete resident coordination window, after which the exact unchanged failure is durably parked instead of amplifying workers, logs, and config WAL forever; replace with a measured per-code condition signal when one is available",
+    },
+    U64KnobDeclaration {
+        registry_version: WATCHER_KNOB_REGISTRY_VERSION,
+        name: WATCHER_ROOT_MISSING_GRACE_MS_KNOB,
+        default: WATCHER_DEFAULT_ROOT_MISSING_GRACE_MS,
+        min: WATCHER_MIN_ROOT_MISSING_GRACE_MS,
+        max: WATCHER_MAX_ROOT_MISSING_GRACE_MS,
+        unit: "milliseconds of continuous exact-root absence",
+        source: "ASTROLABE #960 compatibility with the retired ten-minute C prune window; this value controls durable fault publication only and never deletion",
+        rationale: "a short transient move or mount interruption must not publish a durable root-missing fault, while a sustained absence must become explicit stale state; the project-scoped value is parsed strictly and bounded, and a malformed value refuses instead of silently selecting a default",
     },
 ];
 

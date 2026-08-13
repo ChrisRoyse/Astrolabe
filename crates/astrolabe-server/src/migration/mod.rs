@@ -144,6 +144,9 @@ use provenance::*;
 mod shadow_watermark;
 use shadow_watermark::*;
 
+mod root_identity;
+use root_identity::*;
+
 mod shadow_import;
 use shadow_import::*;
 pub(crate) use shadow_import::{

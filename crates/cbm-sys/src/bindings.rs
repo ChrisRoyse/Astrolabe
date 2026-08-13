@@ -4470,9 +4470,6 @@ unsafe extern "C" {
     -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-    pub fn cbm_watcher_root_missing_errno(err: ::std::os::raw::c_int) -> bool;
-}
-unsafe extern "C" {
     pub fn cbm_cli_set_version(ver: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {

@@ -47,6 +47,135 @@ pub fn parent_roots() -> (&'static str, &'static str) {
     )
 }
 
+/// Stable Windows identity of one open directory object.
+///
+/// The server is deliberately `forbid(unsafe_code)`. This bridge already owns
+/// the process's native/FFI boundary, so the Win32 handle calls live here and
+/// callers receive a fully owned, safe value.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WindowsDirectoryIdentity {
+    pub volume_serial: u64,
+    pub file_id_128: [u8; 16],
+    pub final_handle_path: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WindowsDirectoryIdentityError {
+    pub step: &'static str,
+    pub raw_os_error: Option<i32>,
+    pub message: String,
+}
+
+impl fmt::Display for WindowsDirectoryIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "root identity step {:?} failed: {} (raw_os_error={:?})",
+            self.step, self.message, self.raw_os_error
+        )
+    }
+}
+
+impl Error for WindowsDirectoryIdentityError {}
+
+#[cfg(windows)]
+pub fn capture_windows_directory_identity(
+    path: &Path,
+) -> Result<WindowsDirectoryIdentity, WindowsDirectoryIdentityError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let failure = |step, error: std::io::Error| WindowsDirectoryIdentityError {
+        step,
+        raw_os_error: error.raw_os_error(),
+        message: format!("{}: {error}", path.display()),
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| failure("open_directory", error))?;
+    if !file
+        .metadata()
+        .map_err(|error| failure("directory_metadata", error))?
+        .is_dir()
+    {
+        return Err(failure(
+            "directory_kind",
+            std::io::Error::other("the registered root path is not a directory"),
+        ));
+    }
+
+    let handle = file.as_raw_handle();
+    let mut file_id = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a live directory handle; `file_id` is a correctly
+    // sized writable FILE_ID_INFO buffer and no borrowed value escapes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut file_id).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO fits u32"),
+        )
+    } == 0
+    {
+        return Err(failure("file_id_info", std::io::Error::last_os_error()));
+    }
+
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    // SAFETY: a null/zero buffer is the documented size query for this live
+    // handle and does not dereference the null pointer.
+    let required = unsafe { GetFinalPathNameByHandleW(handle, ptr::null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(failure("final_path_size", std::io::Error::last_os_error()));
+    }
+    let mut buffer = vec![0u16; required as usize + 1];
+    let capacity = u32::try_from(buffer.len()).map_err(|_| {
+        failure(
+            "final_path_capacity",
+            std::io::Error::other("final path buffer exceeds u32"),
+        )
+    })?;
+    // SAFETY: `buffer` is writable for `capacity` UTF-16 units and the owned
+    // directory handle remains live through the call.
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), capacity, flags) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(failure("final_path_read", std::io::Error::last_os_error()));
+    }
+    let final_handle_path = String::from_utf16(&buffer[..written as usize]).map_err(|error| {
+        failure(
+            "final_path_utf16",
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })?;
+    Ok(WindowsDirectoryIdentity {
+        volume_serial: file_id.VolumeSerialNumber,
+        file_id_128: file_id.FileId.Identifier,
+        final_handle_path,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn capture_windows_directory_identity(
+    path: &Path,
+) -> Result<WindowsDirectoryIdentity, WindowsDirectoryIdentityError> {
+    Err(WindowsDirectoryIdentityError {
+        step: "platform",
+        raw_os_error: None,
+        message: format!(
+            "{}: Windows root identity is unavailable outside the native Windows target",
+            path.display()
+        ),
+    })
+}
+
 /// Byte capacity of a CBM store path.
 ///
 /// `cbm_resolve_cache_dir` and `cbm_get_home_dir`
@@ -4947,11 +5076,6 @@ impl CbmWatcher {
     pub fn poll_interval_ms(file_count: i32) -> i32 {
         // SAFETY: pure CBM helper with no pointer inputs.
         unsafe { cbm_sys::cbm_watcher_poll_interval_ms(file_count) }
-    }
-
-    pub fn root_missing_errno(errno: i32) -> bool {
-        // SAFETY: pure CBM helper with no pointer inputs.
-        unsafe { cbm_sys::cbm_watcher_root_missing_errno(errno) }
     }
 
     fn raw_watch_count(&self) -> i32 {
