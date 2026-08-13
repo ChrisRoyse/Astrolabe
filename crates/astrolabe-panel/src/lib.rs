@@ -65,6 +65,8 @@ pub const PANEL_SCHEMA_ID_V4: &str = "astro.panel.v4";
 pub const PANEL_SCHEMA_ID_V5: &str = "astro.panel.v5";
 /// Panel schema id emitted by the v6 routing-context-complete semantic roster.
 pub const PANEL_SCHEMA_ID_V6: &str = "astro.panel.v6";
+/// Panel schema id emitted by the v7 runtime-module-complete semantic roster.
+pub const PANEL_SCHEMA_ID_V7: &str = "astro.panel.v7";
 /// First Astrolabe panel version.
 pub const DEFAULT_PANEL_VERSION: u32 = 1;
 /// Second Astrolabe panel version — adds the S23 `layer_role` frozen slot (#180a).
@@ -77,8 +79,10 @@ pub const PANEL_V4_VERSION: u32 = 4;
 pub const PANEL_V5_VERSION: u32 = 5;
 /// Sixth Astrolabe panel version — typed broker and transport atom coverage.
 pub const PANEL_V6_VERSION: u32 = 6;
+/// Seventh Astrolabe panel version — typed runtime-module request atom coverage.
+pub const PANEL_V7_VERSION: u32 = 7;
 /// Current exhaustive code-memory panel version.
-pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V6_VERSION;
+pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V7_VERSION;
 /// Frozen seed registry schema identifier.
 pub const ASTRO_SEED_REGISTRY_SCHEMA: &str = "astro.seed_registry.v1";
 /// Frozen seed registry artifact kind.
@@ -835,6 +839,14 @@ pub static PANEL_V5_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
 /// byte-identical; S196-S199 add exact broker and transport measurements.
 pub static PANEL_V6_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
     let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
+    slots.extend(semantic::SEMANTIC_SLOT_SPECS_V6.iter().copied());
+    slots
+});
+
+/// Frozen v7 slot roster. Existing physical slot specifications stay
+/// byte-identical; S200-S204 add exact runtime-module request measurements.
+pub static PANEL_V7_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
     slots.extend(semantic::SEMANTIC_SLOT_SPECS.iter().copied());
     slots
 });
@@ -869,6 +881,11 @@ pub fn default_panel_v6_slots() -> &'static [PanelSlotSpec] {
     &PANEL_V6_SLOTS
 }
 
+/// Returns the frozen v7 roster including runtime-module request atoms.
+pub fn default_panel_v7_slots() -> &'static [PanelSlotSpec] {
+    &PANEL_V7_SLOTS
+}
+
 /// Returns the frozen slot roster for a panel roster version.
 ///
 /// Fails closed for a version that has no frozen roster rather than silently
@@ -881,10 +898,11 @@ pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> 
         PANEL_V4_VERSION => Ok(&PANEL_V4_SLOTS),
         PANEL_V5_VERSION => Ok(&PANEL_V5_SLOTS),
         PANEL_V6_VERSION => Ok(&PANEL_V6_SLOTS),
+        PANEL_V7_VERSION => Ok(&PANEL_V7_SLOTS),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen slot roster"),
-            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 or 4 (S0-S185), 5 (S0-S195), or 6 (S0-S199).",
+            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 or 4 (S0-S185), 5 (S0-S195), 6 (S0-S199), or 7 (S0-S204).",
         )),
     }
 }
@@ -898,10 +916,11 @@ pub fn schema_id_for_version(version: u32) -> PanelResult<&'static str> {
         PANEL_V4_VERSION => Ok(PANEL_SCHEMA_ID_V4),
         PANEL_V5_VERSION => Ok(PANEL_SCHEMA_ID_V5),
         PANEL_V6_VERSION => Ok(PANEL_SCHEMA_ID_V6),
+        PANEL_V7_VERSION => Ok(PANEL_SCHEMA_ID_V7),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen schema id"),
-            "Measure with panel version 1, 2, 3, 4, 5, or 6.",
+            "Measure with panel version 1, 2, 3, 4, 5, 6, or 7.",
         )),
     }
 }
@@ -963,7 +982,7 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
 /// Older rosters are byte-identical prefixes, so their consumers see the same
 /// physical slot specification while later semantic slots additionally resolve.
 pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
-    PANEL_V6_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
+    PANEL_V7_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
 }
 
 /// Returns the default frozen contracts for every v1 slot.
@@ -1305,7 +1324,7 @@ fn absent_reason_label(reason: &AbsentReason) -> String {
 /// space; this bridges a gated lens key to its frozen [`SlotId`] so a per-repo
 /// admission set can be applied to a readout without touching the frozen roster.
 pub fn slot_spec_by_key(key: &str) -> Option<&'static PanelSlotSpec> {
-    PANEL_V6_SLOTS.iter().find(|slot| slot.key == key)
+    PANEL_V7_SLOTS.iter().find(|slot| slot.key == key)
 }
 
 impl PanelReadout {

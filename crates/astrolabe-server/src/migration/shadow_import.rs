@@ -815,7 +815,7 @@ pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::CURRENT_SEMANTIC_P
 /// substrate carries no token-multi source, so it stays a labeled `LensUnavailable`
 /// absence rather than a measured row). S23 (`layer_role`) IS included so the
 /// directory-role layout frames can be built (#336). Applicability is still enforced
-/// per class by the panel driver, while S24-S199 are dispatched only from exact
+/// per class by the panel driver, while S24-S204 are dispatched only from exact
 /// typed semantic source values.
 pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
     astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)
