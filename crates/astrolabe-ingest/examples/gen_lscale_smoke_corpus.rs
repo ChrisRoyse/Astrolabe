@@ -15,6 +15,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
 
 use rusqlite::{Connection, params};
@@ -24,6 +25,19 @@ const DEFAULT_NODE_COUNT: usize = 400;
 const DEFAULT_SEED: u64 = 20_260_711;
 const PROJECT: &str = "astrolabe-lscale-smoke";
 const VECTOR_DIMS: usize = 768;
+
+fn sqlite_count(field: &str, value: usize) -> Result<i64, Box<dyn Error>> {
+    i64::try_from(value).map_err(|_| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "ASTRO_LSCALE_COUNT_OUT_OF_RANGE: {field} value {value} exceeds SQLite INTEGER maximum {}; remediation: lower node-count or partition the corpus before generation",
+                i64::MAX
+            ),
+        )
+        .into()
+    })
+}
 
 /// SplitMix64: tiny, dependency-free, deterministic PRNG. Statistical quality
 /// is irrelevant here; only cross-run/cross-platform byte determinism matters.
@@ -246,9 +260,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if node_count < 3 {
         return Err("node-count must be >= 3 (one folder plus two semantic symbols)".into());
     }
+    // This one checked boundary makes the subsequent node-id derivations safe:
+    // every generated index, folder id, and vector count is bounded by node_count.
+    let node_count_sqlite = sqlite_count("node_count", node_count)?;
 
     let (nodes, edges) = build_rows(node_count, seed);
     let hash = content_sha256(&nodes, &edges);
+    let vector_count = nodes.iter().filter(|node| node.vector.is_some()).count();
+    let vector_count_sqlite = sqlite_count("node_vector_count", vector_count)?;
 
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
@@ -324,7 +343,6 @@ fn main() -> Result<(), Box<dyn Error>> {
          );",
     )?;
     let tx = connection.transaction()?;
-    let vector_count = nodes.iter().filter(|node| node.vector.is_some()).count();
     tx.execute(
         "INSERT INTO projects(name, indexed_at, root_path, index_mode, semantic_state, semantic_vector_dimension, semantic_eligible_node_count, node_vector_count, token_vector_count)
          VALUES (?1, ?2, ?3, 'full', 'available', 768, ?4, ?4, 1)",
@@ -332,7 +350,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             PROJECT,
             "1970-01-01T00:00:00Z",
             "/pinned/lscale-smoke",
-            vector_count,
+            vector_count_sqlite,
         ],
     )?;
     for node in &nodes {
@@ -383,9 +401,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             "schema": "astrolabe-lscale-smoke-corpus-v1",
             "path": out.display().to_string(),
             "project": PROJECT,
-            "node_count": nodes.len(),
+            "node_count": node_count_sqlite,
             "edge_count": edges.len(),
-            "vector_count": nodes.iter().filter(|node| node.vector.is_some()).count(),
+            "vector_count": vector_count_sqlite,
             "seed": seed,
             "content_sha256": hash,
         })
