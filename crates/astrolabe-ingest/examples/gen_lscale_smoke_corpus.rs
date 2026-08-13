@@ -257,8 +257,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(DEFAULT_SEED);
-    if node_count < 3 {
-        return Err("node-count must be >= 3 (one folder plus two semantic symbols)".into());
+    if node_count < 4 {
+        return Err(
+            "node-count must be >= 4 (one folder plus three semantic symbols, including at least two vector-eligible functions)"
+                .into(),
+        );
     }
     // This one checked boundary makes the subsequent node-id derivations safe:
     // every generated index, folder id, and vector count is bounded by node_count.
