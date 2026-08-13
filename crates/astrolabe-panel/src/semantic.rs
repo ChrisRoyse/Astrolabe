@@ -28,8 +28,9 @@ pub const SEMANTIC_PRESENCE_DIM: u32 = 256;
 pub const SEMANTIC_HASH_DIM: u32 = 65_536;
 /// Versioned semantic registry schema used by the frozen panel-v3/v4 prefix.
 pub const SEMANTIC_REGISTRY_SCHEMA: &str = "astro.cbm.semantic-registry.v1";
-/// Registry schema for panel v5, which appends typed content-defect atoms and
-/// gives each value lens an identity independent of unrelated future additions.
+/// Registry schema for panel v5 and later. It gives each value lens an identity
+/// independent of unrelated future additions while each frozen panel keeps its
+/// exact ordered registry prefix.
 pub const SEMANTIC_REGISTRY_SCHEMA_V2: &str = "astro.cbm.semantic-registry.v2";
 /// Stable algorithm identity for exact structured encoders.
 pub const SEMANTIC_ENCODER_ID: &str = "astro.cbm.semantic-encoders.v1";
@@ -1657,14 +1658,54 @@ pub const SEMANTIC_RULES: &[SemanticRule] = &[
         Category,
         "sem.edge.outcome_class"
     ),
+    rule!(
+        165,
+        196,
+        Node,
+        "properties.broker",
+        Text,
+        Category,
+        "sem.node.broker"
+    ),
+    rule!(
+        166,
+        197,
+        Node,
+        "properties.transport",
+        Text,
+        Category,
+        "sem.node.transport"
+    ),
+    rule!(
+        167,
+        198,
+        Edge,
+        "properties.broker",
+        Text,
+        Category,
+        "sem.edge.broker"
+    ),
+    rule!(
+        168,
+        199,
+        Edge,
+        "properties.transport",
+        Text,
+        Category,
+        "sem.edge.transport"
+    ),
 ];
 
 /// Number of rules frozen into the panel-v3/v4 prefix.
 pub const SEMANTIC_V4_RULE_COUNT: usize = 155;
 /// Last semantic slot id in the panel-v3/v4 frozen roster.
 pub const SEMANTIC_V4_SLOT_END: u16 = 185;
+/// Number of rules frozen into the panel-v5 prefix.
+pub const SEMANTIC_V5_RULE_COUNT: usize = 165;
+/// Last semantic slot id in the panel-v5 frozen roster.
+pub const SEMANTIC_V5_SLOT_END: u16 = 195;
 /// Last semantic slot id in the current frozen roster.
-pub const SEMANTIC_SLOT_END: u16 = 195;
+pub const SEMANTIC_SLOT_END: u16 = 199;
 
 const PRESENCE_SLOTS: &[PanelSlotSpec] = &[
     presence_slot(24, "sem.presence.project"),
@@ -1712,6 +1753,18 @@ pub static SEMANTIC_SLOT_SPECS_V4: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(
     let mut out = PRESENCE_SLOTS.to_vec();
     out.extend(
         SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT]
+            .iter()
+            .map(slot_spec_for_rule),
+    );
+    out
+});
+
+/// Frozen semantic slot specifications used by panel v5. This prefix must
+/// remain byte-identical when later producer atoms append new rules.
+pub static SEMANTIC_SLOT_SPECS_V5: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut out = PRESENCE_SLOTS.to_vec();
+    out.extend(
+        SEMANTIC_RULES[..SEMANTIC_V5_RULE_COUNT]
             .iter()
             .map(slot_spec_for_rule),
     );
@@ -1782,10 +1835,10 @@ pub fn semantic_rule_count_for_family(family: SemanticFamily) -> usize {
 /// Number of independently typed rules in a family for one frozen panel
 /// version. Older panels see only their immutable registry prefix.
 pub fn semantic_rule_count_for_family_version(family: SemanticFamily, version: u32) -> usize {
-    let rules = if version <= crate::PANEL_V4_VERSION {
-        &SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT]
-    } else {
-        SEMANTIC_RULES
+    let rules = match version {
+        0..=crate::PANEL_V4_VERSION => &SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT],
+        crate::PANEL_V5_VERSION => &SEMANTIC_RULES[..SEMANTIC_V5_RULE_COUNT],
+        _ => SEMANTIC_RULES,
     };
     rules.iter().filter(|rule| rule.family == family).count()
 }
@@ -1801,15 +1854,18 @@ pub fn semantic_registry_sha256() -> [u8; 32] {
 }
 
 /// Content address of the exact ordered registry manifest for a frozen panel
-/// version. Panel v3/v4 retain their original prefix and schema bytes.
+/// version. Earlier panels retain their original prefix and schema bytes.
 pub fn semantic_registry_sha256_for_panel(version: u32) -> [u8; 32] {
-    let (schema, rules) = if version <= crate::PANEL_V4_VERSION {
-        (
+    let (schema, rules) = match version {
+        0..=crate::PANEL_V4_VERSION => (
             SEMANTIC_REGISTRY_SCHEMA,
             &SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT],
-        )
-    } else {
-        (SEMANTIC_REGISTRY_SCHEMA_V2, SEMANTIC_RULES)
+        ),
+        crate::PANEL_V5_VERSION => (
+            SEMANTIC_REGISTRY_SCHEMA_V2,
+            &SEMANTIC_RULES[..SEMANTIC_V5_RULE_COUNT],
+        ),
+        _ => (SEMANTIC_REGISTRY_SCHEMA_V2, SEMANTIC_RULES),
     };
     let mut hasher = Sha256::new();
     hasher.update(schema.as_bytes());
@@ -1837,10 +1893,11 @@ pub fn semantic_weights_identity(slot: SlotId) -> PanelResult<[u8; 32]> {
 
 /// Frozen weights/spec identity for a semantic slot in one panel version.
 ///
-/// Panel v3/v4 preserve the historical whole-registry identity. Panel v5 value
-/// lenses bind only their own typed rule, so appending an unrelated future lens
-/// cannot mutate an existing lens id. Presence lenses still bind the complete
-/// registry because each new ordinal changes their interpreted dimensions.
+/// Panel v3/v4 preserve the historical whole-registry identity. Panel v5 and
+/// later value lenses bind only their own typed rule, so appending an unrelated
+/// future lens cannot mutate an existing lens id. Presence lenses still bind the
+/// complete version-specific registry because each new ordinal changes their
+/// interpreted dimensions.
 pub fn semantic_weights_identity_for_panel(slot: SlotId, version: u32) -> PanelResult<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(SEMANTIC_ENCODER_ID.as_bytes());

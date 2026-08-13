@@ -1623,11 +1623,9 @@ static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
         char channel_qn[CBM_SZ_512];
         snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s",
                  ch->transport ? ch->transport : "unknown", ch->channel_name);
-        char esc_cn[CBM_SZ_256];
-        cbm_json_escape(esc_cn, sizeof(esc_cn), ch->channel_name);
         char channel_props[CBM_SZ_512];
-        snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
-                 ch->transport ? ch->transport : "unknown", esc_cn);
+        snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\"}",
+                 ch->transport ? ch->transport : "unknown");
         int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
                                                   channel_qn, "", 0, 0, channel_props);
         const cbm_gbuf_node_t *src_node = find_channel_src(ctx, ch, rel, module_qn);
