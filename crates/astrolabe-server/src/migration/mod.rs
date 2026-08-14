@@ -101,6 +101,9 @@ use config_store::*;
 
 mod locks;
 use locks::*;
+pub(crate) use locks::{
+    VerifyChainLaneOwner, try_verify_chain_lane_owner_at, wait_verify_chain_startup_barrier_at,
+};
 
 mod project_transition;
 pub(crate) use project_transition::*;
@@ -184,7 +187,10 @@ use layout_lane::*;
 
 mod status_surface;
 use status_surface::*;
-pub(crate) use status_surface::{janitor_startup_verify_projects, periodic_verify_chain_tick};
+pub(crate) use status_surface::{
+    VerifyChainStartupReadiness, janitor_startup_verify_projects_at,
+    observe_verify_chain_startup_readiness_at, periodic_verify_chain_tick,
+};
 
 mod optimizer;
 use optimizer::*;

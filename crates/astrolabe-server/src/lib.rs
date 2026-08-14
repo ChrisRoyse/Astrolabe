@@ -364,13 +364,13 @@ fn run_server() -> Result<i32, DynError> {
         background_eligible,
         "server.activation_epoch"
     );
-    let _verify_chain_loop = background_eligible
+    let verify_chain_loop = background_eligible
         .then(VerifyChainLoop::start)
         .transpose()?;
     let mut incremental_watcher_loop = background_eligible.then(IncrementalWatcherLoop::start);
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
-    let resident_result = serve_resident_jsonrpc(&runner);
+    let resident_result = serve_resident_jsonrpc(&runner, verify_chain_loop.as_ref());
     if let Some(watcher) = incremental_watcher_loop.as_mut() {
         watcher.stop();
     }
@@ -395,7 +395,10 @@ enum ResidentInput {
 /// Shipping resident transport. A dedicated reader may block on the client's
 /// stdin pipe, while the thread-affine CBM owner keeps a real coordination
 /// clock and can close an affected cached SQLite store between requests.
-fn serve_resident_jsonrpc(runner: &CbmToolRunner) -> Result<(), DynError> {
+fn serve_resident_jsonrpc(
+    runner: &CbmToolRunner,
+    verify_chain_loop: Option<&VerifyChainLoop>,
+) -> Result<(), DynError> {
     use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 
     // Capacity one preserves the original sequential backpressure: at most one
@@ -429,8 +432,14 @@ fn serve_resident_jsonrpc(runner: &CbmToolRunner) -> Result<(), DynError> {
     let mut writer = stdout.lock();
     let cadence = Duration::from_millis(astrolabe_domain::knobs::WATCHER_DEFAULT_POLL_INTERVAL_MS);
     loop {
+        if let Some(verify_chain_loop) = verify_chain_loop {
+            verify_chain_loop.ensure_healthy()?;
+        }
         match receiver.recv_timeout(cadence) {
             Ok(ResidentInput::Frame(frame)) => {
+                if let Some(verify_chain_loop) = verify_chain_loop {
+                    verify_chain_loop.ensure_healthy()?;
+                }
                 if runner.quiesce_project_transition()? {
                     tracing::info!("server.project_transition_quiesced");
                 }
@@ -1312,6 +1321,7 @@ struct ParentWatchdog {
 struct VerifyChainLoop {
     shutdown: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<JoinHandle<()>>,
+    fatal_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 struct IncrementalWatcherLoop {
@@ -1373,24 +1383,86 @@ impl VerifyChainLoop {
             return Ok(Self {
                 shutdown: None,
                 handle: None,
+                fatal_error: Arc::new(std::sync::Mutex::new(None)),
             });
         }
 
         let interval = verify_chain_loop_interval()?;
+        let interval_ms = u64::try_from(interval.as_millis()).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_INTERVAL_OVERFLOW: periodic interval cannot be represented \
+                 as u64 milliseconds: {error}. Remediation: repair the \
+                 ASTROLABE_VERIFY_CHAIN_INTERVAL_MS setting before restarting the server."
+            )
+            .into()
+        })?;
+        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
         // #277: one-time deep boot gate before the steady-state bounded scrub lane
         // begins — re-hashes each project's whole persisted ledger from genesis and
-        // refuses foreground admission on a tampered/damaged store. The readiness
-        // record is durable before the server constructs its request runner.
-        let report = migration::janitor_startup_verify_projects(
-            u64::try_from(interval.as_millis()).map_err(|error| -> DynError {
-                format!(
-                    "ASTRO_VERIFY_CHAIN_INTERVAL_OVERFLOW: periodic interval cannot be \
-                     represented as u64 milliseconds: {error}. Remediation: repair the \
-                     ASTROLABE_VERIFY_CHAIN_INTERVAL_MS setting before restarting the server."
-                )
-                .into()
-            })?,
-        )?;
+        // refuses foreground admission on a tampered/damaged store. #1123 elects
+        // one cache-wide exact process generation; every follower crosses one OS
+        // startup barrier and reads one owner-bound SQLite terminal row instead
+        // of polling or duplicating production-scale work (#1064 PC-03/PC-07/
+        // PC-13/PC-17/PC-32/PC-38).
+        let mut unpublished_retry = false;
+        let (lane_owner, report, startup_role, startup_owner_pid, startup_owner_ticks) = loop {
+            if let Some(mut owner) = migration::try_verify_chain_lane_owner_at(&cache_dir)? {
+                let report = migration::janitor_startup_verify_projects_at(
+                    &cache_dir,
+                    interval_ms,
+                    &mut owner,
+                )?;
+                let owner_pid = owner.pid;
+                let owner_ticks = owner.process_start_utc_ticks;
+                break (Some(owner), report, "owner", owner_pid, owner_ticks);
+            }
+
+            migration::wait_verify_chain_startup_barrier_at(&cache_dir)?;
+            match migration::observe_verify_chain_startup_readiness_at(&cache_dir, interval_ms)? {
+                migration::VerifyChainStartupReadiness::Ready {
+                    report,
+                    owner_pid,
+                    owner_process_start_utc_ticks,
+                } => {
+                    break (
+                        None,
+                        report,
+                        "follower",
+                        owner_pid,
+                        owner_process_start_utc_ticks,
+                    );
+                }
+                migration::VerifyChainStartupReadiness::Unpublished { detail } => {
+                    if unpublished_retry {
+                        return Err(format!(
+                            "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_UNPUBLISHED: the cache-wide lane \
+                             remained contended after its startup barrier was open, while the \
+                             readiness source of truth remained unpublished ({detail}). \
+                             Remediation: preserve both lock files and _config.db, inspect the \
+                             exact live lane owner, and repair the protocol mismatch without \
+                             polling or duplicating the ledger scan."
+                        )
+                        .into());
+                    }
+                    // The prior exact owner died before terminal publication. Retry only the
+                    // election once; a winner must run a fresh from-genesis scan. If another
+                    // follower wins, its held startup barrier supplies the next observation.
+                    unpublished_retry = true;
+                }
+                migration::VerifyChainStartupReadiness::Verifying {
+                    owner_pid,
+                    owner_process_start_utc_ticks,
+                } => {
+                    return Err(format!(
+                        "ASTRO_VERIFY_CHAIN_STARTUP_BARRIER_MISMATCH: exact live owner \
+                         ({owner_pid},{owner_process_start_utc_ticks}) remained in verifying state \
+                         after its startup barrier opened. Remediation: preserve both locks and \
+                         _config.db and repair the owner publication order before admission."
+                    )
+                    .into());
+                }
+            }
+        };
         if report.damaged_projects != 0 {
             return Err(format!(
                 "ASTRO_VERIFY_CHAIN_STARTUP_DAMAGED: startup verification found {} damaged \
@@ -1403,14 +1475,20 @@ impl VerifyChainLoop {
             .into());
         }
         tracing::info!(
-            "verify_chain_loop.ready checked_projects={} discovered_projects={} interval_ms={}",
+            "verify_chain_loop.ready role={} owner_pid={} owner_process_start_utc_ticks={} checked_projects={} discovered_projects={} interval_ms={}",
+            startup_role,
+            startup_owner_pid,
+            startup_owner_ticks,
             report.checked_projects,
             report.discovered_projects,
             interval.as_millis(),
         );
 
         let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
+        let fatal_error = Arc::new(std::sync::Mutex::new(None));
+        let thread_fatal_error = Arc::clone(&fatal_error);
         let handle = thread::spawn(move || {
+            let mut lane_owner = lane_owner;
             loop {
                 match shutdown_receiver.recv_timeout(interval) {
                     Ok(()) => break,
@@ -1433,6 +1511,77 @@ impl VerifyChainLoop {
                     );
                     break;
                 }
+
+                if lane_owner.is_none() {
+                    match migration::try_verify_chain_lane_owner_at(&cache_dir) {
+                        Ok(Some(mut owner)) => {
+                            let owner_pid = owner.pid;
+                            let owner_ticks = owner.process_start_utc_ticks;
+                            match migration::janitor_startup_verify_projects_at(
+                                &cache_dir,
+                                interval_ms,
+                                &mut owner,
+                            ) {
+                                Ok(report) if report.damaged_projects == 0 => {
+                                    tracing::info!(
+                                        "verify_chain_loop.takeover owner_pid={} owner_process_start_utc_ticks={} checked_projects={} discovered_projects={}",
+                                        owner_pid,
+                                        owner_ticks,
+                                        report.checked_projects,
+                                        report.discovered_projects,
+                                    );
+                                    lane_owner = Some(owner);
+                                    // Startup readiness names the first permissible periodic
+                                    // tick as one full interval after terminal publication.
+                                    continue;
+                                }
+                                Ok(report) => {
+                                    publish_verify_chain_fatal(
+                                        &thread_fatal_error,
+                                        format!(
+                                            "ASTRO_VERIFY_CHAIN_TAKEOVER_DAMAGED: elected \
+                                             takeover owner ({owner_pid},{owner_ticks}) found {} \
+                                             damaged project(s) among {} checked / {} discovered. \
+                                             Remediation: inspect the persisted readiness and \
+                                             per-project verification rows and repair the exact \
+                                             damaged vault before restarting.",
+                                            report.damaged_projects,
+                                            report.checked_projects,
+                                            report.discovered_projects,
+                                        ),
+                                    );
+                                    break;
+                                }
+                                Err(error) => {
+                                    publish_verify_chain_fatal(
+                                        &thread_fatal_error,
+                                        format!(
+                                            "ASTRO_VERIFY_CHAIN_TAKEOVER_FAILED: elected takeover \
+                                             owner ({owner_pid},{owner_ticks}) could not complete \
+                                             the fresh from-genesis startup scan: {error}. \
+                                             Remediation: preserve the readiness/lock/vault state \
+                                             and repair the exact failure before restarting."
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            publish_verify_chain_fatal(
+                                &thread_fatal_error,
+                                format!(
+                                    "ASTRO_VERIFY_CHAIN_TAKEOVER_ELECTION_FAILED: follower could \
+                                     not evaluate/elect the cache-wide verifier: {error}. \
+                                     Remediation: preserve the lane/readiness/vault state and \
+                                     repair the exact ownership failure before restarting."
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                }
                 match migration::periodic_verify_chain_tick() {
                     Ok(report) => {
                         if report.skipped_import_in_progress_projects == 0 {
@@ -1452,7 +1601,16 @@ impl VerifyChainLoop {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!("verify_chain_loop.tick_failed error={error}");
+                        publish_verify_chain_fatal(
+                            &thread_fatal_error,
+                            format!(
+                                "ASTRO_VERIFY_CHAIN_PERIODIC_TICK_FAILED: elected cache-wide \
+                                 owner could not complete its periodic verification tick: \
+                                 {error}. Remediation: preserve the readiness and vault state, \
+                                 diagnose the exact tick failure, and restart only after repair."
+                            ),
+                        );
+                        break;
                     }
                 }
             }
@@ -1461,7 +1619,36 @@ impl VerifyChainLoop {
         Ok(Self {
             shutdown: Some(shutdown_sender),
             handle: Some(handle),
+            fatal_error,
         })
+    }
+
+    fn ensure_healthy(&self) -> Result<(), DynError> {
+        let fatal_error = self.fatal_error.lock().map_err(|_| -> DynError {
+            "ASTRO_VERIFY_CHAIN_FATAL_STATE_POISONED: the cache-wide verifier fatal-state cell is poisoned. Remediation: stop serving foreground requests, preserve logs/state, and restart after diagnosing the verifier thread failure."
+                .into()
+        })?;
+        if let Some(error) = fatal_error.as_ref() {
+            return Err(error.clone().into());
+        }
+        Ok(())
+    }
+}
+
+fn publish_verify_chain_fatal(fatal_error: &std::sync::Mutex<Option<String>>, error: String) {
+    tracing::error!(error = %error, "verify_chain_loop.fatal");
+    match fatal_error.lock() {
+        Ok(mut slot) => {
+            if slot.is_none() {
+                *slot = Some(error);
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                code = "ASTRO_VERIFY_CHAIN_FATAL_STATE_POISONED",
+                "verify_chain_loop.fatal_state_publish_failed"
+            );
+        }
     }
 }
 

@@ -3,7 +3,7 @@ pub(crate) const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 pub(crate) const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v2";
 pub(crate) const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str =
     "astrolabe.periodic_verify_chain_tick.v3";
-const VERIFY_CHAIN_STARTUP_READINESS_SCHEMA: &str = "astrolabe.verify_chain_startup_readiness.v1";
+const VERIFY_CHAIN_STARTUP_READINESS_SCHEMA: &str = "astrolabe.verify_chain_startup_readiness.v2";
 const VERIFY_CHAIN_STARTUP_READINESS_KEY: &str = "astrolabe.verify_chain_startup_readiness_json";
 const STARTUP_VERIFY_OPERATION: &str = "janitor_startup_verify";
 const STARTUP_VERIFY_ADMISSION_ORDER: &str = "completed_before_foreground_admission";
@@ -18,6 +18,27 @@ pub(crate) struct JanitorStartupVerifyReport {
     pub(crate) discovered_projects: u64,
     pub(crate) checked_projects: u64,
     pub(crate) damaged_projects: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum VerifyChainStartupReadiness {
+    /// A lane is contended but its current exact owner has not yet published a
+    /// v2 readiness row, or the row belongs to an absent/reused generation.
+    /// The startup coordinator gives this short publication boundary a bounded
+    /// diagnostic window; it never treats the state as ready.
+    Unpublished { detail: String },
+    /// The exact live owner is performing the one from-genesis scan. Followers
+    /// wait without a data-dependent timeout rather than duplicate that work.
+    Verifying {
+        owner_pid: u32,
+        owner_process_start_utc_ticks: u64,
+    },
+    /// A terminal ready row bound to the exact live lane owner.
+    Ready {
+        report: JanitorStartupVerifyReport,
+        owner_pid: u32,
+        owner_process_start_utc_ticks: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1267,22 +1288,14 @@ pub(crate) fn health_trajectory_ndjson(
 /// Fails **closed** per project: a damaged chain is recorded as
 /// `periodic_verify_status = "error"` with the janitor refusal, never a silent
 /// pass. Returns exact discovered, checked, and damaged project counts.
-/// Resolves the CBM cache dir and runs the one-time [`janitor_startup_verify_projects_at`]
-/// boot gate over every discovered shadow project. Called once at server startup.
-pub(crate) fn janitor_startup_verify_projects(
-    periodic_interval_ms: u64,
-) -> Result<JanitorStartupVerifyReport, DynError> {
-    let _activation_fence =
-        crate::activation_epoch::require_active_generation("janitor_startup_verify_projects")?;
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    janitor_startup_verify_projects_at(&cache_dir, periodic_interval_ms)
-}
-
+/// Runs the one-time boot gate under the exact elected cache-wide owner.
 pub(crate) fn janitor_startup_verify_projects_at(
     cache_dir: &Path,
     periodic_interval_ms: u64,
+    owner: &mut VerifyChainLaneOwner,
 ) -> Result<JanitorStartupVerifyReport, DynError> {
     let started_at_unix_ms = unix_epoch_millis();
+    let owner_identity = owner.identity_json();
     persist_verify_chain_startup_readiness_at(
         cache_dir,
         &json!({
@@ -1298,6 +1311,7 @@ pub(crate) fn janitor_startup_verify_projects_at(
             "periodic_interval_ms": periodic_interval_ms,
             "first_periodic_tick_not_before_unix_ms": Value::Null,
             "error": Value::Null,
+            "owner": owner_identity,
         }),
     )?;
     let result = janitor_startup_verify_projects_inner(cache_dir, started_at_unix_ms);
@@ -1322,8 +1336,10 @@ pub(crate) fn janitor_startup_verify_projects_at(
                         completed_at_unix_ms.saturating_add(periodic_interval_ms)
                     ),
                     "error": Value::Null,
+                    "owner": owner.identity_json(),
                 }),
             )?;
+            owner.release_startup_barrier()?;
             Ok(report)
         }
         Err(error) => {
@@ -1341,6 +1357,7 @@ pub(crate) fn janitor_startup_verify_projects_at(
                 "periodic_interval_ms": periodic_interval_ms,
                 "first_periodic_tick_not_before_unix_ms": Value::Null,
                 "error": error_text,
+                "owner": owner.identity_json(),
             });
             persist_verify_chain_startup_readiness_at(cache_dir, &readiness).map_err(
                 |persist_error| -> DynError {
@@ -1353,8 +1370,216 @@ pub(crate) fn janitor_startup_verify_projects_at(
                     .into()
                 },
             )?;
+            owner.release_startup_barrier()?;
             Err(error)
         }
+    }
+}
+
+pub(crate) fn observe_verify_chain_startup_readiness_at(
+    cache_dir: &Path,
+    periodic_interval_ms: u64,
+) -> Result<VerifyChainStartupReadiness, DynError> {
+    let Some(serialized) = read_config_value(cache_dir, VERIFY_CHAIN_STARTUP_READINESS_KEY)? else {
+        return Ok(VerifyChainStartupReadiness::Unpublished {
+            detail: "startup readiness row is absent".to_string(),
+        });
+    };
+    let readiness: Value = serde_json::from_str(&serialized).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: persisted startup readiness row is \
+             not valid JSON: {error}. Remediation: preserve _config.db and the verify-chain lane \
+             lock, inspect the exact row bytes, and restart only after repairing the producer."
+        )
+        .into()
+    })?;
+    let schema = readiness
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if schema == "astrolabe.verify_chain_startup_readiness.v1" {
+        return Ok(VerifyChainStartupReadiness::Unpublished {
+            detail: "the previous unowned v1 readiness row has not yet been replaced by the contending v2 owner".to_string(),
+        });
+    }
+    if schema != VERIFY_CHAIN_STARTUP_READINESS_SCHEMA {
+        return Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_SCHEMA_MISMATCH: persisted startup readiness \
+             schema {schema:?} does not match {VERIFY_CHAIN_STARTUP_READINESS_SCHEMA:?}. \
+             Remediation: preserve _config.db and the lane lock; update or repair the exact \
+             readiness producer instead of inferring compatibility."
+        )
+        .into());
+    }
+    let owner = readiness.get("owner").and_then(Value::as_object).ok_or_else(
+        || -> DynError {
+            "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_INVALID: v2 startup readiness omits its exact owner object. Remediation: preserve _config.db and the lane lock, inspect the malformed row, and restart only after repairing the producer."
+                .into()
+        },
+    )?;
+    let owner_pid_u64 = owner.get("pid").and_then(Value::as_u64).ok_or_else(|| -> DynError {
+        "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_INVALID: v2 startup readiness owner omits a u64 pid. Remediation: preserve _config.db and the lane lock and repair the malformed owner row."
+            .into()
+    })?;
+    let owner_pid = u32::try_from(owner_pid_u64).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_INVALID: persisted owner PID {owner_pid_u64} is \
+             outside the Windows u32 process-id domain: {error}. Remediation: preserve and \
+             repair the exact readiness row."
+        )
+        .into()
+    })?;
+    let owner_process_start_utc_ticks = owner
+        .get("process_start_utc_ticks")
+        .and_then(Value::as_u64)
+        .filter(|ticks| *ticks != 0)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_INVALID: v2 startup readiness owner omits nonzero process_start_utc_ticks. Remediation: preserve _config.db and the lane lock and repair the malformed owner row."
+                .into()
+        })?;
+    match astrolabe_bridge::process_generation_state(owner_pid, owner_process_start_utc_ticks) {
+        Ok(astrolabe_bridge::ProcessGenerationState::Matching) => {}
+        Ok(astrolabe_bridge::ProcessGenerationState::Absent) => {
+            return Ok(VerifyChainStartupReadiness::Unpublished {
+                detail: format!(
+                    "persisted readiness owner ({owner_pid},{owner_process_start_utc_ticks}) is absent"
+                ),
+            });
+        }
+        Ok(astrolabe_bridge::ProcessGenerationState::Reused {
+            actual_start_utc_ticks,
+        }) => {
+            return Ok(VerifyChainStartupReadiness::Unpublished {
+                detail: format!(
+                    "persisted readiness owner PID {owner_pid} was reused: expected start ticks \
+                     {owner_process_start_utc_ticks}, observed {actual_start_utc_ticks}"
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_UNEVALUABLE: exact readiness owner \
+                 ({owner_pid},{owner_process_start_utc_ticks}) could not be probed: {error}. \
+                 Remediation: preserve _config.db and the lane lock, repair process-query access, \
+                 and restart; unevaluable ownership never authorizes admission or takeover."
+            )
+            .into());
+        }
+    }
+    let observed_interval = readiness
+        .get("periodic_interval_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: v2 readiness omits u64 periodic_interval_ms. Remediation: preserve and repair the exact row before admission."
+                .into()
+        })?;
+    if observed_interval != periodic_interval_ms {
+        return Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_INTERVAL_MISMATCH: live owner \
+             ({owner_pid},{owner_process_start_utc_ticks}) published interval \
+             {observed_interval}ms, but this resident requires {periodic_interval_ms}ms. \
+             Remediation: launch every resident with the same registry-backed interval; do not \
+             infer or substitute one process's policy."
+        )
+        .into());
+    }
+    let status = readiness
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: v2 readiness omits string status. Remediation: preserve and repair the exact row before admission."
+                .into()
+        })?;
+    match status {
+        "verifying" => {
+            if readiness
+                .get("foreground_admission")
+                .and_then(Value::as_str)
+                != Some("blocked")
+                || !readiness
+                    .get("completed_at_unix_ms")
+                    .is_some_and(Value::is_null)
+            {
+                return Err(
+                    "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: live-owner verifying row does not keep foreground blocked with a null completion. Remediation: preserve and repair the exact readiness producer before admission."
+                        .into(),
+                );
+            }
+            Ok(VerifyChainStartupReadiness::Verifying {
+                owner_pid,
+                owner_process_start_utc_ticks,
+            })
+        }
+        "ready" => {
+            if readiness
+                .get("foreground_admission")
+                .and_then(Value::as_str)
+                != Some("released")
+                || readiness
+                    .get("completed_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                || readiness
+                    .get("first_periodic_tick_not_before_unix_ms")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(
+                    "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: live-owner ready row lacks released admission or terminal timestamps. Remediation: preserve and repair the exact readiness producer before admission."
+                        .into(),
+                );
+            }
+            let count = |field: &str| -> Result<u64, DynError> {
+                readiness.get(field).and_then(Value::as_u64).ok_or_else(|| {
+                    format!(
+                        "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: live-owner ready row omits \
+                         u64 field {field:?}. Remediation: preserve and repair the exact row \
+                         before admission."
+                    )
+                    .into()
+                })
+            };
+            let report = JanitorStartupVerifyReport {
+                discovered_projects: count("discovered_projects")?,
+                checked_projects: count("checked_projects")?,
+                damaged_projects: count("damaged_projects")?,
+            };
+            if report.damaged_projects != 0 {
+                return Err(format!(
+                    "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: status ready carries {} \
+                     damaged project(s). Remediation: preserve _config.db and every vault and \
+                     repair the contradictory readiness row before admission.",
+                    report.damaged_projects,
+                )
+                .into());
+            }
+            Ok(VerifyChainStartupReadiness::Ready {
+                report,
+                owner_pid,
+                owner_process_start_utc_ticks,
+            })
+        }
+        "refused_damaged_chain" => Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_DAMAGED: live verify-chain owner \
+             ({owner_pid},{owner_process_start_utc_ticks}) refused foreground admission after \
+             detecting a damaged persisted chain. Remediation: inspect the per-project \
+             periodic_verify_error rows and repair the exact damaged vault before restarting."
+        )
+        .into()),
+        "error" => Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_OWNER_FAILED: live verify-chain owner \
+             ({owner_pid},{owner_process_start_utc_ticks}) published terminal error {:?}. \
+             Remediation: preserve _config.db and every vault, diagnose the exact owner error, \
+             and restart only after repair.",
+            readiness.get("error"),
+        )
+        .into()),
+        other => Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_READINESS_INVALID: live owner published unknown status \
+             {other:?}. Remediation: preserve and repair the exact readiness producer before \
+             admission."
+        )
+        .into()),
     }
 }
 
@@ -1479,7 +1704,87 @@ fn persist_verify_chain_startup_readiness_at(
     readiness: &Value,
 ) -> Result<(), DynError> {
     let serialized = serde_json::to_string(readiness)?;
-    write_config_value(cache_dir, VERIFY_CHAIN_STARTUP_READINESS_KEY, &serialized)?;
+    let mut connection = open_config(cache_dir).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_CONFIG_OPEN_FAILED: opening {} for an owner-bound \
+             readiness transaction failed: {error}. Remediation: preserve the config database \
+             and lane lock and repair the exact SQLite/open failure before restarting.",
+            cache_dir.join("_config.db").display(),
+        )
+        .into()
+    })?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_CONFIG_SETUP_FAILED: selecting FULL synchronous \
+                 durability for {} failed: {error}. Remediation: preserve the config database \
+                 and lane lock and inspect the exact SQLite failure.",
+                cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_TRANSACTION_BEGIN_FAILED: BEGIN IMMEDIATE for {} \
+                 failed: {error}. Remediation: preserve the contending owners and config bytes, \
+                 diagnose the exact writer, and retry only through elected-lane admission.",
+                cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            params![VERIFY_CHAIN_STARTUP_READINESS_KEY, serialized],
+        )
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_WRITE_FAILED: writing owner-bound readiness in {} \
+                 failed: {error}. Remediation: preserve the transaction/store diagnostics and \
+                 repair the exact SQLite failure before restarting.",
+                cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
+    let transaction_readback: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![VERIFY_CHAIN_STARTUP_READINESS_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_TRANSACTION_READBACK_FAILED: same-transaction \
+                 readiness readback in {} failed: {error}. Remediation: preserve _config.db and \
+                 the lane lock and inspect the exact SQLite failure.",
+                cache_dir.join("_config.db").display(),
+            )
+            .into()
+        })?;
+    if transaction_readback.as_deref() != Some(serialized.as_str()) {
+        return Err(format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_TRANSACTION_READBACK_MISMATCH: same-transaction \
+             readiness bytes differ; expected {serialized:?}, observed \
+             {transaction_readback:?}. Remediation: preserve _config.db and the lane lock and \
+             inspect SQLite/schema integrity before restarting."
+        )
+        .into());
+    }
+    transaction.commit().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_TRANSACTION_COMMIT_FAILED: committing owner-bound \
+             readiness in {} failed after exact in-transaction readback: {error}. Remediation: \
+             preserve _config.db and the lane lock, inspect transaction durability, and restart \
+             only after repair.",
+            cache_dir.join("_config.db").display(),
+        )
+        .into()
+    })?;
+    drop(connection);
     let readback = read_config_value(cache_dir, VERIFY_CHAIN_STARTUP_READINESS_KEY)?;
     if readback.as_deref() != Some(serialized.as_str()) {
         return Err(format!(

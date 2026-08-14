@@ -1,6 +1,9 @@
 use super::*;
 pub(crate) const SHADOW_IMPORT_LOCK_SUFFIX: &str = ".astrolabe-shadow-import.lock";
 pub(crate) const BACKGROUND_LANE_LOCK_SUFFIX: &str = ".astrolabe-background-lane.lock";
+pub(crate) const VERIFY_CHAIN_LANE_LOCK_NAME: &str = ".astrolabe-verify-chain-lane.lock";
+pub(crate) const VERIFY_CHAIN_STARTUP_BARRIER_LOCK_NAME: &str =
+    ".astrolabe-verify-chain-startup-barrier.lock";
 pub(crate) const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 pub(crate) const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
@@ -23,6 +26,51 @@ pub(crate) struct BackgroundLaneOwner {
     pub(crate) _path: PathBuf,
     pub(crate) activation_identity: Option<crate::activation_epoch::ActivationIdentity>,
     pub(crate) owner_fields: Value,
+}
+
+/// Exact cache-wide owner of the startup/periodic verify-chain lane (#1123).
+///
+/// The retained lane lock is the lifetime authority. The startup barrier is
+/// acquired before the lane so a follower cannot observe readiness until the
+/// elected owner has durably published one terminal startup state.
+#[derive(Debug)]
+pub(crate) struct VerifyChainLaneOwner {
+    _file: fs::File,
+    startup_barrier_file: Option<fs::File>,
+    pub(crate) path: PathBuf,
+    pub(crate) pid: u32,
+    pub(crate) process_start_utc_ticks: u64,
+}
+
+impl VerifyChainLaneOwner {
+    pub(crate) fn identity_json(&self) -> Value {
+        json!({
+            "pid": self.pid,
+            "process_start_utc_ticks": self.process_start_utc_ticks,
+        })
+    }
+
+    pub(crate) fn release_startup_barrier(&mut self) -> Result<(), DynError> {
+        let barrier = self
+            .startup_barrier_file
+            .as_ref()
+            .ok_or_else(|| -> DynError {
+                "ASTRO_VERIFY_CHAIN_STARTUP_BARRIER_ALREADY_RELEASED: the elected owner no longer holds its startup barrier. Remediation: preserve the lane/readiness state and repair the duplicate terminal-publication path."
+                    .into()
+            })?;
+        barrier.unlock().map_err(|error| -> DynError {
+            format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_BARRIER_RELEASE_FAILED: elected owner \
+                 ({},{}) could not release the terminal-readiness barrier: {error}. \
+                 Remediation: preserve the owner and readiness bytes and restart only after \
+                 diagnosing the exact filesystem failure.",
+                self.pid, self.process_start_utc_ticks,
+            )
+            .into()
+        })?;
+        self.startup_barrier_file = None;
+        Ok(())
+    }
 }
 
 impl Drop for ShadowImportLock {
@@ -117,6 +165,138 @@ pub(crate) fn try_readable_marker_lock(marker_path: &Path) -> Result<Option<fs::
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Attempts to elect this exact process generation as the one cache-wide
+/// verify-chain owner. Contention is an ordinary follower observation, not an
+/// error and never authorizes duplicate verification work.
+///
+/// Cost is O(1): one exact lock-file open/try-lock and, only for the winner, one
+/// process-generation probe plus a bounded owner-record rewrite. The production
+/// ledger/project cardinality is deliberately absent from this election path
+/// (#1064 PC-03/PC-07/PC-13/PC-32; #1123).
+pub(crate) fn try_verify_chain_lane_owner_at(
+    cache_dir: &Path,
+) -> Result<Option<VerifyChainLaneOwner>, DynError> {
+    let _activation_fence =
+        crate::activation_epoch::require_active_generation("verify_chain_lane_acquire")?;
+    fs::create_dir_all(cache_dir)?;
+    let startup_barrier_path = cache_dir.join(VERIFY_CHAIN_STARTUP_BARRIER_LOCK_NAME);
+    let startup_barrier_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&startup_barrier_path)?;
+    match startup_barrier_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_VERIFY_CHAIN_STARTUP_BARRIER_LOCK_FAILED: acquiring startup barrier {} \
+                 failed: {error}. Remediation: preserve the barrier, lane lock, and config \
+                 database; inspect the exact filesystem failure and restart without bypassing \
+                 startup serialization.",
+                startup_barrier_path.display(),
+            )
+            .into());
+        }
+    }
+    let path = cache_dir.join(VERIFY_CHAIN_LANE_LOCK_NAME);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => {
+            crate::activation_epoch::verify_activation_fence(
+                _activation_fence.as_ref(),
+                "verify_chain_lane_owner_publish",
+            )?;
+            let pid = std::process::id();
+            let process_start_utc_ticks =
+                astrolabe_bridge::process_start_utc_ticks(pid).map_err(|error| -> DynError {
+                    format!(
+                        "ASTRO_VERIFY_CHAIN_OWNER_IDENTITY_UNAVAILABLE: exact creation ticks for \
+                         cache-wide verify-chain owner PID {pid} could not be read: {error}. \
+                         Remediation: preserve the config database and lane lock, repair native \
+                         process-query access, and restart; never publish PID-only ownership."
+                    )
+                    .into()
+                })?;
+            file.set_len(0)?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&json!({
+                    "schema": "astrolabe.verify-chain-lane-owner.v1",
+                    "pid": pid,
+                    "process_start_utc_ticks": process_start_utc_ticks,
+                }))?
+            )?;
+            file.sync_all()?;
+            Ok(Some(VerifyChainLaneOwner {
+                _file: file,
+                startup_barrier_file: Some(startup_barrier_file),
+                path,
+                pid,
+                process_start_utc_ticks,
+            }))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            startup_barrier_file.unlock()?;
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "ASTRO_VERIFY_CHAIN_LANE_LOCK_FAILED: acquiring cache-wide verify-chain lane {} \
+             failed: {error}. Remediation: preserve the lock and config database, inspect the \
+             exact filesystem failure, and restart without bypassing the lane.",
+            path.display(),
+        )
+        .into()),
+    }
+}
+
+/// Waits for the elected owner to publish a terminal startup row, then releases
+/// the barrier immediately. The wait count is independent of project/ledger N:
+/// each follower crosses the barrier once and performs one readiness read
+/// (#1064 PC-03/PC-07/PC-13/PC-32; #1123).
+pub(crate) fn wait_verify_chain_startup_barrier_at(cache_dir: &Path) -> Result<(), DynError> {
+    let activation_fence =
+        crate::activation_epoch::require_active_generation("verify_chain_startup_barrier_wait")?;
+    fs::create_dir_all(cache_dir)?;
+    let path = cache_dir.join(VERIFY_CHAIN_STARTUP_BARRIER_LOCK_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_BARRIER_WAIT_FAILED: waiting for elected-owner terminal \
+             publication at {} failed: {error}. Remediation: preserve the barrier/lane/config \
+             state and repair the exact filesystem failure without admitting foreground work.",
+            path.display(),
+        )
+        .into()
+    })?;
+    crate::activation_epoch::verify_activation_fence(
+        activation_fence.as_ref(),
+        "verify_chain_startup_barrier_observed",
+    )?;
+    file.unlock().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_VERIFY_CHAIN_STARTUP_BARRIER_OBSERVER_RELEASE_FAILED: follower could not \
+             release observed startup barrier {}: {error}. Remediation: preserve state and \
+             repair the exact filesystem failure before restarting.",
+            path.display(),
+        )
+        .into()
+    })?;
+    Ok(())
 }
 
 pub(crate) fn background_lane_owners() -> &'static Mutex<BTreeMap<String, BackgroundLaneOwner>> {
