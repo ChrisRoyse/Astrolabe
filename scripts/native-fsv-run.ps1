@@ -2387,10 +2387,15 @@ function Read-AstroResidentCohortPlan {
     elseif ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v2') {
         @($basePlanProperties) + 'phase_store_owner_contract'
     }
+    elseif ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v3') {
+        @($basePlanProperties) + @(
+            'phase_store_owner_contract', 'auxiliary_state_contract'
+        )
+    }
     else {
         Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
             "resident-cohort plan schema '$schema' is not supported" `
-            'publish an exact v1 retained-SQLite plan or v2 explicit phase-owner plan'
+            'publish an exact v1 retained-SQLite, v2 explicit phase-owner, or v3 explicit auxiliary-state plan'
     }
     Assert-AstroExactObjectProperties $plan $planProperties `
         'ASTRO_FSV_COHORT_PLAN_INVALID' 'resident-cohort plan'
@@ -2418,6 +2423,16 @@ function Read-AstroResidentCohortPlan {
         }
         $contract
     }
+    $auxiliaryStateContract = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v3') {
+        $value = [string]$plan.auxiliary_state_contract
+        if ($value -cne 'absent' -and $value -cne 'read_only_tail') {
+            Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
+                "auxiliary_state_contract must be exactly 'absent' or 'read_only_tail', observed '$value'" `
+                'declare whether the SQLite lifecycle requires namespace absence or admits only a zero-owner, empty-WAL read-only tail'
+        }
+        $value
+    }
+    else { 'absent' }
     $residentCount = [int]$plan.resident_count
     if ($residentCount -lt 2 -or $residentCount -gt 16 -or
         [string]$residentCount -cne [string]$plan.resident_count) {
@@ -2538,6 +2553,7 @@ function Read-AstroResidentCohortPlan {
         indexer_timeout_ms = [int]$timeouts.indexer_timeout_ms
         resident_exit_timeout_ms = [int]$timeouts.resident_exit_timeout_ms
         phase_store_owner_contract = $phaseStoreOwnerContract
+        auxiliary_state_contract = $auxiliaryStateContract
     }
 }
 
@@ -2715,6 +2731,95 @@ function Wait-AstroCohortSidecarsAbsent {
     Fail-Astro 'ASTRO_FSV_COHORT_SIDECAR_RETAINED' `
         "SQLite sidecars did not become stably absent during '$Phase': $($attempts | ConvertTo-Json -Depth 8 -Compress)" `
         'preserve the store and exact process chronology; inspect the owner that retained the SQLite generation'
+}
+
+function Get-AstroCohortStoreInventory {
+    param([Parameter(Mandatory)][string[]]$StorePaths)
+    $files = @($StorePaths | ForEach-Object {
+        $path = $_
+        if (-not (Test-AstroPathLongPath -LiteralPath $path)) {
+            return [ordered]@{
+                path = $path; exists = $false; bytes = 0; sha256 = $null
+            }
+        }
+        if (-not (Test-AstroPathLongPath -LiteralPath $path -PathType Leaf)) {
+            Fail-Astro 'ASTRO_FSV_COHORT_STORE_TYPE_INVALID' `
+                "SQLite family member is not one ordinary file: $path" `
+                'preserve the complete family and replace the non-file entry before retrying'
+        }
+        Assert-NotReparseEntry $path 'SQLite cohort family member'
+        return [ordered]@{
+            path = $path
+            exists = $true
+            bytes = [uint64](Get-AstroFileLengthLongPath $path)
+            sha256 = File-Sha256 $path
+        }
+    })
+    return [ordered]@{
+        observed_at_utc = [DateTime]::UtcNow.ToString('o')
+        files = $files
+    }
+}
+
+function Read-AstroCohortAuxiliaryState {
+    param(
+        [Parameter(Mandatory)][string[]]$StorePaths,
+        [Parameter(Mandatory)][ValidateSet('absent', 'read_only_tail')][string]$Contract,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds,
+        [Parameter(Mandatory)][string]$Phase
+    )
+    if ($Contract -ceq 'absent') {
+        $absence = Wait-AstroCohortSidecarsAbsent $StorePaths[1..2] `
+            $TimeoutMilliseconds "$Phase-sidecars-absent"
+        return [ordered]@{
+            phase = $Phase; contract = $Contract; state = 'absent'
+            evidence = $absence
+        }
+    }
+
+    # #1124 / #1064 PC-03/07/13/35/41: after exact zero-owner proof, read the
+    # fixed three-file family twice. No timeout/poll loop depends on project or
+    # ledger N. Hashing cost is O(B), where B is the physical config-family byte
+    # count named by the plan; paths and read order are invariant.
+    $first = Get-AstroCohortStoreInventory -StorePaths $StorePaths
+    [Threading.Thread]::Sleep(100)
+    $second = Get-AstroCohortStoreInventory -StorePaths $StorePaths
+    $firstBytes = $first.files | ConvertTo-Json -Depth 8 -Compress
+    $secondBytes = $second.files | ConvertTo-Json -Depth 8 -Compress
+    if ($firstBytes -cne $secondBytes) {
+        Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_STATE_DRIFT' `
+            "SQLite family changed between zero-owner stable reads during '$Phase' (before=$firstBytes; after=$secondBytes)" `
+            'preserve every family byte and inspect the unrecorded writer or filesystem transition'
+    }
+    $database = $second.files[0]
+    $wal = $second.files[1]
+    $shm = $second.files[2]
+    if (-not [bool]$database.exists) {
+        Fail-Astro 'ASTRO_FSV_COHORT_STORE_MISSING' `
+            "SQLite main database disappeared during '$Phase': $($database.path)" `
+            'preserve the family and repair the missing source of truth before retrying'
+    }
+    if ([bool]$wal.exists -and [uint64]$wal.bytes -ne 0) {
+        Fail-Astro 'ASTRO_FSV_COHORT_NONEMPTY_WAL_RETAINED' `
+            "read_only_tail during '$Phase' retained a nonempty WAL ($($wal.bytes) bytes, sha256=$($wal.sha256))" `
+            'preserve the complete SQLite family; committed state may live outside the main DB and cannot be inferred or discarded'
+    }
+    if ([bool]$wal.exists -ne [bool]$shm.exists) {
+        Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_FAMILY_PARTIAL' `
+            "read_only_tail during '$Phase' observed WAL/SHM presence mismatch (wal=$([bool]$wal.exists), shm=$([bool]$shm.exists))" `
+            'preserve the partial family and diagnose its exact SQLite lifecycle before retrying'
+    }
+    return [ordered]@{
+        phase = $Phase
+        contract = $Contract
+        state = if ([bool]$wal.exists) { 'read_only_tail' } else { 'absent' }
+        stable = $true
+        required_consecutive_matches = 2
+        before = $first
+        after = $second
+        wal_empty = (-not [bool]$wal.exists) -or [uint64]$wal.bytes -eq 0
+        shm_trust = if ([bool]$shm.exists) { 'transient_wal_index' } else { 'absent' }
+    }
 }
 
 function Invoke-AstroCohortRequest {
@@ -3157,6 +3262,7 @@ function Invoke-AstroResidentCohort {
             plan = [ordered]@{ path = $plan.path; sha256 = $plan.sha256_before }
             store_paths = $plan.store_paths
             phase_store_owner_contract = $plan.phase_store_owner_contract
+            auxiliary_state_contract = $plan.auxiliary_state_contract
         })
 
         for ($ordinal = 1; $ordinal -le $plan.resident_count; $ordinal++) {
@@ -3372,8 +3478,8 @@ function Invoke-AstroResidentCohort {
 
         $zeroAfterIndexer = Wait-AstroCohortStoreOwners $plan.store_paths @() `
             $plan.holder_timeout_ms 'after-indexer-zero-holders'
-        $sidecarsAfterIndexer = Wait-AstroCohortSidecarsAbsent $plan.store_paths[1..2] `
-            $plan.holder_timeout_ms 'after-indexer-sidecars-absent'
+        $sidecarsAfterIndexer = Read-AstroCohortAuxiliaryState $plan.store_paths `
+            $plan.auxiliary_state_contract $plan.holder_timeout_ms 'after-indexer'
         $storeChronology.Add($zeroAfterIndexer)
         $storeChronology.Add($sidecarsAfterIndexer)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
@@ -3429,8 +3535,8 @@ function Invoke-AstroResidentCohort {
         }
         $finalOwners = Wait-AstroCohortStoreOwners $plan.store_paths @() `
             $plan.holder_timeout_ms 'final-zero-holders'
-        $finalSidecars = Wait-AstroCohortSidecarsAbsent $plan.store_paths[1..2] `
-            $plan.holder_timeout_ms 'final-sidecars-absent'
+        $finalSidecars = Read-AstroCohortAuxiliaryState $plan.store_paths `
+            $plan.auxiliary_state_contract $plan.holder_timeout_ms 'final'
         $storeChronology.Add($finalOwners)
         $storeChronology.Add($finalSidecars)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
@@ -3525,6 +3631,7 @@ function Invoke-AstroResidentCohort {
                 path = $plan.path; sha256_before = $plan.sha256_before
                 sha256_after = $planHashAfter; stable = $planStable
                 phase_store_owner_contract = $plan.phase_store_owner_contract
+                auxiliary_state_contract = $plan.auxiliary_state_contract
             }
             live_state = [ordered]@{
                 path = $LiveStatePath; published = $true
@@ -3709,6 +3816,7 @@ function Invoke-AstroResidentCohort {
                             File-Sha256 $plan.path
                         } else { $null }
                         phase_store_owner_contract = $plan.phase_store_owner_contract
+                        auxiliary_state_contract = $plan.auxiliary_state_contract
                     }
                     live_state = [ordered]@{
                         path = $LiveStatePath; published = $liveStatePublished
