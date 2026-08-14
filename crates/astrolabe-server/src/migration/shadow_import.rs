@@ -1005,9 +1005,13 @@ where
     C: Clock,
 {
     fn stage_error(stage: &str, error: impl std::fmt::Display) -> DynError {
-        format!(
-            "ASTRO_ASSAY_SIGNAL_TRANSACTION_FAILED: stage={stage}; cause={error}; remediation: preserve the prepared marker, signal-cards.ndjson, and _config.db, then diagnose the exact stage before running the explicit recovery protocol"
+        ToolFault::new(
+            "ASTRO_ASSAY_SIGNAL_TRANSACTION_FAILED",
+            format!("signal-card publication failed at stage {stage:?}"),
+            "preserve the prepared marker, signal-cards.ndjson, and _config.db, then diagnose the exact stage before running the explicit recovery protocol",
         )
+        .with_detail("stage", stage)
+        .with_detail("cause", error.to_string())
         .into()
     }
 
