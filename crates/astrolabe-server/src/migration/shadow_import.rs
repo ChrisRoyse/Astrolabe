@@ -6104,6 +6104,31 @@ pub(crate) fn open_shadow_vault_writable(
     open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, false, true)
 }
 
+/// Opens a write-capable vault whose ledger and time-index mutations belong to
+/// one already-admitted generation. Post-publication verification is part of
+/// that generation's durable transaction, so it must not resample wall clock.
+pub(crate) fn open_shadow_vault_writable_with_generation_clock(
+    vault_dir: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    generation_observed_at_ms: u64,
+) -> Result<AsterVault<FixedClock>, DynError> {
+    let vault_id = VaultId::from_str(vault_id)?;
+    Ok(AsterVault::open_with_clock(
+        vault_dir,
+        vault_id,
+        vault_salt.as_bytes().to_vec(),
+        VaultOptions {
+            restore_mvcc_rows: true,
+            read_only: false,
+            restore_ledger_hook: true,
+            selected_cfs: None,
+            ..VaultOptions::default()
+        },
+        FixedClock::new(generation_observed_at_ms),
+    )?)
+}
+
 fn open_shadow_vault_with_access(
     vault_dir: &Path,
     vault_id: &str,

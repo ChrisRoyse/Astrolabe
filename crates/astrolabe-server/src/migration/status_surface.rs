@@ -432,6 +432,26 @@ fn scrub_project_with_import_owner(
     // Writable handle: the scrub advances the persisted JanitorCheckpoint and
     // appends the witnessed Measure scrub record. selected_cfs=None (all CFs).
     let vault = open_shadow_vault_writable(vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    scrub_open_vault(&vault)
+}
+
+fn scrub_project_with_generation_clock(
+    cache_dir: &Path,
+    project: &str,
+    outcome: &ShadowImportOutcome,
+    shadow_import_lock: &ShadowImportLock,
+) -> Result<PeriodicScrubOutcome, DynError> {
+    shadow_import_lock.assert_owns(cache_dir, project)?;
+    let vault = open_shadow_vault_writable_with_generation_clock(
+        &outcome.vault_dir,
+        &outcome.vault_id,
+        &outcome.vault_salt,
+        outcome.generation_observed_at_ms,
+    )?;
+    scrub_open_vault(&vault)
+}
+
+fn scrub_open_vault<C: Clock>(vault: &AsterVault<C>) -> Result<PeriodicScrubOutcome, DynError> {
     match astrolabe_ingest::run_janitor_scrub_step(&vault, None) {
         Ok(report) => {
             let checkpoint = report.checkpoint();
@@ -484,12 +504,10 @@ pub(crate) fn post_publish_verify_project(
     shadow_import_lock: &ShadowImportLock,
 ) -> Result<Value, DynError> {
     let checked_at_unix_ms = unix_epoch_millis();
-    let scrub = scrub_project_with_import_owner(
+    let scrub = scrub_project_with_generation_clock(
         cache_dir,
         project,
-        &outcome.vault_dir,
-        &outcome.vault_id,
-        &outcome.vault_salt,
+        outcome,
         shadow_import_lock,
     )
     .map_err(|error| -> DynError {
