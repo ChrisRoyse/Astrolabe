@@ -313,7 +313,12 @@ fn run_mode(payload: &Path, pair_count: usize) -> AnyResult<Value> {
         &vault_dir,
         vault_id,
         VAULT_SALT.to_vec(),
-        VaultOptions::default(),
+        VaultOptions {
+            // Match the production shadow-import construction mode: the SIM
+            // planner is intentionally unavailable to full-MVCC handles.
+            restore_mvcc_rows: false,
+            ..VaultOptions::default()
+        },
         FixedClock::new(FIXED_TIME_MS),
     )?;
     let plan = plan_similarity_family_run(
