@@ -37,7 +37,6 @@ pub(crate) struct BackgroundLaneOwner {
 pub(crate) struct VerifyChainLaneOwner {
     _file: fs::File,
     startup_barrier_file: Option<fs::File>,
-    pub(crate) path: PathBuf,
     pub(crate) pid: u32,
     pub(crate) process_start_utc_ticks: u64,
 }
@@ -240,7 +239,6 @@ pub(crate) fn try_verify_chain_lane_owner_at(
             Ok(Some(VerifyChainLaneOwner {
                 _file: file,
                 startup_barrier_file: Some(startup_barrier_file),
-                path,
                 pid,
                 process_start_utc_ticks,
             }))
