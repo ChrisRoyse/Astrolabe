@@ -2392,10 +2392,15 @@ function Read-AstroResidentCohortPlan {
             'phase_store_owner_contract', 'auxiliary_state_contract'
         )
     }
+    elseif ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4') {
+        @($basePlanProperties) + @(
+            'phase_store_owner_contract', 'auxiliary_state_contract'
+        )
+    }
     else {
         Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
             "resident-cohort plan schema '$schema' is not supported" `
-            'publish an exact v1 retained-SQLite, v2 explicit phase-owner, or v3 explicit auxiliary-state plan'
+            'publish an exact v1 retained-SQLite, v2 explicit phase-owner, v3 empty-tail, or v4 stable-family plan'
     }
     Assert-AstroExactObjectProperties $plan $planProperties `
         'ASTRO_FSV_COHORT_PLAN_INVALID' 'resident-cohort plan'
@@ -2423,12 +2428,16 @@ function Read-AstroResidentCohortPlan {
         }
         $contract
     }
-    $auxiliaryStateContract = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v3') {
+    $auxiliaryStateContract = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v3' -or
+        $schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4') {
         $value = [string]$plan.auxiliary_state_contract
-        if ($value -cne 'absent' -and $value -cne 'read_only_tail') {
+        $valid = $value -ceq 'absent' -or $value -ceq 'read_only_tail' -or
+            ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4' -and
+                $value -ceq 'stable_wal_family')
+        if (-not $valid) {
             Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
-                "auxiliary_state_contract must be exactly 'absent' or 'read_only_tail', observed '$value'" `
-                'declare whether the SQLite lifecycle requires namespace absence or admits only a zero-owner, empty-WAL read-only tail'
+                "auxiliary_state_contract is invalid for schema '$schema': '$value'" `
+                'declare absent/read_only_tail for v3, or absent/read_only_tail/stable_wal_family for v4'
         }
         $value
     }
@@ -2764,7 +2773,7 @@ function Get-AstroCohortStoreInventory {
 function Read-AstroCohortAuxiliaryState {
     param(
         [Parameter(Mandatory)][string[]]$StorePaths,
-        [Parameter(Mandatory)][ValidateSet('absent', 'read_only_tail')][string]$Contract,
+        [Parameter(Mandatory)][ValidateSet('absent', 'read_only_tail', 'stable_wal_family')][string]$Contract,
         [Parameter(Mandatory)][int]$TimeoutMilliseconds,
         [Parameter(Mandatory)][string]$Phase
     )
@@ -2777,7 +2786,7 @@ function Read-AstroCohortAuxiliaryState {
         }
     }
 
-    # #1124 / #1064 PC-03/07/13/35/41: after exact zero-owner proof, read the
+    # #1124/#1125 / #1064 PC-03/04/07/13/35/38/41: after exact zero-owner proof, read the
     # fixed three-file family twice. No timeout/poll loop depends on project or
     # ledger N. Hashing cost is O(B), where B is the physical config-family byte
     # count named by the plan; paths and read order are invariant.
@@ -2799,25 +2808,40 @@ function Read-AstroCohortAuxiliaryState {
             "SQLite main database disappeared during '$Phase': $($database.path)" `
             'preserve the family and repair the missing source of truth before retrying'
     }
-    if ([bool]$wal.exists -and [uint64]$wal.bytes -ne 0) {
+    if ($Contract -ceq 'read_only_tail' -and
+        [bool]$wal.exists -and [uint64]$wal.bytes -ne 0) {
         Fail-Astro 'ASTRO_FSV_COHORT_NONEMPTY_WAL_RETAINED' `
             "read_only_tail during '$Phase' retained a nonempty WAL ($($wal.bytes) bytes, sha256=$($wal.sha256))" `
             'preserve the complete SQLite family; committed state may live outside the main DB and cannot be inferred or discarded'
     }
     if ([bool]$wal.exists -ne [bool]$shm.exists) {
         Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_FAMILY_PARTIAL' `
-            "read_only_tail during '$Phase' observed WAL/SHM presence mismatch (wal=$([bool]$wal.exists), shm=$([bool]$shm.exists))" `
+            "$Contract during '$Phase' observed WAL/SHM presence mismatch (wal=$([bool]$wal.exists), shm=$([bool]$shm.exists))" `
             'preserve the partial family and diagnose its exact SQLite lifecycle before retrying'
+    }
+    # stable_wal_family deliberately classifies the exact representation without
+    # forcing a checkpoint. The already-required subsequent resident reopen and
+    # bound response are the SQLite-aware semantic read; hashes alone never claim
+    # that a nonempty WAL is valid or reconstruct its contents.
+    $state = if (-not [bool]$wal.exists) {
+        'absent'
+    }
+    elseif ([uint64]$wal.bytes -eq 0) {
+        'read_only_tail'
+    }
+    else {
+        'wal_backed'
     }
     return [ordered]@{
         phase = $Phase
         contract = $Contract
-        state = if ([bool]$wal.exists) { 'read_only_tail' } else { 'absent' }
+        state = $state
         stable = $true
         required_consecutive_matches = 2
         before = $first
         after = $second
         wal_empty = (-not [bool]$wal.exists) -or [uint64]$wal.bytes -eq 0
+        wal_is_source_of_truth = [bool]$wal.exists -and [uint64]$wal.bytes -gt 0
         shm_trust = if ([bool]$shm.exists) { 'transient_wal_index' } else { 'absent' }
     }
 }
