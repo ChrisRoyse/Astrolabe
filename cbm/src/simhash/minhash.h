@@ -39,6 +39,11 @@
 #define CBM_LSH_BANDS 32
 #define CBM_LSH_ROWS 2
 
+/* Caller-owned scratch required by the allocation-free query path.  The
+ * capacity is twice the largest candidate buffer used by production, keeping
+ * the open-addressed set below 50% load. */
+#define CBM_LSH_QUERY_SEEN_CAP 16384
+
 /* ── MinHash fingerprint ─────────────────────────────────────────── */
 
 /* A MinHash signature: K minimum hash values, one per seed. */
@@ -119,21 +124,29 @@ typedef struct {
 /* Create a new LSH index. */
 cbm_lsh_index_t *cbm_lsh_new(void);
 
-/* Insert an entry into the LSH index. */
-void cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry);
+/* Insert an entry into the LSH index.  Returns false without changing any
+ * logical entry/bucket counts when required storage cannot be admitted. */
+bool cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry);
 
 /* Query candidates similar to the given fingerprint.
  * Returns candidate entries via `out` (caller does NOT free the array
  * — it is owned by the index).  Sets `count`.
  * NOT thread-safe: uses index-internal result buffer. */
-void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+bool cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                    const cbm_lsh_entry_t ***out, int *count);
 
 /* Thread-safe variant: writes candidates into caller-provided buffer.
  * `out_buf` must have room for at least `out_cap` pointers.
- * Returns the actual candidate count (may exceed out_cap — result is truncated). */
+ * Returns the candidate count, or -1 when required scratch allocation fails. */
 int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                        const cbm_lsh_entry_t **out_buf, int out_cap);
+
+/* Allocation-free thread-safe query used by bounded workers.  `seen_slots`
+ * must contain exactly CBM_LSH_QUERY_SEEN_CAP int64_t elements and is cleared
+ * by the call.  Returns the candidate count, or -1 for invalid scratch. */
+int cbm_lsh_query_into_scratch(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                               const cbm_lsh_entry_t **out_buf, int out_cap, int64_t *seen_slots,
+                               int seen_cap);
 
 /* Free the LSH index and all internal storage. */
 void cbm_lsh_free(cbm_lsh_index_t *idx);

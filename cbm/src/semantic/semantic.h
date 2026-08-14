@@ -93,7 +93,8 @@ bool cbm_sem_is_enabled(void);
 enum { CBM_SEM_MAX_TOKENS = 512 };
 
 /* Split a name into tokens: camelCase, snake_case, dot.separated.
- * Writes up to max_out tokens into out. Returns token count.
+ * Writes up to max_out tokens into out. Returns token count, or -1 after
+ * releasing every token produced by this call if an allocation fails.
  * Tokens are lowercased. Caller must free each token.
  * An invalid UTF-8 byte is a token boundary (split, never fused) and is counted
  * as a stripped byte; a valid multi-byte UTF-8 char is skipped atomically. */

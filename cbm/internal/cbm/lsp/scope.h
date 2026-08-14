@@ -58,7 +58,11 @@ static inline bool cbm_lsp_read_positive_limit(CBMArena *arena, const char *name
     errno = 0;
     char *end = NULL;
     long parsed = strtol(raw, &end, 10);
-    if (errno == ERANGE || end == raw || !end || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+    if (errno == ERANGE || end == raw || !end || *end != '\0' || parsed <= 0
+#if LONG_MAX > INT_MAX
+        || parsed > INT_MAX
+#endif
+    ) {
         cbm_arena_mark_failed(arena, "CBM_LSP_LIMIT_CONFIG_INVALID", operation, 0);
         return false;
     }

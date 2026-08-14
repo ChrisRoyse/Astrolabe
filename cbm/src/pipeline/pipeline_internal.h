@@ -820,7 +820,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * Propagates per-function loop_depth along CALLS edges into a transitive
  * worst-case nested-loop estimate (transitive_loop_depth) and flags call-graph
  * cycles (recursive). Runs on the graph buffer before the dump. */
-void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
+int cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
 
 /* Build a process/request-unique staging identity beside a live database.
  * The caller owns *out_path. The direct writer still opens it with CREATE_NEW,

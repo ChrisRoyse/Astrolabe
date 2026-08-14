@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <limits.h>
 
 /* ── AST node type normalisation ─────────────────────────────────── */
 
@@ -53,7 +54,11 @@ enum { BUCKET_INIT_CAP = 8, GROW_FACTOR = 2, ENTRY_INIT_CAP = 64, RESULT_INIT_CA
 enum { MAX_BUCKET_SIZE = 200 };
 
 /* Seen-set for O(1) dedup during query (simple open-addressing hash table). */
-enum { SEEN_SET_BITS = 14, SEEN_SET_SIZE = 16384, SEEN_SET_MASK = 16383 };
+enum {
+    SEEN_SET_BITS = 14,
+    SEEN_SET_SIZE = CBM_LSH_QUERY_SEEN_CAP,
+    SEEN_SET_MASK = CBM_LSH_QUERY_SEEN_CAP - 1,
+};
 
 /* Knuth multiplicative hash constant for node_id → seen-set slot. */
 enum { KNUTH_MULT = 2654435761ULL };
@@ -396,50 +401,101 @@ static uint32_t band_hash(const cbm_minhash_t *fp, int band) {
     return (uint32_t)(h & LSH_BUCKET_MASK);
 }
 
-static void bucket_push(lsh_bucket_t *bucket, int entry_index) {
+static bool checked_grow_cap(int current, int initial, size_t item_size, int *out) {
+    if (!out || current < 0 || initial <= 0 || item_size == 0) {
+        return false;
+    }
+    int next = initial;
+    if (current >= initial) {
+        if (current > INT_MAX / GROW_FACTOR) {
+            return false;
+        }
+        next = current * GROW_FACTOR;
+    }
+    if ((size_t)next > SIZE_MAX / item_size) {
+        return false;
+    }
+    *out = next;
+    return true;
+}
+
+static bool bucket_reserve_one(lsh_bucket_t *bucket) {
     if (bucket->count >= bucket->cap) {
-        int new_cap = bucket->cap < BUCKET_INIT_CAP ? BUCKET_INIT_CAP : bucket->cap * GROW_FACTOR;
+        int new_cap = 0;
+        if (!checked_grow_cap(bucket->cap, BUCKET_INIT_CAP, sizeof(int), &new_cap)) {
+            cbm_log_error("minhash.lsh_bucket_capacity_failed", "code",
+                          "CBM_LSH_BUCKET_CAPACITY_OVERFLOW", "message",
+                          "LSH bucket capacity cannot be represented safely", "remediation",
+                          "reduce the indexed corpus size, then retry");
+            return false;
+        }
         int *new_items = realloc(bucket->items, (size_t)new_cap * sizeof(int));
         if (!new_items) {
-            return;
+            cbm_log_error("minhash.lsh_bucket_alloc_failed", "code", "CBM_LSH_BUCKET_ALLOC_FAILED",
+                          "message", "LSH bucket storage could not be grown", "remediation",
+                          "free memory or reduce the indexed corpus size, then retry");
+            return false;
         }
         bucket->items = new_items;
         bucket->cap = new_cap;
     }
-    bucket->items[bucket->count++] = entry_index;
+    return true;
 }
 
 cbm_lsh_index_t *cbm_lsh_new(void) {
     cbm_lsh_index_t *idx = calloc(SKIP_ONE, sizeof(cbm_lsh_index_t));
+    if (!idx) {
+        cbm_log_error("minhash.lsh_alloc_failed", "code", "CBM_LSH_INDEX_ALLOC_FAILED", "message",
+                      "LSH index storage could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+    }
     return idx;
 }
 
-void cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry) {
+bool cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry) {
     if (!idx || !entry || !entry->fingerprint) {
-        return;
+        return false;
     }
 
-    /* Store a copy of the entry */
+    /* Admit every allocation before changing entry_count or any bucket count.
+     * Capacity growth may move an owned buffer, but a failure leaves the
+     * complete logical index unchanged and therefore safely retryable. */
     if (idx->entry_count >= idx->entry_cap) {
-        int new_cap =
-            idx->entry_cap < ENTRY_INIT_CAP ? ENTRY_INIT_CAP : idx->entry_cap * GROW_FACTOR;
+        int new_cap = 0;
+        if (!checked_grow_cap(idx->entry_cap, ENTRY_INIT_CAP, sizeof(cbm_lsh_entry_t), &new_cap)) {
+            cbm_log_error("minhash.lsh_entry_capacity_failed", "code",
+                          "CBM_LSH_ENTRY_CAPACITY_OVERFLOW", "message",
+                          "LSH entry capacity cannot be represented safely", "remediation",
+                          "reduce the indexed corpus size, then retry");
+            return false;
+        }
         cbm_lsh_entry_t *new_entries =
             realloc(idx->entries, (size_t)new_cap * sizeof(cbm_lsh_entry_t));
         if (!new_entries) {
-            return;
+            cbm_log_error("minhash.lsh_entry_alloc_failed", "code", "CBM_LSH_ENTRY_ALLOC_FAILED",
+                          "message", "LSH entry storage could not be grown", "remediation",
+                          "free memory or reduce the indexed corpus size, then retry");
+            return false;
         }
         idx->entries = new_entries;
         idx->entry_cap = new_cap;
     }
     int entry_idx = idx->entry_count;
-    idx->entries[entry_idx] = *entry;
-    idx->entry_count++;
-
-    /* Insert index into each band's bucket */
     for (int b = 0; b < CBM_LSH_BANDS; b++) {
         uint32_t h = band_hash(entry->fingerprint, b);
-        bucket_push(&idx->bands[b][h], entry_idx);
+        if (!bucket_reserve_one(&idx->bands[b][h])) {
+            return false;
+        }
     }
+
+    idx->entries[entry_idx] = *entry;
+    idx->entry_count++;
+    for (int b = 0; b < CBM_LSH_BANDS; b++) {
+        uint32_t h = band_hash(entry->fingerprint, b);
+        lsh_bucket_t *bucket = &idx->bands[b][h];
+        bucket->items[bucket->count++] = entry_idx;
+    }
+    return true;
 }
 
 /* O(1) seen-set: open-addressing hash table on node_id for dedup. */
@@ -448,10 +504,11 @@ typedef struct {
     int cap;
 } seen_set_t;
 
-static void seen_set_init(seen_set_t *s) {
+static bool seen_set_init(seen_set_t *s) {
     s->slots = calloc(SEEN_SET_SIZE, sizeof(int64_t));
     s->cap = SEEN_SET_SIZE;
     /* 0 means empty — node_ids are always > 0 */
+    return s->slots != NULL;
 }
 
 static bool seen_set_insert(seen_set_t *s, int64_t node_id) {
@@ -480,8 +537,15 @@ static void seen_set_free(seen_set_t *s) {
 /* Append a candidate to the result buffer, growing if needed. */
 static bool result_push(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *candidate) {
     if (idx->result_count >= idx->result_cap) {
-        int new_cap =
-            idx->result_cap < RESULT_INIT_CAP ? RESULT_INIT_CAP : idx->result_cap * GROW_FACTOR;
+        int new_cap = 0;
+        if (!checked_grow_cap(idx->result_cap, RESULT_INIT_CAP, sizeof(const cbm_lsh_entry_t *),
+                              &new_cap)) {
+            cbm_log_error("minhash.lsh_query_capacity_failed", "code",
+                          "CBM_LSH_QUERY_RESULT_CAPACITY_OVERFLOW", "message",
+                          "LSH query result capacity cannot be represented safely", "remediation",
+                          "reduce the indexed corpus size, then retry");
+            return false;
+        }
         const cbm_lsh_entry_t **new_buf =
             realloc(idx->result_buf, (size_t)new_cap * sizeof(const cbm_lsh_entry_t *));
         if (!new_buf) {
@@ -494,13 +558,16 @@ static bool result_push(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *candidate) 
     return true;
 }
 
-void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+bool cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                    const cbm_lsh_entry_t ***out, int *count) {
+    if (!out || !count) {
+        return false;
+    }
     *out = NULL;
     *count = 0;
 
     if (!idx || !fp) {
-        return;
+        return false;
     }
 
     cbm_lsh_index_t *mut_idx = (cbm_lsh_index_t *)idx;
@@ -508,7 +575,13 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
 
     /* O(1) dedup via open-addressing hash set */
     seen_set_t seen;
-    seen_set_init(&seen);
+    if (!seen_set_init(&seen)) {
+        cbm_log_error("minhash.lsh_query_alloc_failed", "code",
+                      "CBM_LSH_QUERY_SCRATCH_ALLOC_FAILED", "message",
+                      "LSH query deduplication scratch could not be allocated", "remediation",
+                      "free memory or reduce concurrent query pressure, then retry");
+        return false;
+    }
 
     for (int b = 0; b < CBM_LSH_BANDS; b++) {
         uint32_t h = band_hash(fp, b);
@@ -523,7 +596,12 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                 continue; /* already seen */
             }
             if (!result_push(mut_idx, candidate)) {
-                break;
+                seen_set_free(&seen);
+                cbm_log_error("minhash.lsh_query_alloc_failed", "code",
+                              "CBM_LSH_QUERY_RESULT_ALLOC_FAILED", "message",
+                              "LSH query result storage could not be grown", "remediation",
+                              "free memory or reduce concurrent query pressure, then retry");
+                return false;
             }
         }
     }
@@ -531,17 +609,18 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
     seen_set_free(&seen);
     *out = mut_idx->result_buf;
     *count = mut_idx->result_count;
+    return true;
 }
 
-int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
-                       const cbm_lsh_entry_t **out_buf, int out_cap) {
-    if (!idx || !fp || !out_buf || out_cap <= 0) {
-        return 0;
+int cbm_lsh_query_into_scratch(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                               const cbm_lsh_entry_t **out_buf, int out_cap, int64_t *seen_slots,
+                               int seen_cap) {
+    if (!idx || !fp || !out_buf || out_cap <= 0 || !seen_slots || seen_cap != SEEN_SET_SIZE) {
+        return -1;
     }
 
-    /* Thread-local dedup — no shared state touched. */
-    seen_set_t seen;
-    seen_set_init(&seen);
+    memset(seen_slots, 0, (size_t)seen_cap * sizeof(*seen_slots));
+    seen_set_t seen = {.slots = seen_slots, .cap = seen_cap};
 
     int count = 0;
     for (int b = 0; b < CBM_LSH_BANDS; b++) {
@@ -562,7 +641,21 @@ int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
         }
     }
 
-    seen_set_free(&seen);
+    return count;
+}
+
+int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                       const cbm_lsh_entry_t **out_buf, int out_cap) {
+    int64_t *seen_slots = calloc(SEEN_SET_SIZE, sizeof(*seen_slots));
+    if (!seen_slots) {
+        cbm_log_error("minhash.lsh_query_alloc_failed", "code",
+                      "CBM_LSH_QUERY_SCRATCH_ALLOC_FAILED", "message",
+                      "LSH query deduplication scratch could not be allocated", "remediation",
+                      "free memory or reduce concurrent query pressure, then retry");
+        return -1;
+    }
+    int count = cbm_lsh_query_into_scratch(idx, fp, out_buf, out_cap, seen_slots, SEEN_SET_SIZE);
+    free(seen_slots);
     return count;
 }
 

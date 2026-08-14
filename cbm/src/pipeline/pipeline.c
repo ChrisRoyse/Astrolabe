@@ -3395,8 +3395,7 @@ static int predump_cfg(cbm_pipeline_ctx_t *ctx) {
     return cbm_pipeline_pass_configlink(ctx);
 }
 static int predump_complexity(cbm_pipeline_ctx_t *ctx) {
-    cbm_pipeline_pass_complexity(ctx);
-    return 0;
+    return cbm_pipeline_pass_complexity(ctx);
 }
 
 static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {

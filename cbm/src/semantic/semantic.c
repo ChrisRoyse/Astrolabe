@@ -161,12 +161,18 @@ static bool is_camel_break(const char *name, int i) {
 }
 
 /* Flush the current buffer as a token into out[]. */
-static void flush_token(char *buf, int *blen, char **out, int *count, int max_out) {
+static bool flush_token(char *buf, int *blen, char **out, int *count, int max_out) {
     if (*blen > 0 && *count < max_out) {
         buf[*blen] = '\0';
-        out[(*count)++] = strdup(buf);
+        char *token = strdup(buf);
+        if (!token) {
+            *blen = 0;
+            return false;
+        }
+        out[(*count)++] = token;
     }
     *blen = 0;
+    return true;
 }
 
 /* Count of invalid-UTF-8 bytes stripped by the tokenizer since the last take.
@@ -201,7 +207,9 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
             /* Invalid UTF-8 byte: treat as a TOKEN BOUNDARY (split, don't fuse the
              * surrounding halves into a token that never existed in the source) and
              * count the stripped byte as labeled degradation (#532). */
-            flush_token(buf, &blen, out, &count, max_out);
+            if (!flush_token(buf, &blen, out, &count, max_out)) {
+                goto allocation_failed;
+            }
             atomic_fetch_add(&g_sem_tokenize_stripped_bytes, 1ULL);
             continue;
         }
@@ -209,7 +217,9 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
         bool split = is_token_delim(c);
         bool camel = is_camel_break(name, i);
         if (split || camel) {
-            flush_token(buf, &blen, out, &count, max_out);
+            if (!flush_token(buf, &blen, out, &count, max_out)) {
+                goto allocation_failed;
+            }
             if (split) {
                 continue;
             }
@@ -218,7 +228,9 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
             buf[blen++] = (char)tolower((unsigned char)c);
         }
     }
-    flush_token(buf, &blen, out, &count, max_out);
+    if (!flush_token(buf, &blen, out, &count, max_out)) {
+        goto allocation_failed;
+    }
 
     /* Abbreviation expansion: add expanded forms for common code abbreviations.
      * "err" → also add "error", "ctx" → "context", etc. */
@@ -391,13 +403,27 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
     for (int t = 0; t < orig_count && count < max_out; t++) {
         for (int a = 0; abbrevs[a].abbrev; a++) {
             if (strcmp(out[t], abbrevs[a].abbrev) == 0) {
-                out[count++] = strdup(abbrevs[a].expanded);
+                char *expanded = strdup(abbrevs[a].expanded);
+                if (!expanded) {
+                    goto allocation_failed;
+                }
+                out[count++] = expanded;
                 break;
             }
         }
     }
 
     return count;
+
+allocation_failed:
+    for (int i = 0; i < count; i++) {
+        free(out[i]);
+        out[i] = NULL;
+    }
+    cbm_log_error("semantic.tokenize_alloc_failed", "code", "CBM_SEM_TOKEN_ALLOC_FAILED", "message",
+                  "semantic token storage could not be allocated", "remediation",
+                  "free memory or reduce the indexed corpus size, then retry");
+    return -1;
 }
 
 /* ── Dense vector operations ─────────────────────────────────────── */
@@ -1092,9 +1118,8 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         char worker_buf[CBM_SZ_32];
         snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
         corpus_rollback_entries(corpus, base_entry_count);
-        cbm_log_error("semantic.corpus.worker_count_invalid", "code",
-                      "CBM_WORKER_COUNT_INVALID", "operation", "add_docs_batch",
-                      "worker_count", worker_buf, "message",
+        cbm_log_error("semantic.corpus.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                      "operation", "add_docs_batch", "worker_count", worker_buf, "message",
                       "worker-count configuration is invalid", "remediation",
                       "set CBM_WORKERS to an integer from 1 through 256 or remove it");
         return CBM_NOT_FOUND;
@@ -1128,8 +1153,8 @@ int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         .operation = "semantic.corpus.add_docs_batch",
     };
     cbm_parallel_for_result_t dispatch_result = {0};
-    int dispatch_rc = cbm_parallel_for(worker_count, batch_resolve_worker, &bc, opts,
-                                       &dispatch_result);
+    int dispatch_rc =
+        cbm_parallel_for(worker_count, batch_resolve_worker, &bc, opts, &dispatch_result);
     corpus->doc_token_ids -= base_doc;
     corpus->doc_token_counts -= base_doc;
 
@@ -1716,8 +1741,8 @@ static bool finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t 
     cbm_parallel_for_opts_t quant_opts = p->opts;
     quant_opts.operation = "semantic.corpus.quantize_pass1";
     cbm_parallel_for_result_t quant_result = {0};
-    if (cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, quant_opts,
-                         &quant_result) != 0) {
+    if (cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, quant_opts, &quant_result) !=
+        0) {
         free(pass1);
         free(pass1_q);
         return false;
@@ -1743,8 +1768,7 @@ static bool finalize_pass2(finalize_params_t *p, int8_t *pass1_q, cbm_sem_vec_t 
     cbm_parallel_for_opts_t int8_opts = p->opts;
     int8_opts.operation = "semantic.corpus.cooccur_int8";
     cbm_parallel_for_result_t int8_result = {0};
-    if (cbm_parallel_for(p->worker_count, cooccur_worker_int8, &cc, int8_opts, &int8_result) !=
-        0) {
+    if (cbm_parallel_for(p->worker_count, cooccur_worker_int8, &cc, int8_opts, &int8_result) != 0) {
         free(pass1);
         free(pass1_q);
         return false;
@@ -1794,9 +1818,8 @@ bool cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     if (worker_count <= 0) {
         char worker_buf[CBM_SZ_32];
         snprintf(worker_buf, sizeof(worker_buf), "%d", worker_count);
-        cbm_log_error("semantic.corpus.worker_count_invalid", "code",
-                      "CBM_WORKER_COUNT_INVALID", "operation", "finalize",
-                      "worker_count", worker_buf, "message",
+        cbm_log_error("semantic.corpus.worker_count_invalid", "code", "CBM_WORKER_COUNT_INVALID",
+                      "operation", "finalize", "worker_count", worker_buf, "message",
                       "worker-count configuration is invalid", "remediation",
                       "set CBM_WORKERS to an integer from 1 through 256 or remove it");
         return false;
@@ -1905,13 +1928,11 @@ static int parse_token_index(const char *idx_str) {
  * all-zero semantic vector for a one-document corpus.  Smoothing preserves
  * rarity ordering while giving every valid observed term finite evidence. */
 static float corpus_idf_weight(int document_count, int document_frequency) {
-    if (document_count <= 0 || document_frequency <= 0 ||
-        document_frequency > document_count) {
+    if (document_count <= 0 || document_frequency <= 0 || document_frequency > document_count) {
         return 0.0F;
     }
-    return CBM_SEM_UNIT_POS +
-           logf((CBM_SEM_UNIT_POS + (float)document_count) /
-                (CBM_SEM_UNIT_POS + (float)document_frequency));
+    return CBM_SEM_UNIT_POS + logf((CBM_SEM_UNIT_POS + (float)document_count) /
+                                   (CBM_SEM_UNIT_POS + (float)document_frequency));
 }
 
 float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token) {
