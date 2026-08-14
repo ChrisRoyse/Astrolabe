@@ -503,7 +503,7 @@ fn config_refusal_case(root: &Path, name: &str, raw: &str) -> AnyResult<Value> {
     if !matches!(
         (name, code),
         ("empty", "ASTRO_WEAVE_KNOB_EMPTY")
-            | ("nonnumeric", "ASTRO_WEAVE_KNOB_NOT_INTEGER")
+            | ("nonnumeric", "ASTRO_WEAVE_KNOB_NON_NUMERIC")
             | ("out_of_range", "ASTRO_WEAVE_KNOB_OUT_OF_RANGE")
             | ("whitespace", "ASTRO_WEAVE_KNOB_WHITESPACE")
     ) {
