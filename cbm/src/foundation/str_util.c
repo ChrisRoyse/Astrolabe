@@ -614,7 +614,10 @@ enum {
  * past a NUL: a NUL continuation byte fails the range checks first (#493).
  * Exported (#503) so the raw-text UTF-8 sanitizer at the SQLite insert boundary
  * reuses the identical RFC 3629 validation the JSON escaper uses. */
-int cbm_utf8_sequence_len(const unsigned char *src) {
+int cbm_utf8_sequence_len_n(const unsigned char *src, size_t available) {
+    if (!src || available == 0) {
+        return 0;
+    }
     unsigned char lead = src[0];
     unsigned char lo = 0x80, hi = 0xBF;
     int len;
@@ -637,6 +640,9 @@ int cbm_utf8_sequence_len(const unsigned char *src) {
     } else {
         return 0; /* 0x80-0xC1, 0xF5-0xFF: never a valid lead byte */
     }
+    if (available < (size_t)len) {
+        return 0;
+    }
     if (src[1] < lo || src[1] > hi) {
         return 0;
     }
@@ -646,6 +652,38 @@ int cbm_utf8_sequence_len(const unsigned char *src) {
         }
     }
     return len;
+}
+
+int cbm_utf8_sequence_len(const unsigned char *src) {
+    if (!src) {
+        return 0;
+    }
+    size_t available = 1;
+    while (available < 4 && src[available] != '\0') {
+        available++;
+    }
+    return cbm_utf8_sequence_len_n(src, available);
+}
+
+size_t cbm_utf8_invalid_byte_count(const unsigned char *src, size_t len) {
+    if (!src) {
+        return 0;
+    }
+    size_t invalid = 0;
+    for (size_t at = 0; at < len;) {
+        if (src[at] < 0x80) {
+            at++;
+            continue;
+        }
+        int sequence_len = cbm_utf8_sequence_len_n(src + at, len - at);
+        if (sequence_len > 0) {
+            at += (size_t)sequence_len;
+            continue;
+        }
+        invalid++;
+        at++;
+    }
+    return invalid;
 }
 
 int cbm_json_escape(char *buf, int bufsize, const char *src) {

@@ -561,6 +561,8 @@ typedef struct {
     uint32_t end_byte;
     const char *source;
     uint32_t source_len;
+    uint32_t invalid_utf8_bytes;
+    uint32_t quarantined_definitions;
     bool is_missing;
 } CBMParseDiagnostic;
 

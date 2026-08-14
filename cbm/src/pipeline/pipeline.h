@@ -273,6 +273,12 @@ uint_least64_t cbm_pipeline_get_dangling_rust_module_skips(const cbm_pipeline_t 
  * every run, including zero, so malformed-source recovery is never silent. */
 uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p);
 
+/* Ill-formed source bytes found inside persisted parser-recovery spans, plus
+ * the exact number of definitions quarantined before graph construction. Both
+ * counters are emitted on every successful index, including zero. */
+uint_least64_t cbm_pipeline_get_invalid_utf8_bytes(const cbm_pipeline_t *p);
+uint_least64_t cbm_pipeline_get_invalid_utf8_quarantined_definitions(const cbm_pipeline_t *p);
+
 /* Exact compilation-context coverage captured before extraction. Paths are
  * borrowed from the pipeline and remain valid until cbm_pipeline_free(). A
  * configuration-absent file is a real source atom outside the selected build

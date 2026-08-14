@@ -4312,6 +4312,8 @@ impl ExtractedFile {
                     start_byte: item.start_byte,
                     end_byte: item.end_byte,
                     source,
+                    invalid_utf8_bytes: item.invalid_utf8_bytes,
+                    quarantined_definitions: item.quarantined_definitions,
                     is_missing: item.is_missing,
                 })
             })
@@ -4688,6 +4690,8 @@ pub struct ParseDiagnostic {
     pub start_byte: u32,
     pub end_byte: u32,
     pub source: Vec<u8>,
+    pub invalid_utf8_bytes: u32,
+    pub quarantined_definitions: u32,
     pub is_missing: bool,
 }
 

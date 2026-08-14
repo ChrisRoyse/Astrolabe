@@ -305,6 +305,12 @@ struct cbm_pipeline {
      * exact number of diagnostic rows collected from real source trees. */
     uint_least64_t parse_recovery_diagnostics;
 
+    /* Definition-identity loss caused by ill-formed source bytes. These are
+     * summed from the same persisted ParseDiagnostic facts that drive
+     * quarantine, never recomputed from sanitized graph text. */
+    uint_least64_t invalid_utf8_bytes;
+    uint_least64_t invalid_utf8_quarantined_definitions;
+
     /* Retained successful-run phase telemetry. Fixed storage makes telemetry
      * collection allocation-free after pipeline creation and prevents clean
      * worker-log retention from accumulating on disk. */
@@ -941,6 +947,8 @@ cbm_pipeline_t *cbm_pipeline_new_at(const char *repo_path, const char *db_path,
     p->ambiguous_reference_skips = 0;
     p->unresolved_reference_source_skips = 0;
     p->parse_recovery_diagnostics = 0;
+    p->invalid_utf8_bytes = 0;
+    p->invalid_utf8_quarantined_definitions = 0;
     p->phase_metrics_complete = true;
     p->parallel_dispatches_complete = true;
     p->parallel_resolver_accounting_present = false;
@@ -2176,6 +2184,22 @@ void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64
 
 uint_least64_t cbm_pipeline_get_parse_recovery_diagnostics(const cbm_pipeline_t *p) {
     return p ? p->parse_recovery_diagnostics : 0;
+}
+
+void cbm_pipeline_add_invalid_utf8_accounting(cbm_pipeline_t *p, uint_least64_t bytes,
+                                              uint_least64_t quarantined_definitions) {
+    if (p) {
+        p->invalid_utf8_bytes += bytes;
+        p->invalid_utf8_quarantined_definitions += quarantined_definitions;
+    }
+}
+
+uint_least64_t cbm_pipeline_get_invalid_utf8_bytes(const cbm_pipeline_t *p) {
+    return p ? p->invalid_utf8_bytes : 0;
+}
+
+uint_least64_t cbm_pipeline_get_invalid_utf8_quarantined_definitions(const cbm_pipeline_t *p) {
+    return p ? p->invalid_utf8_quarantined_definitions : 0;
 }
 
 const cbm_gbuf_node_t *cbm_pipeline_find_reference_source(

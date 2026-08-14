@@ -507,8 +507,10 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
     int nodes_created;
     int errors;
     uint_least64_t parse_recovery_diagnostics;
+    uint_least64_t invalid_utf8_bytes;
+    uint_least64_t invalid_utf8_quarantined_definitions;
     char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - (PP_ESC_SPACE * sizeof(int)) -
-              sizeof(uint_least64_t)];
+              (3 * sizeof(uint_least64_t))];
 } extract_worker_state_t;
 
 typedef struct {
@@ -657,9 +659,11 @@ static void insert_diagnostic_into_gbuf(extract_worker_state_t *ws, const cbm_fi
     snprintf(props, sizeof(props),
              "{\"code\":\"%s\",\"operation\":\"%s\",\"node_type\":\"%s\","
              "\"message\":\"%s\",\"remediation\":\"%s\",\"start_byte\":%u,"
-             "\"end_byte\":%u,\"missing\":%s}",
+             "\"end_byte\":%u,\"missing\":%s,\"invalid_utf8_bytes\":%u,"
+             "\"quarantined_definitions\":%u}",
              diag->code, operation, node_type, message, remediation, diag->start_byte,
-             diag->end_byte, diag->is_missing ? "true" : "false");
+             diag->end_byte, diag->is_missing ? "true" : "false", diag->invalid_utf8_bytes,
+             diag->quarantined_definitions);
     const uint8_t *atom_source = (const uint8_t *)diag->source;
     size_t atom_source_len = (size_t)diag->source_len;
     bool source_is_slab = diag->end_byte > diag->start_byte &&
@@ -1165,6 +1169,10 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->diagnostics.count; d++) {
             insert_diagnostic_into_gbuf(ws, fi, ec->project_name,
                                         &result->diagnostics.items[d], source_bytes, source_size);
+            ws->invalid_utf8_bytes +=
+                (uint_least64_t)result->diagnostics.items[d].invalid_utf8_bytes;
+            ws->invalid_utf8_quarantined_definitions +=
+                (uint_least64_t)result->diagnostics.items[d].quarantined_definitions;
         }
         ws->parse_recovery_diagnostics += (uint_least64_t)result->diagnostics.count;
 
@@ -1456,6 +1464,9 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
             total_errors += workers[i].errors;
             cbm_pipeline_add_parse_recovery_diagnostics(ctx->pipeline,
                                                         workers[i].parse_recovery_diagnostics);
+            cbm_pipeline_add_invalid_utf8_accounting(
+                ctx->pipeline, workers[i].invalid_utf8_bytes,
+                workers[i].invalid_utf8_quarantined_definitions);
             cbm_gbuf_free(workers[i].local_gbuf);
         }
     }

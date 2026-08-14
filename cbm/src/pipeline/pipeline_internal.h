@@ -144,6 +144,8 @@ int cbm_pipeline_reconcile_incremental_git_structure(cbm_pipeline_t *p, cbm_gbuf
 int cbm_pipeline_git_structure_matches_store(cbm_pipeline_t *p, cbm_store_t *store, bool *matches);
 
 void cbm_pipeline_add_parse_recovery_diagnostics(cbm_pipeline_t *p, uint_least64_t count);
+void cbm_pipeline_add_invalid_utf8_accounting(cbm_pipeline_t *p, uint_least64_t bytes,
+                                              uint_least64_t quarantined_definitions);
 void cbm_pipeline_record_parallel_dispatch(cbm_pipeline_t *p, const char *operation,
                                            const char *mode, const char *code, int item_count,
                                            int requested_workers, int admitted_workers,

@@ -56,6 +56,9 @@ static void ps_record_tree_diagnostics(CBMExtractCtx *ctx, TSNode root, bool emb
                     : "inspect the exact span; unaffected syntax remains indexed with this "
                       "degradation labeled",
                 missing);
+            if (ts_node_is_error(node)) {
+                continue;
+            }
         }
         ts_nstack_push_children(&stack, &scratch, node);
     }

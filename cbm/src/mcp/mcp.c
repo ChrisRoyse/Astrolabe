@@ -8871,9 +8871,24 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
             "with exact source span and remediation.");
     }
 
+    uint_least64_t invalid_utf8_bytes = cbm_pipeline_get_invalid_utf8_bytes(p);
+    uint_least64_t invalid_utf8_quarantined_definitions =
+        cbm_pipeline_get_invalid_utf8_quarantined_definitions(p);
+    yyjson_mut_obj_add_uint(doc, root, "invalid_utf8_bytes", (uint64_t)invalid_utf8_bytes);
+    yyjson_mut_obj_add_uint(doc, root, "invalid_utf8_quarantined_definitions",
+                            (uint64_t)invalid_utf8_quarantined_definitions);
+    if (invalid_utf8_bytes > 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "invalid_utf8_hint",
+            "Ill-formed UTF-8 bytes occurred inside parser-recovery spans. Definitions whose "
+            "exact source ranges contain those spans were quarantined before graph construction; "
+            "inspect the persisted ParseDiagnostic rows for byte-exact evidence and remediation.");
+    }
+
     bool partial_success = content_defect_nodes > 0 || ambiguous_skips > 0 ||
                            unresolved_source_skips > 0 || dangling_rust_module_skips > 0 ||
-                           parse_recovery_diagnostics > 0;
+                           parse_recovery_diagnostics > 0 || invalid_utf8_bytes > 0 ||
+                           invalid_utf8_quarantined_definitions > 0;
     yyjson_mut_obj_add_str(doc, root, "status",
                            partial_success ? "partial_success" : "indexed");
 

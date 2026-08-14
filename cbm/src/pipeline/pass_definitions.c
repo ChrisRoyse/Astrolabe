@@ -521,9 +521,11 @@ static void process_diagnostic(cbm_pipeline_ctx_t *ctx, const CBMParseDiagnostic
     snprintf(props, sizeof(props),
              "{\"code\":\"%s\",\"operation\":\"%s\",\"node_type\":\"%s\","
              "\"message\":\"%s\",\"remediation\":\"%s\",\"start_byte\":%u,"
-             "\"end_byte\":%u,\"missing\":%s}",
+             "\"end_byte\":%u,\"missing\":%s,\"invalid_utf8_bytes\":%u,"
+             "\"quarantined_definitions\":%u}",
              diag->code, operation, node_type, message, remediation, diag->start_byte,
-             diag->end_byte, diag->is_missing ? "true" : "false");
+             diag->end_byte, diag->is_missing ? "true" : "false", diag->invalid_utf8_bytes,
+             diag->quarantined_definitions);
     int64_t node_id = cbm_gbuf_upsert_source_node(
         ctx->gbuf, "ParseDiagnostic", diag->code, qn, rel, (int)diag->start_line,
         (int)diag->end_line, (const uint8_t *)diag->source, (size_t)diag->source_len,
@@ -792,6 +794,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
         for (int d = 0; d < result->diagnostics.count; d++) {
             process_diagnostic(ctx, &result->diagnostics.items[d], rel);
+            cbm_pipeline_add_invalid_utf8_accounting(
+                ctx->pipeline, (uint_least64_t)result->diagnostics.items[d].invalid_utf8_bytes,
+                (uint_least64_t)result->diagnostics.items[d].quarantined_definitions);
             total_diagnostics++;
         }
         cbm_pipeline_add_parse_recovery_diagnostics(ctx->pipeline,

@@ -1086,6 +1086,8 @@ pub struct CBMParseDiagnostic {
     pub end_byte: u32,
     pub source: *const ::std::os::raw::c_char,
     pub source_len: u32,
+    pub invalid_utf8_bytes: u32,
+    pub quarantined_definitions: u32,
     pub is_missing: bool,
 }
 impl Default for CBMParseDiagnostic {
@@ -4134,6 +4136,14 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_pipeline_get_parse_recovery_diagnostics(p: *const cbm_pipeline_t) -> uint_least64_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_invalid_utf8_bytes(p: *const cbm_pipeline_t) -> uint_least64_t;
+}
+unsafe extern "C" {
+    pub fn cbm_pipeline_get_invalid_utf8_quarantined_definitions(
+        p: *const cbm_pipeline_t,
+    ) -> uint_least64_t;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

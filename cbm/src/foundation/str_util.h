@@ -105,6 +105,16 @@ int cbm_json_escape(char *buf, int bufsize, const char *src);
  * NUL. Shared (#503) by the JSON escaper and the raw-text sanitizer below. */
 int cbm_utf8_sequence_len(const unsigned char *src);
 
+/* Bounded form of cbm_utf8_sequence_len for byte-exact source slices. It never
+ * reads beyond `available`, so parser diagnostics do not borrow validation
+ * authority from bytes outside their persisted span. */
+int cbm_utf8_sequence_len_n(const unsigned char *src, size_t available);
+
+/* Count bytes that cannot participate in any RFC 3629 sequence. Valid
+ * multibyte sequences advance atomically; an invalid byte advances by one,
+ * matching cbm_sem_tokenize's stripped-byte accounting exactly. */
+size_t cbm_utf8_invalid_byte_count(const unsigned char *src, size_t len);
+
 /* Sanitize raw text into a valid-UTF-8 copy for a non-JSON SQLite text column
  * (#503): valid multi-byte sequences are copied atomically (truncation lands
  * only on a character boundary) and every invalid byte becomes U+FFFD, so the

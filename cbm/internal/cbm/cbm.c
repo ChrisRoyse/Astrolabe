@@ -18,6 +18,7 @@
 #include "foundation/compat_fs.h" // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/log.h"       // cbm_log_warn — explicit preprocessor diagnostics
 #include "foundation/slab_alloc.h" // cbm_slab_install — stable tree-sitter allocator binding
+#include "foundation/str_util.h"   // shared bounded RFC 3629 validation (#937)
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "parse_budget.h"
@@ -360,6 +361,19 @@ bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
     }
     uint32_t start = ts_node_start_byte(node);
     uint32_t end = ts_node_end_byte(node);
+    uint32_t invalid_utf8_bytes = 0;
+    if (ts_node_is_error(node) && !is_missing && end > start && end <= (uint32_t)ctx->source_len) {
+        invalid_utf8_bytes = (uint32_t)cbm_utf8_invalid_byte_count(
+            (const unsigned char *)ctx->source + start, (size_t)(end - start));
+    }
+    if (invalid_utf8_bytes > 0) {
+        code = "CBM_PARSE_INVALID_UTF8";
+        operation = "parse_tree_sitter_validate_utf8";
+        message = "the parser recovery span contains ill-formed UTF-8 bytes; no definition "
+                  "whose exact source span includes this degradation may enter the graph";
+        remediation = "replace the reported bytes with the intended source encoding and re-index; "
+                      "unaffected definitions outside the exact span remain publishable";
+    }
     CBMParseDiagnostic diag = {
         .code = code,
         .operation = operation,
@@ -370,6 +384,7 @@ bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
         .end_line = cbm_node_end_line_inclusive(node),
         .start_byte = start,
         .end_byte = end,
+        .invalid_utf8_bytes = invalid_utf8_bytes,
         .is_missing = is_missing,
     };
     if (end > start && end <= (uint32_t)ctx->source_len) {
@@ -380,13 +395,14 @@ bool cbm_add_parse_diagnostic(CBMExtractCtx *ctx, TSNode node, const char *code,
         diag.source_len = end - start;
     }
     bool pushed = cbm_diagnostics_push(&ctx->result->diagnostics, ctx->arena, diag);
-    char line_text[32];
+    char line_text[32], invalid_text[32];
     (void)snprintf(line_text, sizeof(line_text), "%u", diag.start_line);
+    (void)snprintf(invalid_text, sizeof(invalid_text), "%u", diag.invalid_utf8_bytes);
     cbm_log_warn("extract.parse_diagnostic", "code", code ? code : "", "operation",
                  operation ? operation : "", "path", ctx->rel_path ? ctx->rel_path : "",
-                 "node_type", diag.node_type ? diag.node_type : "", "line", line_text,
-                 "missing", is_missing ? "true" : "false", "message", message ? message : "",
-                 "remediation", remediation ? remediation : "");
+                 "node_type", diag.node_type ? diag.node_type : "", "line", line_text, "missing",
+                 is_missing ? "true" : "false", "invalid_utf8_bytes", invalid_text, "message",
+                 message ? message : "", "remediation", remediation ? remediation : "");
     return pushed;
 }
 
@@ -422,6 +438,129 @@ static void cbm_record_tree_sitter_parse_diagnostics(CBMExtractCtx *ctx) {
         ts_nstack_push_children(&stack, &scratch, node);
     }
     cbm_arena_destroy(&scratch);
+}
+
+static int cbm_compare_parse_diagnostic_source_order(const void *left_ptr, const void *right_ptr) {
+    const CBMParseDiagnostic *left = (const CBMParseDiagnostic *)left_ptr;
+    const CBMParseDiagnostic *right = (const CBMParseDiagnostic *)right_ptr;
+#define CBM_DIAGNOSTIC_COMPARE_NUMBER(field) \
+    do {                                     \
+        if (left->field < right->field)      \
+            return -1;                       \
+        if (left->field > right->field)      \
+            return 1;                        \
+    } while (0)
+    CBM_DIAGNOSTIC_COMPARE_NUMBER(start_byte);
+    CBM_DIAGNOSTIC_COMPARE_NUMBER(end_byte);
+    CBM_DIAGNOSTIC_COMPARE_NUMBER(invalid_utf8_bytes);
+    CBM_DIAGNOSTIC_COMPARE_NUMBER(is_missing);
+    const char *left_code = left->code ? left->code : "";
+    const char *right_code = right->code ? right->code : "";
+    int code_order = strcmp(left_code, right_code);
+    if (code_order != 0) {
+        return code_order;
+    }
+    const char *left_operation = left->operation ? left->operation : "";
+    const char *right_operation = right->operation ? right->operation : "";
+    int operation_order = strcmp(left_operation, right_operation);
+    if (operation_order != 0) {
+        return operation_order;
+    }
+    CBM_DIAGNOSTIC_COMPARE_NUMBER(source_len);
+    if (left->source_len > 0 && left->source && right->source) {
+        int source_order = memcmp(left->source, right->source, left->source_len);
+        if (source_order != 0) {
+            return source_order;
+        }
+    }
+    return 0;
+#undef CBM_DIAGNOSTIC_COMPARE_NUMBER
+}
+
+/* The primary DFS records diagnostics in source order, but language-specific
+ * extractors can append nested diagnostics later. Re-establish one total,
+ * deterministic source order before searching. Then find the first ill-formed
+ * span fully owned by one definition in O(log D + overlaps), where D is this
+ * file's persisted diagnostic count. Source bytes and end-exclusive offsets
+ * are invariant across extraction, quarantine, graph construction, and
+ * readback. */
+static int cbm_definition_invalid_utf8_diagnostic(const CBMFileResult *result,
+                                                  const CBMDefinition *definition) {
+    if (!result || !definition || definition->end_byte <= definition->start_byte ||
+        result->diagnostics.count <= 0) {
+        return -1;
+    }
+    int low = 0;
+    int high = result->diagnostics.count;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (result->diagnostics.items[middle].start_byte < definition->start_byte) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    for (int i = low; i < result->diagnostics.count; i++) {
+        const CBMParseDiagnostic *diagnostic = &result->diagnostics.items[i];
+        if (diagnostic->start_byte >= definition->end_byte) {
+            break;
+        }
+        if (diagnostic->invalid_utf8_bytes > 0 && diagnostic->end_byte <= definition->end_byte) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* A recovered suffix is not a source identity. Remove every affected
+ * definition before registry/graph construction and retain its exact parser
+ * span as the durable diagnostic. The Module remains: it identifies the real
+ * file, while all definition-scoped claims overlapping an ill-formed span are
+ * quarantined. This policy is language-neutral because every extractor writes
+ * through the shared CBMDefinition array. */
+static bool cbm_quarantine_invalid_utf8_definitions(CBMFileResult *result, const char *rel_path) {
+    if (!result || result->defs.count <= 0 || result->diagnostics.count <= 0) {
+        return true;
+    }
+    qsort(result->diagnostics.items, (size_t)result->diagnostics.count,
+          sizeof(*result->diagnostics.items), cbm_compare_parse_diagnostic_source_order);
+    int write = 0;
+    for (int read = 0; read < result->defs.count; read++) {
+        CBMDefinition definition = result->defs.items[read];
+        bool is_module = definition.label && strcmp(definition.label, "Module") == 0;
+        int diagnostic_index =
+            is_module ? -1 : cbm_definition_invalid_utf8_diagnostic(result, &definition);
+        if (diagnostic_index < 0) {
+            result->defs.items[write++] = definition;
+            continue;
+        }
+        CBMParseDiagnostic *diagnostic = &result->diagnostics.items[diagnostic_index];
+        if (diagnostic->quarantined_definitions == UINT32_MAX) {
+            cbm_file_result_set_error(
+                result, "CBM_INVALID_UTF8_QUARANTINE_COUNT_OVERFLOW",
+                "quarantine_invalid_utf8_definitions", "definition_identity", UINT32_MAX,
+                "the exact invalid-UTF-8 quarantine count exceeded its persisted range",
+                "split the source file without changing its bytes and retry the complete corpus");
+            return false;
+        }
+        diagnostic->quarantined_definitions++;
+        char start_text[32], end_text[32], invalid_text[32];
+        (void)snprintf(start_text, sizeof(start_text), "%u", diagnostic->start_byte);
+        (void)snprintf(end_text, sizeof(end_text), "%u", diagnostic->end_byte);
+        (void)snprintf(invalid_text, sizeof(invalid_text), "%u", diagnostic->invalid_utf8_bytes);
+        cbm_log_warn(
+            "extract.definition_quarantined", "code", "CBM_PARSE_INVALID_UTF8", "path",
+            rel_path ? rel_path : "", "name", definition.name ? definition.name : "",
+            "qualified_name", definition.qualified_name ? definition.qualified_name : "",
+            "diagnostic_start_byte", start_text, "diagnostic_end_byte", end_text,
+            "invalid_utf8_bytes", invalid_text, "message",
+            "a parser-recovered definition identity was excluded before graph construction",
+            "remediation",
+            "replace the exact diagnostic bytes with the intended encoding and "
+            "re-index the repository");
+    }
+    result->defs.count = write;
+    return true;
 }
 
 // --- String input reader (for parse_with_options) ---
@@ -1602,6 +1741,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!cbm_extract_arena_ok(result, "definitions", rel_path)) {
         goto extraction_failed;
     }
+    if (!cbm_quarantine_invalid_utf8_definitions(result, rel_path) || result->has_error) {
+        goto extraction_failed;
+    }
     cbm_extract_imports(&ctx);
     if (!cbm_extract_arena_ok(result, "imports", rel_path)) {
         goto extraction_failed;
@@ -1758,6 +1900,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                 "supply another real build configuration to expand contextual coverage");
         }
 
+    }
+
+    if (!cbm_quarantine_invalid_utf8_definitions(result, rel_path) || result->has_error) {
+        goto extraction_failed;
     }
 
     // Bottleneck call-context metrics. Each call is attributed to the INNERMOST
