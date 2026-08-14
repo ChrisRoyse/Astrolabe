@@ -531,6 +531,24 @@ impl CardLedger {
         &self,
         requests: &[AssayCardAppendRequest],
     ) -> Result<PreparedAssayCardBatch> {
+        // Request-only validation must complete before opening the ledger with
+        // `create(true)`: a malformed batch is a pre-I/O refusal and must not
+        // materialize a durable ledger path.
+        let mut request_identities = BTreeMap::new();
+        for (ordinal, request) in requests.iter().enumerate() {
+            if !valid_input_fingerprint(&request.input_fingerprint) {
+                return Err(invalid_input_fingerprint(&request.input_fingerprint));
+            }
+            if let Some(first_ordinal) =
+                request_identities.insert(request.input_fingerprint.as_str(), ordinal)
+            {
+                return Err(input_fingerprint_collision(format!(
+                    "batch request repeats input fingerprint {} at ordinal {ordinal} after ordinal {first_ordinal}",
+                    request.input_fingerprint
+                )));
+            }
+        }
+
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -580,21 +598,6 @@ impl CardLedger {
                 )
             })?;
             let parsed = parse_ledger_bytes(&self.path, &physical)?;
-
-            let mut request_identities = BTreeMap::new();
-            for (ordinal, request) in requests.iter().enumerate() {
-                if !valid_input_fingerprint(&request.input_fingerprint) {
-                    return Err(invalid_input_fingerprint(&request.input_fingerprint));
-                }
-                if let Some(first_ordinal) =
-                    request_identities.insert(request.input_fingerprint.as_str(), ordinal)
-                {
-                    return Err(input_fingerprint_collision(format!(
-                        "batch request repeats input fingerprint {} at ordinal {ordinal} after ordinal {first_ordinal}",
-                        request.input_fingerprint
-                    )));
-                }
-            }
 
             let mut existing_positions = Vec::with_capacity(requests.len());
             for request in requests {
