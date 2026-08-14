@@ -2742,31 +2742,88 @@ function Wait-AstroCohortSidecarsAbsent {
         'preserve the store and exact process chronology; inspect the owner that retained the SQLite generation'
 }
 
+function Get-AstroCohortStoreMember {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $handle = $null
+    $stream = $null
+    try {
+        try {
+            $handle = [AstroLauncherLockNative]::OpenExactSharedDeleteReadFile($full)
+        }
+        catch {
+            $cause = $_.Exception
+            while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+            $nativeError = if ($cause -is [ComponentModel.Win32Exception]) {
+                [int]$cause.NativeErrorCode
+            }
+            else { -1 }
+            if ($nativeError -eq 2 -or $nativeError -eq 3) {
+                return [ordered]@{
+                    path = $full; exists = $false; bytes = 0; sha256 = $null
+                    file_id = $null; final_path = $null; link_count = 0
+                }
+            }
+            Fail-Astro 'ASTRO_FSV_COHORT_STORE_OPEN_FAILED' `
+                "could not retain SQLite family member '$full' (native_error=$nativeError; exception=$($cause.GetType().FullName); message=$($cause.Message))" `
+                'preserve the complete family and inspect the exact native open failure; do not infer absence or retry through another path'
+        }
+
+        $fileIdBefore = [AstroLauncherLockNative]::GetFileIdentity($handle)
+        $finalPathBefore = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        $linkCountBefore = [uint32][AstroLauncherLockNative]::GetNumberOfLinks($handle)
+        if (-not [string]::Equals(
+                $finalPathBefore, $full, [StringComparison]::OrdinalIgnoreCase
+            ) -or $linkCountBefore -ne 1) {
+            Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_STATE_DRIFT' `
+                "SQLite family member identity changed at retained-open (expected=$full; final=$finalPathBefore; file_id=$fileIdBefore; links=$linkCountBefore)" `
+                'preserve every family byte and inspect the namespace transition before retrying'
+        }
+
+        $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::Read)
+        $lengthBefore = [uint64]$stream.Length
+        $sha256 = [AstroLauncherLockNative]::ComputeOrdinaryFileSha256($handle)
+        $lengthAfter = [uint64]$stream.Length
+        $fileIdAfter = [AstroLauncherLockNative]::GetFileIdentity($handle)
+        $finalPathAfter = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        $linkCountAfter = [uint32][AstroLauncherLockNative]::GetNumberOfLinks($handle)
+        if ($lengthAfter -ne $lengthBefore -or $fileIdAfter -cne $fileIdBefore -or
+            $linkCountAfter -ne $linkCountBefore -or -not [string]::Equals(
+                $finalPathAfter, $finalPathBefore, [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_STATE_DRIFT' `
+                "SQLite family member changed during retained hash (path=$full; bytes=$lengthBefore->$lengthAfter; file_id=$fileIdBefore->$fileIdAfter; links=$linkCountBefore->$linkCountAfter; final=$finalPathBefore->$finalPathAfter)" `
+                'preserve every family byte and inspect the namespace or writer transition'
+        }
+        return [ordered]@{
+            path = $full
+            exists = $true
+            bytes = $lengthAfter
+            sha256 = $sha256
+            file_id = $fileIdAfter
+            final_path = $finalPathAfter
+            link_count = $linkCountAfter
+        }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        elseif ($null -ne $handle) { $handle.Dispose() }
+    }
+}
+
 function Get-AstroCohortStoreInventory {
     param([Parameter(Mandatory)][string[]]$StorePaths)
-    $files = @($StorePaths | ForEach-Object {
-        $path = $_
-        if (-not (Test-AstroPathLongPath -LiteralPath $path)) {
-            return [ordered]@{
-                path = $path; exists = $false; bytes = 0; sha256 = $null
-            }
-        }
-        if (-not (Test-AstroPathLongPath -LiteralPath $path -PathType Leaf)) {
-            Fail-Astro 'ASTRO_FSV_COHORT_STORE_TYPE_INVALID' `
-                "SQLite family member is not one ordinary file: $path" `
-                'preserve the complete family and replace the non-file entry before retrying'
-        }
-        Assert-NotReparseEntry $path 'SQLite cohort family member'
-        return [ordered]@{
-            path = $path
-            exists = $true
-            bytes = [uint64](Get-AstroFileLengthLongPath $path)
-            sha256 = File-Sha256 $path
-        }
-    })
+    $files = [Collections.Generic.List[object]]::new()
+    foreach ($path in $StorePaths) {
+        $files.Add((Get-AstroCohortStoreMember -Path $path))
+    }
     return [ordered]@{
         observed_at_utc = [DateTime]::UtcNow.ToString('o')
-        files = $files
+        files = @($files)
     }
 }
 
