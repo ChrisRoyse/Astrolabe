@@ -498,7 +498,7 @@ enum LiveIndex {
     Lexical(InvertedIndex),
     Vector {
         dim: u32,
-        index: HnswIndex,
+        index: Box<HnswIndex>,
     },
     /// Sparse structural slot. There is no vendored ANN for the sparse S1/S4
     /// spaces here, so the per-symbol normalized vectors are retained and ranked
@@ -552,7 +552,7 @@ impl SlotIndexSet {
                 SlotIndexKind::Lexical => LiveIndex::Lexical(InvertedIndex::new(spec.slot)),
                 SlotIndexKind::Vector { dim } => LiveIndex::Vector {
                     dim,
-                    index: HnswIndex::new(spec.slot, dim, manifest.knobs.seed),
+                    index: Box::new(HnswIndex::new(spec.slot, dim, manifest.knobs.seed)),
                 },
                 SlotIndexKind::Structural { dim } => LiveIndex::Structural {
                     dim,

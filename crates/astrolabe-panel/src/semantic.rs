@@ -1839,13 +1839,11 @@ pub static SEMANTIC_SLOT_SPECS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| 
     out
 });
 
-static SEMANTIC_RULE_INDEX: LazyLock<
-    BTreeMap<(SemanticFamily, SemanticSourceType), BTreeMap<&'static str, &'static SemanticRule>>,
-> = LazyLock::new(|| {
-    let mut index = BTreeMap::<
-        (SemanticFamily, SemanticSourceType),
-        BTreeMap<&'static str, &'static SemanticRule>,
-    >::new();
+type SemanticRuleIndex =
+    BTreeMap<(SemanticFamily, SemanticSourceType), BTreeMap<&'static str, &'static SemanticRule>>;
+
+static SEMANTIC_RULE_INDEX: LazyLock<SemanticRuleIndex> = LazyLock::new(|| {
+    let mut index = SemanticRuleIndex::new();
     for rule in SEMANTIC_RULES {
         let prior = index
             .entry((rule.family, rule.source_type))

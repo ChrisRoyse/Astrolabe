@@ -109,9 +109,7 @@ pub(crate) fn guard_check_at(
     };
 
     // 2. Target CxId (verdict subject).
-    let Some(target_raw) =
-        string_arg(args_obj, "target").or_else(|| string_arg(args_obj, "subject"))
-    else {
+    let Some(target_raw) = string_arg(args_obj, "target") else {
         return guard_check_refused(
             "ASTRO_GUARD_CHECK_INVALID",
             "guard_check requires target (candidate CxId hex)",

@@ -12,7 +12,6 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt;
-use std::thread;
 
 use astrolabe_domain::EdgeKind;
 use calyx_assay::AssayStore;
@@ -41,12 +40,15 @@ mod ann;
 mod bounded_run;
 mod complete_xterms;
 pub mod drift_producer;
+mod ordered_parallel;
 pub mod signal_cards;
 mod sim_rows;
 mod xterm_cotenant;
 mod xterm_rows;
 
-pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
+pub use ann::{
+    AnnFamilyReport, DenseCandidateStrategy, DenseStrategyMeasurement, QuantScaleMeasurement,
+};
 pub use complete_xterms::{
     ASTRO_XTERM_COMPLETION_CORRUPT, ASTRO_XTERM_COMPLETION_OVERFLOW,
     ASTRO_XTERM_COMPLETION_RESOURCE_EXHAUSTED, ASTRO_XTERM_SOURCE_CORRUPT,
@@ -81,6 +83,7 @@ pub use kernel_index::{
     persist_kernel_member_index, read_persisted_kernel_member_index,
     read_persisted_kernel_member_index_descriptor,
 };
+pub use ordered_parallel::ParallelScheduleTelemetry;
 pub use signal_cards::{
     ASTRO_WEAVE_SIGNAL_CARD_INPUT_INVALID, ProducedSignalCard, SIGNAL_AXIS_STRUCTURAL_DEGREE,
     SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes, derive_symbol_axes,
@@ -103,13 +106,13 @@ pub use xterm_cotenant::{
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
     ASTRO_XTERM_ROW_CORRUPT, ASTRO_XTERM_RUN_SOURCE_INVALID, AgreementGraphAspect,
-    BoundedEagerCrossTermKindPlan, EagerCrossTermPersistReport, EagerCrossTermPhysicalScan,
-    EagerCrossTermRunTelemetry, PersistedAgreementEdge, XTERM_EAGER_LEDGER_SCHEMA,
-    agreement_graph_aspect, agreement_graph_from_persisted_rows,
-    agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots, eager_xterm_key,
-    persist_eager_cross_term_kind_run, persist_eager_cross_term_kind_run_delta,
-    plan_eager_cross_term_kind_run, plan_eager_cross_term_kind_run_delta,
-    stream_eager_cross_term_rows,
+    BoundedEagerCrossTermKindPlan, EagerCrossTermDeltaPlanRequest, EagerCrossTermPersistReport,
+    EagerCrossTermPhysicalScan, EagerCrossTermPlanRequest, EagerCrossTermRunTelemetry,
+    PersistedAgreementEdge, XTERM_EAGER_LEDGER_SCHEMA, agreement_graph_aspect,
+    agreement_graph_from_persisted_rows, agreement_graph_from_persisted_rows_with_cotenants,
+    designed_kind_for_slots, eager_xterm_key, persist_eager_cross_term_kind_run,
+    persist_eager_cross_term_kind_run_delta, plan_eager_cross_term_kind_run,
+    plan_eager_cross_term_kind_run_delta, stream_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -185,10 +188,10 @@ pub const DEFAULT_SIM_API_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIM_PROFILE_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIMILARITY_PER_NODE_CAP: usize = 10;
 /// Superseded by the registry-declared `weave_similarity_workers` knob (#433):
-/// [`SimilarityPlannerConfig::default`] now resolves the worker count via
-/// [`crate::knobs::weave_similarity_workers`] (host parallelism), not this bare
-/// `1`. Retained only as the explicit single-shard reference an operator may pin
-/// for a reproducible serial bench.
+/// [`SimilarityPlannerConfig::resolve_runtime`] resolves its declared environment
+/// override or host parallelism once before admission. Retained only as the
+/// explicit single-shard reference an operator may pin for a reproducible serial
+/// bench.
 pub const DEFAULT_SIMILARITY_WORKERS: usize = 1;
 pub const DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT: usize = 50_000;
 /// MinHash signature length for LSH banding candidate generation.
@@ -746,7 +749,9 @@ impl Default for AnnCandidateConfig {
 pub struct SimilarityPlannerConfig {
     pub thresholds: SimilarityThresholds,
     pub per_node_cap: usize,
-    pub worker_count: usize,
+    /// Output- and scheduling-affecting weave knobs, resolved once before
+    /// admission and reused unchanged by every family.
+    pub runtime: knobs::ResolvedSimilarityKnobs,
     pub disabled_families: BTreeSet<SimilarityFamily>,
     pub exact_pair_node_limit: Option<usize>,
     /// Per-family candidate generation strategy. Families not present use the
@@ -757,6 +762,21 @@ pub struct SimilarityPlannerConfig {
 }
 
 impl SimilarityPlannerConfig {
+    /// Resolve the declared runtime configuration exactly once. Present invalid
+    /// overrides and host-parallelism discovery faults are returned without a
+    /// substitute plan.
+    pub fn resolve_runtime() -> Result<Self, knobs::WeaveRuntimeConfigError> {
+        Ok(Self {
+            thresholds: SimilarityThresholds::default(),
+            per_node_cap: DEFAULT_SIMILARITY_PER_NODE_CAP,
+            runtime: knobs::resolve_similarity_knobs()?,
+            disabled_families: BTreeSet::new(),
+            exact_pair_node_limit: Some(DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT),
+            candidate_strategies: BTreeMap::new(),
+            ann: AnnCandidateConfig::default(),
+        })
+    }
+
     pub fn with_disabled_family(mut self, family: SimilarityFamily) -> Self {
         self.disabled_families.insert(family);
         self
@@ -782,26 +802,6 @@ impl SimilarityPlannerConfig {
             .get(&family)
             .copied()
             .unwrap_or(SimilarityCandidateStrategy::Ann)
-    }
-}
-
-impl Default for SimilarityPlannerConfig {
-    fn default() -> Self {
-        Self {
-            thresholds: SimilarityThresholds::default(),
-            per_node_cap: DEFAULT_SIMILARITY_PER_NODE_CAP,
-            // #433: resolve to the measured host parallelism instead of the bare
-            // serial `1` (registry-declared `weave_similarity_workers` knob). The
-            // exact-cosine rescoring shards are proven byte-identical to the serial
-            // plan (worker-count invariant), so this changes only wall-clock — the
-            // largest weave sub-stage (`similarity_plan`) no longer runs serial on a
-            // many-core host.
-            worker_count: crate::knobs::weave_similarity_workers(),
-            disabled_families: BTreeSet::new(),
-            exact_pair_node_limit: Some(DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT),
-            candidate_strategies: BTreeMap::new(),
-            ann: AnnCandidateConfig::default(),
-        }
     }
 }
 
@@ -892,6 +892,10 @@ pub struct SimilarityFamilyStreamReport {
     pub skips: SimilaritySkipReport,
     pub workers_requested: usize,
     pub timing_ms: Vec<(String, u64)>,
+    /// Bounded worker/coordinator accounting for every parallel source-owned
+    /// pass used to produce this family. Candidate-generation passes precede
+    /// the exact rescoring pass in execution order.
+    pub scheduler_telemetry: Vec<ParallelScheduleTelemetry>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -962,6 +966,11 @@ pub enum SimilarityPlanError {
     InvalidWorkerCount {
         value: usize,
     },
+    InvalidRuntimeConfig {
+        field: &'static str,
+        value: String,
+        requirement: &'static str,
+    },
     InvalidThreshold {
         field: &'static str,
         value: f32,
@@ -1019,6 +1028,14 @@ impl fmt::Display for SimilarityPlanError {
                     "similarity worker_count must be greater than zero, got {value}"
                 )
             }
+            Self::InvalidRuntimeConfig {
+                field,
+                value,
+                requirement,
+            } => write!(
+                f,
+                "similarity runtime config {field} = {value:?} is invalid: {requirement}"
+            ),
             Self::InvalidThreshold { field, value } => {
                 write!(
                     f,
@@ -1075,7 +1092,7 @@ pub fn plan_similarity_edges(
     Ok(SimilarityPlan {
         edges,
         skips,
-        workers_requested: config.worker_count,
+        workers_requested: config.runtime.similarity_workers_resolved(),
         timing_ms,
     })
 }
@@ -1152,14 +1169,16 @@ where
         return Ok(SimilarityFamilyStreamReport {
             edge_count: 0,
             skips,
-            workers_requested: config.worker_count,
+            workers_requested: config.runtime.similarity_workers_resolved(),
             timing_ms: Vec::new(),
+            scheduler_telemetry: Vec::new(),
         });
     }
 
     let vectors = collect_family_vectors(nodes, family, &mut skips);
     let strategy = config.candidate_strategy(family);
     let t_generate = std::time::Instant::now();
+    let mut scheduler_telemetry = Vec::new();
     let candidate_lists = match strategy {
         SimilarityCandidateStrategy::ExactPairs => {
             if let Some(limit) = config.exact_pair_node_limit
@@ -1175,11 +1194,12 @@ where
                 return Ok(SimilarityFamilyStreamReport {
                     edge_count: 0,
                     skips,
-                    workers_requested: config.worker_count,
+                    workers_requested: config.runtime.similarity_workers_resolved(),
                     timing_ms: vec![(
                         format!("ann_generate.{family}"),
                         t_generate.elapsed().as_millis() as u64,
                     )],
+                    scheduler_telemetry,
                 });
             }
             None
@@ -1189,8 +1209,10 @@ where
                 family,
                 &vectors,
                 &config.ann,
+                &config.runtime,
                 config.per_node_cap,
             )?;
+            scheduler_telemetry.extend(generated.scheduler_telemetry);
             skips.ann_reports.insert(family, generated.report);
             Some(generated.per_source)
         }
@@ -1201,15 +1223,16 @@ where
     )];
     let threshold = config.thresholds.threshold(family);
     let t_rescore = std::time::Instant::now();
-    let pair_counts = stream_family_edges(
+    let (pair_counts, rescore_telemetry) = stream_family_edges(
         family,
         threshold,
         config.per_node_cap,
         &vectors,
-        config.worker_count,
+        config.runtime.similarity_workers_resolved(),
         candidate_lists.as_deref(),
         &mut emit,
     )?;
+    scheduler_telemetry.push(rescore_telemetry);
     timing_ms.push((
         format!("rescore.{family}"),
         t_rescore.elapsed().as_millis() as u64,
@@ -1222,8 +1245,9 @@ where
     Ok(SimilarityFamilyStreamReport {
         edge_count,
         skips,
-        workers_requested: config.worker_count,
+        workers_requested: config.runtime.similarity_workers_resolved(),
         timing_ms,
+        scheduler_telemetry,
     })
 }
 
@@ -2944,7 +2968,7 @@ where
     let (capped, scratch_high_water) = cross_term_values_into(
         nodes,
         kind,
-        &selected_indices,
+        selected_indices,
         sample_cap,
         sample_seed,
         |node_index, value| {
@@ -3402,9 +3426,71 @@ fn validate_plan_request(
             value: config.per_node_cap,
         });
     }
-    if config.worker_count == 0 {
+    let runtime = &config.runtime;
+    if runtime.similarity_workers_resolved() == 0 {
         return Err(SimilarityPlanError::InvalidWorkerCount {
-            value: config.worker_count,
+            value: runtime.similarity_workers_resolved(),
+        });
+    }
+    if runtime.registry_version() != knobs::WEAVE_KNOB_REGISTRY_VERSION {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "registry_version",
+            value: runtime.registry_version().to_string(),
+            requirement: "must equal the active weave knob registry version",
+        });
+    }
+    let Some(strategy) = knobs::weave_knob(knobs::WEAVE_DENSE_ANN_STRATEGY_KNOB) else {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "dense_ann_strategy",
+            value: runtime.dense_ann_strategy().to_string(),
+            requirement: "the active weave registry must declare the dense ANN strategy",
+        });
+    };
+    if !strategy.accepts(runtime.dense_ann_strategy()) {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "dense_ann_strategy",
+            value: runtime.dense_ann_strategy().to_string(),
+            requirement: "must be within the declared dense ANN strategy interval",
+        });
+    }
+    let Some(exact_max_dim) = knobs::weave_knob(knobs::WEAVE_DENSE_ANN_EXACT_MAX_DIM_KNOB) else {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "dense_ann_exact_max_dim",
+            value: runtime.dense_ann_exact_max_dim().to_string(),
+            requirement: "the active weave registry must declare the exact-kNN dimension cutoff",
+        });
+    };
+    if u64::try_from(runtime.dense_ann_exact_max_dim())
+        .map_or(true, |value| !exact_max_dim.accepts(value))
+    {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "dense_ann_exact_max_dim",
+            value: runtime.dense_ann_exact_max_dim().to_string(),
+            requirement: "must be within the declared exact-kNN dimension interval",
+        });
+    }
+    let Some(workers) = knobs::weave_knob(knobs::WEAVE_SIMILARITY_WORKERS_KNOB) else {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "similarity_workers_requested",
+            value: runtime.similarity_workers_requested().to_string(),
+            requirement: "the active weave registry must declare the similarity worker count",
+        });
+    };
+    if !workers.accepts(runtime.similarity_workers_requested()) {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "similarity_workers_requested",
+            value: runtime.similarity_workers_requested().to_string(),
+            requirement: "must be within the declared similarity-worker interval",
+        });
+    }
+    if runtime.similarity_workers_requested() != 0
+        && usize::try_from(runtime.similarity_workers_requested()).ok()
+            != Some(runtime.similarity_workers_resolved())
+    {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "similarity_workers_resolved",
+            value: runtime.similarity_workers_resolved().to_string(),
+            requirement: "must equal the positive explicitly requested worker count",
         });
     }
     validate_ann_config(&config.ann)?;
@@ -3586,123 +3672,99 @@ fn stream_family_edges<F>(
     worker_count: usize,
     candidates: Option<&[Vec<usize>]>,
     emit: &mut F,
-) -> Result<SimilarityPairCounts, SimilarityPlanError>
+) -> Result<(SimilarityPairCounts, ParallelScheduleTelemetry), SimilarityPlanError>
 where
     F: FnMut(Vec<SimilarityEdge>) -> Result<(), SimilarityPlanError>,
 {
-    // Each source owns one independent, bounded result row. Workers publish
-    // through capacity-one channels, and the recorder drains contiguous ranges
-    // in source order. The reduction is integer addition plus a total edge order,
-    // so worker scheduling cannot affect bytes.
+    // Each worker owns strided sources and retains at most one bounded result row;
+    // the coordinator accepts exact global source order. The reduction is integer
+    // addition plus a total edge order, so worker scheduling cannot affect bytes.
     let source_count = vectors.len();
-    if source_count == 0 {
-        return Ok(SimilarityPairCounts::default());
-    }
-    let worker_count = worker_count.min(source_count).max(1);
-    if worker_count == 1 {
-        let mut counts = SimilarityPairCounts::default();
-        for source in 0..source_count {
-            let (mut edges, source_counts) =
-                plan_one_source(family, threshold, per_node_cap, vectors, source, candidates);
+    let mut counts = SimilarityPairCounts::default();
+    let telemetry = ordered_parallel::run_ordered_parallel(
+        format!("rescore.{family}"),
+        source_count,
+        worker_count,
+        |_| Ok::<_, SimilarityPlanError>(()),
+        |_, source| {
+            Ok::<_, SimilarityPlanError>(plan_one_source(
+                family,
+                threshold,
+                per_node_cap,
+                vectors,
+                source,
+                candidates,
+            ))
+        },
+        |_, (mut edges, source_counts)| {
             edges.sort_by(stable_edge_order);
-            add_pair_counts(&mut counts, &source_counts);
-            emit(edges)?;
-        }
-        return Ok(counts);
-    }
+            add_pair_counts(family, &mut counts, &source_counts)?;
+            emit(edges)
+        },
+    )
+    .map_err(|failure| ordered_stream_failure(family, *failure))?;
+    Ok((counts, telemetry))
+}
 
-    let chunk_size = source_count.div_ceil(worker_count);
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        handles.try_reserve_exact(worker_count).map_err(|error| {
-            SimilarityPlanError::PersistenceSinkFailure {
-                family,
-                message: format!(
-                    "ASTRO_WEAVE_SIM_STREAM_CAPACITY_EXHAUSTED: reserve {worker_count} worker handles: {error}"
-                ),
-            }
-        })?;
-        let mut receivers = Vec::new();
-        receivers.try_reserve_exact(worker_count).map_err(|error| {
-            SimilarityPlanError::PersistenceSinkFailure {
-                family,
-                message: format!(
-                    "ASTRO_WEAVE_SIM_STREAM_CAPACITY_EXHAUSTED: reserve {worker_count} result channels: {error}"
-                ),
-            }
-        })?;
-        let mut start = 0;
-        while start < source_count {
-            let end = (start + chunk_size).min(source_count);
-            let range = start..end;
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            receivers.push((range.clone(), receiver));
-            handles.push(scope.spawn(move || {
-                for source in range {
-                    let planned = plan_one_source(
-                        family,
-                        threshold,
-                        per_node_cap,
-                        vectors,
-                        source,
-                        candidates,
-                    );
-                    if sender.send((source, planned)).is_err() {
-                        return;
-                    }
-                }
-            }));
-            start = end;
-        }
+fn ordered_stream_failure(
+    family: SimilarityFamily,
+    failure: ordered_parallel::OrderedParallelFailure<SimilarityPlanError>,
+) -> SimilarityPlanError {
+    use ordered_parallel::OrderedParallelFailureKind;
 
-        let mut counts = SimilarityPairCounts::default();
-        let mut terminal_error = None;
-        'workers: for (range, receiver) in &receivers {
-            for expected_source in range.clone() {
-                let (observed_source, (mut edges, source_counts)) = match receiver.recv() {
-                    Ok(result) => result,
-                    Err(error) => {
-                        terminal_error = Some(SimilarityPlanError::PersistenceSinkFailure {
-                            family,
-                            message: format!(
-                                "ASTRO_WEAVE_SIM_STREAM_DISCONNECTED: expected source ordinal {expected_source}: {error}"
-                            ),
-                        });
-                        break 'workers;
-                    }
-                };
-                if observed_source != expected_source {
-                    terminal_error = Some(SimilarityPlanError::PersistenceSinkFailure {
-                        family,
-                        message: format!(
-                            "ASTRO_WEAVE_SIM_STREAM_ORDER_DRIFT: expected source ordinal {expected_source}, observed {observed_source}"
-                        ),
-                    });
-                    break 'workers;
-                }
-                edges.sort_by(stable_edge_order);
-                add_pair_counts(&mut counts, &source_counts);
-                if let Err(error) = emit(edges) {
-                    terminal_error = Some(error);
-                    break 'workers;
-                }
-            }
-        }
-        drop(receivers);
-        for handle in handles {
-            if handle.join().is_err() && terminal_error.is_none() {
-                terminal_error = Some(SimilarityPlanError::PersistenceSinkFailure {
-                    family,
-                    message: "ASTRO_WEAVE_SIM_STREAM_WORKER_PANICKED: no partial family plan was accepted"
-                        .to_string(),
-                });
-            }
-        }
-        match terminal_error {
-            Some(error) => Err(error),
-            None => Ok(counts),
-        }
-    })
+    let telemetry = failure.telemetry;
+    let topology = format!(
+        "requested_workers={}, effective_workers={}, started_workers={}, completed_sources={}/{}",
+        telemetry.requested_workers,
+        telemetry.effective_workers,
+        telemetry.started_workers,
+        telemetry.completed_sources,
+        telemetry.source_count
+    );
+    let message = match failure.kind {
+        OrderedParallelFailureKind::Compute { error, .. }
+        | OrderedParallelFailureKind::Accept { error, .. } => return *error,
+        OrderedParallelFailureKind::InvalidWorkerCount => format!(
+            "ASTRO_WEAVE_SIM_STREAM_WORKER_COUNT_INVALID: {topology}; set the declared similarity worker count to a positive resolved value"
+        ),
+        OrderedParallelFailureKind::Capacity {
+            component,
+            requested_items,
+            message,
+        } => format!(
+            "ASTRO_WEAVE_SIM_STREAM_CAPACITY_EXHAUSTED: {component}, requested_items={requested_items}, {topology}: {message}"
+        ),
+        OrderedParallelFailureKind::Telemetry { field, message } => format!(
+            "ASTRO_WEAVE_SIM_STREAM_TELEMETRY_INVALID: field={field}, {topology}: {message}; preserve the source generation and diagnose the native monotonic clock/accounting fault"
+        ),
+        OrderedParallelFailureKind::Spawn {
+            worker_index,
+            message,
+        } => format!(
+            "ASTRO_WEAVE_SIM_STREAM_WORKER_SPAWN_FAILED: worker_index={worker_index}, {topology}: {message}; inspect the native thread-creation error and host resource state"
+        ),
+        OrderedParallelFailureKind::Disconnected {
+            worker_index,
+            expected_source,
+            message,
+        } => format!(
+            "ASTRO_WEAVE_SIM_STREAM_DISCONNECTED: worker_index={worker_index}, expected_source_ordinal={expected_source}, {topology}: {message}; inspect the worker panic/resource diagnostics"
+        ),
+        OrderedParallelFailureKind::OrderDrift {
+            worker_index,
+            expected_source,
+            observed_source,
+        } => format!(
+            "ASTRO_WEAVE_SIM_STREAM_ORDER_DRIFT: worker_index={worker_index}, expected_source_ordinal={expected_source}, observed_source_ordinal={observed_source}, {topology}; preserve the source generation and scheduler telemetry for diagnosis"
+        ),
+        OrderedParallelFailureKind::WorkerPanicked {
+            worker_index,
+            message,
+        } => format!(
+            "ASTRO_WEAVE_SIM_STREAM_WORKER_PANICKED: worker_index={worker_index}, {topology}: {message}; preserve the source generation and inspect the exact worker failure"
+        ),
+    };
+    SimilarityPlanError::PersistenceSinkFailure { family, message }
 }
 
 fn plan_one_source(
@@ -3759,18 +3821,59 @@ fn plan_one_source(
     (admitted, counts)
 }
 
-fn add_pair_counts(total: &mut SimilarityPairCounts, source: &SimilarityPairCounts) {
-    total.candidate_pairs = total.candidate_pairs.saturating_add(source.candidate_pairs);
-    total.incompatible_shape_pairs = total
-        .incompatible_shape_pairs
-        .saturating_add(source.incompatible_shape_pairs);
-    total.below_threshold_pairs = total
-        .below_threshold_pairs
-        .saturating_add(source.below_threshold_pairs);
-    total.cap_dropped_pairs = total
-        .cap_dropped_pairs
-        .saturating_add(source.cap_dropped_pairs);
-    total.admitted_pairs = total.admitted_pairs.saturating_add(source.admitted_pairs);
+fn add_pair_counts(
+    family: SimilarityFamily,
+    total: &mut SimilarityPairCounts,
+    source: &SimilarityPairCounts,
+) -> Result<(), SimilarityPlanError> {
+    fn add(
+        family: SimilarityFamily,
+        field: &'static str,
+        total: &mut usize,
+        increment: usize,
+    ) -> Result<(), SimilarityPlanError> {
+        *total = total.checked_add(increment).ok_or_else(|| {
+            SimilarityPlanError::PersistenceSinkFailure {
+                family,
+                message: format!(
+                    "ASTRO_WEAVE_SIM_PAIR_COUNT_OVERFLOW: {field} total {total} plus {increment} exceeded usize; no partial similarity plan was published"
+                ),
+            }
+        })?;
+        Ok(())
+    }
+
+    add(
+        family,
+        "candidate_pairs",
+        &mut total.candidate_pairs,
+        source.candidate_pairs,
+    )?;
+    add(
+        family,
+        "incompatible_shape_pairs",
+        &mut total.incompatible_shape_pairs,
+        source.incompatible_shape_pairs,
+    )?;
+    add(
+        family,
+        "below_threshold_pairs",
+        &mut total.below_threshold_pairs,
+        source.below_threshold_pairs,
+    )?;
+    add(
+        family,
+        "cap_dropped_pairs",
+        &mut total.cap_dropped_pairs,
+        source.cap_dropped_pairs,
+    )?;
+    add(
+        family,
+        "admitted_pairs",
+        &mut total.admitted_pairs,
+        source.admitted_pairs,
+    )?;
+    Ok(())
 }
 
 /// Scores one candidate pair with the exact cosine and applies threshold and

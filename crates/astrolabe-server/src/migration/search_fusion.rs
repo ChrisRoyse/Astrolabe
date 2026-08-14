@@ -214,7 +214,7 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
         temporal_alpha_millis,
         explicit_override: explicit_override.as_ref(),
     };
-    let outcome = match execute_fused_query(&manifest, &index_set, &table, &request) {
+    let outcome = match execute_fused_query(&manifest, &index_set, table, &request) {
         Ok(outcome) => outcome,
         Err(FusedQueryError::Search(error)) => return search_error_result(&error),
         Err(FusedQueryError::Coded {

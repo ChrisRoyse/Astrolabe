@@ -6,7 +6,11 @@
 //! workspace shares one knob shape, exactly as `astrolabe-assay`'s knob registry
 //! does (`ASSAY_BITS_KNOBS`).
 
+use std::error::Error;
+use std::fmt;
+
 use astrolabe_domain::knobs::U64KnobDeclaration;
+use serde::Serialize;
 
 /// Registry version tag for the weave performance knobs (#433).
 pub const WEAVE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-knobs-v1";
@@ -15,6 +19,8 @@ pub const WEAVE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-knobs-v1";
 pub const WEAVE_NEIGHBORHOOD_SAMPLE_CAP_KNOB: &str = "weave_neighborhood_sample_cap";
 /// Name of the similarity-planner worker-count knob.
 pub const WEAVE_SIMILARITY_WORKERS_KNOB: &str = "weave_similarity_workers";
+/// Environment override for the similarity-planner worker-count knob.
+pub const WEAVE_SIMILARITY_WORKERS_ENV: &str = "ASTRO_WEAVE_SIMILARITY_WORKERS";
 /// Name of the dense ANN candidate-build strategy knob (#441).
 pub const WEAVE_DENSE_ANN_STRATEGY_KNOB: &str = "weave_dense_ann_strategy";
 
@@ -183,15 +189,17 @@ pub const WEAVE_MAX_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_DIM_AWARE
 pub const WEAVE_DEFAULT_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_DIM_AWARE;
 /// Environment override for the dense ANN strategy knob. A declared operator/probe
 /// channel (not a hidden constant): the value is parsed as the knob ordinal and
-/// **validated against the declaration's closed interval** — an unset, unparseable,
-/// or out-of-range value fails closed to [`WEAVE_DEFAULT_DENSE_ANN_STRATEGY`], never
-/// to an undeclared value. This is the mechanism the #441 probe uses to exercise
+/// **validated against the declaration's closed interval**. Unset selects the
+/// declared default; present invalid input returns a structured refusal and no
+/// weave generation may begin. This is the mechanism the #441 probe uses to exercise
 /// global OFF (0, sequential HNSW) vs global ON (1, exact kNN) on one consolidated
 /// binary; unset selects the dim-aware default (2).
 pub const WEAVE_DENSE_ANN_STRATEGY_ENV: &str = "ASTRO_WEAVE_DENSE_ANN_STRATEGY";
 
 /// Name of the dim-aware exact-kNN dimensionality cutoff knob (#441).
 pub const WEAVE_DENSE_ANN_EXACT_MAX_DIM_KNOB: &str = "weave_dense_ann_exact_max_dim";
+/// Environment override for the dim-aware exact-kNN cutoff.
+pub const WEAVE_DENSE_ANN_EXACT_MAX_DIM_ENV: &str = "ASTRO_WEAVE_DENSE_ANN_EXACT_MAX_DIM";
 /// Largest dense-group dimensionality for which the dim-aware strategy (2) selects
 /// exact blocked kNN; groups with a larger dim use sequential HNSW (#441).
 ///
@@ -265,65 +273,237 @@ pub fn weave_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
 /// The resolved neighborhood peer sample cap as a `usize`. The single accessor the
 /// weave cross-term planner uses (#433).
 pub fn weave_neighborhood_sample_cap() -> usize {
-    usize::try_from(WEAVE_DEFAULT_NEIGHBORHOOD_SAMPLE_CAP).unwrap_or(2_048)
+    const VALUE: usize = {
+        assert!(WEAVE_DEFAULT_NEIGHBORHOOD_SAMPLE_CAP <= usize::MAX as u64);
+        WEAVE_DEFAULT_NEIGHBORHOOD_SAMPLE_CAP as usize
+    };
+    VALUE
 }
 
-/// The resolved similarity-planner worker count as a `usize` (#433). `0` (the
-/// default) resolves to the measured host parallelism, clamped to at least one, so
-/// the planner shards its rescoring across every available core; a positive knob
-/// value pins an explicit count. The planner further clamps the effective count to
-/// the source count.
-pub fn weave_similarity_workers() -> usize {
-    match usize::try_from(WEAVE_DEFAULT_SIMILARITY_WORKERS).unwrap_or(0) {
-        0 => std::thread::available_parallelism()
+/// Immutable, once-resolved configuration used by every similarity family.
+///
+/// `similarity_workers_requested=0` is the declared "use host parallelism"
+/// sentinel. `similarity_workers_resolved` records the positive host count found
+/// before admission; each scheduler receipt separately records the effective
+/// count after clamping to its physical source cardinality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedSimilarityKnobs {
+    registry_version: &'static str,
+    dense_ann_strategy: u64,
+    dense_ann_exact_max_dim: usize,
+    similarity_workers_requested: u64,
+    similarity_workers_resolved: usize,
+}
+
+impl ResolvedSimilarityKnobs {
+    pub const fn registry_version(&self) -> &'static str {
+        self.registry_version
+    }
+
+    pub const fn dense_ann_strategy(&self) -> u64 {
+        self.dense_ann_strategy
+    }
+
+    pub const fn dense_ann_exact_max_dim(&self) -> usize {
+        self.dense_ann_exact_max_dim
+    }
+
+    pub const fn similarity_workers_requested(&self) -> u64 {
+        self.similarity_workers_requested
+    }
+
+    pub const fn similarity_workers_resolved(&self) -> usize {
+        self.similarity_workers_resolved
+    }
+
+    /// Pure dense-group routing over already-resolved scalar configuration.
+    pub fn dense_ann_use_exact(&self, dim: u32) -> Result<bool, WeaveRuntimeConfigError> {
+        match self.dense_ann_strategy {
+            WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW => Ok(false),
+            WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN => Ok(true),
+            WEAVE_DENSE_ANN_STRATEGY_DIM_AWARE => {
+                Ok(dim as usize <= self.dense_ann_exact_max_dim)
+            }
+            observed => Err(WeaveRuntimeConfigError {
+                code: "ASTRO_WEAVE_RUNTIME_CONFIG_INVALID",
+                message: format!(
+                    "resolved dense ANN strategy {observed} is outside [{WEAVE_MIN_DENSE_ANN_STRATEGY}..={WEAVE_MAX_DENSE_ANN_STRATEGY}]"
+                ),
+                remediation:
+                    "discard the invalid in-memory plan and resolve it again from the declared weave knob registry"
+                        .to_string(),
+                knob: WEAVE_DENSE_ANN_STRATEGY_KNOB,
+                environment: None,
+                observed_value: Some(observed.to_string()),
+            }),
+        }
+    }
+}
+
+/// Structured runtime-configuration refusal. A present invalid override never
+/// selects a default and never starts a weave generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WeaveRuntimeConfigError {
+    pub code: &'static str,
+    pub message: String,
+    pub remediation: String,
+    pub knob: &'static str,
+    pub environment: Option<&'static str>,
+    pub observed_value: Option<String>,
+}
+
+impl fmt::Display for WeaveRuntimeConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: {}; remediation: {}",
+            self.code, self.message, self.remediation
+        )
+    }
+}
+
+impl Error for WeaveRuntimeConfigError {}
+
+fn invalid_override(
+    code: &'static str,
+    declaration: &'static U64KnobDeclaration,
+    environment: &'static str,
+    observed_value: Option<String>,
+    reason: impl fmt::Display,
+) -> WeaveRuntimeConfigError {
+    WeaveRuntimeConfigError {
+        code,
+        message: format!(
+            "{environment} cannot resolve declared knob {}: {reason}; accepted integer interval is [{}..={}]",
+            declaration.name, declaration.min, declaration.max
+        ),
+        remediation: format!(
+            "unset {environment} to select declared default {}, or set one base-10 integer in [{}..={}]",
+            declaration.default, declaration.min, declaration.max
+        ),
+        knob: declaration.name,
+        environment: Some(environment),
+        observed_value,
+    }
+}
+
+fn resolve_declared_override(
+    knob: &'static str,
+    environment: &'static str,
+) -> Result<u64, WeaveRuntimeConfigError> {
+    let declaration = weave_knob(knob).ok_or_else(|| WeaveRuntimeConfigError {
+        code: "ASTRO_WEAVE_KNOB_DECLARATION_MISSING",
+        message: format!("runtime resolver could not find declared weave knob {knob}"),
+        remediation: "restore the knob declaration and registry entry before starting weave"
+            .to_string(),
+        knob,
+        environment: Some(environment),
+        observed_value: None,
+    })?;
+    let Some(raw_os) = std::env::var_os(environment) else {
+        return Ok(declaration.default);
+    };
+    let raw = raw_os.into_string().map_err(|_| {
+        invalid_override(
+            "ASTRO_WEAVE_KNOB_NON_UNICODE",
+            declaration,
+            environment,
+            None,
+            "present value is not Unicode",
+        )
+    })?;
+    if raw.is_empty() {
+        return Err(invalid_override(
+            "ASTRO_WEAVE_KNOB_EMPTY",
+            declaration,
+            environment,
+            Some(raw),
+            "present value is empty",
+        ));
+    }
+    if raw != raw.trim() {
+        return Err(invalid_override(
+            "ASTRO_WEAVE_KNOB_WHITESPACE",
+            declaration,
+            environment,
+            Some(raw),
+            "present value contains leading or trailing whitespace",
+        ));
+    }
+    let value = raw.parse::<u64>().map_err(|error| {
+        invalid_override(
+            "ASTRO_WEAVE_KNOB_NON_NUMERIC",
+            declaration,
+            environment,
+            Some(raw.clone()),
+            format_args!("present value is not a base-10 u64: {error}"),
+        )
+    })?;
+    if !declaration.accepts(value) {
+        return Err(invalid_override(
+            "ASTRO_WEAVE_KNOB_OUT_OF_RANGE",
+            declaration,
+            environment,
+            Some(raw),
+            format_args!("parsed value {value} is outside the declaration"),
+        ));
+    }
+    Ok(value)
+}
+
+fn usize_value(knob: &'static str, value: u64) -> Result<usize, WeaveRuntimeConfigError> {
+    usize::try_from(value).map_err(|error| WeaveRuntimeConfigError {
+        code: "ASTRO_WEAVE_KNOB_PLATFORM_RANGE",
+        message: format!(
+            "declared knob {knob} value {value} cannot be represented as usize on this native target: {error}"
+        ),
+        remediation:
+            "preserve the requested configuration and run the supported native Windows x86_64 artifact"
+                .to_string(),
+        knob,
+        environment: None,
+        observed_value: Some(value.to_string()),
+    })
+}
+
+/// Resolve every output- or scheduling-affecting similarity knob exactly once.
+///
+/// Resolution is O(1), performs no corpus/store access, and has no substitute
+/// path: present invalid input or host-parallelism discovery failure returns a
+/// structured error before admission identity or generation publication.
+pub fn resolve_similarity_knobs() -> Result<ResolvedSimilarityKnobs, WeaveRuntimeConfigError> {
+    let dense_ann_strategy =
+        resolve_declared_override(WEAVE_DENSE_ANN_STRATEGY_KNOB, WEAVE_DENSE_ANN_STRATEGY_ENV)?;
+    let exact_max_dim = resolve_declared_override(
+        WEAVE_DENSE_ANN_EXACT_MAX_DIM_KNOB,
+        WEAVE_DENSE_ANN_EXACT_MAX_DIM_ENV,
+    )?;
+    let similarity_workers_requested =
+        resolve_declared_override(WEAVE_SIMILARITY_WORKERS_KNOB, WEAVE_SIMILARITY_WORKERS_ENV)?;
+    let similarity_workers_resolved = if similarity_workers_requested == 0 {
+        std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-            .max(1),
-        explicit => explicit,
-    }
-}
+            .map_err(|error| WeaveRuntimeConfigError {
+                code: "ASTRO_WEAVE_HOST_PARALLELISM_UNAVAILABLE",
+                message: format!(
+                    "host parallelism discovery failed while resolving declared knob {WEAVE_SIMILARITY_WORKERS_KNOB}: {error}"
+                ),
+                remediation: format!(
+                    "set {WEAVE_SIMILARITY_WORKERS_ENV} to an explicit integer in [1..={WEAVE_MAX_SIMILARITY_WORKERS}] after diagnosing the native host query"
+                ),
+                knob: WEAVE_SIMILARITY_WORKERS_KNOB,
+                environment: Some(WEAVE_SIMILARITY_WORKERS_ENV),
+                observed_value: Some(similarity_workers_requested.to_string()),
+            })?
+    } else {
+        usize_value(WEAVE_SIMILARITY_WORKERS_KNOB, similarity_workers_requested)?
+    };
 
-/// The resolved dense ANN candidate-build strategy ordinal (#441).
-///
-/// Resolves the [`WEAVE_DENSE_ANN_STRATEGY_ENV`] override, parses it as the knob
-/// ordinal, and **fails closed** to [`WEAVE_DEFAULT_DENSE_ANN_STRATEGY`] when the
-/// value is unset, unparseable, or outside the declared closed interval — an
-/// operator can never select an undeclared strategy. When the override is absent
-/// the shipped default is returned, so the sequential-HNSW path is byte-identical
-/// to the pre-#441 build.
-pub fn weave_dense_ann_strategy() -> u64 {
-    let declaration = weave_knob(WEAVE_DENSE_ANN_STRATEGY_KNOB);
-    std::env::var(WEAVE_DENSE_ANN_STRATEGY_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| declaration.is_some_and(|knob| knob.accepts(*value)))
-        .unwrap_or(WEAVE_DEFAULT_DENSE_ANN_STRATEGY)
-}
-
-/// The resolved dim-aware exact-kNN dimensionality cutoff as a `usize` (#441). The
-/// dim-aware strategy (2) selects exact blocked kNN for a dense group when its dim is
-/// `<= this`, else sequential HNSW.
-pub fn weave_dense_ann_exact_max_dim() -> usize {
-    usize::try_from(WEAVE_DEFAULT_DENSE_ANN_EXACT_MAX_DIM).unwrap_or(256)
-}
-
-/// Whether the deterministic parallel exact blocked-kNN dense ANN build is selected
-/// for a dense group of dimensionality `dim` (#441).
-///
-/// Resolves the [`weave_dense_ann_strategy`] ordinal:
-/// - `0` (sequential HNSW) → always `false` (the pre-#441 byte-parity baseline).
-/// - `1` (global exact kNN) → always `true`.
-/// - `2` (dim-aware, the default) → `true` when `dim <= weave_dense_ann_exact_max_dim`
-///   (low-dim groups such as `SIM_PROFILE` dim=24, where exact kNN is measured 7.7–20×
-///   faster than HNSW), else `false` (high-dim groups such as `SIM_SEMANTIC` dim=768,
-///   routed to HNSW to avoid the measured ~9% large-n exact-kNN regression).
-///
-/// The result is a pure function of the resolved strategy, the cutoff, and `dim`, so
-/// a byte-identical corpus routes every group identically across runs.
-pub fn weave_dense_ann_use_exact(dim: u32) -> bool {
-    match weave_dense_ann_strategy() {
-        WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW => false,
-        WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN => true,
-        _ => dim as usize <= weave_dense_ann_exact_max_dim(),
-    }
+    Ok(ResolvedSimilarityKnobs {
+        registry_version: WEAVE_KNOB_REGISTRY_VERSION,
+        dense_ann_strategy,
+        dense_ann_exact_max_dim: usize_value(WEAVE_DENSE_ANN_EXACT_MAX_DIM_KNOB, exact_max_dim)?,
+        similarity_workers_requested,
+        similarity_workers_resolved,
+    })
 }

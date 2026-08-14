@@ -163,14 +163,82 @@ pub struct PersistedAgreementEdge {
     pub provenance: &'static str,
 }
 
+/// Named inputs for one complete eager cross-term planning run.
+pub struct EagerCrossTermPlanRequest<'a> {
+    run_directory: PathBuf,
+    source_binding: String,
+    nodes: &'a [SimilarityNode],
+    kind: EagerAgreementKind,
+    cx_ids: &'a BTreeMap<String, CxId>,
+    active_slot_count: usize,
+}
+
+impl<'a> EagerCrossTermPlanRequest<'a> {
+    pub fn new(
+        run_directory: impl Into<PathBuf>,
+        source_binding: impl Into<String>,
+        nodes: &'a [SimilarityNode],
+        kind: EagerAgreementKind,
+        cx_ids: &'a BTreeMap<String, CxId>,
+        active_slot_count: usize,
+    ) -> Self {
+        Self {
+            run_directory: run_directory.into(),
+            source_binding: source_binding.into(),
+            nodes,
+            kind,
+            cx_ids,
+            active_slot_count,
+        }
+    }
+}
+
+/// Named inputs for one delta-scoped eager cross-term planning run.
+pub struct EagerCrossTermDeltaPlanRequest<'a> {
+    run_directory: PathBuf,
+    source_binding: String,
+    nodes: &'a [SimilarityNode],
+    kind: EagerAgreementKind,
+    symbol_ids: &'a BTreeSet<String>,
+    cx_ids: &'a BTreeMap<String, CxId>,
+    active_slot_count: usize,
+}
+
+impl<'a> EagerCrossTermDeltaPlanRequest<'a> {
+    pub fn new(
+        run_directory: impl Into<PathBuf>,
+        source_binding: impl Into<String>,
+        nodes: &'a [SimilarityNode],
+        kind: EagerAgreementKind,
+        symbol_ids: &'a BTreeSet<String>,
+        cx_ids: &'a BTreeMap<String, CxId>,
+        active_slot_count: usize,
+    ) -> Self {
+        Self {
+            run_directory: run_directory.into(),
+            source_binding: source_binding.into(),
+            nodes,
+            kind,
+            symbol_ids,
+            cx_ids,
+            active_slot_count,
+        }
+    }
+}
+
+struct EagerCrossTermOwnedPlanRequest<'a> {
+    run_directory: PathBuf,
+    source_binding: String,
+    nodes: &'a [SimilarityNode],
+    kind: EagerAgreementKind,
+    symbol_ids: Option<&'a BTreeSet<String>>,
+    cx_ids: &'a BTreeMap<String, CxId>,
+    active_slot_count: usize,
+}
+
 pub fn plan_eager_cross_term_kind_run<C, F>(
     vault: &AsterVault<C>,
-    run_directory: impl Into<PathBuf>,
-    source_binding: impl Into<String>,
-    nodes: &[SimilarityNode],
-    kind: EagerAgreementKind,
-    cx_ids: &BTreeMap<String, CxId>,
-    active_slot_count: usize,
+    request: EagerCrossTermPlanRequest<'_>,
     mut observe: F,
 ) -> calyx_core::Result<BoundedEagerCrossTermKindPlan>
 where
@@ -179,26 +247,22 @@ where
 {
     plan_eager_cross_term_kind_run_owned(
         vault,
-        run_directory,
-        source_binding,
-        nodes,
-        kind,
-        None,
-        cx_ids,
-        active_slot_count,
+        EagerCrossTermOwnedPlanRequest {
+            run_directory: request.run_directory,
+            source_binding: request.source_binding,
+            nodes: request.nodes,
+            kind: request.kind,
+            symbol_ids: None,
+            cx_ids: request.cx_ids,
+            active_slot_count: request.active_slot_count,
+        },
         &mut observe,
     )
 }
 
 pub fn plan_eager_cross_term_kind_run_delta<C, F>(
     vault: &AsterVault<C>,
-    run_directory: impl Into<PathBuf>,
-    source_binding: impl Into<String>,
-    nodes: &[SimilarityNode],
-    kind: EagerAgreementKind,
-    symbol_ids: &BTreeSet<String>,
-    cx_ids: &BTreeMap<String, CxId>,
-    active_slot_count: usize,
+    request: EagerCrossTermDeltaPlanRequest<'_>,
     mut observe: F,
 ) -> calyx_core::Result<BoundedEagerCrossTermKindPlan>
 where
@@ -207,36 +271,37 @@ where
 {
     plan_eager_cross_term_kind_run_owned(
         vault,
-        run_directory,
-        source_binding,
-        nodes,
-        kind,
-        Some(symbol_ids),
-        cx_ids,
-        active_slot_count,
+        EagerCrossTermOwnedPlanRequest {
+            run_directory: request.run_directory,
+            source_binding: request.source_binding,
+            nodes: request.nodes,
+            kind: request.kind,
+            symbol_ids: Some(request.symbol_ids),
+            cx_ids: request.cx_ids,
+            active_slot_count: request.active_slot_count,
+        },
         &mut observe,
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the source-generation, ownership, and observer bindings must remain explicit at the run boundary"
-)]
 fn plan_eager_cross_term_kind_run_owned<C, F>(
     vault: &AsterVault<C>,
-    run_directory: impl Into<PathBuf>,
-    source_binding: impl Into<String>,
-    nodes: &[SimilarityNode],
-    kind: EagerAgreementKind,
-    symbol_ids: Option<&BTreeSet<String>>,
-    cx_ids: &BTreeMap<String, CxId>,
-    active_slot_count: usize,
+    request: EagerCrossTermOwnedPlanRequest<'_>,
     observe: &mut F,
 ) -> calyx_core::Result<BoundedEagerCrossTermKindPlan>
 where
     C: Clock,
     F: FnMut(&EagerCrossTermRow) -> calyx_core::Result<()>,
 {
+    let EagerCrossTermOwnedPlanRequest {
+        run_directory,
+        source_binding,
+        nodes,
+        kind,
+        symbol_ids,
+        cx_ids,
+        active_slot_count,
+    } = request;
     let xterm_snapshot_seq = vault.snapshot();
     let xterm_generation = vault.cf_content_generation(ColumnFamily::XTerm)?;
     let workspace = RunWorkspace::create(
@@ -244,7 +309,7 @@ where
         format!("eager-xterm:{}", kind.wire_name()),
         format!(
             "{};xterm_snapshot_seq={xterm_snapshot_seq};xterm_generation={xterm_generation}",
-            source_binding.into()
+            source_binding
         ),
     )?;
     let mut chunks = Vec::new();

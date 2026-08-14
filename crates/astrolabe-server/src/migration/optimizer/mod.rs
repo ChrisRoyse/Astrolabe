@@ -99,7 +99,12 @@ pub(crate) fn optimizer_status_json_at(
         "capabilities": {
             "status": "enabled",
             "propose": "enabled_from_measured_deficits_to_persisted_queue",
-            "trigger_ack": "enabled_durable_ledger_action",
+            "loom_reactive_read": {
+                "status": "enabled",
+                "provider": "calyx-loom",
+                "source": "AsterVault:ColumnFamily::Ledger+Reactive",
+            },
+            "loom_trigger_ack": "enabled_durable_ledger_action",
             "janitor": "enabled_budgeted_tick",
         },
     }))

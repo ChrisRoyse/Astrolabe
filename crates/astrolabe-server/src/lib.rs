@@ -1475,13 +1475,13 @@ impl Drop for VerifyChainLoop {
                  code=ASTRO_VERIFY_CHAIN_SHUTDOWN_SEND_FAILED"
             );
         }
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                tracing::error!(
-                    "verify_chain_loop.thread_panicked \
-                     code=ASTRO_VERIFY_CHAIN_THREAD_PANICKED"
-                );
-            }
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!(
+                "verify_chain_loop.thread_panicked \
+                 code=ASTRO_VERIFY_CHAIN_THREAD_PANICKED"
+            );
         }
     }
 }

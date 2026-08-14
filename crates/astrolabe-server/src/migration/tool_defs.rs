@@ -1,36 +1,45 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 24] {
-    [
-        get_provenance_tool_definition(),
-        detect_anomalies_tool_definition(),
-        optimizer_status_tool_definition(),
-        get_readiness_tool_definition(),
-        impute_fields_tool_definition(),
-        anchor_outcome_tool_definition(),
-        predict_impact_tool_definition(),
-        coverage_ingest_tool_definition(),
-        team_artifact_tool_definition(),
-        guard_calibrate_tool_definition(),
-        guard_check_tool_definition(),
-        measure_bits_tool_definition(),
-        find_similar_tool_definition(),
-        guard_lock_tool_definition(),
-        guard_commit_ood_tool_definition(),
-        guard_advisory_hook_tool_definition(),
-        assay_gate_tool_definition(),
-        abduce_cause_tool_definition(),
-        forecast_tool_definition(),
-        // #39 + #40 + #353: unified get_kernel (modes read|gaps|quadrant|build),
-        // kernel_answer, and anchor_erase, appended after the base roster.
-        get_kernel_tool_definition(),
-        kernel_answer_tool_definition(),
-        anchor_erase_tool_definition(),
-        // #1009: L5 latent (indirect) associations.
-        discover_latent_links_tool_definition(),
-        // #1012/#1097: composed, association-contextualized discovery generation.
-        discover_associations_tool_definition(),
-    ]
+/// The immutable Rust-native MCP registry, constructed once per process.
+///
+/// `tools/list`, native CLI help, public-name membership, and runtime argument
+/// validation all borrow these exact values. Keeping one process-scope instance
+/// prevents both schema drift and per-request reconstruction of the 24 schema
+/// trees (#1120; #1064 PC-03/PC-43).
+pub(crate) fn astrolabe_tool_definitions() -> &'static [Value; 24] {
+    static DEFINITIONS: OnceLock<[Value; 24]> = OnceLock::new();
+    DEFINITIONS.get_or_init(|| {
+        [
+            get_provenance_tool_definition(),
+            detect_anomalies_tool_definition(),
+            optimizer_status_tool_definition(),
+            get_readiness_tool_definition(),
+            impute_fields_tool_definition(),
+            anchor_outcome_tool_definition(),
+            predict_impact_tool_definition(),
+            coverage_ingest_tool_definition(),
+            team_artifact_tool_definition(),
+            guard_calibrate_tool_definition(),
+            guard_check_tool_definition(),
+            measure_bits_tool_definition(),
+            find_similar_tool_definition(),
+            guard_lock_tool_definition(),
+            guard_commit_ood_tool_definition(),
+            guard_advisory_hook_tool_definition(),
+            assay_gate_tool_definition(),
+            abduce_cause_tool_definition(),
+            forecast_tool_definition(),
+            // #39 + #40 + #353: unified get_kernel (modes read|gaps|quadrant|build),
+            // kernel_answer, and anchor_erase, appended after the base roster.
+            get_kernel_tool_definition(),
+            kernel_answer_tool_definition(),
+            anchor_erase_tool_definition(),
+            // #1009: L5 latent (indirect) associations.
+            discover_latent_links_tool_definition(),
+            // #1012/#1097: composed, association-contextualized discovery generation.
+            discover_associations_tool_definition(),
+        ]
+    })
 }
 
 pub(crate) fn discover_associations_tool_definition() -> Value {
@@ -57,16 +66,6 @@ pub(crate) fn discover_associations_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -128,16 +127,6 @@ pub(crate) fn discover_latent_links_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -174,16 +163,6 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
             },
             "required": [],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -219,16 +198,6 @@ pub(crate) fn kernel_answer_tool_definition() -> Value {
             },
             "required": ["query"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -260,16 +229,6 @@ pub(crate) fn anchor_erase_tool_definition() -> Value {
             },
             "required": ["project", "source", "confirm"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -302,16 +261,6 @@ pub(crate) fn guard_commit_ood_tool_definition() -> Value {
             },
             "required": ["project", "commit_ref", "symbols"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -348,16 +297,6 @@ pub(crate) fn guard_advisory_hook_tool_definition() -> Value {
             },
             "required": ["project", "candidate"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -402,16 +341,6 @@ pub(crate) fn assay_gate_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -453,16 +382,6 @@ pub(crate) fn guard_lock_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -483,10 +402,6 @@ pub(crate) fn abduce_cause_tool_definition() -> Value {
                     "type": "string",
                     "description": "Qualified name of the failing symbol to reason back from. Must resolve in this project's indexed graph or the call refuses fail-closed."
                 },
-                "subject": {
-                    "type": "string",
-                    "description": "Alias for failure."
-                },
                 "observed_at": {
                     "type": "integer",
                     "description": "Server-observed epoch (seconds or ms) at which the failure was observed — the recency and causality reference. Defaults to the server wall clock; pass an explicit value for reproducible abduction. 0 refuses."
@@ -499,16 +414,6 @@ pub(crate) fn abduce_cause_tool_definition() -> Value {
             },
             "required": ["project", "failure"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -529,10 +434,6 @@ pub(crate) fn forecast_tool_definition() -> Value {
                     "type": "string",
                     "description": "Qualified name of the symbol/test whose failure recurrence to forecast. Must resolve in this project's indexed graph or the call refuses fail-closed."
                 },
-                "test": {
-                    "type": "string",
-                    "description": "Alias for subject."
-                },
                 "mode": {
                     "type": "string",
                     "enum": ["recurrence", "flaky"],
@@ -545,16 +446,6 @@ pub(crate) fn forecast_tool_definition() -> Value {
             },
             "required": ["project", "subject"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "array", "items": {"type": "object"}},
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -591,19 +482,6 @@ pub(crate) fn measure_bits_tool_definition() -> Value {
             },
             "required": ["project", "mode"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -633,19 +511,6 @@ pub(crate) fn predict_impact_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -665,10 +530,6 @@ pub(crate) fn guard_check_tool_definition() -> Value {
                 "target": {
                     "type": "string",
                     "description": "Candidate symbol CxId hex; the verdict ledger entry's subject."
-                },
-                "subject": {
-                    "type": "string",
-                    "description": "Alias for target."
                 },
                 "candidate": {
                     "type": "object",
@@ -721,19 +582,6 @@ pub(crate) fn guard_check_tool_definition() -> Value {
             },
             "required": ["project", "target", "candidate", "exemplars"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -788,19 +636,6 @@ pub(crate) fn coverage_ingest_tool_definition() -> Value {
             },
             "required": ["project", "coverage_format", "coverage_report", "test_format", "test_report", "coverage_source", "run_id"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -931,19 +766,6 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
             },
             "required": ["project", "domain"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -978,10 +800,6 @@ pub(crate) fn anchor_outcome_tool_definition() -> Value {
                     "type": "string",
                     "description": "Full test-report text in the declared format. Partial or malformed reports refuse fail-closed."
                 },
-                "report_text": {
-                    "type": "string",
-                    "description": "Alias for report."
-                },
                 "confidence": {
                     "type": "number",
                     "description": "Optional confidence. Resolved sources require exactly 1.0; proxy sources require a finite value in (0,1) and default to 0.8."
@@ -991,21 +809,8 @@ pub(crate) fn anchor_outcome_tool_definition() -> Value {
                     "description": "Server-observed epoch (seconds or ms) at which the outcome was observed. Defaults to the server wall clock; pass an explicit value for reproducible CI anchoring. 0 refuses."
                 }
             },
-            "required": ["project", "source", "format"],
+            "required": ["project", "source", "format", "report"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -1030,10 +835,6 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
                     "type": "string",
                     "description": "Symbol id or answer id required by lineage, answer_trace, and reproduce."
                 },
-                "subject": {
-                    "type": "string",
-                    "description": "Alias for subject_id."
-                },
                 "drift_bound_microunits": {
                     "type": "integer",
                     "description": "reproduce: optional tightening-only override of the 1e-3 (1000-microunit) drift bound. A value above the pinned default is refused; omit to use 1e-3."
@@ -1049,19 +850,6 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
             },
             "required": ["project", "mode"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -1085,19 +873,6 @@ pub(crate) fn detect_anomalies_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -1106,7 +881,7 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
     json!({
         "name": "optimizer_status",
         "title": "Optimizer Status",
-        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project, durably acknowledge pending reactive trigger events for a subscription, or generate pending proposals from measured deficits.",
+        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project, including Calyx Loom's physical Ledger+Reactive subscription/event state; durably acknowledge pending Loom trigger events for a subscription; or generate pending proposals from measured deficits.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1126,19 +901,6 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -1166,19 +928,6 @@ pub(crate) fn get_readiness_tool_definition() -> Value {
             },
             "required": ["project"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -1211,19 +960,6 @@ pub(crate) fn impute_fields_tool_definition() -> Value {
             },
             "required": ["project", "target", "field"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }
@@ -1253,21 +989,9 @@ pub(crate) fn team_artifact_tool_definition() -> Value {
                     "type": "string",
                     "description": "Explicit artifact directory. Overrides repo_path/.codebase-memory."
                 },
-                "output_dir": {
-                    "type": "string",
-                    "description": "Alias for artifact_dir in export mode."
-                },
-                "input_dir": {
-                    "type": "string",
-                    "description": "Alias for artifact_dir in import mode."
-                },
                 "adopted_graph_path": {
                     "type": "string",
                     "description": "Import destination for verified graph bytes. Defaults to the local CBM cache DB for project."
-                },
-                "cache_db_path": {
-                    "type": "string",
-                    "description": "Alias for adopted_graph_path when importing into a CBM cache DB."
                 },
                 "signing_key_hex": {
                     "type": "string",
@@ -1280,19 +1004,6 @@ pub(crate) fn team_artifact_tool_definition() -> Value {
             },
             "required": ["mode"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }

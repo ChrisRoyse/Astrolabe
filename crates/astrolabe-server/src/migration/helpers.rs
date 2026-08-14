@@ -160,11 +160,11 @@ pub(crate) fn merge_object(target: &mut Map<String, Value>, additions: &Map<Stri
 
 pub(crate) fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynError> {
     let mut sanitized = args.clone();
-    sanitized.remove("calyx");
-    sanitized.remove("calyx_search");
+    sanitized.remove(MIGRATION_DIAL_ARG);
+    sanitized.remove(SEARCH_SCALE_ARG);
     // #198: an Astrolabe-side knob, never forwarded to the CBM tool, which would reject it as
     // an unknown argument.
-    sanitized.remove("calyx_skills");
+    sanitized.remove(SKILL_DISCOVERY_ARG);
     // #1113: the public request is validated at the Astrolabe admission
     // boundary and replaced with one private, immutable worker transport. It
     // is generation provenance, not a caller action/cache identity.

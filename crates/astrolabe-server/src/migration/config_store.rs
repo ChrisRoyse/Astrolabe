@@ -2,6 +2,8 @@ use super::*;
 
 pub(crate) const CONFIG_KEY_PREFIX: &str = "astrolabe.calyx.";
 pub(crate) const AUTO_WATCH_CONFIG_KEY: &str = "auto_watch";
+/// Public `index_repository` migration-dial argument.
+pub(crate) const MIGRATION_DIAL_ARG: &str = "calyx";
 
 #[derive(Debug)]
 pub(crate) struct AutoWatchPolicyError {
@@ -41,6 +43,19 @@ impl MigrationDial {
             Self::Shadow => "shadow",
         }
     }
+}
+
+/// Canonical public schema for [`MIGRATION_DIAL_ARG`].
+///
+/// Omission deliberately has no JSON-Schema `default`: the runtime first reuses
+/// a persisted project dial and selects `off` only when no row exists. Advertising
+/// a static default would misdescribe that stateful admission rule.
+pub(crate) fn migration_dial_property_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["off", "shadow"],
+        "description": "Astrolabe migration dial. shadow runs and persists the complete project-scoped Calyx pipeline; off runs the legacy CBM index and persists that choice. Omit to reuse this project's persisted dial, or off when the project has no persisted dial. Invalid values refuse before indexing; no mode is inferred or substituted."
+    })
 }
 
 pub(crate) fn read_auto_watch_policy_at(cache_dir: &Path) -> Result<bool, AutoWatchPolicyError> {

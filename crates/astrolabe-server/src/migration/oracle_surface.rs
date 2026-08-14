@@ -331,9 +331,7 @@ pub(crate) fn handle_abduce_cause(args_json: &str) -> Result<String, DynError> {
     let Some(project) = status_project_from_args(args_obj)? else {
         return tool_error_result("abduce_cause requires project");
     };
-    let failure = string_arg(args_obj, "failure")
-        .or_else(|| string_arg(args_obj, "subject"))
-        .map(ToOwned::to_owned);
+    let failure = string_arg(args_obj, "failure").map(ToOwned::to_owned);
     let observed_at = match args_obj.get("observed_at") {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) => Some(text.clone()),
@@ -620,9 +618,7 @@ pub(crate) fn handle_forecast(args_json: &str) -> Result<String, DynError> {
     let Some(project) = status_project_from_args(args_obj)? else {
         return tool_error_result("forecast requires project");
     };
-    let subject = string_arg(args_obj, "subject")
-        .or_else(|| string_arg(args_obj, "test"))
-        .map(ToOwned::to_owned);
+    let subject = string_arg(args_obj, "subject").map(ToOwned::to_owned);
     let mode = string_arg(args_obj, "mode")
         .unwrap_or("recurrence")
         .to_owned();

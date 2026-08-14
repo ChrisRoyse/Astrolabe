@@ -167,6 +167,12 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
             "provenance",
             "provenance_json",
         )?,
+        "weave": compact_persisted_surface_ref(
+            cache_dir,
+            project,
+            "weave",
+            "weave_json",
+        )?,
         "invalidations": compact_persisted_surface_ref(
             cache_dir,
             project,
@@ -431,7 +437,7 @@ fn scrub_project_with_import_owner(
     shadow_import_lock.assert_owns(cache_dir, project)?;
     // Writable handle: the scrub advances the persisted JanitorCheckpoint and
     // appends the witnessed Measure scrub record. selected_cfs=None (all CFs).
-    let vault = open_shadow_vault_writable(vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    let vault = open_shadow_vault_writable(vault_dir, vault_id, vault_salt, Vec::new())?;
     scrub_open_vault(&vault)
 }
 
@@ -452,7 +458,7 @@ fn scrub_project_with_generation_clock(
 }
 
 fn scrub_open_vault<C: Clock>(vault: &AsterVault<C>) -> Result<PeriodicScrubOutcome, DynError> {
-    match astrolabe_ingest::run_janitor_scrub_step(&vault, None) {
+    match astrolabe_ingest::run_janitor_scrub_step(vault, None) {
         Ok(report) => {
             let checkpoint = report.checkpoint();
             let (slice_start, slice_end, fsv) = match &report {
@@ -972,7 +978,7 @@ pub(crate) fn periodic_verify_status_at(
         "error": error,
         "freshness": "last_observed",
         "trust": if status == "intact" { "verified" } else { "provisional" },
-        "remediation": periodic_verify_remediation(&status),
+        "remediation": periodic_verify_remediation(status),
     }))
 }
 

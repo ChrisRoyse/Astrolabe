@@ -90,6 +90,9 @@ pub const ASTRO_ASSAY_INPUT_FINGERPRINT_INVALID: &str = "ASTRO_ASSAY_INPUT_FINGE
 /// One canonical assay-card input identity resolved to more than one durable
 /// payload/seed, or was already duplicated in the append-only chain.
 pub const ASTRO_ASSAY_INPUT_FINGERPRINT_COLLISION: &str = "ASTRO_ASSAY_INPUT_FINGERPRINT_COLLISION";
+/// A prepared assay-card batch no longer matches the exact append-only ledger
+/// prefix or an interrupted batch is only partly present.
+pub const ASTRO_ASSAY_LEDGER_BATCH_STATE_INVALID: &str = "ASTRO_ASSAY_LEDGER_BATCH_STATE_INVALID";
 /// A lens capability-gate input was malformed: misaligned sample vectors, a
 /// non-finite measured value, or an out-of-range correlation.
 pub const ASTRO_ASSAY_GATE_INPUT_INVALID: &str = "ASTRO_ASSAY_GATE_INPUT_INVALID";

@@ -14,6 +14,19 @@ fn handle_tool_raw_admitted(
     tool_name: &str,
     args_json: &str,
 ) -> Result<String, DynError> {
+    if let Some(definition) = astrolabe_native_tool_definition(tool_name)
+        && let Err(error) = validate_native_tool_arguments(tool_name, definition, args_json)
+    {
+        if let Some(result) = tool_fault_result_from_error(error.as_ref()) {
+            tracing::warn!(
+                tool = tool_name,
+                code = ToolFault::from_error(error.as_ref()).map(|fault| fault.code().to_string()),
+                "mcp.native_tool.argument_refused"
+            );
+            return result;
+        }
+        return Err(error);
+    }
     match tool_name {
         "list_projects" => handle_list_projects(runner, args_json),
         "index_repository" => handle_index_repository(runner, args_json),
@@ -93,6 +106,10 @@ pub fn handle_jsonrpc_raw(
     if !should_intercept_tool_call(tool_name) {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
+    if is_advertised_astrolabe_tool(tool_name) {
+        let result_raw = handle_tool_raw_admitted(runner, tool_name, &args_json)?;
+        return Ok(Some(jsonrpc_result_response(id.clone(), &result_raw)?));
+    }
     let Some(args_obj) = arguments.as_object() else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
@@ -121,9 +138,273 @@ pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
 }
 
 pub(crate) fn is_advertised_astrolabe_tool(tool_name: &str) -> bool {
+    astrolabe_native_tool_definition(tool_name).is_some()
+}
+
+fn astrolabe_native_tool_definition(tool_name: &str) -> Option<&'static Value> {
     astrolabe_tool_definitions()
         .iter()
-        .any(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
+        .find(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
+}
+
+/// Validate a native request against the exact `inputSchema` object served by
+/// `tools/list` before the handler can open Config, SQLite, or any vault family.
+/// The supported schema vocabulary is deliberately small and exactly matches
+/// the checked-in native definitions: object/array/scalar types, properties,
+/// required fields, closed objects, enums, and numeric bounds.
+fn validate_native_tool_arguments(
+    tool_name: &str,
+    definition: &Value,
+    args_json: &str,
+) -> Result<(), DynError> {
+    let value = serde_json::from_str::<Value>(args_json).map_err(|error| {
+        ToolFault::new(
+            "ASTRO_MCP_ARGUMENTS_JSON_INVALID",
+            format!("{tool_name} arguments are not valid JSON: {error}"),
+            "pass one JSON object matching this tool's inputSchema from tools/list",
+        )
+    })?;
+    let schema = definition
+        .get("inputSchema")
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_MISSING: {tool_name} has no inputSchema; remediation: repair the immutable native definition before dispatch"
+            )
+            .into()
+        })?;
+    validate_schema_value(tool_name, "arguments", schema, &value)
+}
+
+fn validate_schema_value(
+    tool_name: &str,
+    path: &str,
+    schema: &Value,
+    actual: &Value,
+) -> Result<(), DynError> {
+    let schema = schema.as_object().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} schema at {path} is not an object; remediation: repair the immutable native definition before dispatch"
+        )
+        .into()
+    })?;
+    if let Some(expected_type) = schema.get("type") {
+        let expected_type = expected_type.as_str().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} schema type at {path} is not a string; remediation: repair the immutable native definition before dispatch"
+            )
+            .into()
+        })?;
+        if !json_value_matches_type(actual, expected_type) {
+            return Err(ToolFault::new(
+                "ASTRO_MCP_ARGUMENT_TYPE_INVALID",
+                format!(
+                    "{tool_name} argument {path:?} must be JSON type {expected_type}; received {}",
+                    json_type_name(actual)
+                ),
+                "correct the named value to match the inputSchema returned by tools/list, then retry",
+            )
+            .with_argument(path, expected_type, actual)
+            .into());
+        }
+    }
+    if let Some(variants) = schema.get("enum") {
+        let variants = variants.as_array().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} enum at {path} is not an array; remediation: repair the immutable native definition before dispatch"
+            )
+            .into()
+        })?;
+        if !variants.contains(actual) {
+            return Err(ToolFault::new(
+                "ASTRO_MCP_ARGUMENT_ENUM_INVALID",
+                format!("{tool_name} argument {path:?} is not an advertised enum value"),
+                "use one of the exact enum values returned in this tool's tools/list inputSchema",
+            )
+            .with_detail("argument", path)
+            .with_detail("allowed_values", variants.clone())
+            .with_detail("observed_value", actual.clone())
+            .into());
+        }
+    }
+    validate_schema_number_bounds(tool_name, path, schema, actual)?;
+    validate_schema_integer_multiple(tool_name, path, schema, actual)?;
+
+    if let Some(object) = actual.as_object() {
+        let properties = match schema.get("properties") {
+            Some(value) => Some(value.as_object().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} properties at {path} are not an object; remediation: repair the immutable native definition before dispatch"
+                )
+                .into()
+            })?),
+            None => None,
+        };
+        if let Some(required) = schema.get("required") {
+            let required = required.as_array().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} required at {path} is not an array; remediation: repair the immutable native definition before dispatch"
+                )
+                .into()
+            })?;
+            for required_name in required {
+                let required_name = required_name.as_str().ok_or_else(|| -> DynError {
+                    format!(
+                        "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} required entry at {path} is not a string; remediation: repair the immutable native definition before dispatch"
+                    )
+                    .into()
+                })?;
+                if !object.contains_key(required_name) {
+                    return Err(ToolFault::new(
+                        "ASTRO_MCP_ARGUMENT_REQUIRED",
+                        format!("{tool_name} requires argument {required_name:?}"),
+                        "supply every field listed in this tool's tools/list inputSchema.required array",
+                    )
+                    .with_detail("argument", required_name)
+                    .with_detail("argument_path", format!("{path}.{required_name}"))
+                    .into());
+                }
+            }
+        }
+        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+            let properties = properties.ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_MCP_NATIVE_SCHEMA_INVALID: closed {tool_name} object at {path} has no properties map; remediation: repair the immutable native definition before dispatch"
+                )
+                .into()
+            })?;
+            if let Some((name, value)) = object
+                .iter()
+                .find(|(name, _)| !properties.contains_key(name.as_str()))
+            {
+                return Err(ToolFault::new(
+                    "ASTRO_MCP_ARGUMENT_UNKNOWN",
+                    format!("{tool_name} received unknown argument {name:?} at {path}"),
+                    "remove the unknown field or use a field advertised in this tool's tools/list inputSchema",
+                )
+                .with_argument(format!("{path}.{name}"), "advertised property", value)
+                .into());
+            }
+        }
+        if let Some(properties) = properties {
+            for (name, property_schema) in properties {
+                if let Some(value) = object.get(name) {
+                    validate_schema_value(
+                        tool_name,
+                        &format!("{path}.{name}"),
+                        property_schema,
+                        value,
+                    )?;
+                }
+            }
+        }
+    }
+    if let Some(array) = actual.as_array()
+        && let Some(items) = schema.get("items")
+    {
+        for (ordinal, value) in array.iter().enumerate() {
+            validate_schema_value(tool_name, &format!("{path}[{ordinal}]"), items, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the integer subset of JSON Schema `multipleOf` exactly, without
+/// floating-point rounding. Every native schema using this keyword currently
+/// declares an integer argument and a positive integer divisor. A future
+/// non-integer declaration is rejected as an immutable-schema defect instead
+/// of being approximately interpreted.
+fn validate_schema_integer_multiple(
+    tool_name: &str,
+    path: &str,
+    schema: &Map<String, Value>,
+    actual: &Value,
+) -> Result<(), DynError> {
+    let Some(multiple_value) = schema.get("multipleOf") else {
+        return Ok(());
+    };
+    let Some(multiple) = multiple_value.as_u64().filter(|value| *value > 0) else {
+        return Err(format!(
+            "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} multipleOf at {path} must be a positive integer; remediation: repair the immutable native definition before dispatch"
+        )
+        .into());
+    };
+    let remainder = if let Some(value) = actual.as_u64() {
+        value % multiple
+    } else if let Some(value) = actual.as_i64() {
+        value.unsigned_abs() % multiple
+    } else {
+        return Err(format!(
+            "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} uses integer-only multipleOf at {path} for a non-integer value; remediation: declare type=integer with a positive integer divisor"
+        )
+        .into());
+    };
+    if remainder != 0 {
+        return Err(ToolFault::new(
+            "ASTRO_MCP_ARGUMENT_MULTIPLE_INVALID",
+            format!(
+                "{tool_name} argument {path:?} is not an exact multiple of advertised multipleOf {multiple}"
+            ),
+            "use a value exactly divisible by the multipleOf returned by tools/list",
+        )
+        .with_detail("argument", path)
+        .with_detail("multiple_of", multiple)
+        .with_detail("observed_value", actual.clone())
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_schema_number_bounds(
+    tool_name: &str,
+    path: &str,
+    schema: &Map<String, Value>,
+    actual: &Value,
+) -> Result<(), DynError> {
+    let Some(number) = actual.as_f64() else {
+        return Ok(());
+    };
+    for (bound_name, below) in [("minimum", true), ("maximum", false)] {
+        let Some(bound_value) = schema.get(bound_name) else {
+            continue;
+        };
+        let bound = bound_value.as_f64().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} {bound_name} at {path} is not numeric; remediation: repair the immutable native definition before dispatch"
+            )
+            .into()
+        })?;
+        let violates = if below {
+            number < bound
+        } else {
+            number > bound
+        };
+        if violates {
+            return Err(ToolFault::new(
+                "ASTRO_MCP_ARGUMENT_BOUND_INVALID",
+                format!("{tool_name} argument {path:?} violates advertised {bound_name} {bound}"),
+                "use a value inside the exact numeric bounds returned by tools/list",
+            )
+            .with_detail("argument", path)
+            .with_detail("bound", bound_name)
+            .with_detail("bound_value", bound)
+            .with_detail("observed_value", number)
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn json_value_matches_type(value: &Value, expected_type: &str) -> bool {
+    match expected_type {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
 }
 
 /// Print per-tool `--help` for an ASTROLABE-NATIVE tool (#428) — a tool served by
@@ -151,7 +432,7 @@ pub(crate) fn print_astrolabe_native_tool_help(
     tool_name: &str,
 ) -> Result<bool, DynError> {
     let Some(definition) = astrolabe_tool_definitions()
-        .into_iter()
+        .iter()
         .find(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
     else {
         return Ok(false);
@@ -245,6 +526,21 @@ pub(crate) fn handle_tools_list_jsonrpc(
             );
             return Ok(Some(tools_list_invalid_params_response(id, fault)?));
         };
+        if let Some((name, value)) = params.iter().find(|(name, _)| name.as_str() != "cursor") {
+            let fault = ToolFault::new(
+                "ASTRO_MCP_TOOLS_LIST_ARGUMENT_UNKNOWN",
+                format!("tools/list received unknown parameter {name:?}"),
+                "remove the unknown parameter; only a server-issued cursor is defined, and this executable returns its complete bounded roster without issuing one",
+            )
+            .with_argument(format!("params.{name}"), "cursor or omitted", value);
+            tracing::warn!(
+                code = fault.code(),
+                parameter = name.as_str(),
+                actual_type = json_type_name(value),
+                "mcp.tools_list_unknown_param"
+            );
+            return Ok(Some(tools_list_invalid_params_response(id, fault)?));
+        }
         if let Some(cursor) = params.get("cursor") {
             let mut fault = ToolFault::new(
                 "ASTRO_MCP_TOOLS_CURSOR_INVALID",
@@ -309,11 +605,11 @@ pub(crate) fn compose_complete_tool_roster(cbm_registry_json: &str) -> Result<Va
         }
     }
     for definition in astrolabe_tool_definitions() {
-        let name = tool_definition_name(&definition, "Astrolabe-native")?;
+        let name = tool_definition_name(definition, "Astrolabe-native")?;
         // Explicit precedence rule: a legacy CBM definition owns a shared name;
         // the overlays below add only Astrolabe's declared extensions.
         if names.insert(name.to_string()) {
-            tools.push(definition);
+            tools.push(definition.clone());
         }
     }
 
@@ -323,13 +619,15 @@ pub(crate) fn compose_complete_tool_roster(cbm_registry_json: &str) -> Result<Va
     // one public definition to extend.
     for tool in tools.iter_mut() {
         match tool.get("name").and_then(Value::as_str) {
-            Some("search_graph") => overlay_search_graph_extensions(tool),
+            Some("index_repository") => overlay_index_repository_extensions(tool)?,
+            Some("get_architecture") => overlay_get_architecture_extensions(tool)?,
+            Some("search_graph") => overlay_search_graph_extensions(tool)?,
             // #43: advertise the opt-in `scored` best-first knob on the CBM
             // trace_path schema so clients can discover it, same overlay pattern.
-            Some("trace_path") | Some("trace_call_path") => overlay_trace_path_extensions(tool),
+            Some("trace_path") | Some("trace_call_path") => overlay_trace_path_extensions(tool)?,
             // #43: advertise the opt-in `as_of` time-travel knob on the CBM
             // query_graph schema so clients can discover it, same overlay pattern.
-            Some("query_graph") => overlay_query_graph_extensions(tool),
+            Some("query_graph") => overlay_query_graph_extensions(tool)?,
             _ => {}
         }
     }
@@ -361,55 +659,264 @@ fn tools_list_invalid_params_response(id: Value, fault: ToolFault) -> Result<Str
     }))?)
 }
 
-/// #328: merge the Astrolabe `search_graph` extension properties into the CBM
-/// tool's `inputSchema.properties`, leaving any CBM-native property untouched.
-pub(crate) fn overlay_search_graph_extensions(tool: &mut Value) {
-    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
-        return;
-    };
-    let properties = schema
-        .entry("properties")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(properties) = properties.as_object_mut() else {
-        return;
-    };
-    for (name, spec) in search_graph_astrolabe_property_overlay() {
-        properties.entry(name).or_insert(spec);
+const INDEX_REPOSITORY_BASE_PUBLIC_ARGS: [&str; 5] = [
+    "repo_path",
+    "mode",
+    "target_projects",
+    GENERATION_OBSERVED_AT_MS_ARG,
+    "persistence",
+];
+const INDEX_REPOSITORY_PUBLIC_ARGS: [&str; 8] = [
+    "repo_path",
+    "mode",
+    "target_projects",
+    GENERATION_OBSERVED_AT_MS_ARG,
+    "persistence",
+    MIGRATION_DIAL_ARG,
+    SEARCH_SCALE_ARG,
+    SKILL_DISCOVERY_ARG,
+];
+
+fn index_repository_astrolabe_property_overlay() -> Vec<(String, Value)> {
+    vec![
+        (
+            GENERATION_OBSERVED_AT_MS_ARG.to_string(),
+            generation_clock_property_schema(),
+        ),
+        (
+            MIGRATION_DIAL_ARG.to_string(),
+            migration_dial_property_schema(),
+        ),
+        (
+            SEARCH_SCALE_ARG.to_string(),
+            search_scale_override_property_schema(),
+        ),
+        (
+            SKILL_DISCOVERY_ARG.to_string(),
+            skill_discovery_override_property_schema(),
+        ),
+    ]
+}
+
+/// Merge one handler-owned property set into a legacy tool definition. A
+/// malformed base schema or a differently-defined collision is a registry
+/// defect and refuses the entire tools/list response instead of silently
+/// omitting or overriding public behavior.
+fn overlay_tool_properties(
+    tool: &mut Value,
+    expected_tool_name: &str,
+    overlay: Vec<(String, Value)>,
+) -> Result<(), DynError> {
+    let actual_name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_TOOL_SCHEMA_INVALID: {expected_tool_name} definition has no non-empty name; remediation: repair the immutable tool registry"
+            )
+            .into()
+        })?;
+    if actual_name != expected_tool_name {
+        return Err(format!(
+            "ASTRO_MCP_TOOL_SCHEMA_NAME_MISMATCH: expected {expected_tool_name:?}, observed {actual_name:?}; remediation: route each schema overlay to its exact tool definition"
+        )
+        .into());
     }
+    let schema = tool
+        .get_mut("inputSchema")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_TOOL_SCHEMA_INVALID: {expected_tool_name}.inputSchema is not an object; remediation: repair the immutable base definition before applying extensions"
+            )
+            .into()
+        })?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(format!(
+            "ASTRO_MCP_TOOL_SCHEMA_INVALID: {expected_tool_name}.inputSchema.type is not object; remediation: repair the immutable base definition before applying extensions"
+        )
+        .into());
+    }
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_TOOL_SCHEMA_INVALID: {expected_tool_name}.inputSchema.properties is not an object; remediation: repair the immutable base definition before applying extensions"
+            )
+            .into()
+        })?;
+    for (name, spec) in overlay {
+        if let Some(existing) = properties.get(&name) {
+            if existing != &spec {
+                return Err(format!(
+                    "ASTRO_MCP_TOOL_SCHEMA_COLLISION: {expected_tool_name}.{name} has different base and host schemas; remediation: keep one canonical property definition shared by schema and handler validation"
+                )
+                .into());
+            }
+        } else {
+            properties.insert(name, spec);
+        }
+    }
+    Ok(())
+}
+
+/// #1073: add every public Astrolabe argument consumed by the
+/// `index_repository` host handler and close the object against unknown fields.
+fn overlay_index_repository_extensions(tool: &mut Value) -> Result<(), DynError> {
+    let base_properties = tool
+        .get("inputSchema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MCP_INDEX_SCHEMA_INVALID: index_repository base properties are missing; remediation: repair the CBM registry before serving tools/list".into()
+        })?;
+    for name in base_properties.keys() {
+        if !INDEX_REPOSITORY_BASE_PUBLIC_ARGS.contains(&name.as_str())
+            && !INDEX_REPOSITORY_PUBLIC_ARGS.contains(&name.as_str())
+        {
+            return Err(format!(
+                "ASTRO_MCP_INDEX_SCHEMA_UNOWNED_PROPERTY: base index_repository schema advertises unowned property {name:?}; remediation: add one handler-validated canonical contract for that property before exposing it"
+            )
+            .into());
+        }
+    }
+    overlay_tool_properties(
+        tool,
+        "index_repository",
+        index_repository_astrolabe_property_overlay(),
+    )?;
+    let schema = tool
+        .get_mut("inputSchema")
+        .and_then(Value::as_object_mut)
+        .ok_or("ASTRO_MCP_INDEX_SCHEMA_INVALID: index_repository inputSchema disappeared during overlay")?;
+    match schema.get("additionalProperties") {
+        None | Some(Value::Bool(false)) => {
+            schema.insert("additionalProperties".to_string(), Value::Bool(false));
+        }
+        Some(other) => {
+            return Err(format!(
+                "ASTRO_MCP_INDEX_SCHEMA_OPEN: index_repository additionalProperties is {other}; remediation: keep the public request closed and add every supported field to the canonical contract"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_index_repository_public_arguments(args: &Map<String, Value>) -> Result<(), ToolFault> {
+    for (name, value) in args {
+        if !INDEX_REPOSITORY_PUBLIC_ARGS.contains(&name.as_str()) {
+            return Err(ToolFault::new(
+                "ASTRO_INDEX_ARGUMENT_UNKNOWN",
+                format!("index_repository received unknown public argument {name:?}"),
+                "remove the unknown field or use a field advertised by this server's index_repository tools/list schema",
+            )
+            .with_argument(
+                name,
+                format!("one of {}", INDEX_REPOSITORY_PUBLIC_ARGS.join(", ")),
+                value,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// #1120: extend the existing selector enum from the same constants consumed
+/// by `ArchitectureRequestPlan`, then close the now-host-validated request.
+fn overlay_get_architecture_extensions(tool: &mut Value) -> Result<(), DynError> {
+    let schema = tool
+        .get_mut("inputSchema")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: get_architecture.inputSchema is not an object; remediation: repair the immutable CBM definition".into()
+        })?;
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: get_architecture properties are missing; remediation: repair the immutable CBM definition".into()
+        })?;
+    let aspects = properties
+        .get_mut("aspects")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: get_architecture.aspects is not an object; remediation: repair the immutable CBM definition".into()
+        })?;
+    let variants = aspects
+        .get_mut("items")
+        .and_then(Value::as_object_mut)
+        .and_then(|items| items.get_mut("enum"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: get_architecture.aspects.items.enum is missing; remediation: repair the immutable CBM definition".into()
+        })?;
+    let observed = variants
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if observed != CBM_ARCHITECTURE_ASPECTS {
+        return Err(format!(
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_DRIFT: legacy aspect enum was {observed:?}, expected {:?}; remediation: reconcile the CBM handler and the host canonical selector set before serving tools/list",
+            CBM_ARCHITECTURE_ASPECTS
+        )
+        .into());
+    }
+    variants.extend(
+        ASTROLABE_ARCHITECTURE_ASPECTS
+            .into_iter()
+            .map(|aspect| Value::String(aspect.to_string())),
+    );
+    aspects.insert(
+        "description".to_string(),
+        Value::String(
+            "Aspects to include. Omit for the complete legacy CBM architecture without extra Calyx reads; overview is the compact legacy summary; all includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
+                .to_string(),
+        ),
+    );
+    match schema.get("additionalProperties") {
+        None | Some(Value::Bool(false)) => {
+            schema.insert("additionalProperties".to_string(), Value::Bool(false));
+        }
+        Some(other) => {
+            return Err(format!(
+                "ASTRO_MCP_ARCHITECTURE_SCHEMA_OPEN: get_architecture additionalProperties is {other}; remediation: keep the request closed and add supported fields to the canonical contract"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// #328: merge the Astrolabe `search_graph` extension properties into the CBM
+/// tool's `inputSchema.properties`, refusing schema drift.
+pub(crate) fn overlay_search_graph_extensions(tool: &mut Value) -> Result<(), DynError> {
+    overlay_tool_properties(
+        tool,
+        "search_graph",
+        search_graph_astrolabe_property_overlay(),
+    )
 }
 
 /// #43: merge the Astrolabe `scored` extension property into the CBM `trace_path`
 /// tool's `inputSchema.properties`, leaving CBM-native properties untouched.
-pub(crate) fn overlay_trace_path_extensions(tool: &mut Value) {
-    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
-        return;
-    };
-    let properties = schema
-        .entry("properties")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(properties) = properties.as_object_mut() else {
-        return;
-    };
-    for (name, spec) in trace_path_astrolabe_property_overlay() {
-        properties.entry(name).or_insert(spec);
-    }
+pub(crate) fn overlay_trace_path_extensions(tool: &mut Value) -> Result<(), DynError> {
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("trace_path")
+        .to_string();
+    overlay_tool_properties(tool, &name, trace_path_astrolabe_property_overlay())
 }
 
 /// #43: merge the Astrolabe `as_of` extension property into the CBM `query_graph`
 /// tool's `inputSchema.properties`, leaving CBM-native properties untouched.
-pub(crate) fn overlay_query_graph_extensions(tool: &mut Value) {
-    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
-        return;
-    };
-    let properties = schema
-        .entry("properties")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(properties) = properties.as_object_mut() else {
-        return;
-    };
-    for (name, spec) in query_graph_astrolabe_property_overlay() {
-        properties.entry(name).or_insert(spec);
-    }
+pub(crate) fn overlay_query_graph_extensions(tool: &mut Value) -> Result<(), DynError> {
+    overlay_tool_properties(
+        tool,
+        "query_graph",
+        query_graph_astrolabe_property_overlay(),
+    )
 }
 
 pub(crate) fn should_wrap_tool(
@@ -433,12 +940,9 @@ pub(crate) fn should_wrap_tool(
             };
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
-        "get_architecture" => {
-            let Some(project) = status_project_from_args(args)? else {
-                return Ok(false);
-            };
-            Ok(read_dial(&project)? == MigrationDial::Shadow)
-        }
+        // Always wrap so the host-owned selector/schema contract is enforced
+        // identically for legacy and shadow projects before any store access.
+        "get_architecture" => Ok(true),
         "search_graph" => {
             Ok(search_graph_has_astrolabe_knob(args) || shadow_project_requested(args)?.is_some())
         }
@@ -497,17 +1001,37 @@ pub(crate) fn handle_index_repository(
     runner: &CbmToolRunner,
     args_json: &str,
 ) -> Result<String, DynError> {
-    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
-        return Ok(runner.handle_tool_raw("index_repository", args_json)?);
+    let args = match serde_json::from_str::<Value>(args_json) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolFault::new(
+                "ASTRO_INDEX_ARGUMENTS_JSON_INVALID",
+                format!("index_repository arguments are not valid JSON: {error}"),
+                "pass one JSON object matching the advertised index_repository input schema",
+            )
+            .into_result();
+        }
     };
     let Some(args_obj) = args.as_object() else {
-        return Ok(runner.handle_tool_raw("index_repository", args_json)?);
+        return ToolFault::new(
+            "ASTRO_INDEX_ARGUMENTS_OBJECT_REQUIRED",
+            "index_repository arguments must be a JSON object",
+            "pass one JSON object matching the advertised index_repository input schema",
+        )
+        .with_argument("arguments", "JSON object", &args)
+        .into_result();
     };
     if args_obj.contains_key(astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG) {
-        return tool_error_result(format!(
-            "ASTRO_COMPILE_CONTEXT_PRIVATE_ARG_COLLISION: caller supplied reserved argument {:?}; remediation: remove the private transport field and let Astrolabe derive it from repo_path",
-            astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG
-        ));
+        return ToolFault::new(
+            "ASTRO_COMPILE_CONTEXT_PRIVATE_ARG_COLLISION",
+            format!(
+                "caller supplied reserved argument {:?}",
+                astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG
+            ),
+            "remove the private transport field and let Astrolabe derive it from repo_path",
+        )
+        .with_detail("argument", astrolabe_bridge::ASTRO_COMPILATION_CONTEXT_ARG)
+        .into_result();
     }
     if args_obj.contains_key(GENERATION_OBSERVED_AT_MS_PRIVATE_ARG) {
         return ToolFault::new(
@@ -524,9 +1048,17 @@ pub(crate) fn handle_index_repository(
         .into_result();
     }
     if args_obj.contains_key("name") {
-        return tool_error_result(
-            "CBM_PROJECT_NAME_OVERRIDE_REFUSED: project storage identity is derived only from the canonical repository root; remove the name argument and use the project returned by index_repository",
-        );
+        return ToolFault::new(
+            "CBM_PROJECT_NAME_OVERRIDE_REFUSED",
+            "project storage identity is derived only from the canonical repository root",
+            "remove the name argument and use the project returned by index_repository",
+        )
+        .with_detail("argument", "name")
+        .into_result();
+    }
+    if let Err(fault) = validate_index_repository_public_arguments(args_obj) {
+        tracing::warn!(code = fault.code(), "mcp.index_repository.argument_refused");
+        return fault.into_result();
     }
     let generation_clock_request = match GenerationClockRequest::parse(args_obj) {
         Ok(request) => request,
@@ -536,18 +1068,46 @@ pub(crate) fn handle_index_repository(
 
     let search_scale_override = match parse_search_scale_override(args_obj) {
         Ok(value) => value,
-        Err(message) => return tool_error_result(message),
+        Err(message) => {
+            return ToolFault::new(
+                "ASTRO_SEARCH_SCALE_ARGUMENT_INVALID",
+                message,
+                "pass calyx_search as the closed object advertised by index_repository tools/list",
+            )
+            .with_detail("argument", SEARCH_SCALE_ARG)
+            .into_result();
+        }
     };
     let skill_discovery_override = match parse_skill_discovery_override(args_obj) {
         Ok(value) => value,
-        Err(message) => return tool_error_result(message),
+        Err(message) => {
+            return ToolFault::new(
+                "ASTRO_SKILL_DISCOVERY_ARGUMENT_INVALID",
+                message,
+                "pass calyx_skills as the closed object advertised by index_repository tools/list",
+            )
+            .with_detail("argument", SKILL_DISCOVERY_ARG)
+            .into_result();
+        }
     };
     let project = index_project_from_args(args_obj)?;
-    let explicit_dial = args_obj.get("calyx");
+    let explicit_dial = args_obj.get(MIGRATION_DIAL_ARG);
     let dial = match explicit_dial {
         Some(value) => match MigrationDial::parse(value) {
             Ok(dial) => dial,
-            Err(message) => return tool_error_result(message),
+            Err(message) => {
+                return ToolFault::new(
+                    "ASTRO_MIGRATION_DIAL_ARGUMENT_INVALID",
+                    message,
+                    "pass calyx=\"off\" or calyx=\"shadow\" exactly; omit it only to reuse persisted project state",
+                )
+                .with_argument(
+                    MIGRATION_DIAL_ARG,
+                    "string enum off|shadow",
+                    value,
+                )
+                .into_result();
+            }
         },
         None => project
             .as_ref()
@@ -699,8 +1259,27 @@ pub(crate) fn handle_index_repository(
             Ok(settings) => settings,
             Err(error) => return tool_error_result(format!("search scale config failed: {error}")),
         };
-    let index_admission_identity =
-        shadow_index_admission_identity(&sanitized_args, &search_scale_settings, &skills)?;
+    let similarity_config = match SimilarityPlannerConfig::resolve_runtime() {
+        Ok(config) => config,
+        Err(error) => {
+            let mut fault =
+                ToolFault::new(error.code, error.message.clone(), error.remediation.clone())
+                    .with_detail("knob", error.knob);
+            if let Some(environment) = error.environment {
+                fault = fault.with_detail("environment", environment);
+            }
+            if let Some(observed_value) = error.observed_value {
+                fault = fault.with_detail("observed_value", observed_value);
+            }
+            return fault.into_result();
+        }
+    };
+    let index_admission_identity = shadow_index_admission_identity(
+        &sanitized_args,
+        &search_scale_settings,
+        &skills,
+        &similarity_config,
+    )?;
     let mut action_policy =
         shadow_index_action_policy(&cache_dir, &project, &index_admission_identity)?;
     if let Some(repo) = repo_path
@@ -929,15 +1508,16 @@ pub(crate) fn handle_index_repository(
                 // before the long vault import, so an external kill leaves the next
                 // reconcile something it can verify and rescue instead of destroy.
                 publication.journal_stage_completion()?;
-                let outcome = import_shadow_vault_with_archaeology_at(
-                    publication.stage_cache(),
-                    &project,
+                let outcome = import_shadow_vault_with_archaeology_at(ShadowImportRequest {
+                    cache_dir: publication.stage_cache(),
+                    project: &project,
                     row_sink,
-                    &search_scale_settings,
-                    repo_path.as_deref(),
-                    &action_policy,
+                    search_scale_settings: &search_scale_settings,
+                    similarity_config: &similarity_config,
+                    repo: repo_path.as_deref(),
+                    action_policy: &action_policy,
                     generation_clock,
-                )?;
+                })?;
                 Ok((result, outcome))
             })();
             let (result, outcome) = match staged {
@@ -1325,17 +1905,58 @@ pub(crate) fn handle_get_architecture(
     runner: &CbmToolRunner,
     args_json: &str,
 ) -> Result<String, DynError> {
-    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
-        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+    let args = match serde_json::from_str::<Value>(args_json) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolFault::new(
+                "ASTRO_ARCHITECTURE_ARGUMENTS_JSON_INVALID",
+                format!("get_architecture arguments are not valid JSON: {error}"),
+                "pass one JSON object matching the advertised get_architecture input schema",
+            )
+            .into_result();
+        }
     };
     let Some(args_obj) = args.as_object() else {
-        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+        return ToolFault::new(
+            "ASTRO_ARCHITECTURE_ARGUMENTS_OBJECT_REQUIRED",
+            "get_architecture arguments must be a JSON object",
+            "pass one JSON object matching the advertised get_architecture input schema",
+        )
+        .with_argument("arguments", "JSON object", &args)
+        .into_result();
     };
-    let Some(project) = status_project_from_args(args_obj)? else {
-        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+    let plan = match ArchitectureRequestPlan::parse(args_obj) {
+        Ok(plan) => plan,
+        Err(fault) => {
+            tracing::warn!(code = fault.code(), "mcp.get_architecture.argument_refused");
+            return fault.into_result();
+        }
     };
+    let project = args_obj
+        .get("project")
+        .and_then(Value::as_str)
+        .expect("ArchitectureRequestPlan validated project")
+        .to_string();
     if read_dial(&project)? != MigrationDial::Shadow {
-        return Ok(runner.handle_tool_raw("get_architecture", args_json)?);
+        if !plan.astrolabe_outputs.is_empty() {
+            return ToolFault::new(
+                "ASTRO_ARCHITECTURE_SHADOW_REQUIRED",
+                format!(
+                    "project {project:?} is not shadow-indexed, so its requested Calyx architecture aspects have no project vault"
+                ),
+                "run index_repository with calyx=\"shadow\" for this project, then retry the unchanged aspect request",
+            )
+            .with_detail(
+                "requested_astrolabe_aspects",
+                plan.astrolabe_outputs.iter().copied().collect::<Vec<_>>(),
+            )
+            .into_result();
+        }
+        let cbm_args = plan
+            .cbm_args_json
+            .as_deref()
+            .expect("a request without Astrolabe aspects always retains CBM arguments");
+        return Ok(runner.handle_tool_raw("get_architecture", cbm_args)?);
     }
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "get_architecture")?
@@ -1343,27 +1964,66 @@ pub(crate) fn handle_get_architecture(
         return Ok(refusal);
     }
 
-    let result = runner.handle_tool_raw("get_architecture", args_json)?;
-    if tool_result_is_error(&result)? {
+    let Some(cbm_args) = plan.cbm_args_json.as_deref() else {
+        let astrolabe = match read_astrolabe_architecture_aspects(
+            &cache_dir,
+            &project,
+            &plan.astrolabe_outputs,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolFault::new(
+                    "ASTRO_ARCHITECTURE_ASPECT_READ_FAILED",
+                    format!(
+                        "get_architecture could not read the requested persisted Calyx aspect state for project {project:?}: {error}"
+                    ),
+                    "inspect the named persisted generation and owning producer, repair or regenerate it, then retry the unchanged aspect request",
+                )
+                .with_detail(
+                    "requested_astrolabe_aspects",
+                    plan.astrolabe_outputs.iter().copied().collect::<Vec<_>>(),
+                )
+                .with_detail("cause", error.to_string())
+                .into_result();
+            }
+        };
+        return tool_json_result(json!({
+            "project": project,
+            "astrolabe": astrolabe,
+        }));
+    };
+    // In a mixed request the CBM architecture result is a prerequisite. Do not
+    // open any Calyx store when that prerequisite refuses or errors (PC-13/35).
+    let result = runner.handle_tool_raw("get_architecture", cbm_args)?;
+    if tool_result_is_error(&result)? || plan.astrolabe_outputs.is_empty() {
         return Ok(result);
     }
+    let astrolabe = match read_astrolabe_architecture_aspects(
+        &cache_dir,
+        &project,
+        &plan.astrolabe_outputs,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return ToolFault::new(
+                "ASTRO_ARCHITECTURE_ASPECT_READ_FAILED",
+                format!(
+                    "get_architecture could not read the requested persisted Calyx aspect state for project {project:?}: {error}"
+                ),
+                "inspect the named persisted generation and owning producer, repair or regenerate it, then retry the unchanged aspect request",
+            )
+            .with_detail(
+                "requested_astrolabe_aspects",
+                plan.astrolabe_outputs.iter().copied().collect::<Vec<_>>(),
+            )
+            .with_detail("cause", error.to_string())
+            .into_result();
+        }
+    };
     augment_tool_result(
         &result,
         json!({
-            "astrolabe": {
-                "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
-                "bridges": read_bridges_metadata(&cache_dir, &project)?,
-                "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
-                "anomalies": read_anomaly_report(&cache_dir, &project)?,
-                "provenance": read_provenance_metadata(&cache_dir, &project)?,
-                "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
-                "redundancy": read_redundancy_neff_aspect(&cache_dir, &project),
-                "layout_map": read_layout_map_aspect(&cache_dir, &project)?,
-                // #43: the two aspects that were genuinely missing on main
-                // (kernel_context/agreement_graph/n_eff already serve above).
-                "grounding_gaps": read_grounding_gaps_aspect(&cache_dir, &project)?,
-                "signal_ranking": read_signal_ranking_aspect(&cache_dir, &project)?,
-            },
+            "astrolabe": astrolabe,
         }),
     )
 }
@@ -1556,7 +2216,7 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
             "get_provenance requires mode: lineage, answer_trace, verify_chain, reproduce, or inter_agent_trust",
         );
     };
-    let subject_id = string_arg(args_obj, "subject_id").or_else(|| string_arg(args_obj, "subject"));
+    let subject_id = string_arg(args_obj, "subject_id");
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let mut store = match provenance_store_for_project(&cache_dir, &project) {
         Ok(store) => store,
@@ -1786,7 +2446,22 @@ pub(crate) fn handle_measure_bits(args_json: &str) -> Result<String, DynError> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let value = measure_bits_json_at(&cache_dir, &project, mode, axis, scope, refresh)?;
+    let value = match measure_bits_json_at(&cache_dir, &project, mode, axis, scope, refresh) {
+        Ok(value) => value,
+        Err(error) => {
+            return ToolFault::new(
+                "ASTRO_ASSAY_SIGNAL_TRANSACTION_READ_FAILED",
+                format!(
+                    "measure_bits refused to serve project {project:?} because its persisted Assay state could not be verified"
+                ),
+                "preserve _config.db and signal-cards.ndjson, inspect the exact cause field, then reindex or run the explicit #885 recovery protocol",
+            )
+            .with_detail("mode", mode)
+            .with_detail("project", project)
+            .with_detail("cause", error.to_string())
+            .into_result();
+        }
+    };
     if value.get("status").and_then(Value::as_str) == Some("refused") {
         tool_json_error_result(value)
     } else {

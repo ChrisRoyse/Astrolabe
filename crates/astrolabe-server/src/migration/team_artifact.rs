@@ -505,10 +505,7 @@ pub(crate) fn team_artifact_dir_from_args(
     args: &Map<String, Value>,
     mode: &str,
 ) -> Result<PathBuf, String> {
-    if let Some(path) = string_arg(args, "artifact_dir")
-        .or_else(|| string_arg(args, "output_dir"))
-        .or_else(|| string_arg(args, "input_dir"))
-    {
+    if let Some(path) = string_arg(args, "artifact_dir") {
         return Ok(PathBuf::from(path));
     }
     if let Some(repo_path) = string_arg(args, "repo_path") {
@@ -523,9 +520,7 @@ pub(crate) fn team_adopted_graph_path_from_args(
     args: &Map<String, Value>,
     project: Option<&str>,
 ) -> Result<PathBuf, String> {
-    if let Some(path) =
-        string_arg(args, "adopted_graph_path").or_else(|| string_arg(args, "cache_db_path"))
-    {
+    if let Some(path) = string_arg(args, "adopted_graph_path") {
         return Ok(PathBuf::from(path));
     }
     let Some(project) = project else {

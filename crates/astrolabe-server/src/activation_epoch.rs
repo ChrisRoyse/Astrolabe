@@ -399,9 +399,8 @@ pub(crate) fn reader_generation_fields() -> Result<Value, DynError> {
 fn workspace_reader_executable() -> Result<ReaderExecutableIdentity, DynError> {
     WORKSPACE_READER_EXECUTABLE
         .get_or_init(capture_workspace_reader_executable)
-        .as_ref()
-        .map(Clone::clone)
-        .map_err(|error| -> DynError { error.clone().into() })
+        .clone()
+        .map_err(|error| -> DynError { error.into() })
 }
 
 fn capture_workspace_reader_executable() -> Result<ReaderExecutableIdentity, String> {

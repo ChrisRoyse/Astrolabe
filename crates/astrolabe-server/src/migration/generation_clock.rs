@@ -89,6 +89,17 @@ impl GenerationClockRequest {
     }
 }
 
+/// Canonical public schema for [`GENERATION_OBSERVED_AT_MS_ARG`].
+pub(crate) fn generation_clock_property_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": GENERATION_CLOCK_MAX_MS,
+        "multipleOf": 1000,
+        "description": "Optional reproducible generation observation in Unix milliseconds. Must be nonzero and exactly representable by the Project row's UTC-seconds field. Omit to observe the real pipeline-admission boundary once."
+    })
+}
+
 impl GenerationClock {
     pub(crate) fn from_persisted(observed_at_ms: u64) -> Result<Self, ToolFault> {
         validate_generation_observed_at_ms(observed_at_ms)?;
@@ -156,7 +167,7 @@ fn validate_generation_observed_at_ms(observed_at_ms: u64) -> Result<(), ToolFau
         .with_detail(GENERATION_OBSERVED_AT_MS_ARG, observed_at_ms)
         .with_detail("maximum", GENERATION_CLOCK_MAX_MS));
     }
-    if observed_at_ms % 1000 != 0 {
+    if !observed_at_ms.is_multiple_of(1000) {
         return Err(ToolFault::new(
             "ASTRO_GENERATION_CLOCK_SECOND_INEXACT",
             format!(

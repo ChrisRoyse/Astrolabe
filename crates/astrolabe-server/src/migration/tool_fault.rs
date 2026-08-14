@@ -202,14 +202,6 @@ impl fmt::Display for ToolFault {
 
 impl Error for ToolFault {}
 
-/// Emit a caller-correctable refusal as an MCP tool execution error.
-///
-/// The only way to produce an error tool result. Takes the fault whole so the
-/// code, message, and remediation cannot be lost to string formatting.
-pub(crate) fn tool_fault_result(fault: ToolFault) -> Result<String, DynError> {
-    fault.into_result()
-}
-
 /// The canonical envelope for an error that escaped a handler as `Err`, or
 /// `None` when the error carries no structured envelope and is therefore a
 /// genuine internal fault.

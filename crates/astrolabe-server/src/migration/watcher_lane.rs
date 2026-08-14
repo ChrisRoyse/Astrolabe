@@ -561,9 +561,9 @@ fn registration_root_admission(
                     first_observed_unix_ms: now,
                     observation_count: 0,
                 });
-            state.observation_count = state.observation_count.checked_add(1).ok_or_else(|| {
-                "ASTRO_WATCHER_ROOT_OBSERVATION_OVERFLOW: missing-root observation counter overflowed; remediation: preserve the project and restart only after recording the fault"
-            })?;
+            state.observation_count = state.observation_count.checked_add(1).ok_or(
+                "ASTRO_WATCHER_ROOT_OBSERVATION_OVERFLOW: missing-root observation counter overflowed; remediation: preserve the project and restart only after recording the fault",
+            )?;
             if state.first_observed_at.elapsed().as_millis() < u128::from(grace_ms) {
                 return Ok(RootAdmissionDisposition::Refused);
             }
@@ -657,9 +657,9 @@ fn registration_root_admission(
 }
 
 fn root_missing_grace_ms(registration: &WatchRegistration) -> Result<u64, DynError> {
-    let declaration = watcher_knob(WATCHER_ROOT_MISSING_GRACE_MS_KNOB).ok_or_else(|| {
-        "ASTRO_WATCHER_ROOT_GRACE_KNOB_UNDECLARED: watcher root grace knob is absent from the registry"
-    })?;
+    let declaration = watcher_knob(WATCHER_ROOT_MISSING_GRACE_MS_KNOB).ok_or(
+        "ASTRO_WATCHER_ROOT_GRACE_KNOB_UNDECLARED: watcher root grace knob is absent from the registry",
+    )?;
     let Some(raw) = registration.root_missing_grace_ms_raw.as_deref() else {
         return Ok(WATCHER_DEFAULT_ROOT_MISSING_GRACE_MS);
     };

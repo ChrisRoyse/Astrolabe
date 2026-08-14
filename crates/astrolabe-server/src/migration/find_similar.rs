@@ -153,7 +153,7 @@ fn parse_find_similar_args(args: &Map<String, Value>) -> Result<FindSimilarArgs,
                 "Pass the project whose shadow vault holds the search corpus.",
             )
         })?;
-    let anchor = anchor_symbol_from_args(args).ok_or_else(|| {
+    let anchor = string_arg(args, "symbol").map(ToOwned::to_owned).ok_or_else(|| {
         ToolFault::new(
             ASTRO_FIND_SIMILAR_ANCHOR,
             "find_similar requires an anchor symbol",
@@ -188,9 +188,7 @@ fn parse_find_similar_args(args: &Map<String, Value>) -> Result<FindSimilarArgs,
         .with_detail("argument", "mode")
         .with_detail("observed_mode", mode.clone()));
     }
-    let k = fs_optional_u64(args, "k")?
-        .or(fs_optional_u64(args, "limit")?)
-        .unwrap_or(DEFAULT_FIND_SIMILAR_K);
+    let k = fs_optional_u64(args, "k")?.unwrap_or(DEFAULT_FIND_SIMILAR_K);
     let ef = fs_optional_u64(args, "ef")?.unwrap_or(DEFAULT_FIND_SIMILAR_EF);
     Ok(FindSimilarArgs {
         project,
@@ -199,16 +197,6 @@ fn parse_find_similar_args(args: &Map<String, Value>) -> Result<FindSimilarArgs,
         k,
         ef,
     })
-}
-
-/// Reads the anchor symbol id from any of the accepted arg keys.
-fn anchor_symbol_from_args(args: &Map<String, Value>) -> Option<String> {
-    for key in ["symbol", "symbol_id", "anchor", "qualified_name"] {
-        if let Some(value) = string_arg(args, key) {
-            return Some(value.to_string());
-        }
-    }
-    None
 }
 
 /// MCP entry point for `find_similar`.
@@ -645,7 +633,7 @@ pub(crate) fn find_similar_tool_definition() -> Value {
                 },
                 "symbol": {
                     "type": "string",
-                    "description": "Anchor symbol qualified_name — the already-indexed symbol to find neighbors of. Aliases: symbol_id, anchor, qualified_name. An anchor absent from the index refuses fail-closed."
+                    "description": "Anchor symbol qualified_name — the already-indexed symbol to find neighbors of. An anchor absent from the index refuses fail-closed."
                 },
                 "mode": {
                     "type": "string",
@@ -654,7 +642,7 @@ pub(crate) fn find_similar_tool_definition() -> Value {
                 },
                 "k": {
                     "type": "integer",
-                    "description": "Requested neighbor count (default 10; planner cap 100). Alias: limit."
+                    "description": "Requested neighbor count (default 10; planner cap 100)."
                 },
                 "ef": {
                     "type": "integer",
@@ -663,19 +651,6 @@ pub(crate) fn find_similar_tool_definition() -> Value {
             },
             "required": ["project", "symbol"],
             "additionalProperties": false
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
-                },
-                "structuredContent": {"type": "object"},
-                "isError": {"type": "boolean"}
-            },
-            "required": ["content", "isError"],
-            "additionalProperties": true
         }
     })
 }

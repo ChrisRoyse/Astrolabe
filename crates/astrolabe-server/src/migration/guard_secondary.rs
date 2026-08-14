@@ -136,10 +136,7 @@ pub(crate) fn guard_commit_ood_at(
         }
     };
 
-    let Some(commit_ref) = string_arg(args_obj, "commit_ref")
-        .or_else(|| string_arg(args_obj, "commit"))
-        .map(str::to_string)
-    else {
+    let Some(commit_ref) = string_arg(args_obj, "commit_ref").map(str::to_string) else {
         return guard_secondary_refused(
             "ASTRO_GUARD_COMMIT_OOD_INVALID",
             "guard_commit_ood requires commit_ref",

@@ -1,5 +1,9 @@
 use super::*;
 
+/// Public `index_repository` skill-discovery override object.
+pub(crate) const SKILL_DISCOVERY_ARG: &str = "calyx_skills";
+const SKILL_MAX_SYMBOLS_FIELD: &str = "max_symbols";
+
 /// Operator override for the registry-declared skill-discovery knobs (#198).
 ///
 /// Only knobs an operator may legitimately tune are exposed. Bounds are deliberately **not**
@@ -21,27 +25,45 @@ pub(crate) struct SkillDiscoveryOverride {
 pub(crate) fn parse_skill_discovery_override(
     args: &Map<String, Value>,
 ) -> Result<Option<SkillDiscoveryOverride>, String> {
-    let Some(value) = args.get("calyx_skills") else {
+    let Some(value) = args.get(SKILL_DISCOVERY_ARG) else {
         return Ok(None);
     };
     let obj = value
         .as_object()
         .ok_or_else(|| "calyx_skills must be a JSON object".to_string())?;
     for key in obj.keys() {
-        if key.as_str() != "max_symbols" {
+        if key.as_str() != SKILL_MAX_SYMBOLS_FIELD {
             return Err(format!(
                 "unknown calyx_skills field {key:?}; expected max_symbols"
             ));
         }
     }
     let max_symbols =
-        match obj.get("max_symbols") {
+        match obj.get(SKILL_MAX_SYMBOLS_FIELD) {
             Some(value) => Some(value.as_u64().ok_or_else(|| {
                 "calyx_skills.max_symbols must be an unsigned integer".to_string()
             })?),
             None => None,
         };
     Ok(Some(SkillDiscoveryOverride { max_symbols }))
+}
+
+/// Canonical public schema for [`SKILL_DISCOVERY_ARG`], sharing the exact key
+/// and registry bounds used by the runtime discovery planner.
+pub(crate) fn skill_discovery_override_property_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Astrolabe skill-discovery overrides for a calyx=\"shadow\" generation. Values outside the registered range refuse; they are never clamped.",
+        "properties": {
+            (SKILL_MAX_SYMBOLS_FIELD): {
+                "type": "integer",
+                "minimum": astrolabe_kernel::MIN_SKILL_MAX_SYMBOLS,
+                "maximum": astrolabe_kernel::MAX_SKILL_MAX_SYMBOLS,
+                "description": "Maximum symbols admitted to the O(n²) skill-discovery sweep, using the exact astrolabe-kernel registry bounds."
+            }
+        },
+        "additionalProperties": false
+    })
 }
 
 /// Builds the skill-discovery config for an import: registry defaults, with any operator

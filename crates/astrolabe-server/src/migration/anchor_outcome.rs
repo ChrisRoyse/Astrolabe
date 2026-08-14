@@ -206,9 +206,7 @@ pub(crate) fn handle_anchor_outcome(args_json: &str) -> Result<String, DynError>
             "anchor_outcome test_run requires format (junit_xml, cargo_test_json, pytest_verbose, go_test_json, or vitest_json)",
         );
     };
-    let Some(report_text) =
-        string_arg(args_obj, "report").or_else(|| string_arg(args_obj, "report_text"))
-    else {
+    let Some(report_text) = string_arg(args_obj, "report") else {
         return tool_error_result("anchor_outcome test_run requires a non-empty report");
     };
     let confidence = match args_obj.get("confidence") {

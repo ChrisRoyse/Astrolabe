@@ -10,7 +10,7 @@
 //! key stream, and exact outcome stream. Reconciliation validates existing bytes
 //! before using their source hash to skip unchanged records.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -933,17 +933,14 @@ fn decode_association_source_base(
     let cx_id = cx_from_exact_key(key, "Base")?;
     let base = BaseRecord::decode_for_key(cx_id, bytes)?;
     let panel_version = base.constellation().panel_version;
-    if !roster_cache.contains_key(&panel_version) {
+    if let Entry::Vacant(entry) = roster_cache.entry(panel_version) {
         let roster = astrolabe_panel::slots_for_version(panel_version).map_err(|error| {
             source_corrupt(format!(
                 "Base {} names unknown panel version {panel_version}: {error}",
                 cx_hex(cx_id)
             ))
         })?;
-        roster_cache.insert(
-            panel_version,
-            roster.iter().map(|slot| slot.slot_id()).collect(),
-        );
+        entry.insert(roster.iter().map(|slot| slot.slot_id()).collect());
     }
     let roster_ids = roster_cache.get(&panel_version).ok_or_else(|| {
         source_corrupt(format!(
@@ -1277,7 +1274,7 @@ fn slot_descriptor(slot: &PreparedSlot) -> SlotDescriptor {
             token_dim, norms, ..
         } => SlotDescriptor::Multi {
             token_dim: *token_dim,
-            zero_norm: norms.iter().any(|norm| *norm == 0.0),
+            zero_norm: norms.contains(&0.0),
         },
         PreparedSlot::Absent { reason } => SlotDescriptor::Absent {
             reason: reason.clone(),
@@ -1551,7 +1548,7 @@ fn incompatible(reason: PairReason) -> CompletePairOutcome {
 fn has_zero_norm(slot: &PreparedSlot) -> bool {
     match slot {
         PreparedSlot::Dense { norm, .. } | PreparedSlot::Sparse { norm, .. } => *norm == 0.0,
-        PreparedSlot::Multi { norms, .. } => norms.iter().any(|norm| *norm == 0.0),
+        PreparedSlot::Multi { norms, .. } => norms.contains(&0.0),
         PreparedSlot::Absent { .. } => false,
     }
 }

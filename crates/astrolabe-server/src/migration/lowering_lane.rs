@@ -200,16 +200,16 @@ fn read_lowering_status_record(
     let source_sha256 = format!("{:x}", Sha256::digest(raw.as_bytes()));
     if let (Some(observation_raw), Some(fault_raw)) =
         (observation_raw.as_deref(), fault_raw.as_deref())
-        && let Some(fault) = cached_terminal_fault(
+        && let Some(fault) = cached_terminal_fault(CachedTerminalFaultRequest {
             cache_dir,
             project,
-            &key,
-            &raw,
+            key: &key,
+            source_raw: &raw,
             observation_raw,
             fault_raw,
-            raw.len(),
-            &source_sha256,
-        )?
+            source_bytes: raw.len(),
+            source_sha256: &source_sha256,
+        })?
     {
         return Ok(Some(LoweringStatusRecord::Terminal { fault }));
     }
@@ -287,16 +287,30 @@ fn terminal_fault_matches_source(
         && fault.get("remediation").and_then(Value::as_str).is_some()
 }
 
-fn cached_terminal_fault(
-    cache_dir: &Path,
-    project: &str,
-    key: &str,
-    source_raw: &str,
-    observation_raw: &str,
-    fault_raw: &str,
+struct CachedTerminalFaultRequest<'a> {
+    cache_dir: &'a Path,
+    project: &'a str,
+    key: &'a str,
+    source_raw: &'a str,
+    observation_raw: &'a str,
+    fault_raw: &'a str,
     source_bytes: usize,
-    source_sha256: &str,
+    source_sha256: &'a str,
+}
+
+fn cached_terminal_fault(
+    request: CachedTerminalFaultRequest<'_>,
 ) -> Result<Option<Value>, DynError> {
+    let CachedTerminalFaultRequest {
+        cache_dir,
+        project,
+        key,
+        source_raw,
+        observation_raw,
+        fault_raw,
+        source_bytes,
+        source_sha256,
+    } = request;
     let registry_key = lowering_registry_key(cache_dir, project);
     {
         let cache = terminal_cache()
@@ -378,16 +392,16 @@ fn observe_malformed_lowering_status(
     let source_sha256 = format!("{:x}", Sha256::digest(raw.as_bytes()));
 
     if let (Some(observation_raw), Some(fault_raw)) = (observation_raw, fault_raw)
-        && let Some(fault) = cached_terminal_fault(
+        && let Some(fault) = cached_terminal_fault(CachedTerminalFaultRequest {
             cache_dir,
             project,
             key,
-            raw,
+            source_raw: raw,
             observation_raw,
             fault_raw,
             source_bytes,
-            &source_sha256,
-        )?
+            source_sha256: &source_sha256,
+        })?
     {
         return Ok(LoweringStatusRecord::Terminal { fault });
     }
@@ -424,16 +438,16 @@ fn observe_malformed_lowering_status(
     if let (Some(transaction_observation_raw), Some(transaction_fault_raw)) = (
         transaction_observation.as_deref(),
         transaction_fault.as_deref(),
-    ) && let Some(fault) = cached_terminal_fault(
+    ) && let Some(fault) = cached_terminal_fault(CachedTerminalFaultRequest {
         cache_dir,
         project,
         key,
-        raw,
-        transaction_observation_raw,
-        transaction_fault_raw,
+        source_raw: raw,
+        observation_raw: transaction_observation_raw,
+        fault_raw: transaction_fault_raw,
         source_bytes,
-        &source_sha256,
-    )? {
+        source_sha256: &source_sha256,
+    })? {
         tx.commit()?;
         return Ok(LoweringStatusRecord::Terminal { fault });
     }

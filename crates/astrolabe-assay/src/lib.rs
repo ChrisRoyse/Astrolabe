@@ -85,7 +85,10 @@ pub use gate::{
     GateVerdict, LensCapabilityCard, ServingAdmission, build_capability_card, gate_lens,
     is_sole_critical_carrier, max_admitted_correlation, pearson_correlation,
 };
-pub use ledger::{AssayCardEntry, CardLedger, input_fingerprint};
+pub use ledger::{
+    AssayCardAppendRequest, AssayCardBatchReceipt, AssayCardEntry, AssayCardLineReceipt,
+    CardLedger, PreparedAssayCardBatch, input_fingerprint,
+};
 pub use multivariate::{
     conditional_mi_bits, interaction_information_bits, joint_entropy_bits, normalized_mi_bits,
     transfer_entropy_bits,

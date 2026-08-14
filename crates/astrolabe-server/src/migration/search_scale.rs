@@ -1,5 +1,18 @@
 use super::*;
 
+/// Public `index_repository` search-scale override object.
+pub(crate) const SEARCH_SCALE_ARG: &str = "calyx_search";
+const INDEX_BACKEND_FIELD: &str = "index_backend";
+const FUNNEL_ACTIVATION_RECORDS_FIELD: &str = "funnel_activation_records";
+const ESTIMATED_INDEX_RSS_BYTES_FIELD: &str = "estimated_index_rss_bytes";
+const MASTER_BUDGET_BYTES_FIELD: &str = "master_budget_bytes";
+const SEARCH_SCALE_FIELDS: [&str; 4] = [
+    INDEX_BACKEND_FIELD,
+    FUNNEL_ACTIVATION_RECORDS_FIELD,
+    ESTIMATED_INDEX_RSS_BYTES_FIELD,
+    MASTER_BUDGET_BYTES_FIELD,
+];
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SearchScaleSettings {
     pub(crate) index_backend: SearchIndexBackend,
@@ -20,25 +33,19 @@ pub(crate) struct SearchScaleOverride {
 pub(crate) fn parse_search_scale_override(
     args: &Map<String, Value>,
 ) -> Result<Option<SearchScaleOverride>, String> {
-    let Some(value) = args.get("calyx_search") else {
+    let Some(value) = args.get(SEARCH_SCALE_ARG) else {
         return Ok(None);
     };
     let obj = value
         .as_object()
         .ok_or_else(|| "calyx_search must be a JSON object".to_string())?;
     for key in obj.keys() {
-        if !matches!(
-            key.as_str(),
-            "index_backend"
-                | "funnel_activation_records"
-                | "estimated_index_rss_bytes"
-                | "master_budget_bytes"
-        ) {
+        if !SEARCH_SCALE_FIELDS.contains(&key.as_str()) {
             return Err(format!("unknown calyx_search field {key:?}"));
         }
     }
 
-    let index_backend = match obj.get("index_backend") {
+    let index_backend = match obj.get(INDEX_BACKEND_FIELD) {
         Some(value) => {
             let raw = value
                 .as_str()
@@ -54,10 +61,42 @@ pub(crate) fn parse_search_scale_override(
 
     Ok(Some(SearchScaleOverride {
         index_backend,
-        funnel_activation_records: optional_u64_field(obj, "funnel_activation_records")?,
-        estimated_index_rss_bytes: optional_u64_field(obj, "estimated_index_rss_bytes")?,
-        master_budget_bytes: optional_u64_field(obj, "master_budget_bytes")?,
+        funnel_activation_records: optional_u64_field(obj, FUNNEL_ACTIVATION_RECORDS_FIELD)?,
+        estimated_index_rss_bytes: optional_u64_field(obj, ESTIMATED_INDEX_RSS_BYTES_FIELD)?,
+        master_budget_bytes: optional_u64_field(obj, MASTER_BUDGET_BYTES_FIELD)?,
     }))
+}
+
+/// Canonical public schema for [`SEARCH_SCALE_ARG`], colocated with and built
+/// from the exact field constants consumed by [`parse_search_scale_override`].
+pub(crate) fn search_scale_override_property_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Astrolabe search-scale admission overrides for a calyx=\"shadow\" generation. Every supplied value is persisted in the generation receipt; malformed or unknown fields refuse before indexing.",
+        "properties": {
+            (INDEX_BACKEND_FIELD): {
+                "type": "string",
+                "enum": ["in_memory_hnsw", "diskann", "spann"],
+                "description": "Persisted Sextant index backend selected for this project generation."
+            },
+            (FUNNEL_ACTIVATION_RECORDS_FIELD): {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Record-count threshold used by the persisted kernel-first funnel plan."
+            },
+            (ESTIMATED_INDEX_RSS_BYTES_FIELD): {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Measured or explicitly supplied estimated index resident bytes used by admission."
+            },
+            (MASTER_BUDGET_BYTES_FIELD): {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Explicit master memory budget used by search-scale admission."
+            }
+        },
+        "additionalProperties": false
+    })
 }
 
 pub(crate) fn optional_u64_field(

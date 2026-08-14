@@ -99,7 +99,7 @@ pub(crate) fn preserved_stage_root(live_cache: &Path) -> PathBuf {
 
 pub(crate) fn preserved_stage_dir(live_cache: &Path, project: &str) -> PathBuf {
     let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
-    preserved_stage_root(live_cache).join(project_digest[..32].to_string())
+    preserved_stage_root(live_cache).join(&project_digest[..32])
 }
 
 /// Every keying dimension of the CBM pass. A preserved stage is adopted only when

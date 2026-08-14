@@ -99,7 +99,29 @@ pub(crate) fn measure_bits_json_at(
     }
 
     let key = measure_bits_card_key(project, mode, axis, scope);
-    let Some(raw) = read_config_value(cache_dir, &key)? else {
+    let mut signal_transaction = None;
+    let raw = if mode == "signals" {
+        let Some(state) = read_committed_signal_card_state(cache_dir, project)? else {
+            return Ok(measure_bits_refused(
+                project,
+                mode,
+                axis,
+                scope,
+                "ASTRO_ASSAY_MEASURE_BITS_CARD_UNAVAILABLE",
+                format!("no committed signals-card transaction exists for project {project:?}"),
+                "run index_repository with calyx=\"shadow\" to commit the complete signals-card transaction",
+            ));
+        };
+        let raw = state
+            .rows
+            .iter()
+            .find_map(|(observed_key, value)| (observed_key == &key).then(|| value.clone()));
+        signal_transaction = Some(state.marker);
+        raw
+    } else {
+        read_config_value(cache_dir, &key)?
+    };
+    let Some(raw) = raw else {
         return Ok(measure_bits_refused(
             project,
             mode,
@@ -109,7 +131,7 @@ pub(crate) fn measure_bits_json_at(
             format!(
                 "no persisted {mode} card for project {project:?} (scope={scope:?}, axis={axis:?})"
             ),
-            "run the assay lane for this scope, or call measure_bits with refresh:true (calibration) after persisting its inputs",
+            "run index_repository with calyx=\"shadow\" for signals, or call measure_bits with refresh:true for calibration after persisting its inputs",
         ));
     };
     let doc: Value = match serde_json::from_str(&raw) {
@@ -137,6 +159,23 @@ pub(crate) fn measure_bits_json_at(
             "delete the malformed card row and re-run the assay lane / refresh",
         ));
     }
+    if doc.get("project").and_then(Value::as_str) != Some(project)
+        || doc.get("mode").and_then(Value::as_str) != Some(mode)
+        || doc.get("axis") != Some(&opt_str(axis))
+        || doc.get("scope") != Some(&opt_str(scope))
+    {
+        return Ok(measure_bits_refused(
+            project,
+            mode,
+            axis,
+            scope,
+            "ASTRO_ASSAY_MEASURE_BITS_CARD_IDENTITY_MISMATCH",
+            format!(
+                "persisted card at config:{key} does not encode its requested project/mode/axis/scope identity"
+            ),
+            "preserve the row and transaction marker, then rerun the owning assay producer",
+        ));
+    }
 
     let mut response = json!({
         "schema": MEASURE_BITS_SCHEMA,
@@ -155,6 +194,11 @@ pub(crate) fn measure_bits_json_at(
         "source": format!("config:{key}"),
         "refresh_applied": false,
     });
+    if let Some(transaction) = signal_transaction
+        && let Some(object) = response.as_object_mut()
+    {
+        object.insert("transaction".to_string(), transaction);
+    }
     if refresh {
         // A refresh was requested for a mode whose recompute is owned by the
         // background assay lane, not this on-demand path: serve the cached card

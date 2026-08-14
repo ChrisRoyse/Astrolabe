@@ -363,18 +363,32 @@ fn find_latent_ledger_ref<C: Clock>(
     .into())
 }
 
-fn persisted_response(
-    state: &str,
-    request_sha256: &[u8; 32],
-    artifact_key: &[u8],
-    manifest_key: &[u8],
-    artifact_bytes: &[u8],
-    manifest_bytes: &[u8],
-    source_fingerprint: &[u8; 32],
+struct LatentPersistedResponse<'a> {
+    state: &'a str,
+    request_sha256: &'a [u8; 32],
+    artifact_key: &'a [u8],
+    manifest_key: &'a [u8],
+    artifact_bytes: &'a [u8],
+    manifest_bytes: &'a [u8],
+    source_fingerprint: &'a [u8; 32],
     snapshot_seq: Seq,
-    ledger_ref: &LedgerRef,
-    fsv: Option<&astrolabe_domain::fsv::FsvAck>,
-) -> Value {
+    ledger_ref: &'a LedgerRef,
+    fsv: Option<&'a astrolabe_domain::fsv::FsvAck>,
+}
+
+fn persisted_response(response: LatentPersistedResponse<'_>) -> Value {
+    let LatentPersistedResponse {
+        state,
+        request_sha256,
+        artifact_key,
+        manifest_key,
+        artifact_bytes,
+        manifest_bytes,
+        source_fingerprint,
+        snapshot_seq,
+        ledger_ref,
+        fsv,
+    } = response;
     json!({
         "schema": LATENT_PERSISTED_SCHEMA,
         "state": state,
@@ -468,18 +482,18 @@ fn persist_latent_result(
         {
             let ledger_ref =
                 find_latent_ledger_ref(&vault, current_seq, &request_sha256, &manifest_bytes)?;
-            return Ok(persisted_response(
-                "unchanged",
-                &request_sha256,
-                &artifact_key,
-                &manifest_key,
-                persisted_artifact,
-                persisted_manifest,
-                &input.csr.source_fingerprint_blake3,
-                current_seq,
-                &ledger_ref,
-                None,
-            ));
+            return Ok(persisted_response(LatentPersistedResponse {
+                state: "unchanged",
+                request_sha256: &request_sha256,
+                artifact_key: &artifact_key,
+                manifest_key: &manifest_key,
+                artifact_bytes: persisted_artifact,
+                manifest_bytes: persisted_manifest,
+                source_fingerprint: &input.csr.source_fingerprint_blake3,
+                snapshot_seq: current_seq,
+                ledger_ref: &ledger_ref,
+                fsv: None,
+            }));
         }
         (Some(_), Some(persisted_manifest)) => {
             let prior: LatentPersistedManifest = serde_json::from_slice(persisted_manifest)
@@ -542,18 +556,18 @@ fn persist_latent_result(
     )?;
     vault.flush()?;
     let fsv = plan.verify_committed_with_ledger_ref(&vault, commit_seq, &ledger_ref)?;
-    Ok(persisted_response(
-        "written",
-        &request_sha256,
-        &artifact_key,
-        &manifest_key,
-        input.artifact_bytes,
-        &manifest_bytes,
-        &input.csr.source_fingerprint_blake3,
-        commit_seq,
-        &ledger_ref,
-        Some(&fsv),
-    ))
+    Ok(persisted_response(LatentPersistedResponse {
+        state: "written",
+        request_sha256: &request_sha256,
+        artifact_key: &artifact_key,
+        manifest_key: &manifest_key,
+        artifact_bytes: input.artifact_bytes,
+        manifest_bytes: &manifest_bytes,
+        source_fingerprint: &input.csr.source_fingerprint_blake3,
+        snapshot_seq: commit_seq,
+        ledger_ref: &ledger_ref,
+        fsv: Some(&fsv),
+    }))
 }
 
 fn attach_persistence(mut served: Value, persistence: Value) -> Value {
@@ -874,9 +888,7 @@ pub(crate) fn handle_discover_latent_links(args_json: &str) -> Result<String, Dy
     let relation = string_arg(args_obj, "relation")
         .unwrap_or("coupling")
         .to_string();
-    let seed = string_arg(args_obj, "seed")
-        .or_else(|| string_arg(args_obj, "symbol"))
-        .map(ToOwned::to_owned);
+    let seed = string_arg(args_obj, "seed").map(ToOwned::to_owned);
     let endpoint_a = string_arg(args_obj, "a").map(ToOwned::to_owned);
     let endpoint_c = string_arg(args_obj, "c").map(ToOwned::to_owned);
 

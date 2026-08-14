@@ -963,17 +963,6 @@ where
 /// slot vectors, the derived structural axes, and the bits config.
 const SHADOW_SIGNAL_CARDS_SEED: u64 = 0x5165_A15C_A5D5_EED1;
 
-/// Labeled fail-closed degradation for the index-time signal-card summary — a
-/// telemetry surface, so a failure is labeled, never a hard import failure.
-fn signal_cards_unavailable(reason: String) -> Value {
-    json!({
-        "status": "unavailable",
-        "reason": reason,
-        "trust": "provisional",
-        "provenance": "unavailable",
-    })
-}
-
 fn ordered_readback_summary(metrics: &calyx_aster::mvcc::OrderedReadbackMetrics) -> Value {
     json!({
         "session_snapshot_seq": metrics.session_snapshot_seq,
@@ -992,180 +981,146 @@ fn ordered_readback_summary(metrics: &calyx_aster::mvcc::OrderedReadbackMetrics)
     })
 }
 
-/// Best-effort index-time signal-card production (#379), the write counterpart of
+/// Transactional index-time signal-card production (#379/#885), the write counterpart of
 /// the `get_architecture` `signal_ranking` aspect (`read_signal_ranking_aspect`),
 /// which reads per-axis `assay_card.signals.axis:*` config rows that nothing
 /// produced on a real corpus — so the aspect served labeled-`unavailable` forever.
 ///
 /// Derives each symbol's structural axes (`symbol_kind`, `structural_degree`) from
 /// the persisted graph and measures every dense slot's bits about each axis
-/// ([`astrolabe_weave::measure_index_time_signal_cards`]), then persists one
-/// `astrolabe.assay_card.v1` doc per axis to the config store (keyed exactly as
-/// `measure_bits` mode=signals and the aspect reader expect) and ledger-pairs each
-/// card into an append-only hash-chained [`astrolabe_assay::CardLedger`]. Every
-/// persisted doc is proved by an independent readback (invariant 5). Signal
-/// production is telemetry over an already-verified import, so any failure is a
-/// labeled degradation in the returned summary, never a hard import failure; a
-/// corpus with no informative axis is a labeled `absent`, leaving the aspect
-/// honestly `unavailable` rather than fabricating a card.
+/// ([`astrolabe_weave::measure_index_time_signal_cards`]). The complete card set,
+/// including the empty set, is published by the #885 two-store protocol: prepare
+/// the exact SQLite marker while retaining the ledger lock, append/sync/read back
+/// one physical ledger batch, then atomically replace all public card rows and
+/// commit the marker. Any failure aborts the import with a stable stage code;
+/// readers never serve an incomplete or hash-divergent generation.
 fn index_time_signal_cards_summary<C>(
     cache_dir: &Path,
     vault: &AsterVault<C>,
     project: &str,
     vault_dir: &Path,
     generation_clock: GenerationClock,
-) -> Value
+) -> Result<Value, DynError>
 where
     C: Clock,
 {
+    fn stage_error(stage: &str, error: impl std::fmt::Display) -> DynError {
+        format!(
+            "ASTRO_ASSAY_SIGNAL_TRANSACTION_FAILED: stage={stage}; cause={error}; remediation: preserve the prepared marker, signal-cards.ndjson, and _config.db, then diagnose the exact stage before running the explicit recovery protocol"
+        )
+        .into()
+    }
+
     let slots = shadow_available_slots();
-    let production = match astrolabe_weave::measure_index_time_signal_cards(
+    let mut production = astrolabe_weave::measure_index_time_signal_cards(
         vault,
         project,
         &slots,
         SHADOW_SIGNAL_CARDS_SEED,
-    ) {
-        Ok(production) => production,
-        Err(error) => {
-            return json!({
-                "status": "unavailable",
-                "reason": format!("signal-card production failed: {error}"),
-                "trust": "provisional",
-                "provenance": "unavailable",
-            });
-        }
-    };
-    if production.cards.is_empty() {
-        // Genuinely absent: no informative index-time axis for this corpus. The
-        // aspect stays labeled-unavailable — an honest absence, not a faked card.
-        return json!({
-            "status": "absent",
-            "reason": "no informative index-time signal axis for this corpus",
-            "symbols_measured": production.symbols_measured,
-            "axes_skipped_degenerate": production.axes_skipped_degenerate,
-            "slots_skipped_no_dense": production.slots_skipped_no_dense,
-            "slot_readback": ordered_readback_summary(&production.readback),
-            "trust": "provisional",
-            "provenance": "index_time_signal_cards",
-        });
-    }
-
-    let ledger = match astrolabe_assay::CardLedger::open(vault_dir.join("signal-cards.ndjson")) {
-        Ok(ledger) => ledger,
-        Err(error) => {
-            return json!({
-                "status": "unavailable",
-                "reason": format!("signal card ledger unavailable: {error}"),
-                "trust": "provisional",
-                "provenance": "unavailable",
-            });
-        }
-    };
+    )
+    .map_err(|error| stage_error("measure", error))?;
+    // Request order is part of both the ledger batch and transaction identity.
+    // It is fixed before either store is touched so deterministic production is
+    // a prerequisite to publication (PC-38), not a follow-up repair.
+    production
+        .cards
+        .sort_by(|left, right| left.card.axis.cmp(&right.card.axis));
+    let requests = production
+        .cards
+        .iter()
+        .map(|produced| astrolabe_assay::AssayCardAppendRequest {
+            card: produced.card.clone(),
+            seed: SHADOW_SIGNAL_CARDS_SEED,
+            input_fingerprint: produced.input_fingerprint.clone(),
+        })
+        .collect::<Vec<_>>();
+    let ledger = astrolabe_assay::CardLedger::open(vault_dir.join("signal-cards.ndjson"))
+        .map_err(|error| stage_error("ledger_open", error))?;
+    let prepared_ledger = ledger
+        .prepare_batch(&requests)
+        .map_err(|error| stage_error("ledger_prepare", error))?;
     let produced_at = generation_clock.observed_at_seconds();
-
-    let mut axes = Vec::new();
-    let mut cards_persisted = 0usize;
-    let mut cards_ledgered = 0usize;
-    for produced in &production.cards {
-        let card = &produced.card;
-        let axis = card.axis.clone();
-        // Ledger the card first so the persisted config doc can cite its entry.
-        // The producer structurally pairs the card with a versioned content hash
-        // over the source axes, exact aligned observations, resolved bits config,
-        // requested slot roster, and seed. A label is never accepted as identity.
-        let fingerprint = &produced.input_fingerprint;
-        let entry = match ledger.append(card, SHADOW_SIGNAL_CARDS_SEED, fingerprint) {
-            Ok(entry) => entry,
-            Err(error) => {
-                return signal_cards_unavailable(format!(
-                    "ledger append for axis {axis:?} failed: {error}"
-                ));
-            }
-        };
-        cards_ledgered += 1;
-
-        let card_value = match serde_json::to_value(card) {
-            Ok(value) => value,
-            Err(error) => {
-                return signal_cards_unavailable(format!("encode card for axis {axis:?}: {error}"));
-            }
-        };
-        // A card is Trusted only when no contributing slot was a below-floor
-        // provisional posterior estimate.
-        let trust = if card.signals.iter().any(|signal| signal.provisional) {
-            "provisional"
-        } else {
-            "trusted"
-        };
-        let key = measure_bits_card_key(project, "signals", Some(&axis), None);
-        let doc = json!({
-            "schema": ASSAY_CARD_SCHEMA,
-            "mode": "signals",
-            "project": project,
-            "axis": axis,
-            "scope": Value::Null,
-            "seq": entry.seq,
-            "input_fingerprint": entry.input_fingerprint,
-            "produced_at": produced_at,
-            "freshness": "fresh",
-            "freshness_lag": 0,
-            "trust": trust,
-            "provenance": [
-                format!("index_time_signal_cards:{project}"),
-                format!("ledger:signal-cards.ndjson#{}", entry.seq),
-                format!("axis:{axis}"),
-            ],
-            "card": card_value,
-        });
-        let serialized = doc.to_string();
-        if let Err(error) = write_config_value(cache_dir, &key, &serialized) {
-            return signal_cards_unavailable(format!(
-                "persist card for axis {axis:?} failed: {error}"
-            ));
-        }
-        // FSV: read the row back through a fresh connection and confirm the
-        // persisted bytes parse to exactly the document written (invariant 5).
-        match read_config_value(cache_dir, &key) {
-            Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
-                Ok(readback) if readback == doc => {}
-                Ok(_) => {
-                    return signal_cards_unavailable(format!(
-                        "card for axis {axis:?} read back a different value than written"
-                    ));
-                }
-                Err(error) => {
-                    return signal_cards_unavailable(format!(
-                        "card for axis {axis:?} did not parse after write: {error}"
-                    ));
-                }
-            },
-            Ok(None) => {
-                return signal_cards_unavailable(format!(
-                    "card for axis {axis:?} was not readable back immediately after write"
-                ));
-            }
-            Err(error) => {
-                return signal_cards_unavailable(format!(
-                    "card for axis {axis:?} readback failed: {error}"
-                ));
-            }
-        }
-        cards_persisted += 1;
-        axes.push(json!({
-            "axis": axis,
-            "signal_count": card.signals.len(),
-            "trust": trust,
-            "ledger_seq": entry.seq,
-            "input_fingerprint": fingerprint,
-            "config_key": key,
-        }));
+    let plan = SignalCardTransactionPlan::build(
+        project,
+        vault.vault_id(),
+        SHADOW_PANEL_VERSION,
+        production.readback.session_snapshot_seq,
+        produced_at,
+        SignalCardBackendIdentity::shipping_cpu(),
+        &prepared_ledger,
+    )
+    .map_err(|error| stage_error("plan", error))?;
+    let prepare_disposition = persist_signal_card_prepared(cache_dir, plan.prepared_marker())
+        .map_err(|error| stage_error("sqlite_prepare", error))?;
+    let ledger_receipt = prepared_ledger
+        .publish()
+        .map_err(|error| stage_error("ledger_publish", error))?;
+    let committed_marker = plan
+        .committed_marker(&ledger_receipt)
+        .map_err(|error| stage_error("ledger_receipt", error))?;
+    commit_signal_card_transaction(cache_dir, &plan, &committed_marker)
+        .map_err(|error| stage_error("sqlite_commit", error))?;
+    let committed = read_committed_signal_card_state(cache_dir, project)
+        .map_err(|error| stage_error("committed_readback", error))?
+        .ok_or_else(|| stage_error("committed_readback", "committed marker is absent"))?;
+    if committed
+        .marker
+        .get("transaction_id")
+        .and_then(Value::as_str)
+        != Some(plan.transaction_id())
+        || committed.rows.len() != ledger_receipt.entries.len()
+    {
+        return Err(stage_error(
+            "committed_readback",
+            "transaction identity or public-row count differs from the committed plan",
+        ));
     }
 
-    json!({
-        "status": "produced",
-        "axis_count": production.cards.len(),
-        "cards_persisted": cards_persisted,
-        "cards_ledgered": cards_ledgered,
+    let axes = ledger_receipt
+        .entries
+        .iter()
+        .zip(&ledger_receipt.lines)
+        .map(|(entry, line)| {
+            let trust = if entry.card.signals.iter().any(|signal| signal.provisional) {
+                "provisional"
+            } else {
+                "trusted"
+            };
+            json!({
+                "axis": entry.card.axis,
+                "signal_count": entry.card.signals.len(),
+                "trust": trust,
+                "ledger_seq": entry.seq,
+                "ledger_entry_hash": entry.entry_hash,
+                "ledger_offset": line.offset,
+                "ledger_bytes": line.bytes,
+                "ledger_line_blake3": line.line_blake3,
+                "input_fingerprint": entry.input_fingerprint,
+                "config_key": measure_bits_card_key(project, "signals", Some(&entry.card.axis), None),
+            })
+        })
+        .collect::<Vec<_>>();
+    let status = if axes.is_empty() {
+        "committed_empty"
+    } else {
+        "committed"
+    };
+    let prepare_disposition = match prepare_disposition {
+        SignalCardPrepareDisposition::PreparedWritten => "prepared_written",
+        SignalCardPrepareDisposition::PreparedResumed => "prepared_resumed",
+        SignalCardPrepareDisposition::AlreadyCommitted => "already_committed",
+    };
+    Ok(json!({
+        "status": status,
+        "transaction_id": plan.transaction_id(),
+        "transaction": committed.marker,
+        "prepare_disposition": prepare_disposition,
+        "axis_count": axes.len(),
+        "cards_persisted": committed.rows.len(),
+        "cards_ledgered": ledger_receipt.entries.len(),
+        "ledger_file_bytes": ledger_receipt.file_bytes,
+        "ledger_file_blake3": ledger_receipt.file_blake3,
+        "ledger_idempotent_replay": ledger_receipt.idempotent_replay,
         "symbols_measured": production.symbols_measured,
         "axes_skipped_degenerate": production.axes_skipped_degenerate,
         "slots_skipped_no_dense": production.slots_skipped_no_dense,
@@ -1173,7 +1128,7 @@ where
         "axes": axes,
         "trust": "measured",
         "provenance": "index_time_signal_cards",
-    })
+    }))
 }
 
 pub(crate) fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
@@ -1619,7 +1574,8 @@ pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
 /// Complete input/producer identity for the pre-seed unchanged-repository gate (#858).
 /// The record is committed in the same SQLite transaction as the artifacts it names.
 pub(crate) const SHADOW_INDEX_ADMISSION_IDENTITY_KEY: &str = "index_admission_identity_json";
-pub(crate) const SHADOW_INDEX_ADMISSION_SCHEMA: &str = "astrolabe.shadow_index_admission.v1";
+pub(crate) const SHADOW_INDEX_ADMISSION_SCHEMA: &str = "astrolabe.shadow_index_admission.v2";
+const SHADOW_INDEX_ADMISSION_SCHEMA_V1: &str = "astrolabe.shadow_index_admission.v1";
 pub(crate) const GIT_ARCHAEOLOGY_HEAD_KEY: &str = "git_archaeology_head";
 
 /// Metadata key recording the path convention under which this project's git-archaeology
@@ -1673,8 +1629,15 @@ impl ShadowIndexAdmissionIdentity {
         let contracts = inputs.get("contracts").ok_or_else(|| -> DynError {
             "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: admission inputs have no durable contract identity; remediation: preserve the generation and rebuild from authoritative source".into()
         })?;
+        let effective_weave_similarity = inputs
+            .get("effective_weave_similarity")
+            .ok_or_else(|| -> DynError {
+                "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: admission inputs have no effective weave-similarity plan; remediation: preserve the generation and rebuild from authoritative source"
+                    .into()
+            })?;
         Ok(json!({
             "contracts": contracts,
+            "effective_weave_similarity": effective_weave_similarity,
             "producer_executable_sha256": self.producer_executable_sha256,
         }))
     }
@@ -1693,6 +1656,18 @@ pub(crate) fn shadow_index_action_policy(
     };
     let persisted_identity =
         parse_shadow_index_admission_identity(project, &identity_key, &persisted_identity_raw)?;
+    if persisted_identity
+        .record
+        .get("schema")
+        .and_then(Value::as_str)
+        == Some(SHADOW_INDEX_ADMISSION_SCHEMA_V1)
+    {
+        return Ok(ShadowIndexActionPolicy::RebuildDerived {
+            reason: format!(
+                "admission_contract_upgrade:{SHADOW_INDEX_ADMISSION_SCHEMA_V1}->{SHADOW_INDEX_ADMISSION_SCHEMA}"
+            ),
+        });
+    }
     if persisted_identity.identity_sha256 == expected_identity.identity_sha256
         && persisted_identity.record == expected_identity.record
     {
@@ -1753,6 +1728,10 @@ impl ShadowIndexActionPolicy {
     fn permits_content_noop(&self) -> bool {
         !matches!(self, Self::RebuildDerived { .. })
     }
+
+    fn requires_derived_rebuild(&self) -> bool {
+        matches!(self, Self::RebuildDerived { .. })
+    }
 }
 
 /// Capture every input that can change the logical shadow generation before
@@ -1767,6 +1746,7 @@ pub(crate) fn shadow_index_admission_identity(
     sanitized_index_args: &str,
     search_scale: &SearchScaleSettings,
     skills: &SkillDiscoveryConfig,
+    similarity: &SimilarityPlannerConfig,
 ) -> Result<ShadowIndexAdmissionIdentity, DynError> {
     let sanitized_index_args: Value = serde_json::from_str(sanitized_index_args).map_err(
         |error| -> DynError {
@@ -1802,6 +1782,7 @@ pub(crate) fn shadow_index_admission_identity(
             "max_symbols": skills.max_symbols,
             "knob_registry_version": SKILL_DISCOVERY_KNOB_REGISTRY_VERSION,
         },
+        "effective_weave_similarity": &similarity.runtime,
         "contracts": {
             "panel_version": SHADOW_PANEL_VERSION,
             "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
@@ -2078,15 +2059,30 @@ pub(crate) fn shadow_graph_freshness_refusal(
     }))?))
 }
 
+pub(crate) struct ShadowImportRequest<'a> {
+    pub(crate) cache_dir: &'a Path,
+    pub(crate) project: &'a str,
+    pub(crate) row_sink: RowSinkImportCandidate,
+    pub(crate) search_scale_settings: &'a SearchScaleSettings,
+    pub(crate) similarity_config: &'a SimilarityPlannerConfig,
+    pub(crate) repo: Option<&'a Path>,
+    pub(crate) action_policy: &'a ShadowIndexActionPolicy,
+    pub(crate) generation_clock: GenerationClock,
+}
+
 pub(crate) fn import_shadow_vault_with_archaeology_at(
-    cache_dir: &Path,
-    project: &str,
-    row_sink: RowSinkImportCandidate,
-    search_scale_settings: &SearchScaleSettings,
-    repo: Option<&Path>,
-    action_policy: &ShadowIndexActionPolicy,
-    generation_clock: GenerationClock,
+    request: ShadowImportRequest<'_>,
 ) -> Result<ShadowImportOutcome, DynError> {
+    let ShadowImportRequest {
+        cache_dir,
+        project,
+        row_sink,
+        search_scale_settings,
+        similarity_config,
+        repo,
+        action_policy,
+        generation_clock,
+    } = request;
     fs::create_dir_all(cache_dir)?;
     let sqlite_path = sqlite_path(cache_dir, project);
     if !sqlite_path.exists() {
@@ -2617,26 +2613,34 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             .map(|(_, cx_id)| *cx_id)
             .collect(),
     });
+    let force_derived_rebuild = action_policy.requires_derived_rebuild();
+    let derived_changed = import_changed || force_derived_rebuild;
+    let derived_delta = if force_derived_rebuild {
+        None
+    } else {
+        delta.as_ref()
+    };
     shadow_phase!("weave_delta_prepare");
     let mut weave = run_live_weave_with_snapshot(
         &vault,
         cache_dir,
         project,
-        import_changed,
-        delta.as_ref(),
+        derived_changed,
+        derived_delta,
         Some(&after_snapshot),
+        similarity_config,
     )?;
     shadow_phase!("weave");
     let invalidations = persist_delta_invalidations_with_snapshot(
         &vault,
         project,
-        import_changed,
-        delta.as_ref(),
+        derived_changed,
+        derived_delta,
         &weave,
         Some(&after_snapshot),
     )?;
     shadow_phase!("invalidations");
-    let layout_frames = persist_layout_frames(&vault, project, import_changed)?;
+    let layout_frames = persist_layout_frames(&vault, project, derived_changed)?;
     shadow_phase!("layout_frames");
     let drift = index_time_drift_summary(&vault, project, &vault_dir);
     shadow_phase!("drift");
@@ -2654,13 +2658,11 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // signal-ranking cards the get_architecture signal_ranking aspect reads, so
     // that aspect serves real measured bits instead of labeled-unavailable
     // forever. Single post-import call — placed after the graph import and weave
-    // (so slot vectors and the graph snapshot are materialized) and before ledger
-    // verification (so the config writes sit alongside a verified chain).
-    // Best-effort telemetry: a labeled degradation in the summary, never an index
-    // failure. (Shares shadow_import.rs with lane D/E/F index-time hooks — keep
-    // this to exactly this one call.)
+    // so its exact graph/slot snapshot exists. #885 publishes one prepared/commit
+    // transaction over the external ledger and SQLite config rows; a transaction
+    // failure aborts indexing instead of hiding split state as telemetry.
     let signal_cards =
-        index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir, generation_clock);
+        index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir, generation_clock)?;
     shadow_phase!("signal_cards");
     // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
     // propagation. ── EXACT INSERTION POINT ── one post-import call, placed
@@ -3044,6 +3046,7 @@ pub(crate) fn run_live_weave_with_snapshot<C>(
     import_changed: bool,
     delta: Option<&WeaveDelta>,
     snapshot: Option<&CbmCompactGraphSnapshot>,
+    similarity_config: &SimilarityPlannerConfig,
 ) -> Result<Value, DynError>
 where
     C: Clock,
@@ -3174,7 +3177,6 @@ where
         }};
     }
 
-    let similarity_config = SimilarityPlannerConfig::default();
     let mut ms_sim_read_rows = 0u64;
     let mut ms_sim_expand = 0u64;
     let mut similarity_region_scan = None;
@@ -3203,7 +3205,7 @@ where
                     &nodes,
                     family,
                     &changed_symbols,
-                    &similarity_config,
+                    similarity_config,
                     &mut region,
                 );
                 release_slot!(family.slot());
@@ -3261,14 +3263,24 @@ where
                 vault,
                 run_directory,
                 format!(
-                    "project={project};compact_source_snapshot_seq={source_snapshot_seq};slot={};slot_generation={source_slot_generation}",
-                    family.slot().get()
+                    "project={project};compact_source_snapshot_seq={source_snapshot_seq};slot={};slot_generation={source_slot_generation};weave_registry={};dense_ann_strategy={};dense_ann_exact_max_dim={};similarity_workers_requested={};similarity_workers_resolved={}",
+                    family.slot().get(),
+                    similarity_config.runtime.registry_version(),
+                    similarity_config.runtime.dense_ann_strategy(),
+                    similarity_config.runtime.dense_ann_exact_max_dim(),
+                    similarity_config.runtime.similarity_workers_requested(),
+                    similarity_config.runtime.similarity_workers_resolved(),
                 ),
                 plan_nodes,
                 family,
-                &similarity_config,
+                similarity_config,
             )?;
             let planned_edge_count = plan.edge_count();
+            let scheduler_telemetry = plan.stream_report().scheduler_telemetry.clone();
+            let candidate_generation = similarity_candidate_generation_receipt(
+                family,
+                plan.stream_report().skips.ann_reports.get(&family),
+            );
             similarity_edge_count = similarity_edge_count.saturating_add(planned_edge_count);
             vector_skip_count =
                 vector_skip_count.saturating_add(plan.stream_report().skips.vector_skips.len());
@@ -3316,6 +3328,9 @@ where
                 "nodes_planned": plan_nodes.len(),
                 "edge_count": planned_edge_count,
                 "edge_dump_hash": report.edge_dump_hash,
+                "resolved_config": &similarity_config.runtime,
+                "candidate_generation": candidate_generation,
+                "scheduler_telemetry": scheduler_telemetry,
                 "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
@@ -3397,23 +3412,27 @@ where
             let plan = match (delta, dirty_cx_ids.as_ref()) {
                 (Some(delta), Some(dirty_cx_ids)) => plan_eager_cross_term_kind_run_delta(
                     vault,
-                    run_directory,
-                    source_binding,
-                    &nodes,
-                    kind,
-                    &delta.dirty_symbol_ids,
-                    dirty_cx_ids,
-                    active_slot_count,
+                    EagerCrossTermDeltaPlanRequest::new(
+                        run_directory,
+                        source_binding,
+                        &nodes,
+                        kind,
+                        &delta.dirty_symbol_ids,
+                        dirty_cx_ids,
+                        active_slot_count,
+                    ),
                     &mut observe,
                 )?,
                 _ => plan_eager_cross_term_kind_run(
                     vault,
-                    run_directory,
-                    source_binding,
-                    &nodes,
-                    kind,
-                    &cx_ids,
-                    active_slot_count,
+                    EagerCrossTermPlanRequest::new(
+                        run_directory,
+                        source_binding,
+                        &nodes,
+                        kind,
+                        &cx_ids,
+                        active_slot_count,
+                    ),
                     &mut observe,
                 )?,
             };
@@ -3771,6 +3790,93 @@ where
             "state": complete_xterms.state,
         },
     }))
+}
+
+/// Persist the exact candidate-generator and quantization facts an agent needs
+/// to tell which Weave/Sextant path physically produced one family. Forge is
+/// named only as uncommissioned until a Forge-owned producer actually executes.
+/// The scalar8 scale is emitted as both the exact IEEE-754 bits and its decoded
+/// value; the bits remain the reproducibility contract.
+fn similarity_candidate_generation_receipt(
+    family: SimilarityFamily,
+    ann: Option<&astrolabe_weave::AnnFamilyReport>,
+) -> Value {
+    let Some(ann) = ann else {
+        return json!({
+            "strategy": "exact_pairs",
+            "family": family.wire_name(),
+            "providers": ["astrolabe-weave"],
+            "quantization": {
+                "status": "not_used",
+                "reason": "this family generation used exact pair enumeration"
+            },
+            "forge": {
+                "status": "not_commissioned",
+                "reason": "no Forge-owned candidate or quantization producer is wired into this path; track commissioning under #1057"
+            },
+        });
+    };
+    let mut providers = vec!["astrolabe-weave"];
+    if !ann.quant_scale_measurements.is_empty() {
+        providers.push("calyx-sextant");
+    }
+    let quantization = if ann.quant_scale_measurements.is_empty() {
+        json!({
+            "status": "not_used",
+            "reason": "no dense dimension group with at least two rows was processed"
+        })
+    } else {
+        json!({
+            "status": "used",
+            "provider": "calyx-sextant",
+            "codec": "scalar8",
+            "scale_contract": "max_abs_div_127_f32_bits",
+            "measurements": ann.quant_scale_measurements.iter().map(|measurement| json!({
+                "dim": measurement.dim,
+                "pool_nodes": measurement.pool_nodes,
+                "scale_f32_bits": measurement.scale_bits,
+                "scale": measurement.scale(),
+            })).collect::<Vec<_>>(),
+        })
+    };
+    let dense = if ann.dense_strategy_measurements.is_empty() {
+        json!({
+            "status": "not_used",
+            "pool_nodes": ann.dense_pool_nodes,
+            "reason": "no dense dimension group contained at least two rows"
+        })
+    } else {
+        json!({
+            "status": "used",
+            "provider": "calyx-sextant",
+            "pool_nodes": ann.dense_pool_nodes,
+            "dimension_groups": ann.hnsw_dim_groups,
+            "candidate_pairs": ann.dense_candidate_pairs,
+            "strategies": ann.dense_strategy_measurements.iter().map(|measurement| json!({
+                "dim": measurement.dim,
+                "pool_nodes": measurement.pool_nodes,
+                "algorithm": measurement.strategy.wire_name(),
+            })).collect::<Vec<_>>(),
+        })
+    };
+    json!({
+        "strategy": "ann",
+        "family": family.wire_name(),
+        "providers": providers,
+        "sparse": {
+            "provider": "astrolabe-weave",
+            "algorithm": "minhash_lsh",
+            "pool_nodes": ann.sparse_pool_nodes,
+            "buckets": ann.lsh_buckets,
+            "candidate_pairs": ann.lsh_candidate_pairs,
+        },
+        "dense": dense,
+        "quantization": quantization,
+        "forge": {
+            "status": "not_commissioned",
+            "reason": "no Forge-owned candidate or quantization producer is wired into this path; track commissioning under #1057"
+        },
+    })
 }
 
 pub(crate) fn import_shadow_vault_report<C, R>(
@@ -5667,9 +5773,9 @@ fn parse_shadow_index_admission_identity(
         )
         .into()
     })?;
-    if schema != SHADOW_INDEX_ADMISSION_SCHEMA {
+    if schema != SHADOW_INDEX_ADMISSION_SCHEMA && schema != SHADOW_INDEX_ADMISSION_SCHEMA_V1 {
         return Err(format!(
-            "ASTRO_SHADOW_ADMISSION_IDENTITY_SCHEMA: project {project:?} admission schema {schema:?} is not {SHADOW_INDEX_ADMISSION_SCHEMA:?}; remediation: rebuild this generation with the active producer"
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_SCHEMA: project {project:?} admission schema {schema:?} is neither current {SHADOW_INDEX_ADMISSION_SCHEMA:?} nor recognized predecessor {SHADOW_INDEX_ADMISSION_SCHEMA_V1:?}; remediation: preserve the generation and rebuild it with the active producer after diagnosing the unknown record"
         )
         .into());
     }
