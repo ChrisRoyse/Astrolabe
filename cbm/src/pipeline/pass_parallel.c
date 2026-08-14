@@ -1029,23 +1029,10 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         /* Borrow the one verified immutable source entry. Extraction is never
          * permitted to reopen the snapshot or manufacture a substitute. */
         size_t source_size = 0;
-        const uint8_t *source_bytes =
-            cbm_source_slab_get(ec->source_slab, file_idx, &source_size);
-        if (!source_bytes || source_size > (size_t)INT_MAX || source_size != (size_t)fi->size) {
-            cbm_log_error(
-                "parallel.extract.source_refused", "code", "CBM_EXTRACTION_SOURCE_SLAB_INVALID",
-                "path", fi->rel_path ? fi->rel_path : "", "message",
-                "the extraction source entry is absent, malformed, or differs from the captured "
-                "file size",
-                "remediation",
-                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+        const uint8_t *source_bytes = NULL;
+        if (cbm_pipeline_borrow_source(ec->pipeline, ec->source_slab, fi, "parallel_extract_source",
+                                       &source_bytes, &source_size) != 0) {
             ws->errors++;
-            cbm_pipeline_record_fatal_error(
-                ec->pipeline, "CBM_EXTRACTION_SOURCE_SLAB_INVALID", "read_source_slab",
-                "parallel_extract", fi->rel_path, source_size,
-                "the extraction source entry is absent, malformed, or differs from the captured "
-                "file size",
-                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
             atomic_store_explicit(ec->cancelled, 1, memory_order_relaxed);
             extract_admission_release(ec, &admission, fi, cbm_mem_rss(), 0, false, NULL);
             break;
@@ -1280,18 +1267,44 @@ static int reject_invalid_parallel_worker_count(const char *operation, int worke
     return CBM_NOT_FOUND;
 }
 
+static int validate_parallel_source_bindings(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                             int file_count, const char *operation) {
+    if (!ctx || !files || file_count < 0) {
+        if (ctx && ctx->pipeline) {
+            cbm_pipeline_record_fatal_error(
+                ctx->pipeline, "CBM_SOURCE_SLAB_CONSUMER_ARGUMENT_INVALID", operation,
+                "source_slab", "", file_count < 0 ? (size_t)(-(int64_t)file_count) : 0,
+                "the parallel source consumer received an invalid context, file view, or count",
+                "repair the parallel dispatch contract before retrying the unchanged generation");
+        } else {
+            cbm_log_error(
+                "source_slab.consumer_refused", "code", "CBM_SOURCE_SLAB_CONSUMER_ARGUMENT_INVALID",
+                "operation", operation ? operation : "validate_parallel_source_bindings", "message",
+                "the parallel source consumer received an invalid context, file view, or count",
+                "remediation",
+                "repair the parallel dispatch contract before retrying the unchanged generation");
+        }
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        const uint8_t *source = NULL;
+        size_t source_len = 0;
+        if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, &files[i], operation,
+                                       &source, &source_len) != 0) {
+            return CBM_NOT_FOUND;
+        }
+    }
+    return 0;
+}
+
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count) {
     if (file_count == 0) {
         return 0;
     }
-    if (!ctx || !ctx->source_slab || ctx->source_slab->file_count != file_count) {
-        cbm_log_error("parallel.extract.source_refused", "code",
-                      "CBM_EXTRACTION_SOURCE_SLAB_INVALID", "message",
-                      "the parallel extraction source slab is absent or has the wrong file count",
-                      "remediation",
-                      "build and verify the complete immutable source slab before extraction");
+    if (validate_parallel_source_bindings(ctx, files, file_count,
+                                          "validate_parallel_extract_sources") != 0) {
         return CBM_NOT_FOUND;
     }
     if (worker_count <= 0) {
@@ -3552,17 +3565,26 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * walks across thousands of files in a single worker thread. */
         if (cross_lsp_eligible) {
             size_t lsp_source_size = 0;
-            const uint8_t *lsp_source_bytes =
-                cbm_source_slab_get(rc->source_slab, file_idx, &lsp_source_size);
-            if (!lsp_source_bytes || lsp_source_size == 0 || lsp_source_size > (size_t)INT_MAX ||
-                lsp_source_size != (size_t)rc->files[file_idx].size) {
-                cbm_log_error(
-                    "parallel.resolve.source_refused", "code", "CBM_RESOLVE_SOURCE_SLAB_INVALID",
-                    "path", rel ? rel : "", "message",
-                    "the cross-file resolver source entry is absent, malformed, or has a changed "
-                    "length",
-                    "remediation",
-                    "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+            const uint8_t *lsp_source_bytes = NULL;
+            if (cbm_pipeline_borrow_source(rc->pipeline, rc->source_slab, &rc->files[file_idx],
+                                           "parallel_cross_lsp_source", &lsp_source_bytes,
+                                           &lsp_source_size) != 0) {
+                ws->errors++;
+                atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
+                cbm_registry_reach_cache_end();
+                cbm_registry_import_map_cache_end();
+                cbm_registry_resolve_cache_end();
+                free(module_qn);
+                cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
+                break;
+            }
+            if (lsp_source_size == 0) {
+                cbm_pipeline_record_fatal_error(
+                    rc->pipeline, "CBM_RESOLVE_EMPTY_SOURCE_INCONSISTENT",
+                    "parallel_cross_lsp_source", "parallel_resolve", rel, 0,
+                    "a cross-LSP-eligible extraction result is bound to an exact empty source",
+                    "preserve the generation and repair extraction/source eligibility before "
+                    "retrying");
                 ws->errors++;
                 atomic_store_explicit(rc->cancelled, SKIP_ONE, memory_order_relaxed);
                 cbm_registry_reach_cache_end();
@@ -3747,12 +3769,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     if (file_count == 0) {
         return 0;
     }
-    if (!ctx || !ctx->source_slab || ctx->source_slab->file_count != file_count) {
-        cbm_log_error("parallel.resolve.source_refused", "code",
-                      "CBM_RESOLVE_SOURCE_SLAB_INVALID", "message",
-                      "the parallel resolver source slab is absent or has the wrong file count",
-                      "remediation",
-                      "retain the verified immutable source slab through parallel resolution");
+    if (validate_parallel_source_bindings(ctx, files, file_count,
+                                          "validate_parallel_resolve_sources") != 0) {
         return CBM_NOT_FOUND;
     }
     if (worker_count <= 0) {

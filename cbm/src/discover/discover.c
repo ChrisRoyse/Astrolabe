@@ -549,6 +549,7 @@ static bool fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     fi->sha256[0] = '\0';
     fi->auxiliary = auxiliary;
     fi->interpretation_input = interpretation_input;
+    fi->source_slab_index = -1;
     fl->count++;
     return true;
 }

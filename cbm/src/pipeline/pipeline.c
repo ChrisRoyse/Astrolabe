@@ -216,7 +216,6 @@ struct cbm_pipeline {
     uint8_t *embedded_compilation_context;
     size_t embedded_compilation_context_bytes;
     cbm_compile_context_index_t *compile_contexts;
-    const cbm_source_slab_t *current_source_slab;
     const char *compile_context_authority;
     int compile_context_c_family_files;
     int compile_context_bound_files;
@@ -1198,10 +1197,6 @@ cbm_compile_context_index_t *cbm_pipeline_compile_contexts(const cbm_pipeline_t 
     return p ? p->compile_contexts : NULL;
 }
 
-const cbm_source_slab_t *cbm_pipeline_current_source_slab(const cbm_pipeline_t *p) {
-    return p ? p->current_source_slab : NULL;
-}
-
 int cbm_pipeline_get_mode(const cbm_pipeline_t *p) {
     return p ? (int)p->mode : 0;
 }
@@ -1478,6 +1473,127 @@ void cbm_pipeline_record_fatal_error(cbm_pipeline_t *p, const char *code, const 
                                      const char *message, const char *remediation) {
     cbm_pipeline_record_fatal_error_detail(p, code, operation, phase, path, requested, message,
                                            remediation, NULL, NULL, 0);
+}
+
+static int pipeline_source_borrow_refused(cbm_pipeline_t *pipeline, const cbm_file_info_t *file,
+                                          const char *operation, const char *code, size_t requested,
+                                          const char *message, const char *remediation) {
+    const char *path = file && file->rel_path ? file->rel_path : "";
+    if (pipeline) {
+        cbm_pipeline_record_fatal_error(pipeline, code, operation, "source_slab", path, requested,
+                                        message, remediation);
+    } else {
+        char requested_text[32];
+        (void)snprintf(requested_text, sizeof(requested_text), "%zu", requested);
+        cbm_log_error("source_slab.borrow_refused", "code", code, "operation",
+                      operation ? operation : "borrow_source", "path", path, "requested_bytes",
+                      requested_text, "message", message, "remediation", remediation);
+    }
+    return CBM_NOT_FOUND;
+}
+
+int cbm_pipeline_borrow_source(cbm_pipeline_t *pipeline, const cbm_source_slab_t *slab,
+                               const cbm_file_info_t *file, const char *operation,
+                               const uint8_t **out_source, size_t *out_len) {
+    if (out_source) {
+        *out_source = NULL;
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!slab || !file || !operation || !operation[0] || !out_source || !out_len) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_BORROW_ARGUMENT_INVALID", 0,
+            "a source consumer omitted its immutable slab, exact file, operation, or output",
+            "repair the source consumer contract before retrying the unchanged generation");
+    }
+    if (!slab->bytes || !slab->offsets || !slab->lengths || !slab->rel_paths ||
+        slab->file_count <= 0 || slab->storage_bytes == 0) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_UNAVAILABLE", 0,
+            "the complete generation-owned source slab is absent or malformed",
+            "rebuild and verify the complete immutable source slab before running consumers");
+    }
+    int index = file->source_slab_index;
+    if (index < 0) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_FILE_INDEX_UNBOUND", 0,
+            "the source file has no stable generation slab index",
+            "bind every source-only file record before building or slicing the source view");
+    }
+    if (index >= slab->file_count) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_FILE_INDEX_RANGE", (size_t)index,
+            "the source file's stable slab index exceeds the immutable generation",
+            "preserve the generation and rebuild its complete source-only view");
+    }
+    if (!file->rel_path || !slab->rel_paths[index] ||
+        strcmp(file->rel_path, slab->rel_paths[index]) != 0) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_FILE_IDENTITY_MISMATCH", (size_t)index,
+            "the indexed slab entry is bound to a different relative source path",
+            "preserve the generation and repair the subset/file-to-slab identity handoff");
+    }
+    size_t offset = slab->offsets[index];
+    size_t length = slab->lengths[index];
+    if (file->size < 0 || (uint64_t)file->size > (uint64_t)INT_MAX ||
+        length != (size_t)file->size) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_FILE_LENGTH_MISMATCH", length,
+            "the stable slab entry length differs from the captured file identity",
+            "preserve the generation and retry only from one complete stable source capture");
+    }
+    if (offset > slab->storage_bytes || length > slab->storage_bytes - offset ||
+        offset + length >= slab->storage_bytes || slab->bytes[offset + length] != 0) {
+        return pipeline_source_borrow_refused(
+            pipeline, file, operation, "CBM_SOURCE_SLAB_ENTRY_INVALID", length,
+            "the stable source slab entry exceeds its owned storage or lacks its terminator",
+            "preserve the slab diagnostic and rebuild the complete unchanged generation");
+    }
+    *out_source = slab->bytes + offset;
+    *out_len = length;
+    return 0;
+}
+
+int cbm_pipeline_extract_file_borrowed(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                                       const char *operation, CBMFileResult **out_result) {
+    if (out_result) {
+        *out_result = NULL;
+    }
+    if (!ctx || !file || !out_result) {
+        return pipeline_source_borrow_refused(
+            ctx ? ctx->pipeline : NULL, file, operation, "CBM_EXTRACTION_SOURCE_ARGUMENT_INVALID",
+            0, "the source extraction consumer omitted its context, exact file, or output",
+            "repair the extraction handoff before retrying the unchanged generation");
+    }
+    const uint8_t *source = NULL;
+    size_t source_len = 0;
+    if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, file, operation, &source,
+                                   &source_len) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (source_len == 0) {
+        return 0;
+    }
+    CBMFileResult *result = cbm_extract_file_at_path_with_metadata_borrow_source(
+        (const char *)source, (int)source_len, file->language, ctx->project_name, file->rel_path,
+        file->path, cbm_pxc_rust_edition_for_file(ctx, file->rel_path),
+        cbm_pxc_rust_is_crate_root(ctx, file->rel_path),
+        file->structured_classification[0] ? file->structured_classification : NULL,
+        file->structured_classification_provenance[0] ? file->structured_classification_provenance
+                                                      : NULL,
+        cbm_parse_budget_micros(source_len), NULL, NULL,
+        cbm_compile_context_for_file(ctx->compile_contexts, file->rel_path));
+    if (!result) {
+        cbm_pipeline_record_fatal_error(
+            ctx->pipeline, "CBM_EXTRACTION_RESULT_ALLOC_FAILED", operation, "extraction",
+            file->rel_path, source_len,
+            "the immutable source could not produce a complete extraction result",
+            "inspect the allocator diagnostic, free memory, and retry the unchanged corpus");
+        return CBM_NOT_FOUND;
+    }
+    *out_result = result;
+    return 0;
 }
 
 /* Record the terminal diagnostic together with the emitting site's own
@@ -2390,48 +2506,6 @@ static int create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable 
     return 0;
 }
 
-uint8_t *cbm_pipeline_read_file_identity_bytes(const cbm_file_info_t *file, size_t *out_len) {
-    *out_len = 0;
-    if (!file || !file->path || file->size < 0 || (uint64_t)file->size > SIZE_MAX - 1) {
-        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_SIZE_INVALID",
-                      "path", file && file->path ? file->path : "", "message",
-                      "discovery supplied an invalid exact-source size", "remediation",
-                      "re-run discovery after repairing the file metadata");
-        return NULL;
-    }
-    size_t expected = (size_t)file->size;
-    FILE *stream = cbm_fopen(file->path, "rb");
-    if (!stream) {
-        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_OPEN_FAILED",
-                      "path", file->path, "message", "exact source file could not be opened",
-                      "remediation", "restore read access and retry the index");
-        return NULL;
-    }
-    uint8_t *bytes = malloc(expected + 1);
-    if (!bytes) {
-        (void)fclose(stream);
-        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_ALLOC_FAILED",
-                      "path", file->path, "message", "exact file source allocation failed",
-                      "remediation", "free memory or reduce repository size, then retry");
-        return NULL;
-    }
-    size_t actual = expected > 0 ? fread(bytes, 1, expected, stream) : 0;
-    int extra = fgetc(stream);
-    bool failed = actual != expected || extra != EOF || ferror(stream) != 0;
-    (void)fclose(stream);
-    if (failed) {
-        free(bytes);
-        cbm_log_error("structure.file_source_refused", "code", "CBM_FILE_SOURCE_CHANGED", "path",
-                      file->path, "message",
-                      "file bytes changed or became unreadable after discovery", "remediation",
-                      "stop concurrent writers and retry from a stable checkout");
-        return NULL;
-    }
-    bytes[expected] = 0;
-    *out_len = expected;
-    return bytes;
-}
-
 typedef enum {
     CBM_BRANCH_REPLAY_FILE = 1,
     CBM_BRANCH_REPLAY_FOLDER = 2,
@@ -3013,8 +3087,8 @@ int cbm_pipeline_reconcile_incremental_git_structure(cbm_pipeline_t *p, cbm_gbuf
     return 0;
 }
 
-static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
-                          const cbm_source_slab_t *source_slab) {
+static int pass_structure(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                          int file_count) {
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
 
     /* Project node */
@@ -3090,13 +3164,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         const char *qualified_name = file_qn;
         const char *file_path = rel;
         size_t source_len = 0;
-        const uint8_t *source_bytes = cbm_source_slab_get(source_slab, i, &source_len);
-        if (!source_bytes) {
-            cbm_log_error("structure.file_source_refused", "code",
-                          "CBM_FILE_SOURCE_SLAB_ENTRY_INVALID", "path", files[i].path,
-                          "message", "the hash-bound source slab entry is absent or malformed",
-                          "remediation",
-                          "preserve the slab diagnostic and retry the complete unchanged corpus");
+        const uint8_t *source_bytes = NULL;
+        if (cbm_pipeline_borrow_source(p, ctx ? ctx->source_slab : NULL, &files[i],
+                                       "create_file_atom", &source_bytes, &source_len) != 0) {
             free(file_qn);
             if (props_heap_owned) {
                 free(props);
@@ -3676,11 +3746,11 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     cbm_pipeline_phase_probe_t k8s_probe = cbm_pipeline_phase_probe_start(p, "k8s");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    cbm_pipeline_pass_k8s(ctx, files, file_count);
+    rc = cbm_pipeline_pass_k8s(ctx, files, file_count);
     cbm_pipeline_phase_probe_end(p, "k8s", &k8s_probe);
     cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
-    if (check_cancel(p)) {
-        return CBM_NOT_FOUND;
+    if (rc != 0 || check_cancel(p)) {
+        return rc != 0 ? rc : CBM_NOT_FOUND;
     }
     if (cbm_worker_progress_advance_unit(CBM_WORKER_PROGRESS_STAGE_ENRICH, "enrich", 2) != 0) {
         cbm_pipeline_record_fatal_error(
@@ -4145,7 +4215,8 @@ static const char *route_store_verification_code(
 /* Try incremental pipeline or select an atomic full reindex.
  * Returns 0 when incremental completed, PL_ROUTE_FULL when a full rebuild is
  * required, or CBM_NOT_FOUND on a terminal error. */
-static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
+                                        const cbm_source_slab_t *source_slab) {
     p->routed_store_present = false;
     p->routed_store_bytes = 0;
     p->routed_store_sha256[0] = '\0';
@@ -4346,8 +4417,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                      itoa_buf(hash_count));
         cbm_pipeline_phase_probe_t incremental_probe =
             cbm_pipeline_phase_probe_start(p, "incremental_total");
-        int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, identity_store, hashes,
-                                              hash_count);
+        int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, source_slab,
+                                              identity_store, hashes, hash_count);
         identity_store = NULL;
         hashes = NULL;
         cbm_pipeline_phase_probe_end(p, "incremental_total", &incremental_probe);
@@ -5105,7 +5176,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
     cbm_pipeline_phase_probe_t structure_probe = cbm_pipeline_phase_probe_start(p, "structure");
-    if (pass_structure(p, files, file_count, ctx->source_slab) != 0) {
+    if (pass_structure(p, ctx, files, file_count) != 0) {
         cbm_pipeline_phase_probe_end(p, "structure", &structure_probe);
         return CBM_NOT_FOUND;
     }
@@ -5140,7 +5211,6 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->row_sink_completed = false;
     cbm_compile_context_index_free(p->compile_contexts);
     p->compile_contexts = NULL;
-    p->current_source_slab = NULL;
     clear_compile_context_diagnostics(p);
 
     CBM_PROF_START(t_pipeline_total);
@@ -5314,6 +5384,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     int source_index = 0;
     for (int i = 0; i < file_count; i++) {
         if (!files[i].auxiliary) {
+            files[i].source_slab_index = source_index;
             source_files[source_index++] = files[i];
         }
     }
@@ -5328,7 +5399,6 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
     cbm_pipeline_phase_probe_end(p, "source_slab", &source_slab_probe);
-    p->current_source_slab = &source_slab;
     cbm_pipeline_phase_probe_t compile_context_probe =
         cbm_pipeline_phase_probe_start(p, "compile_context");
     cbm_pipeline_ctx_t compile_context_owner = {
@@ -5383,7 +5453,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
 
     /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count);
+    rc = try_incremental_or_delete_db(p, files, file_count, &source_slab);
     if (rc == 0 || rc == CBM_NOT_FOUND) {
         goto cleanup;
     }
@@ -5497,7 +5567,6 @@ cleanup:
     p->gbuf = NULL;
     cbm_compile_context_index_free(p->compile_contexts);
     p->compile_contexts = NULL;
-    p->current_source_slab = NULL;
     cbm_source_slab_destroy(&source_slab);
     cbm_registry_free(p->registry);
     p->registry = NULL;

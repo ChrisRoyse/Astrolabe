@@ -30,41 +30,6 @@
 
 /* ── Internal helpers ────────────────────────────────────────────── */
 
-/* Read entire file into heap-allocated buffer. Returns NULL on error.
- * Caller must free(). Sets *out_len to byte count. */
-static char *k8s_read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-
-    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        return NULL;
-    }
-
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
-}
-
 /* Format int to string for logging. Thread-safe via TLS. */
 static const char *itoa_k8s(int val) {
     enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
@@ -84,12 +49,13 @@ static const char *k8s_basename(const char *path) {
 
 /* ── Kustomize handler ───────────────────────────────────────────── */
 
-static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path,
-                             CBMFileResult *result) {
+static int handle_kustomize(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                            CBMFileResult *result) {
+    const char *rel_path = file->rel_path;
     /* Emit Module node for this kustomize overlay file */
     char *mod_qn = cbm_infra_qn(ctx->project_name, rel_path, "kustomize", NULL);
     if (!mod_qn) {
-        return;
+        return 0;
     }
 
     int64_t mod_id = cbm_gbuf_upsert_node(ctx->gbuf, "Module", k8s_basename(rel_path), mod_qn,
@@ -97,7 +63,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
     free(mod_qn);
 
     if (mod_id <= 0) {
-        return;
+        return 0;
     }
 
     /* If we have a cached extraction result, emit IMPORTS edges for
@@ -107,15 +73,10 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
     bool allocated = false;
 
     if (!res) {
-        /* Fall back to re-extraction */
-        int src_len = 0;
-        char *source = k8s_read_file(path, &src_len);
-        if (source) {
-            res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
-                                   cbm_parse_budget_micros((size_t)src_len), NULL, NULL);
-            free(source);
-            allocated = true;
+        if (cbm_pipeline_extract_file_borrowed(ctx, file, "kustomize_source", &res) != 0) {
+            return CBM_NOT_FOUND;
         }
+        allocated = res != NULL;
     }
 
     if (res) {
@@ -152,6 +113,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
     }
 
     cbm_log_info("pass.k8s.kustomize", "file", rel_path, "imports", itoa_k8s(import_count));
+    return 0;
 }
 
 /* ── K8s cross-manifest label-selector matching ──────────────────────
@@ -380,20 +342,27 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
 
 /* ── K8s manifest handler ────────────────────────────────────────── */
 
-/* source/src_len are the already-read file bytes (caller retains ownership and
- * must free after this call returns).  When `rec` is non-NULL it is populated
+/* source/src_len borrow the generation slab. When `rec` is non-NULL it is populated
  * with the first Resource's node id, name and label/selector values for later
  * cross-manifest selector matching. */
-static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path,
-                                const char *source, int src_len, k8s_record_t *rec) {
-    (void)path; /* retained for symmetry; source is always provided now */
+static int handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                               const char *source, int src_len, k8s_record_t *rec) {
+    const char *rel_path = file->rel_path;
     int resource_count = 0;
 
-    CBMFileResult *res = cbm_extract_file(source, src_len, CBM_LANG_K8S, ctx->project_name,
-                                          rel_path, cbm_parse_budget_micros((size_t)src_len),
-                                          NULL, NULL);
+    CBMFileResult *res = cbm_extract_file_at_path_with_metadata_borrow_source(
+        source, src_len, CBM_LANG_K8S, ctx->project_name, rel_path, file->path, NULL, false,
+        file->structured_classification[0] ? file->structured_classification : NULL,
+        file->structured_classification_provenance[0] ? file->structured_classification_provenance
+                                                      : NULL,
+        cbm_parse_budget_micros((size_t)src_len), NULL, NULL, NULL);
     if (!res) {
-        return;
+        cbm_pipeline_record_fatal_error(
+            ctx->pipeline, "CBM_K8S_EXTRACTION_RESULT_ALLOC_FAILED", "extract_k8s_manifest",
+            "extraction", rel_path, (size_t)src_len,
+            "the immutable Kubernetes source could not produce a complete extraction result",
+            "inspect the allocator diagnostic, free memory, and retry the unchanged corpus");
+        return CBM_NOT_FOUND;
     }
 
     /* Compute file node QN for DEFINES edges */
@@ -435,6 +404,7 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const
     }
 
     cbm_log_info("pass.k8s.manifest", "file", rel_path, "resources", itoa_k8s(resource_count));
+    return 0;
 }
 
 /* ── Helm chart handler ──────────────────────────────────────────── */
@@ -648,6 +618,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     int kustomize_count = 0;
     int manifest_count = 0;
     int helm_count = 0;
+    int empty_source_count = 0;
 
     /* Collect per-manifest selector/label records for cross-manifest matching. */
     k8s_record_array_t recs = {0};
@@ -660,7 +631,6 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             return CBM_NOT_FOUND;
         }
 
-        const char *path = files[i].path;
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
         const char *base = k8s_basename(rel);
@@ -669,21 +639,39 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
             (ctx->result_cache && ctx->result_cache[i]) ? ctx->result_cache[i] : NULL;
 
         if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
-            int dep_len = 0;
-            char *dep_src = k8s_read_file(path, &dep_len);
-            if (dep_src) {
-                handle_dep_manifest(ctx, rel, dep_src,
+            size_t dep_len = 0;
+            const uint8_t *dep_bytes = NULL;
+            if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, &files[i],
+                                           "dependency_manifest_source", &dep_bytes,
+                                           &dep_len) != 0) {
+                free(recs.items);
+                return CBM_NOT_FOUND;
+            }
+            if (dep_len > 0) {
+                handle_dep_manifest(ctx, rel, (const char *)dep_bytes,
                                     is_requirements_file(base) ? "pypi" : "gomod");
-                free(dep_src);
+            } else {
+                empty_source_count++;
             }
         } else if (cbm_is_kustomize_file(base)) {
-            handle_kustomize(ctx, path, rel, cached);
+            if (handle_kustomize(ctx, &files[i], cached) != 0) {
+                free(recs.items);
+                return CBM_NOT_FOUND;
+            }
             kustomize_count++;
         } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
-            /* Read source once to classify (and reuse for uncached extraction). */
-            int src_len = 0;
-            char *source = k8s_read_file(path, &src_len);
-            if (source) {
+            /* Borrow source once to classify and reuse for K8s extraction. */
+            size_t source_size = 0;
+            const uint8_t *source_bytes = NULL;
+            if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, &files[i],
+                                           "k8s_manifest_source", &source_bytes,
+                                           &source_size) != 0) {
+                free(recs.items);
+                return CBM_NOT_FOUND;
+            }
+            if (source_size > 0) {
+                const char *source = (const char *)source_bytes;
+                int src_len = (int)source_size;
                 if (is_helm_chart_file(base)) {
                     handle_helm_chart(ctx, rel, source);
                     helm_count++;
@@ -691,16 +679,20 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     /* Always re-extract with CBM_LANG_K8S regardless of any cached
                      * result: cached results were produced during the parallel YAML
                      * pass and contain no "Resource" definitions.  Pass the already-
-                     * read source buffer so handle_k8s_manifest does not re-read. */
+                     * borrowed source entry so handle_k8s_manifest does not re-read. */
                     (void)cached; /* cached YAML result intentionally discarded */
                     k8s_record_t *rec = (recs.count < recs.cap) ? &recs.items[recs.count] : NULL;
-                    handle_k8s_manifest(ctx, path, rel, source, src_len, rec);
+                    if (handle_k8s_manifest(ctx, &files[i], source, src_len, rec) != 0) {
+                        free(recs.items);
+                        return CBM_NOT_FOUND;
+                    }
                     if (rec && rec->node_id > 0) {
                         recs.count++;
                     }
                     manifest_count++;
                 }
-                free(source);
+            } else {
+                empty_source_count++;
             }
         }
     }
@@ -710,7 +702,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     free(recs.items);
 
     cbm_log_info("pass.done", "pass", "k8s", "kustomize", itoa_k8s(kustomize_count), "manifests",
-                 itoa_k8s(manifest_count));
+                 itoa_k8s(manifest_count), "empty_source", itoa_k8s(empty_source_count));
     (void)helm_count;
     return 0;
 }

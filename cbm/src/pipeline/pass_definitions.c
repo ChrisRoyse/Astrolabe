@@ -2,7 +2,7 @@
  * pass_definitions.c — Extract definitions from source files.
  *
  * For each discovered file:
- *   1. Read source content from disk
+ *   1. Borrow source content from the immutable generation slab
  *   2. Call cbm_extract_file() to get defs, calls, imports
  *   3. Create Function/Class/Method/Variable/Module nodes in graph buffer
  *   4. Register callables in the function registry
@@ -38,74 +38,6 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
  * carry the module QN and are legitimately attributed to the per-file File. */
 static bool pd_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
-}
-
-/* Read entire file into heap-allocated buffer. Returns NULL on error.
- * Caller must free(). Sets *out_len to byte count. *out_size receives the
- * on-disk size and *out_status the failure reason, so the caller can attribute
- * a skip to the right phase/reason (read vs oversized) instead of a silent
- * drop. Both out params may be NULL. */
-static char *read_file(const char *path, int *out_len, long *out_size,
-                       cbm_read_status_t *out_status) {
-    if (out_size) {
-        *out_size = 0;
-    }
-    if (out_status) {
-        *out_status = CBM_READ_OK;
-    }
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        if (out_status) {
-            *out_status = CBM_READ_OPEN_FAIL;
-        }
-        return NULL;
-    }
-
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (out_size) {
-        *out_size = size;
-    }
-
-    if (size <= 0) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_EMPTY;
-        }
-        return NULL;
-    }
-    if (size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OVERSIZED;
-        }
-        return NULL;
-    }
-
-    /* +16 padding: tree-sitter's lexer peeks a few bytes past the final UTF-8
-     * character when computing lookahead, reading beyond the logical end.
-     * Over-allocate and zero the tail so that read stays in-bounds (ASan
-     * flags it as a heap-buffer-overflow otherwise; harmless but real UB). */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OOM;
-        }
-        return NULL;
-    }
-
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
 }
 
 /* Format int to string for logging. Thread-safe via TLS. */
@@ -824,51 +756,19 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             return CBM_NOT_FOUND;
         }
 
-        const char *path = files[i].path;
         const char *rel = files[i].rel_path;
-        CBMLanguage lang = files[i].language;
-
-        /* Read source file */
-        int source_len = 0;
-        long file_size = 0;
-        cbm_read_status_t rst = CBM_READ_OK;
-        char *source = read_file(path, &source_len, &file_size, &rst);
-        if (!source) {
-            errors++;
-            if (rst == CBM_READ_OVERSIZED) {
-                /* Never a silent drop: record the oversized terminal failure
-                 * with its declared and observed sizes. */
-                long cap = cbm_max_file_bytes();
-                char reason[96];
-                snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
-                         (long long)(file_size / (CBM_SZ_1K * CBM_SZ_1K)),
-                         (long long)(cap / (CBM_SZ_1K * CBM_SZ_1K)));
-                cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, "oversized");
-                cbm_log_warn("index.file_oversized", "path", rel, "size_mb",
-                             itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
-                             itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
-                cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
+        CBMFileResult *result = NULL;
+        if (cbm_pipeline_extract_file_borrowed(ctx, &files[i], "sequential_definitions_source",
+                                               &result) != 0) {
+            if (owns_local_cache) {
+                for (int j = 0; j < file_count; j++) {
+                    cbm_free_result(local_cache[j]);
+                }
+                free(local_cache);
             }
-            /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */
-            continue;
+            return CBM_NOT_FOUND;
         }
-
-        /* Extract */
-        CBMFileResult *result = cbm_extract_file_at_path_with_metadata_context(
-            source, source_len, lang, ctx->project_name, rel, path,
-            cbm_pxc_rust_edition_for_file(ctx, rel), cbm_pxc_rust_is_crate_root(ctx, rel),
-            files[i].structured_classification[0] ? files[i].structured_classification : NULL,
-            files[i].structured_classification_provenance[0]
-                ? files[i].structured_classification_provenance
-                : NULL,
-            cbm_parse_budget_micros((size_t)source_len),
-            cbm_compile_context_for_file(ctx->compile_contexts, rel));
-        free(source);
-
-        if (!result) {
-            errors++;
-            cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
+        if (!result) { /* exact empty source */
             continue;
         }
         /* The shared extraction barrier reads the structured result directly,
@@ -909,8 +809,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
             total_imports += create_import_edges_for_file(ctx, result, &files[i], NULL);
-            char *module_qn =
-                cbm_pipeline_fqn_module_dir(ctx->project_name, rel, pd_module_is_dir(lang));
+            char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
+                                                          pd_module_is_dir(files[i].language));
             create_channel_edges_for_file(ctx, result, rel, module_qn);
             create_env_configures_for_file(ctx, result, rel, module_qn);
             free(module_qn);

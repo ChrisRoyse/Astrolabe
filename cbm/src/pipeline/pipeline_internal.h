@@ -758,9 +758,18 @@ size_t cbm_pipeline_append_args_json(char *buf, size_t bufsize, size_t pos, cons
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count);
 
-/* Read exactly the discovery-observed file bytes. The caller owns the returned
- * allocation. A concurrent size/content transition is a structured hard failure. */
-uint8_t *cbm_pipeline_read_file_identity_bytes(const cbm_file_info_t *file, size_t *out_len);
+/* Borrow one exact generation-owned source entry by its stable file binding.
+ * A positional/local-array lookup is deliberately unavailable: subset views
+ * must retain source_slab_index and match the slab's bound relative path. */
+int cbm_pipeline_borrow_source(cbm_pipeline_t *pipeline, const cbm_source_slab_t *slab,
+                               const cbm_file_info_t *file, const char *operation,
+                               const uint8_t **out_source, size_t *out_len);
+
+/* Extract one file from the same immutable slab entry used by structure and
+ * cross-LSP. Exact empty source is a successful no-result; every binding or
+ * allocation failure is a terminal structured pipeline error. */
+int cbm_pipeline_extract_file_borrowed(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                                       const char *operation, CBMFileResult **out_result);
 
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
@@ -839,8 +848,8 @@ int cbm_pipeline_verify_live_store_before_publication(cbm_pipeline_t *p, const c
  * complete persisted hash set. This function takes ownership of store/stored,
  * classifies exact captured SHA-256 values, and opens no live writer. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count, cbm_store_t *store, cbm_file_hash_t *stored,
-                                 int stored_count);
+                                 int file_count, const cbm_source_slab_t *source_slab,
+                                 cbm_store_t *store, cbm_file_hash_t *stored, int stored_count);
 
 enum { CBM_INCREMENTAL_REBUILD_REQUIRED = 2 };
 
@@ -850,7 +859,6 @@ uint64_t cbm_pipeline_generation_observed_at_ms(const cbm_pipeline_t *p);
 const char *cbm_pipeline_source_root(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 cbm_compile_context_index_t *cbm_pipeline_compile_contexts(const cbm_pipeline_t *p);
-const cbm_source_slab_t *cbm_pipeline_current_source_slab(const cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);

@@ -1,7 +1,7 @@
 /*
  * pass_usages.c — Resolve usages, throws, and read/write edges.
  *
- * For each file, re-extracts and resolves:
+ * For each file, reuses the retained extraction or borrows the immutable source and resolves:
  *   - USAGE edges: identifier references (not calls) to registered symbols
  *   - THROWS/RAISES edges: exception types
  *   - READS/WRITES edges: variable read/write access patterns
@@ -33,36 +33,6 @@
  * so same-module resolution keys against the directory-based def-node QNs. */
 static bool pu_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
-}
-
-/* Read file into heap buffer. Caller must free(). */
-static char *read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        return NULL;
-    }
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
 }
 
 static const char *itoa_log(int val) {
@@ -295,7 +265,6 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
             return CBM_NOT_FOUND;
         }
 
-        const char *path = files[i].path;
         const char *rel = files[i].rel_path;
 
         CBMFileResult *result = NULL;
@@ -304,20 +273,14 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
             result = ctx->result_cache[i];
         }
         if (!result) {
-            int source_len = 0;
-            char *source = read_file(path, &source_len);
-            if (!source) {
-                errors++;
+            if (ctx->result_cache) { /* exact empty source */
                 continue;
             }
-            result = cbm_extract_file_at_path_with_rust_edition(
-                source, source_len, files[i].language, ctx->project_name, rel, files[i].path,
-                cbm_pxc_rust_edition_for_file(ctx, rel),
-                cbm_pxc_rust_is_crate_root(ctx, rel),
-                cbm_parse_budget_micros((size_t)source_len), NULL, NULL);
-            free(source);
+            if (cbm_pipeline_extract_file_borrowed(ctx, &files[i], "sequential_usages_source",
+                                                   &result) != 0) {
+                return CBM_NOT_FOUND;
+            }
             if (!result) {
-                errors++;
                 continue;
             }
             result_owned = true;

@@ -1519,27 +1519,13 @@ static int parse_embedded_commands(cbm_pipeline_ctx_t *ctx,
                                 "source discovery",
                                 "repair discovery exclusions or regenerate the build context");
         }
-        ptrdiff_t translation_unit_index = translation_unit - source_files;
-        if (translation_unit_index < 0 || translation_unit_index >= source_count) {
-            free_string_array(arguments, argument_count);
-            return context_fail(
-                ctx, "CBM_COMPILE_CONTEXT_TU_SOURCE_INVALID", "bind_translation_unit_source",
-                file, 0,
-                "the consuming translation unit has no stable immutable source-slab index",
-                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
-        }
         size_t entry_source_len = 0;
-        const uint8_t *entry_source =
-            cbm_source_slab_get(ctx->source_slab, (int)translation_unit_index,
-                                &entry_source_len);
-        if (!entry_source || entry_source_len > (size_t)INT_MAX ||
-            entry_source_len != (size_t)translation_unit->size) {
+        const uint8_t *entry_source = NULL;
+        if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, translation_unit,
+                                       "bind_translation_unit_source", &entry_source,
+                                       &entry_source_len) != 0) {
             free_string_array(arguments, argument_count);
-            return context_fail(
-                ctx, "CBM_COMPILE_CONTEXT_TU_SOURCE_INVALID", "bind_translation_unit_source",
-                file, entry_source_len,
-                "the consuming translation unit is absent or inconsistent in the immutable source slab",
-                "preserve the source-slab diagnostic and retry the complete unchanged corpus");
+            return CBM_NOT_FOUND;
         }
         owner->view.entry_path = translation_unit->path;
         owner->view.entry_source = (const char *)entry_source;

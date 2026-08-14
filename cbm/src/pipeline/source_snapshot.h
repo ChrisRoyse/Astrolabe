@@ -13,12 +13,14 @@ typedef struct {
 
 /* One content-addressed, immutable in-memory view of the captured source
  * corpus. Every entry is NUL-terminated for parsers that inspect text while
- * its authoritative length remains byte-exact. Offsets follow the caller's
- * file order, so no path lookup or per-consumer source copy is required. */
+ * its authoritative length remains byte-exact. Each index is bound to an exact
+ * relative path; copied/subset file views retain that stable index rather than
+ * reinterpreting their local position. */
 typedef struct {
     uint8_t *bytes;
     size_t *offsets;
     size_t *lengths;
+    const char **rel_paths;
     size_t source_bytes;
     size_t storage_bytes;
     size_t allocated_bytes;
@@ -56,11 +58,6 @@ int cbm_source_snapshot_destroy(cbm_source_snapshot_t *snapshot);
  * failure slab remains empty and no consumer can observe a partial corpus. */
 int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
                           uint64_t progress_total, cbm_source_slab_t *slab);
-
-/* Borrow one immutable entry. Returns NULL for an invalid index or malformed
- * slab; an exact empty source returns a non-NULL pointer with length zero. */
-const uint8_t *cbm_source_slab_get(const cbm_source_slab_t *slab, int file_index,
-                                   size_t *out_len);
 
 void cbm_source_slab_destroy(cbm_source_slab_t *slab);
 

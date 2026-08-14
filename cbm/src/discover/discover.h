@@ -104,6 +104,11 @@ typedef struct {
     char structured_classification[16];
     char structured_classification_provenance[128];
     uint8_t structured_classification_rank;
+    /* Stable index into the generation-owned immutable source slab. Discovery
+     * initializes this to -1; the source-only view binds it exactly once. A
+     * copied/subset file record retains the same index, so consumers never
+     * reinterpret their local array position as source identity. */
+    int source_slab_index;
 } cbm_file_info_t;
 
 /* True for files that affect source interpretation even when they are not

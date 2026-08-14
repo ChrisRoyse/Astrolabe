@@ -1330,7 +1330,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
 
     int processed = 0;
     int skipped_no_lsp = 0;
-    int skipped_no_source = 0;
+    int empty_source = 0;
     int per_lang_calls = 0;
 
     for (int i = 0; i < file_count; i++) {
@@ -1342,13 +1342,20 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
             continue;
         }
 
-        int source_len = 0;
-        char *source = pxc_read_file(files[i].path, &source_len);
-        if (!source || source_len <= 0) {
-            free(source);
-            skipped_no_source++;
+        size_t source_size = 0;
+        const uint8_t *source_bytes = NULL;
+        if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, &files[i],
+                                       "sequential_cross_lsp_source", &source_bytes,
+                                       &source_size) != 0) {
+            status = CBM_NOT_FOUND;
+            goto cleanup;
+        }
+        if (source_size == 0) {
+            empty_source++;
             continue;
         }
+        const char *source = (const char *)source_bytes;
+        int source_len = (int)source_size;
 
         if (!def_modules[i]) {
             def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
@@ -1360,7 +1367,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                               files[i].rel_path ? files[i].rel_path : "<unknown>", "message",
                               "cross-LSP could not retain a module identity", "remediation",
                               "free memory or reduce repository size, then retry");
-                free(source);
                 status = -1;
                 goto cleanup;
             }
@@ -1371,7 +1377,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         int imp_count = 0;
         if (cbm_pipeline_import_map_build(ctx->pipeline, ctx->gbuf, ctx->project_name, files[i].rel_path,
                                           &imp_keys, &imp_vals, &imp_count) != 0) {
-            free(source);
             status = -1;
             goto cleanup;
         }
@@ -1380,7 +1385,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                                   def_modules[i], &cross_registries, module_def_index, all_defs,
                                   def_count, imp_keys, imp_vals, imp_count, ctx->rust_manifest) != 0) {
             cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
-            free(source);
             status = -1;
             goto cleanup;
         }
@@ -1395,7 +1399,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                           requested, "message", "cross-LSP file resolution allocation failed",
                           "remediation", "free memory or reduce repository size, then retry");
             cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
-            free(source);
             status = -1;
             goto cleanup;
         }
@@ -1403,7 +1406,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         processed++;
 
         cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
-        free(source);
     }
 
 cleanup:
@@ -1417,8 +1419,8 @@ cleanup:
 
     if (status == 0) {
         cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),
-                     "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",
-                     itoa_buf(skipped_no_source), "defs_total", itoa_buf(def_count), "lsp_calls",
+                     "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_empty_source",
+                     itoa_buf(empty_source), "defs_total", itoa_buf(def_count), "lsp_calls",
                      itoa_buf(per_lang_calls));
     }
     return status;

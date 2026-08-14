@@ -1960,13 +1960,14 @@ void cbm_source_slab_destroy(cbm_source_slab_t *slab) {
     free(slab->bytes);
     free(slab->offsets);
     free(slab->lengths);
+    free(slab->rel_paths);
     memset(slab, 0, sizeof(*slab));
 }
 
 int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
                           uint64_t progress_total, cbm_source_slab_t *slab) {
     if (!slab || file_count <= 0 || !files || slab->bytes || slab->offsets || slab->lengths ||
-        slab->file_count != 0 || progress_total < (uint64_t)file_count) {
+        slab->rel_paths || slab->file_count != 0 || progress_total < (uint64_t)file_count) {
         source_slab_log_failure(
             "CBM_SOURCE_SLAB_INVALID_ARGUMENT", "validate", "", 0, 0, 0,
             "the immutable source slab request is incomplete or already initialized",
@@ -1985,13 +1986,15 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     size_t storage_bytes = 0;
     long max_file_bytes = cbm_max_file_bytes();
     for (int i = 0; i < file_count; i++) {
-        if (!files[i].path || !files[i].rel_path || files[i].size < 0 ||
-            (uint64_t)files[i].size > (uint64_t)INT_MAX ||
+        if (!files[i].path || !files[i].rel_path || files[i].source_slab_index != i ||
+            files[i].size < 0 || (uint64_t)files[i].size > (uint64_t)INT_MAX ||
             (max_file_bytes > 0 && files[i].size > max_file_bytes)) {
             source_slab_log_failure(
                 "CBM_SOURCE_SLAB_FILE_INVALID", "measure_file", files[i].path, 0, 0, 0,
-                "one captured source cannot be represented by the authoritative parser contract",
-                "inspect the captured size/path and configured maximum, then retry unchanged");
+                "one captured source lacks its exact stable slab index or cannot be represented by "
+                "the authoritative parser contract",
+                "rebuild the ordered source-only view and inspect its captured size/path before "
+                "retrying unchanged");
             return CBM_NOT_FOUND;
         }
         size_t length = (size_t)files[i].size;
@@ -2007,15 +2010,17 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     }
 
     size_t index_bytes = (size_t)file_count * sizeof(size_t);
+    size_t path_index_bytes = (size_t)file_count * sizeof(const char *);
     if (storage_bytes > SIZE_MAX - index_bytes ||
-        storage_bytes + index_bytes > SIZE_MAX - index_bytes) {
+        storage_bytes + index_bytes > SIZE_MAX - index_bytes ||
+        storage_bytes + (index_bytes * 2) > SIZE_MAX - path_index_bytes) {
         source_slab_log_failure("CBM_SOURCE_SLAB_ALLOCATION_OVERFLOW", "measure_allocation", "",
                                 SIZE_MAX, 0, 0,
                                 "the source slab and its exact index exceed addressable memory",
                                 "split the corpus into an addressable project boundary and retry");
         return CBM_NOT_FOUND;
     }
-    size_t allocated_bytes = storage_bytes + (index_bytes * 2);
+    size_t allocated_bytes = storage_bytes + (index_bytes * 2) + path_index_bytes;
     size_t budget = cbm_mem_budget();
     size_t rss = cbm_mem_rss();
     size_t machine_available = cbm_mem_available();
@@ -2035,7 +2040,8 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     candidate.bytes = malloc(storage_bytes);
     candidate.offsets = malloc(index_bytes);
     candidate.lengths = malloc(index_bytes);
-    if (!candidate.bytes || !candidate.offsets || !candidate.lengths) {
+    candidate.rel_paths = malloc(path_index_bytes);
+    if (!candidate.bytes || !candidate.offsets || !candidate.lengths || !candidate.rel_paths) {
         source_slab_log_failure("CBM_SOURCE_SLAB_ALLOC_FAILED", "allocate", "", allocated_bytes,
                                 process_headroom, machine_available,
                                 "the admitted immutable source slab allocation failed",
@@ -2051,6 +2057,7 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
         size_t length = (size_t)files[i].size;
         candidate.offsets[i] = cursor;
         candidate.lengths[i] = length;
+        candidate.rel_paths[i] = files[i].rel_path;
         FILE *stream = cbm_fopen(files[i].path, "rb");
         if (!stream) {
             source_slab_log_failure(
@@ -2125,26 +2132,6 @@ int cbm_source_slab_build(const cbm_file_info_t *files, int file_count,
     cbm_log_info("source_slab.complete", "files", files_text, "source_bytes", source_text,
                  "allocated_bytes", allocated_text, "sha256", slab->sha256);
     return 0;
-}
-
-const uint8_t *cbm_source_slab_get(const cbm_source_slab_t *slab, int file_index, size_t *out_len) {
-    if (out_len) {
-        *out_len = 0;
-    }
-    if (!slab || !slab->bytes || !slab->offsets || !slab->lengths || file_index < 0 ||
-        file_index >= slab->file_count) {
-        return NULL;
-    }
-    size_t offset = slab->offsets[file_index];
-    size_t length = slab->lengths[file_index];
-    if (offset > slab->storage_bytes || length > slab->storage_bytes - offset ||
-        offset + length >= slab->storage_bytes || slab->bytes[offset + length] != 0) {
-        return NULL;
-    }
-    if (out_len) {
-        *out_len = length;
-    }
-    return slab->bytes + offset;
 }
 
 #else

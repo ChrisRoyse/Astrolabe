@@ -1724,6 +1724,7 @@ pub struct cbm_file_info_t {
     pub structured_classification: [::std::os::raw::c_char; 16usize],
     pub structured_classification_provenance: [::std::os::raw::c_char; 128usize],
     pub structured_classification_rank: u8,
+    pub source_slab_index: ::std::os::raw::c_int,
 }
 impl Default for cbm_file_info_t {
     fn default() -> Self {

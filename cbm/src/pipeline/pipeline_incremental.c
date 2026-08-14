@@ -1155,18 +1155,18 @@ cleanup:
 /* ── Incremental pipeline entry point ────────────────────────────── */
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count, cbm_store_t *store, cbm_file_hash_t *stored,
-                                 int stored_count) {
+                                 int file_count, const cbm_source_slab_t *source_slab,
+                                 cbm_store_t *store, cbm_file_hash_t *stored, int stored_count) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
     const char *project = cbm_pipeline_project_name(p);
 
-    if (!store || stored_count < 0 || (stored_count > 0 && !stored)) {
+    if (!source_slab || !store || stored_count < 0 || (stored_count > 0 && !stored)) {
         cbm_log_error("incremental.err", "code", "CBM_INCREMENTAL_VERIFIED_INPUT_MISSING", "path",
                       db_path, "message",
-                      "incremental execution requires an already verified read-only store and "
-                      "complete hash set",
+                      "incremental execution requires the immutable generation source slab, an "
+                      "already verified read-only store, and the complete hash set",
                       "remediation", "repair the routing contract and retry the complete corpus");
         if (store) {
             cbm_store_close_required(&store, "incremental.invalid_verified_input");
@@ -1540,7 +1540,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .source_root = cbm_pipeline_source_root(p),
         .all_files = files,
         .all_file_count = file_count,
-        .source_slab = cbm_pipeline_current_source_slab(p),
+        .source_slab = source_slab,
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
@@ -1582,18 +1582,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                 break;
             }
             size_t source_len = 0;
-            uint8_t *source_bytes =
-                cbm_pipeline_read_file_identity_bytes(&changed_files[i], &source_len);
+            const uint8_t *source_bytes = NULL;
+            int source_status =
+                cbm_pipeline_borrow_source(p, ctx.source_slab, &changed_files[i],
+                                           "replace_changed_file_atom", &source_bytes, &source_len);
             int64_t file_id =
-                source_bytes
-                    ? cbm_gbuf_upsert_source_node(existing, "File", basename, file_qn,
-                                                  changed_files[i].rel_path, 0, 0, source_bytes,
-                                                  source_len, 0, (uint64_t)source_len, props)
+                source_status == 0
+                    ? cbm_gbuf_upsert_source_node_borrowed(
+                          existing, "File", basename, file_qn, changed_files[i].rel_path, 0, 0,
+                          source_bytes, source_len, 0, (uint64_t)source_len, props)
                     : 0;
             if (props_heap_owned) {
                 free(props);
             }
-            free(source_bytes);
             free(file_qn);
             if (file_id <= 0) {
                 file_source_failed = true;

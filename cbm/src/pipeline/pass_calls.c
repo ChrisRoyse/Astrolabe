@@ -49,41 +49,6 @@ static bool pc_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
 
-/* Read entire file into heap-allocated buffer. Caller must free(). */
-static char *read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-
-    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        return NULL;
-    }
-
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
-}
-
 /* Format int for logging. Thread-safe via TLS. */
 static const char *itoa_log(int val) {
     static CBM_TLS char bufs[PC_RING][CBM_SZ_32];
@@ -550,27 +515,21 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     return SKIP_ONE;
 }
 
-static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
-                                           const cbm_file_info_t *fi, bool *owned) {
+static int calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx, const cbm_file_info_t *fi,
+                                CBMFileResult **out_result, bool *owned) {
+    *out_result = NULL;
     *owned = false;
-    if (ctx->result_cache && ctx->result_cache[idx]) {
-        return ctx->result_cache[idx];
+    if (ctx->result_cache) {
+        *out_result = ctx->result_cache[idx];
+        return 0;
     }
-    int slen = 0;
-    char *src = read_file(fi->path, &slen);
-    if (!src) {
-        return NULL;
+    if (cbm_pipeline_extract_file_borrowed(ctx, fi, "sequential_calls_source", out_result) != 0) {
+        return CBM_NOT_FOUND;
     }
-    CBMFileResult *r = cbm_extract_file_at_path_with_rust_edition(
-        src, slen, fi->language, ctx->project_name, fi->rel_path, fi->path,
-        cbm_pxc_rust_edition_for_file(ctx, fi->rel_path),
-        cbm_pxc_rust_is_crate_root(ctx, fi->rel_path),
-        cbm_parse_budget_micros((size_t)slen), NULL, NULL);
-    free(src);
-    if (r) {
+    if (*out_result) {
         *owned = true;
     }
-    return r;
+    return 0;
 }
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
@@ -589,9 +548,11 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
         const char *rel = files[i].rel_path;
         bool result_owned = false;
-        CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
+        CBMFileResult *result = NULL;
+        if (calls_get_or_extract(ctx, i, &files[i], &result, &result_owned) != 0) {
+            return CBM_NOT_FOUND;
+        }
         if (!result) {
-            errors++;
             continue;
         }
 
@@ -780,12 +741,18 @@ int cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_in
             continue;
         }
 
-        /* Read source and scan for Depends(func_ref) in function signatures */
-        int source_len = 0;
-        char *source = read_file(files[i].path, &source_len);
-        if (!source) {
+        /* Scan the same immutable source used by extraction for Depends(func_ref). */
+        size_t source_len = 0;
+        const uint8_t *source_bytes = NULL;
+        if (cbm_pipeline_borrow_source(ctx->pipeline, ctx->source_slab, &files[i],
+                                       "fastapi_depends_source", &source_bytes, &source_len) != 0) {
+            status = CBM_NOT_FOUND;
+            break;
+        }
+        if (source_len == 0) {
             continue;
         }
+        const char *source = (const char *)source_bytes;
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
                                                       pc_module_is_dir(files[i].language));
@@ -797,7 +764,6 @@ int cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_in
         if (cbm_pipeline_import_map_build(ctx->pipeline, ctx->gbuf, ctx->project_name, files[i].rel_path,
                                           &imp_keys, &imp_vals, &imp_count) != 0) {
             free(module_qn);
-            free(source);
             status = CBM_NOT_FOUND;
             break;
         }
@@ -820,7 +786,6 @@ int cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_in
 
         free(module_qn);
         cbm_pipeline_import_map_free(imp_keys, imp_vals, imp_count);
-        free(source);
     }
 
     cbm_regfree(&depends_re);
