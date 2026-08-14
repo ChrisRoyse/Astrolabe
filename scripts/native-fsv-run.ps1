@@ -2784,7 +2784,20 @@ function Get-AstroCohortStoreMember {
 
         $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::Read)
         $lengthBefore = [uint64]$stream.Length
-        $sha256 = [AstroLauncherLockNative]::ComputeOrdinaryFileSha256($handle)
+        try {
+            $sha256 = [AstroLauncherLockNative]::ComputeOrdinaryFileSha256($handle)
+        }
+        catch [Management.Automation.MethodInvocationException] {
+            $cause = $_.Exception
+            while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+            if ($cause -is [InvalidOperationException] -and $cause.Message -ceq
+                'exact retained digest-source size changed during hashing') {
+                Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_STATE_DRIFT' `
+                    "SQLite family member size changed inside the retained hash (path=$full; bytes_before=$lengthBefore; helper_exception=$($cause.GetType().FullName); helper_message=$($cause.Message))" `
+                    'preserve every family byte and inspect the writer that changed the retained member during hashing'
+            }
+            throw
+        }
         $lengthAfter = [uint64]$stream.Length
         $fileIdAfter = [AstroLauncherLockNative]::GetFileIdentity($handle)
         $finalPathAfter = ConvertFrom-AstroNativeFinalPath (
