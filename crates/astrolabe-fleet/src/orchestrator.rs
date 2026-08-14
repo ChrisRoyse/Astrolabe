@@ -75,8 +75,8 @@ use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{
-    JobGuard, Selection, child_working_set_bytes, git_capture, safe_reason,
-    silence_credential_prompts,
+    JobGuard, Selection, child_process_start_utc_ticks, child_working_set_bytes, git_capture,
+    safe_reason, silence_credential_prompts,
 };
 use crate::record::{FleetRepoRow, TransitionContext};
 use crate::state::RepoState;
@@ -376,6 +376,9 @@ pub struct RepoVerdict {
     pub github_id: u64,
     /// What happened.
     pub outcome: Outcome,
+    /// Exact generation of the real product child, captured from its retained
+    /// Windows handle immediately after spawn. `None` means no child existed.
+    pub pipeline_child: Option<PipelineChildGeneration>,
     /// Failing stage when quarantined (`preflight`, `pipeline`, `timeout`,
     /// `parse`, `kernel`, `verify`).
     pub stage: Option<String>,
@@ -413,6 +416,16 @@ pub struct RepoVerdict {
     pub secs: f64,
 }
 
+/// Exact identity of one fleet-owned product child. A numeric PID is never
+/// sufficient on its own because Windows may reuse it after process exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PipelineChildGeneration {
+    /// Process identifier assigned by Windows.
+    pub pid: u32,
+    /// Creation `FILETIME` from the retained process handle.
+    pub process_start_utc_ticks: u64,
+}
+
 /// What one worker produced (thread → main).
 struct JobResult {
     row: FleetRepoRow,
@@ -424,6 +437,20 @@ struct JobResult {
     transitions: Vec<(RepoState, TransitionContext)>,
     /// `--force` fact refresh instead of transitions.
     fact_refresh: Option<TransitionContext>,
+}
+
+fn with_pipeline_child(
+    mut result: JobResult,
+    pipeline_child: PipelineChildGeneration,
+) -> JobResult {
+    result.verdict.pipeline_child = Some(pipeline_child);
+    if let Some(rejection) = result.rejection_text.as_mut() {
+        *rejection = format!(
+            "pipeline child: pid={} process_start_utc_ticks={}\n{rejection}",
+            pipeline_child.pid, pipeline_child.process_start_utc_ticks
+        );
+    }
+    result
 }
 
 /// One pass's persisted report plus its would-be fail-closed refusal, for
@@ -499,6 +526,7 @@ pub fn run_pipeline_pass_outcome(
                         full_name: row.record.full_name.clone(),
                         github_id: row.record.github_id,
                         outcome: Outcome::SkippedState,
+                        pipeline_child: None,
                         stage: None,
                         detail: format!(
                             "state {} is not a pipeline source state (cloned|indexed|kerneled)",
@@ -1008,6 +1036,7 @@ fn pipeline_job(
         full_name: row.record.full_name.clone(),
         github_id: row.record.github_id,
         outcome,
+        pipeline_child: None,
         stage: stage.map(str::to_string),
         detail,
         head_commit_hash: None,
@@ -1218,15 +1247,37 @@ fn pipeline_job(
             );
         }
     };
+    let pipeline_child = match child_process_start_utc_ticks(&child) {
+        Ok(process_start_utc_ticks) => PipelineChildGeneration {
+            pid: child.id(),
+            process_start_utc_ticks,
+        },
+        Err(detail) => {
+            let pid = child.id();
+            let _ = child.kill();
+            let status = child.wait();
+            return fail(
+                "pipeline",
+                detail,
+                Some(format!(
+                    "repo: {}\nphase: child identity admission\npid: {pid}\ntermination after identity refusal: {status:?}\n",
+                    row.record.full_name
+                )),
+            );
+        }
+    };
     let _job = match JobGuard::assign(&child) {
         Ok(guard) => guard,
         Err(why) => {
             let _ = child.kill();
             let _ = child.wait();
-            return fail(
-                "pipeline",
-                format!("could not tie the pipeline child to a job object: {why}"),
-                None,
+            return with_pipeline_child(
+                fail(
+                    "pipeline",
+                    format!("could not tie the pipeline child to a job object: {why}"),
+                    None,
+                ),
+                pipeline_child,
             );
         }
     };
@@ -1235,8 +1286,9 @@ fn pipeline_job(
     // Windows process's working set reads stale once it exits, so the peak MUST be
     // captured live; keeping the max here means it survives the child's death and is
     // available for the structured failure detail when a child vanishes without a tool
-    // result (the rc=127 case this issue tracks). One cheap GetProcessMemoryInfo per
-    // 500 ms poll — negligible against a multi-minute index.
+    // result (the rc=127 case this issue tracks). GetProcessMemoryInfo runs once per
+    // existing 500 ms poll. Exact child identity is hoisted once above and is invariant
+    // across this loop (PC-35/PC-38, #1064).
     let mut peak_ws: u64 = 0;
     let mut peak_ws_seen = false;
     let child_timeout_secs = config
@@ -1244,12 +1296,15 @@ fn pipeline_job(
         .checked_add(config.timeout_secs)
         .expect("pipeline configuration was validated before worker dispatch");
     let Some(deadline) = Instant::now().checked_add(Duration::from_secs(child_timeout_secs)) else {
-        return fail(
-            "preflight",
-            format!(
-                "{ASTRO_FLEET_PIPELINE_CONFIG}: combined child deadline {child_timeout_secs}s is not representable by the Windows monotonic clock"
+        return with_pipeline_child(
+            fail(
+                "preflight",
+                format!(
+                    "{ASTRO_FLEET_PIPELINE_CONFIG}: combined child deadline {child_timeout_secs}s is not representable by the Windows monotonic clock"
+                ),
+                None,
             ),
-            None,
+            pipeline_child,
         );
     };
     let status = loop {
@@ -1272,10 +1327,13 @@ fn pipeline_job(
                 thread::sleep(CHILD_POLL);
             }
             Err(error) => {
-                return fail(
-                    "pipeline",
-                    format!("waiting on pipeline child: {error}"),
-                    None,
+                return with_pipeline_child(
+                    fail(
+                        "pipeline",
+                        format!("waiting on pipeline child: {error}"),
+                        None,
+                    ),
+                    pipeline_child,
                 );
             }
         }
@@ -1297,19 +1355,27 @@ fn pipeline_job(
         "<unavailable>".to_string()
     };
     let Some(status) = status else {
-        return fail(
-            "timeout",
-            format!(
-                "pipeline child exceeded the combined {}s admission + {}s pipeline budgets and was killed (job-object confined); last phase={phase_label}; peak RSS={mem_label}",
-                config.host_admission_timeout_secs, config.timeout_secs
+        return with_pipeline_child(
+            fail(
+                "timeout",
+                format!(
+                    "pipeline child pid={}/{} exceeded the combined {}s admission + {}s pipeline budgets and was killed (job-object confined); last phase={phase_label}; peak RSS={mem_label}",
+                    pipeline_child.pid,
+                    pipeline_child.process_start_utc_ticks,
+                    config.host_admission_timeout_secs,
+                    config.timeout_secs
+                ),
+                Some(format!(
+                    "repo: {}\npipeline child: pid={} process_start_utc_ticks={}\nphase: timeout after {}s admission + {}s pipeline budgets\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstderr tail:\n{}\n",
+                    row.record.full_name,
+                    pipeline_child.pid,
+                    pipeline_child.process_start_utc_ticks,
+                    config.host_admission_timeout_secs,
+                    config.timeout_secs,
+                    tail(&stderr_text, 4000)
+                )),
             ),
-            Some(format!(
-                "repo: {}\nphase: timeout after {}s admission + {}s pipeline budgets\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstderr tail:\n{}\n",
-                row.record.full_name,
-                config.host_admission_timeout_secs,
-                config.timeout_secs,
-                tail(&stderr_text, 4000)
-            )),
+            pipeline_child,
         );
     };
     let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
@@ -1319,6 +1385,7 @@ fn pipeline_job(
                 return JobResult {
                     row: row.clone(),
                     verdict: RepoVerdict {
+                        pipeline_child: Some(pipeline_child),
                         head_commit_hash: Some(head),
                         index_admission: Some(index_admission.clone()),
                         secs: started.elapsed().as_secs_f64(),
@@ -1339,15 +1406,20 @@ fn pipeline_job(
             }
             Ok(None) => {}
             Err(detail) => {
-                return fail(
-                    "parse",
-                    format!("malformed CBM_INDEX_HOST_BUSY envelope: {detail}"),
-                    Some(format!(
-                        "repo: {}\nphase: malformed host admission envelope\nstdout:\n{}\nstderr tail:\n{}\n",
-                        row.record.full_name,
-                        head_of(&stdout_text, 8000),
-                        tail(&stderr_text, 8000)
-                    )),
+                return with_pipeline_child(
+                    fail(
+                        "parse",
+                        format!("malformed CBM_INDEX_HOST_BUSY envelope: {detail}"),
+                        Some(format!(
+                            "repo: {}\npipeline child: pid={} process_start_utc_ticks={}\nphase: malformed host admission envelope\nstdout:\n{}\nstderr tail:\n{}\n",
+                            row.record.full_name,
+                            pipeline_child.pid,
+                            pipeline_child.process_start_utc_ticks,
+                            head_of(&stdout_text, 8000),
+                            tail(&stderr_text, 8000)
+                        )),
+                    ),
+                    pipeline_child,
                 );
             }
         }
@@ -1358,20 +1430,35 @@ fn pipeline_job(
         // with the exit code, the last phase the child announced, and its peak resident
         // working set — a structured {code,message,remediation}-grade detail that names
         // the phase and the resource cost even when the child produced no result at all.
-        return fail(
-            "pipeline",
-            format!(
-                "pipeline child exited without a tool result ({status}); last phase={phase_label}; peak RSS={mem_label}; stdout head: {}",
-                safe_reason(&head_of(&stdout_text, 200))
+        return with_pipeline_child(
+            fail(
+                "pipeline",
+                format!(
+                    "pipeline child pid={}/{} exited without a tool result ({status}); last phase={phase_label}; peak RSS={mem_label}; stdout head: {}",
+                    pipeline_child.pid,
+                    pipeline_child.process_start_utc_ticks,
+                    safe_reason(&head_of(&stdout_text, 200))
+                ),
+                Some(format!(
+                    "repo: {}\npipeline child: pid={} process_start_utc_ticks={}\nphase: child exit {status}\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstdout head:\n{}\nstderr tail:\n{}\n",
+                    row.record.full_name,
+                    pipeline_child.pid,
+                    pipeline_child.process_start_utc_ticks,
+                    head_of(&stdout_text, 8000),
+                    tail(&stderr_text, 8000)
+                )),
             ),
-            Some(format!(
-                "repo: {}\nphase: child exit {status}\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstdout head:\n{}\nstderr tail:\n{}\n",
-                row.record.full_name,
-                head_of(&stdout_text, 8000),
-                tail(&stderr_text, 8000)
-            )),
+            pipeline_child,
         );
     }
+
+    // Every result below this point belongs to the exact child generation
+    // captured above. Shadow the pre-spawn failure constructor so parse,
+    // identity, persisted-readback, and result-contract refusals cannot omit
+    // that generation from either the verdict or its rejection receipt.
+    let fail = |stage: &str, detail: String, rejection: Option<String>| {
+        with_pipeline_child(fail(stage, detail, rejection), pipeline_child)
+    };
 
     // Parse the MCP envelope strictly.
     let envelope: Value = match serde_json::from_str(&stdout_text) {
@@ -1626,6 +1713,7 @@ fn pipeline_job(
     JobResult {
         row: row.clone(),
         verdict: RepoVerdict {
+            pipeline_child: Some(pipeline_child),
             full_name: row.record.full_name.clone(),
             github_id: row.record.github_id,
             outcome,

@@ -825,9 +825,48 @@ impl JobGuard {
     }
 }
 
+/// Exact Windows generation of a child while its owned process handle is live.
+///
+/// The returned value is the process creation `FILETIME`: a 64-bit count of
+/// 100-nanosecond intervals since 1601, matching the existing Astrolabe
+/// `process_start_utc_ticks` product contract. Failure is terminal for a
+/// supervised product child: a PID without its creation time is not an exact
+/// identity and must never be persisted as though it were one.
+pub(crate) fn child_process_start_utc_ticks(child: &std::process::Child) -> Result<u64, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{FILETIME, GetLastError};
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the process handle is borrowed from the live `Child`, and all
+    // four output pointers name initialized, correctly sized FILETIME values.
+    let ok = unsafe {
+        GetProcessTimes(
+            child.as_raw_handle(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: GetLastError has no preconditions and is read immediately
+        // after the failed native call.
+        let native_error = unsafe { GetLastError() };
+        return Err(format!(
+            "ASTRO_FLEET_PIPELINE_CHILD_IDENTITY_UNAVAILABLE: GetProcessTimes failed for owned child pid={} (native_error={native_error}); remediation: terminate and reap this unattributed child, preserve its captures, and inspect the Windows process-handle failure before retrying",
+            child.id()
+        ));
+    }
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
 /// Current resident working-set (RSS) bytes of a LIVE child, read from its process
-/// handle via `K32GetProcessMemoryInfo` (#515). A single cheap syscall on the handle
-/// the `Child` already owns. Must be sampled while the process is alive — a Windows
+/// handle via `K32GetProcessMemoryInfo` (#515), once per existing wait-loop poll.
+/// Must be sampled while the process is alive — a Windows
 /// process's working set is torn down at exit and reads stale afterward — so the
 /// caller polls this during its existing wait loop and keeps the running maximum;
 /// that captured peak then survives the child's death for the structured
