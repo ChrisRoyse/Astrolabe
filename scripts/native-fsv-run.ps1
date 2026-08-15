@@ -2796,6 +2796,11 @@ function Get-AstroCohortStoreMember {
                     "SQLite family member size changed inside the retained hash (path=$full; bytes_before=$lengthBefore; helper_exception=$($cause.GetType().FullName); helper_message=$($cause.Message))" `
                     'preserve every family byte and inspect the writer that changed the retained member during hashing'
             }
+            if ($cause -is [ComponentModel.Win32Exception]) {
+                Fail-Astro 'ASTRO_FSV_COHORT_STORE_READ_FAILED' `
+                    "could not hash retained SQLite family member (path=$full; file_id=$fileIdBefore; bytes_before=$lengthBefore; native_error=$([int]$cause.NativeErrorCode); helper_exception=$($cause.GetType().FullName); helper_message=$($cause.Message))" `
+                    'preserve the complete family and inspect the exact native read failure; do not retry or read through another path'
+            }
             throw
         }
         $lengthAfter = [uint64]$stream.Length
@@ -3572,13 +3577,15 @@ function Invoke-AstroResidentCohort {
 
         $zeroAfterIndexer = Wait-AstroCohortStoreOwners $plan.store_paths @() `
             $plan.holder_timeout_ms 'after-indexer-zero-holders'
-        $sidecarsAfterIndexer = Read-AstroCohortAuxiliaryState $plan.store_paths `
-            $plan.auxiliary_state_contract $plan.holder_timeout_ms 'after-indexer'
         $storeChronology.Add($zeroAfterIndexer)
-        $storeChronology.Add($sidecarsAfterIndexer)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
             event = 'store_zero_holder_transition'; owner_evidence = $zeroAfterIndexer
-            sidecar_evidence = $sidecarsAfterIndexer
+        })
+        $sidecarsAfterIndexer = Read-AstroCohortAuxiliaryState $plan.store_paths `
+            $plan.auxiliary_state_contract $plan.holder_timeout_ms 'after-indexer'
+        $storeChronology.Add($sidecarsAfterIndexer)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'store_auxiliary_state'; sidecar_evidence = $sidecarsAfterIndexer
         })
 
         foreach ($state in @($processStates | Where-Object role -ceq 'resident' | Sort-Object ordinal)) {
