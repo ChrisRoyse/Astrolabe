@@ -144,6 +144,10 @@ mod enabled {
             true,
         )?);
         context.attest_physical_identity()?;
+        context
+            .inner()
+            .synchronize()
+            .map_err(driver_boundary_error)?;
         let raw = RawCudaBlockDeallocator::new(Arc::clone(&context));
         let injected = InducedFailureDeallocator::new(raw.clone());
         let budgeter =
