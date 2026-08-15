@@ -188,10 +188,12 @@ Assert-Astro (
     [uint64]$happy.after.stats.reserved_bytes -eq 0 -and
     @($happy.after.allocations).Count -eq 0 -and
     [uint64]$happy.action.pointer -eq [uint64]$happy.before.allocations[0].identity.ptr.0 -and
+    [int]$happy.action.physical_absence.Absent.driver_status -eq 500 -and
+    $happy.action.physical_absence.Absent.driver_status_name -ceq 'CUDA_ERROR_NOT_FOUND' -and
     $happy.before.physical_allocations[0].state.Present.size_bytes -eq $allocationBytes -and
     $happy.after.device.free_bytes -ge $happy.before.device.free_bytes
 ) 'CALYX_FORGE_GPU_FSV_HAPPY_PATH_INVALID' `
-    'happy allocation/free did not agree across pointer, physical VRAM, registry, and accounting'
+    'happy allocation/free did not agree across pointer, documented absence status, physical VRAM, registry, and accounting'
 
 $failedPointer = [uint64]$failed.before.allocations[0].identity.ptr.0
 Assert-Astro (
@@ -218,10 +220,12 @@ Assert-Astro (
     [uint64]$recovery.after.stats.reserved_bytes -eq 0 -and
     [uint64]$recovery.after.stats.quarantined_bytes -eq 0 -and
     [bool]$recovery.after.stats.accounting_equation_valid -and
-    [uint64]$recovery.action.identity.ptr.0 -eq $failedPointer -and
+    [uint64]$recovery.action.release_receipt.identity.ptr.0 -eq $failedPointer -and
+    [int]$recovery.action.physical_absence.Absent.driver_status -eq 500 -and
+    $recovery.action.physical_absence.Absent.driver_status_name -ceq 'CUDA_ERROR_NOT_FOUND' -and
     $recovery.after.device.free_bytes -ge $recovery.before.device.free_bytes
 ) 'CALYX_FORGE_GPU_FSV_RECOVERY_INVALID' `
-    'exact recovery did not prove pointer absence and release the retained accounting record'
+    'exact recovery did not prove documented pointer absence and release the retained accounting record'
 
 $journalPath = Join-Path $payload 'allocation-journal.ndjson'
 $journalLines = [IO.File]::ReadAllLines($journalPath, [Text.Encoding]::UTF8)

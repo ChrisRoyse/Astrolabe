@@ -186,14 +186,18 @@ mod enabled {
             happy_receipt == ALLOCATION_BYTES,
             "happy eviction byte count differed from the allocation",
         )?;
-        require_absent(&raw, happy_ptr, "happy allocation after eviction")?;
+        let happy_absence = require_absent(&raw, happy_ptr, "happy allocation after eviction")?;
         let happy_after = capture_locked_state("happy_after", &registry, &raw)?;
         write_transition(
             &output_dir,
             "10-happy.json",
             "happy_cuda_free",
             &happy_before,
-            json!({"freed_bytes": happy_receipt, "pointer": happy_ptr.0}),
+            json!({
+                "freed_bytes": happy_receipt,
+                "pointer": happy_ptr.0,
+                "physical_absence": happy_absence,
+            }),
             &happy_after,
         )?;
 
@@ -284,7 +288,7 @@ mod enabled {
             quarantine_ptr,
             context.physical_identity(),
         )?;
-        require_absent(
+        let recovery_absence = require_absent(
             &raw,
             quarantine_ptr,
             "quarantined allocation after recovery",
@@ -296,7 +300,10 @@ mod enabled {
             "50-recovery.json",
             "exact_generation_recovery",
             &recovery_before,
-            serde_json::to_value(&recovery_receipt)?,
+            json!({
+                "release_receipt": recovery_receipt,
+                "physical_absence": recovery_absence,
+            }),
             &recovery_after,
         )?;
 
@@ -596,11 +603,18 @@ mod enabled {
         }
     }
 
-    fn require_absent(raw: &RawCudaBlockDeallocator, ptr: DevicePtr, label: &str) -> AnyResult<()> {
-        require(
-            raw.allocation_state(ptr)? == DeviceAllocationState::Absent,
-            &format!("{label}: CUDA pointer remained present"),
-        )
+    fn require_absent(
+        raw: &RawCudaBlockDeallocator,
+        ptr: DevicePtr,
+        label: &str,
+    ) -> AnyResult<DeviceAllocationState> {
+        let observed = raw.allocation_state(ptr)?;
+        match observed {
+            DeviceAllocationState::Absent { .. } => Ok(observed),
+            DeviceAllocationState::Present { .. } => {
+                Err(format!("{label}: CUDA pointer remained present as {observed:?}").into())
+            }
+        }
     }
 
     fn write_transition(

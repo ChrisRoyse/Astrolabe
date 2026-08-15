@@ -107,7 +107,12 @@ pub enum DeviceAllocationState {
         size_bytes: usize,
     },
     /// The CUDA driver reports that the pointer is not allocated.
-    Absent,
+    Absent {
+        /// Exact operation-specific CUDA status that proved absence.
+        driver_status: i32,
+        /// Stable CUDA enum name for the absence status.
+        driver_status_name: &'static str,
+    },
 }
 
 /// Physical CUDA operations required by the allocation registry.
@@ -197,13 +202,26 @@ impl BlockDeallocator for RawCudaBlockDeallocator {
             .inner()
             .bind_to_thread()
             .map_err(|error| cuda_operation_error("probe.bind_context", error))?;
+        self.ctx
+            .inner()
+            .synchronize()
+            .map_err(|error| cuda_operation_error("probe.cuCtxSynchronize", error))?;
         match self.memory.get_address_range(ptr.0) {
             Ok((base, size_bytes)) => Ok(DeviceAllocationState::Present {
                 base: DevicePtr(base),
                 size_bytes,
             }),
             Err(error) if error.0 == sys::CUresult::CUDA_ERROR_INVALID_VALUE => {
-                Ok(DeviceAllocationState::Absent)
+                Ok(DeviceAllocationState::Absent {
+                    driver_status: error.0 as i32,
+                    driver_status_name: "CUDA_ERROR_INVALID_VALUE",
+                })
+            }
+            Err(error) if error.0 == sys::CUresult::CUDA_ERROR_NOT_FOUND => {
+                Ok(DeviceAllocationState::Absent {
+                    driver_status: error.0 as i32,
+                    driver_status_name: "CUDA_ERROR_NOT_FOUND",
+                })
             }
             Err(error) => Err(cuda_operation_error("probe.cuMemGetAddressRange", error)),
         }
@@ -698,7 +716,7 @@ impl<'b, P: VramProbe, D: BlockDeallocator> GpuBlockRegistry<'b, P, D> {
                 "physical allocation mismatch: expected_ptr={} expected_bytes={} observed_base={} observed_bytes={size_bytes}",
                 block.identity.ptr.0, block.identity.size_bytes, base.0
             ))),
-            DeviceAllocationState::Absent => Err(identity_error(format!(
+            DeviceAllocationState::Absent { .. } => Err(identity_error(format!(
                 "physical allocation is absent at pointer {}",
                 block.identity.ptr.0
             ))),
@@ -760,8 +778,8 @@ impl<'b, P: VramProbe, D: BlockDeallocator> GpuBlockRegistry<'b, P, D> {
                 ));
                 return Err(self.pre_free_failure(key, recovery, &error));
             }
-            DeviceAllocationState::Absent if recovery => {}
-            DeviceAllocationState::Absent => {
+            DeviceAllocationState::Absent { .. } if recovery => {}
+            DeviceAllocationState::Absent { .. } => {
                 let error = identity_error(format!(
                     "resident allocation {} was absent before release",
                     identity.ptr.0
@@ -771,7 +789,7 @@ impl<'b, P: VramProbe, D: BlockDeallocator> GpuBlockRegistry<'b, P, D> {
         }
 
         match self.dealloc.allocation_state(identity.ptr) {
-            Ok(DeviceAllocationState::Absent) => {}
+            Ok(DeviceAllocationState::Absent { .. }) => {}
             Ok(DeviceAllocationState::Present { base, size_bytes }) => {
                 let detail = format!(
                     "CUDA allocation remained present after free: base={} bytes={size_bytes} free_error={free_error:?}",
