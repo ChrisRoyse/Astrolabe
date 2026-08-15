@@ -18,7 +18,7 @@ const SIGNAL_CARD_TRANSACTION_SCHEMA_V1: &str = "astrolabe.assay_signal_card_tra
 pub(crate) const SIGNAL_CARD_TRANSACTION_SCHEMA: &str =
     "astrolabe.assay_signal_card_transaction.v2";
 const SIGNAL_CARD_TRANSACTION_SUFFIX: &str = "assay_signal_card_transaction";
-const SIGNAL_CARD_LEDGER_FILE: &str = "signal-cards.ndjson";
+pub(crate) const SIGNAL_CARD_LEDGER_FILE: &str = "signal-cards.ndjson";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SignalCardBackendIdentity {

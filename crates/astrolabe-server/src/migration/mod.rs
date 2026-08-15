@@ -207,6 +207,119 @@ use measure_bits::*;
 mod signal_card_transaction;
 use signal_card_transaction::*;
 
+/// Manual-FSV entrypoint for the real zero-card two-store transaction (#1127).
+///
+/// This feature-gated surface does not alter the shipping index path. It keeps
+/// the production ledger lock alive while `observe_prepared` performs an
+/// independent read, then consumes the same prepared batch through the normal
+/// ledger publication, SQLite commit, and committed-state verifier.
+#[cfg(feature = "manual-fsv")]
+pub fn manual_fsv_commit_empty_signal_card_transaction<F>(
+    cache_dir: &Path,
+    project: &str,
+    vault_id: VaultId,
+    base_seq: u64,
+    produced_at: u64,
+    observe_prepared: F,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync + 'static>>
+where
+    F: FnOnce(&Value) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>,
+{
+    if !cache_dir.is_dir() {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_BUNDLE_MISSING: cache root is not an existing directory: {}",
+            cache_dir.display()
+        )
+        .into());
+    }
+    let ledger_path = vault_dir(cache_dir, project).join(SIGNAL_CARD_LEDGER_FILE);
+    if !ledger_path.parent().is_some_and(|parent| parent.is_dir()) {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_VAULT_MISSING: real vault directory is absent for ledger {}",
+            ledger_path.display()
+        )
+        .into());
+    }
+
+    let ledger = astrolabe_assay::CardLedger::open(&ledger_path)?;
+    let prepared_ledger = ledger.prepare_batch(&[])?;
+    let plan = SignalCardTransactionPlan::build(
+        SignalCardTransactionContext {
+            project,
+            vault_id,
+            panel_version: SHADOW_PANEL_VERSION,
+            base_seq,
+            produced_at,
+            backend: SignalCardBackendIdentity::shipping_cpu(),
+        },
+        &prepared_ledger,
+    )?;
+    let prepare_disposition = persist_signal_card_prepared(cache_dir, plan.prepared_marker())?;
+    let prepared_marker = serde_json::to_value(plan.prepared_marker())?;
+    observe_prepared(&prepared_marker)?;
+
+    let receipt = prepared_ledger.publish()?;
+    let committed_marker = plan.committed_marker(&receipt)?;
+    commit_signal_card_transaction(cache_dir, &plan, &committed_marker)?;
+    let committed = read_committed_signal_card_state(cache_dir, project)?
+        .ok_or("ASTRO_MANUAL_FSV_COMMITTED_STATE_MISSING: production readback returned absence")?;
+    if !receipt.entries.is_empty()
+        || !receipt.lines.is_empty()
+        || !committed.rows.is_empty()
+        || receipt.file_bytes != 0
+        || receipt.file_blake3 != blake3::hash(&[]).to_hex().as_str()
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_EMPTY_TRANSACTION_MISMATCH: expected zero entries/rows/bytes and the empty-file BLAKE3, observed entries={}, lines={}, rows={}, bytes={}, blake3={}",
+            receipt.entries.len(),
+            receipt.lines.len(),
+            committed.rows.len(),
+            receipt.file_bytes,
+            receipt.file_blake3
+        )
+        .into());
+    }
+    let prepare_disposition = match prepare_disposition {
+        SignalCardPrepareDisposition::PreparedWritten => "prepared_written",
+        SignalCardPrepareDisposition::PreparedResumed => "prepared_resumed",
+        SignalCardPrepareDisposition::AlreadyCommitted => "already_committed",
+    };
+    Ok(json!({
+        "schema": "astrolabe.manual_fsv_empty_signal_card_transaction.v1",
+        "project": project,
+        "transaction_id": plan.transaction_id(),
+        "prepare_disposition": prepare_disposition,
+        "ledger_path": ledger_path,
+        "ledger_file_bytes": receipt.file_bytes,
+        "ledger_file_blake3": receipt.file_blake3,
+        "ledger_entries": receipt.entries.len(),
+        "config_rows": committed.rows.len(),
+        "committed_marker": committed.marker,
+    }))
+}
+
+/// Reads the committed signal-card transaction through the production verifier.
+#[cfg(feature = "manual-fsv")]
+pub fn manual_fsv_read_committed_signal_card_transaction(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let state = read_committed_signal_card_state(cache_dir, project)?.ok_or_else(
+        || -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            format!(
+                "ASTRO_MANUAL_FSV_COMMITTED_STATE_MISSING: project {project:?} has no committed signal-card transaction"
+            )
+            .into()
+        },
+    )?;
+    Ok(json!({
+        "schema": "astrolabe.manual_fsv_signal_card_readback.v1",
+        "project": project,
+        "marker": state.marker,
+        "rows": state.rows,
+    }))
+}
+
 mod anchor_outcome;
 use anchor_outcome::*;
 

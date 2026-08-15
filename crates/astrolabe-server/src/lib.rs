@@ -16,7 +16,10 @@ use std::time::Duration;
 use astrolabe_bridge::{BridgeError, CbmToolRunner, ErrorEnvelope};
 use tracing::level_filters::LevelFilter;
 
+#[cfg(not(feature = "manual-fsv"))]
 mod migration;
+#[cfg(feature = "manual-fsv")]
+pub mod migration;
 
 mod activation_epoch;
 

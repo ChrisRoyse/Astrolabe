@@ -2067,7 +2067,6 @@ pub(crate) fn shadow_graph_freshness_refusal(
 
 pub(crate) struct ShadowImportRequest<'a> {
     pub(crate) cache_dir: &'a Path,
-    pub(crate) live_cache: &'a Path,
     pub(crate) project: &'a str,
     pub(crate) row_sink: RowSinkImportCandidate,
     pub(crate) search_scale_settings: &'a SearchScaleSettings,
@@ -2082,7 +2081,6 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 ) -> Result<ShadowImportOutcome, DynError> {
     let ShadowImportRequest {
         cache_dir,
-        live_cache,
         project,
         row_sink,
         search_scale_settings,
