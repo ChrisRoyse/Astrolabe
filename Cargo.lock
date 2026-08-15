@@ -246,6 +246,7 @@ dependencies = [
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "cbm-sys",
  "rusqlite",
  "serde",
  "serde_json",
@@ -253,6 +254,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
