@@ -333,7 +333,9 @@ fn run_weave_plan() -> AnyResult<astrolabe_weave::SimilarityPlan> {
     )?;
     config.per_node_cap = 2;
     config.ann.candidate_multiplier = 1;
-    config.thresholds.sim_semantic_min_score = -1.0;
+    // Zero-score pairs are admitted because the production predicate rejects
+    // only `score < threshold`; use the registry's exact lower bound.
+    config.thresholds.sim_semantic_min_score = 0.0;
     config = config
         .with_candidate_strategy(SimilarityFamily::Semantic, SimilarityCandidateStrategy::Ann);
     Ok(plan_similarity_family_edges(
