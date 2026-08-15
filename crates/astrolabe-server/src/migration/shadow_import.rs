@@ -999,7 +999,6 @@ fn index_time_signal_cards_summary<C>(
     vault: &AsterVault<C>,
     project: &str,
     vault_dir: &Path,
-    published_vault_dir: &Path,
     generation_clock: GenerationClock,
 ) -> Result<Value, DynError>
 where
@@ -1008,7 +1007,7 @@ where
     fn stage_error(stage: &str, error: impl std::fmt::Display) -> DynError {
         ToolFault::new(
             "ASTRO_ASSAY_SIGNAL_TRANSACTION_FAILED",
-            format!("signal-card publication failed at stage {stage:?}"),
+            format!("signal-card publication failed at stage {stage:?}: {error}"),
             "preserve the prepared marker, signal-cards.ndjson, and _config.db, then diagnose the exact stage before running the explicit recovery protocol",
         )
         .with_detail("stage", stage)
@@ -1055,7 +1054,6 @@ where
             backend: SignalCardBackendIdentity::shipping_cpu(),
         },
         &prepared_ledger,
-        &published_vault_dir.join("signal-cards.ndjson"),
     )
     .map_err(|error| stage_error("plan", error))?;
     let prepare_disposition = persist_signal_card_prepared(cache_dir, plan.prepared_marker())
@@ -2114,7 +2112,6 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let content_freshness_watermark_sha256 =
         astrolabe_ingest::fingerprint_sqlite_hex(&sqlite_path)?;
 
-    let published_vault_dir = vault_dir(live_cache, project);
     let vault_dir = vault_dir(cache_dir, project);
     fs::create_dir_all(&vault_dir)?;
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID)?;
@@ -2672,14 +2669,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // so its exact graph/slot snapshot exists. #885 publishes one prepared/commit
     // transaction over the external ledger and SQLite config rows; a transaction
     // failure aborts indexing instead of hiding split state as telemetry.
-    let signal_cards = index_time_signal_cards_summary(
-        cache_dir,
-        &vault,
-        project,
-        &vault_dir,
-        &published_vault_dir,
-        generation_clock,
-    )?;
+    let signal_cards =
+        index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir, generation_clock)?;
     shadow_phase!("signal_cards");
     // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
     // propagation. ── EXACT INSERTION POINT ── one post-import call, placed

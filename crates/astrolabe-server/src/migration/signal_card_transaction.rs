@@ -6,16 +6,19 @@
 //! ledger batch, then commits every public card row plus the committed marker in
 //! one SQLite transaction. Readers serve only a committed, hash-consistent state.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::Component;
 
 use serde::{Deserialize, Serialize};
 
 use super::*;
 
+const SIGNAL_CARD_TRANSACTION_SCHEMA_V1: &str = "astrolabe.assay_signal_card_transaction.v1";
 pub(crate) const SIGNAL_CARD_TRANSACTION_SCHEMA: &str =
-    "astrolabe.assay_signal_card_transaction.v1";
+    "astrolabe.assay_signal_card_transaction.v2";
 const SIGNAL_CARD_TRANSACTION_SUFFIX: &str = "assay_signal_card_transaction";
+const SIGNAL_CARD_LEDGER_FILE: &str = "signal-cards.ndjson";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SignalCardBackendIdentity {
@@ -48,7 +51,10 @@ struct SignalCardBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SignalCardLedgerState {
-    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    member: Option<String>,
     prior_file_bytes: u64,
     prior_file_blake3: String,
     file_bytes: Option<u64>,
@@ -109,6 +115,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn marker_identity(marker: &SignalCardTransactionMarker) -> Value {
+    let ledger = match marker.schema.as_str() {
+        SIGNAL_CARD_TRANSACTION_SCHEMA_V1 => json!({
+            "path": marker.ledger.path,
+            "prior_file_bytes": marker.ledger.prior_file_bytes,
+            "prior_file_blake3": marker.ledger.prior_file_blake3,
+        }),
+        SIGNAL_CARD_TRANSACTION_SCHEMA => json!({
+            "member": marker.ledger.member,
+            "prior_file_bytes": marker.ledger.prior_file_bytes,
+            "prior_file_blake3": marker.ledger.prior_file_blake3,
+        }),
+        _ => Value::Null,
+    };
     json!({
         "schema": marker.schema,
         "project": marker.project,
@@ -118,11 +137,7 @@ fn marker_identity(marker: &SignalCardTransactionMarker) -> Value {
         "produced_at": marker.produced_at,
         "backend": marker.backend,
         "cards": marker.cards,
-        "ledger": {
-            "path": marker.ledger.path,
-            "prior_file_bytes": marker.ledger.prior_file_bytes,
-            "prior_file_blake3": marker.ledger.prior_file_blake3,
-        },
+        "ledger": ledger,
     })
 }
 
@@ -134,11 +149,99 @@ pub(crate) fn signal_card_transaction_key(project: &str) -> String {
     metadata_key(project, SIGNAL_CARD_TRANSACTION_SUFFIX)
 }
 
+fn expected_signal_card_ledger_member(project: &str) -> String {
+    format!("{project}{VAULT_SUFFIX}/{SIGNAL_CARD_LEDGER_FILE}")
+}
+
+fn validate_signal_card_ledger_member(project: &str, member: &str) -> Result<(), DynError> {
+    let mut normal_components = 0_usize;
+    for component in Path::new(member).components() {
+        match component {
+            Component::Normal(_) => normal_components += 1,
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MEMBER_INVALID: project {project:?} ledger member {member:?} contains an absolute/prefix component; expected the exact project-relative member {:?}",
+                    expected_signal_card_ledger_member(project)
+                )
+                .into());
+            }
+            Component::RootDir => {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MEMBER_INVALID: project {project:?} ledger member {member:?} contains a root component; expected the exact project-relative member {:?}",
+                    expected_signal_card_ledger_member(project)
+                )
+                .into());
+            }
+            Component::CurDir => {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MEMBER_INVALID: project {project:?} ledger member {member:?} contains a current-directory component; expected the exact project-relative member {:?}",
+                    expected_signal_card_ledger_member(project)
+                )
+                .into());
+            }
+            Component::ParentDir => {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MEMBER_INVALID: project {project:?} ledger member {member:?} contains a parent component; expected the exact project-relative member {:?}",
+                    expected_signal_card_ledger_member(project)
+                )
+                .into());
+            }
+        }
+    }
+    let expected = expected_signal_card_ledger_member(project);
+    if normal_components != 2 || member != expected {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MEMBER_INVALID: project {project:?} ledger member {member:?} is not the exact admitted member {expected:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn resolve_signal_card_ledger_path(
+    cache_dir: &Path,
+    project: &str,
+    marker: &SignalCardTransactionMarker,
+) -> Result<PathBuf, DynError> {
+    match marker.schema.as_str() {
+        SIGNAL_CARD_TRANSACTION_SCHEMA_V1 => {
+            let path = marker.ledger.path.as_deref().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} v1 marker has no legacy absolute ledger path; preserve the row and reindex to migrate it"
+                )
+                .into()
+            })?;
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_LEGACY_PATH_INVALID: project {project:?} v1 marker ledger path {:?} is not absolute; v1 is non-relocatable and no guessed rewrite is permitted",
+                    marker.ledger.path
+                )
+                .into());
+            }
+            Ok(path)
+        }
+        SIGNAL_CARD_TRANSACTION_SCHEMA => {
+            let member = marker.ledger.member.as_deref().ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} v2 marker has no ledger member; preserve the row and reindex through the v2 producer"
+                )
+                .into()
+            })?;
+            validate_signal_card_ledger_member(project, member)?;
+            Ok(cache_dir.join(member))
+        }
+        schema => Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} marker has unsupported schema {schema:?}; preserve the row and use the explicit migration protocol"
+        )
+        .into()),
+    }
+}
+
 impl SignalCardTransactionPlan {
     pub(crate) fn build(
         context: SignalCardTransactionContext<'_>,
         prepared_ledger: &astrolabe_assay::PreparedAssayCardBatch,
-        published_ledger_path: &Path,
     ) -> Result<Self, DynError> {
         let SignalCardTransactionContext {
             project,
@@ -221,7 +324,8 @@ impl SignalCardTransactionPlan {
             });
             rows.push(SignalCardConfigRow { key, value });
         }
-        let ledger_path = published_ledger_path.to_string_lossy().into_owned();
+        let ledger_member = expected_signal_card_ledger_member(project);
+        validate_signal_card_ledger_member(project, &ledger_member)?;
         let mut prepared = SignalCardTransactionMarker {
             schema: SIGNAL_CARD_TRANSACTION_SCHEMA.to_string(),
             state: "prepared".to_string(),
@@ -234,7 +338,8 @@ impl SignalCardTransactionPlan {
             backend,
             cards: bindings,
             ledger: SignalCardLedgerState {
-                path: ledger_path,
+                path: None,
+                member: Some(ledger_member),
                 prior_file_bytes: prepared_ledger.prior_file_bytes,
                 prior_file_blake3: prepared_ledger.prior_file_blake3.clone(),
                 file_bytes: None,
@@ -303,11 +408,41 @@ fn parse_marker(raw: &str, project: &str) -> Result<SignalCardTransactionMarker,
             "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} marker is invalid: {error}; preserve the row and use the explicit recovery protocol"
         )
     })?;
-    if marker.schema != SIGNAL_CARD_TRANSACTION_SCHEMA || marker.project != project {
+    if marker.project != project {
         return Err(format!(
-            "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} marker schema/project identity mismatch; preserve the row and use the explicit recovery protocol"
+            "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} marker project identity is {:?}; preserve the row and use the explicit recovery protocol",
+            marker.project
         )
         .into());
+    }
+    match marker.schema.as_str() {
+        SIGNAL_CARD_TRANSACTION_SCHEMA_V1 => {
+            if marker.ledger.path.is_none() || marker.ledger.member.is_some() {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} v1 marker must contain exactly one legacy path and no v2 member; preserve the row and use the explicit migration protocol"
+                )
+                .into());
+            }
+            resolve_signal_card_ledger_path(Path::new("."), project, &marker)?;
+        }
+        SIGNAL_CARD_TRANSACTION_SCHEMA => {
+            if marker.ledger.path.is_some() || marker.ledger.member.is_none() {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} v2 marker must contain exactly one relative member and no legacy path; preserve the row and reindex through the v2 producer"
+                )
+                .into());
+            }
+            validate_signal_card_ledger_member(
+                project,
+                marker.ledger.member.as_deref().unwrap_or_default(),
+            )?;
+        }
+        schema => {
+            return Err(format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: project {project:?} marker has unsupported schema {schema:?}; preserve the row and use the explicit migration protocol"
+            )
+            .into());
+        }
     }
     let recomputed = marker_transaction_id(&marker)?;
     if marker.transaction_id != recomputed {
@@ -466,6 +601,213 @@ pub(crate) fn commit_signal_card_transaction(
     Ok(())
 }
 
+fn verify_committed_signal_card_ledger(
+    marker: &SignalCardTransactionMarker,
+    ledger_path: &Path,
+) -> Result<(), DynError> {
+    let expected_file_bytes = marker.ledger.file_bytes.ok_or_else(|| -> DynError {
+        "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: committed marker has no final ledger byte count"
+            .into()
+    })?;
+    let expected_file_blake3 =
+        marker
+            .ledger
+            .file_blake3
+            .as_deref()
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: committed marker has no final ledger digest"
+                    .into()
+            })?;
+    if expected_file_blake3.len() != 64
+        || !expected_file_blake3
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: committed transaction {} has malformed ledger BLAKE3 {:?}",
+            marker.transaction_id, expected_file_blake3
+        )
+        .into());
+    }
+
+    let namespace_metadata = fs::symlink_metadata(ledger_path).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MISSING: cannot inspect committed ledger {} for transaction {}: {error}",
+            ledger_path.display(), marker.transaction_id
+        )
+        .into()
+    })?;
+    if !namespace_metadata.file_type().is_file() {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_NON_FILE: committed ledger {} for transaction {} is not an ordinary file (file={}, directory={}, symlink={})",
+            ledger_path.display(),
+            marker.transaction_id,
+            namespace_metadata.file_type().is_file(),
+            namespace_metadata.file_type().is_dir(),
+            namespace_metadata.file_type().is_symlink()
+        )
+        .into());
+    }
+    let mut ledger = File::open(ledger_path).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MISSING: cannot open committed ledger {} for transaction {}: {error}",
+            ledger_path.display(), marker.transaction_id
+        )
+        .into()
+    })?;
+    let handle_metadata = ledger.metadata()?;
+    if !handle_metadata.is_file() {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_NON_FILE: opened ledger {} for transaction {} is not an ordinary file",
+            ledger_path.display(), marker.transaction_id
+        )
+        .into());
+    }
+    let observed_file_bytes = handle_metadata.len();
+    if namespace_metadata.len() != observed_file_bytes {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_STATE_DRIFT: ledger {} namespace size {} differs from opened-handle size {observed_file_bytes} for transaction {}",
+            ledger_path.display(),
+            namespace_metadata.len(),
+            marker.transaction_id
+        )
+        .into());
+    }
+    if observed_file_bytes != expected_file_bytes {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_SIZE_MISMATCH: committed ledger {} has {observed_file_bytes} bytes, transaction {} expects {expected_file_bytes}",
+            ledger_path.display(), marker.transaction_id
+        )
+        .into());
+    }
+
+    let mut line_ranges = Vec::with_capacity(marker.cards.len());
+    let mut line_readbacks = Vec::with_capacity(marker.cards.len());
+    let mut previous_end = 0_u64;
+    for binding in &marker.cards {
+        if binding.ledger_line.bytes == 0 {
+            return Err(format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: transaction {} ledger seq {} has a zero-byte line receipt",
+                marker.transaction_id, binding.ledger_seq
+            )
+            .into());
+        }
+        let end = binding
+            .ledger_line
+            .offset
+            .checked_add(binding.ledger_line.bytes)
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: transaction {} ledger seq {} line range exceeds u64",
+                    marker.transaction_id, binding.ledger_seq
+                )
+                .into()
+            })?;
+        if binding.ledger_line.offset < previous_end || end > expected_file_bytes {
+            return Err(format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: transaction {} ledger seq {} range {}..{} is overlapping, out of order, or beyond file size {expected_file_bytes}",
+                marker.transaction_id,
+                binding.ledger_seq,
+                binding.ledger_line.offset,
+                end
+            )
+            .into());
+        }
+        let capacity = usize::try_from(binding.ledger_line.bytes)?;
+        line_ranges.push((binding.ledger_line.offset, end));
+        line_readbacks.push(Vec::with_capacity(capacity));
+        previous_end = end;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut file_offset = 0_u64;
+    let mut line_index = 0_usize;
+    loop {
+        let read = ledger.read(&mut buffer).map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_READ_FAILED: reading committed ledger {} at offset {file_offset} for transaction {} failed: {error}",
+                ledger_path.display(), marker.transaction_id
+            )
+            .into()
+        })?;
+        if read == 0 {
+            break;
+        }
+        let read_u64 = u64::try_from(read)?;
+        let chunk_end = file_offset
+            .checked_add(read_u64)
+            .ok_or_else(|| -> DynError {
+                "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_READ_FAILED: streamed ledger offset exceeded u64"
+                    .into()
+            })?;
+        hasher.update(&buffer[..read]);
+        while line_index < line_ranges.len() {
+            let (line_start, line_end) = line_ranges[line_index];
+            if line_end <= file_offset {
+                line_index += 1;
+                continue;
+            }
+            if line_start >= chunk_end {
+                break;
+            }
+            let overlap_start = line_start.max(file_offset);
+            let overlap_end = line_end.min(chunk_end);
+            let chunk_start = usize::try_from(overlap_start - file_offset)?;
+            let chunk_stop = usize::try_from(overlap_end - file_offset)?;
+            line_readbacks[line_index].extend_from_slice(&buffer[chunk_start..chunk_stop]);
+            if line_end <= chunk_end {
+                line_index += 1;
+            } else {
+                break;
+            }
+        }
+        file_offset = chunk_end;
+    }
+    if file_offset != expected_file_bytes {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_STATE_DRIFT: ledger {} streamed {file_offset} bytes but transaction {} expects {expected_file_bytes}",
+            ledger_path.display(), marker.transaction_id
+        )
+        .into());
+    }
+    let observed_file_blake3 = hasher.finalize().to_hex().to_string();
+    if observed_file_blake3 != expected_file_blake3 {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_DIGEST_MISMATCH: committed ledger {} BLAKE3 {observed_file_blake3} differs from transaction {} expected {expected_file_blake3}",
+            ledger_path.display(), marker.transaction_id
+        )
+        .into());
+    }
+
+    for (binding, line) in marker.cards.iter().zip(line_readbacks) {
+        if u64::try_from(line.len())? != binding.ledger_line.bytes
+            || blake3::hash(&line).to_hex().to_string() != binding.ledger_line.line_blake3
+            || !line.ends_with(b"\n")
+        {
+            return Err(format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_LINE_MISMATCH: seq {} physical line hash/size/termination differs from transaction {}",
+                binding.ledger_seq, marker.transaction_id
+            )
+            .into());
+        }
+        let entry: astrolabe_assay::AssayCardEntry =
+            serde_json::from_slice(&line[..line.len() - 1])?;
+        if entry.seq != binding.ledger_seq
+            || entry.entry_hash != binding.ledger_entry_hash
+            || entry.input_fingerprint != binding.input_fingerprint
+            || sha256_hex(&serde_json::to_vec(&entry.card)?) != binding.card_sha256
+        {
+            return Err(format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_ENTRY_MISMATCH: seq {} content differs from transaction {}",
+                binding.ledger_seq, marker.transaction_id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn read_committed_signal_card_state(
     cache_dir: &Path,
     project: &str,
@@ -537,53 +879,8 @@ pub(crate) fn read_committed_signal_card_state(
         rows.push((key.clone(), value));
     }
 
-    let expected_file_bytes = marker.ledger.file_bytes.ok_or_else(|| -> DynError {
-        "ASTRO_ASSAY_SIGNAL_TXN_MARKER_CORRUPT: committed marker has no final ledger byte count"
-            .into()
-    })?;
-    let mut ledger = File::open(&marker.ledger.path).map_err(|error| -> DynError {
-        format!(
-            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_MISSING: cannot open committed ledger {}: {error}",
-            marker.ledger.path
-        )
-        .into()
-    })?;
-    let observed_file_bytes = ledger.metadata()?.len();
-    if observed_file_bytes != expected_file_bytes {
-        return Err(format!(
-            "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_SIZE_MISMATCH: committed ledger {} has {observed_file_bytes} bytes, marker expects {expected_file_bytes}",
-            marker.ledger.path
-        )
-        .into());
-    }
-    for binding in &marker.cards {
-        ledger.seek(SeekFrom::Start(binding.ledger_line.offset))?;
-        let line_bytes = usize::try_from(binding.ledger_line.bytes)?;
-        let mut line = vec![0_u8; line_bytes];
-        ledger.read_exact(&mut line)?;
-        if blake3::hash(&line).to_hex().to_string() != binding.ledger_line.line_blake3
-            || !line.ends_with(b"\n")
-        {
-            return Err(format!(
-                "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_LINE_MISMATCH: seq {} physical line hash/termination differs from transaction {}",
-                binding.ledger_seq, marker.transaction_id
-            )
-            .into());
-        }
-        let entry: astrolabe_assay::AssayCardEntry =
-            serde_json::from_slice(&line[..line.len() - 1])?;
-        if entry.seq != binding.ledger_seq
-            || entry.entry_hash != binding.ledger_entry_hash
-            || entry.input_fingerprint != binding.input_fingerprint
-            || sha256_hex(&serde_json::to_vec(&entry.card)?) != binding.card_sha256
-        {
-            return Err(format!(
-                "ASTRO_ASSAY_SIGNAL_TXN_LEDGER_ENTRY_MISMATCH: seq {} content differs from transaction {}",
-                binding.ledger_seq, marker.transaction_id
-            )
-            .into());
-        }
-    }
+    let ledger_path = resolve_signal_card_ledger_path(cache_dir, project, &marker)?;
+    verify_committed_signal_card_ledger(&marker, &ledger_path)?;
     Ok(Some(CommittedSignalCardState {
         marker: serde_json::to_value(&marker)?,
         rows,
