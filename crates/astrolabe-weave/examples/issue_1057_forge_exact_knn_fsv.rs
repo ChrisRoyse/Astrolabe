@@ -241,7 +241,7 @@ fn run(output: &Path) -> AnyResult<()> {
     let unavailable = child_refusal(
         output,
         "55-unavailable-device",
-        "CALYX_CUDA_DEVICE_SELECTOR_INVALID",
+        "CALYX_CUDA_DEVICE_UNAVAILABLE",
         &[(calyx_forge::CUDA_DEVICE_ENV, "4294967295")],
     )?;
 

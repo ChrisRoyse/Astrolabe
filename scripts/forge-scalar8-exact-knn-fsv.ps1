@@ -269,7 +269,7 @@ foreach ($refusal in @(
 }
 foreach ($childRefusal in @(
     @('54-vram-budget', 'CALYX_FORGE_VRAM_BUDGET'),
-    @('55-unavailable-device', 'CALYX_CUDA_DEVICE_SELECTOR_INVALID')
+    @('55-unavailable-device', 'CALYX_CUDA_DEVICE_UNAVAILABLE')
 )) {
     $errorPath = Join-Path $payload "$($childRefusal[0]).error.json"
     $resultPath = Join-Path $payload "$($childRefusal[0]).result.json"
@@ -333,7 +333,7 @@ $analysis = [ordered]@{
     maximum_dimension = [int]$maxDimension.receipt.dim
     refusal_codes = @(
         'CALYX_FORGE_SHAPE_MISMATCH', 'CALYX_FORGE_NUMERICAL_INVARIANT',
-        'CALYX_FORGE_VRAM_BUDGET', 'CALYX_CUDA_DEVICE_SELECTOR_INVALID'
+        'CALYX_FORGE_VRAM_BUDGET', 'CALYX_CUDA_DEVICE_UNAVAILABLE'
     )
     nvidia_smi_sha256 = Get-Sha256File $nvidiaPath
     runner_schema = [string]$run.schema
