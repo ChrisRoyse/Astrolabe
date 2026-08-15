@@ -187,7 +187,7 @@ Assert-Astro (
     [uint64]$happy.before.stats.reserved_bytes -eq $allocationBytes -and
     [uint64]$happy.after.stats.reserved_bytes -eq 0 -and
     @($happy.after.allocations).Count -eq 0 -and
-    [uint64]$happy.action.pointer -eq [uint64]$happy.before.allocations[0].identity.ptr.0 -and
+    [uint64]$happy.action.pointer -eq [uint64]$happy.before.allocations[0].identity.ptr -and
     [int]$happy.action.physical_absence.Absent.driver_status -eq 500 -and
     $happy.action.physical_absence.Absent.driver_status_name -ceq 'CUDA_ERROR_NOT_FOUND' -and
     $happy.before.physical_allocations[0].state.Present.size_bytes -eq $allocationBytes -and
@@ -195,10 +195,16 @@ Assert-Astro (
 ) 'CALYX_FORGE_GPU_FSV_HAPPY_PATH_INVALID' `
     'happy allocation/free did not agree across pointer, documented absence status, physical VRAM, registry, and accounting'
 
-$failedPointer = [uint64]$failed.before.allocations[0].identity.ptr.0
+$failedPointer = [uint64]$failed.before.allocations[0].identity.ptr
+$attemptedPointer = [uint64]($failedPointer + [uint64]1)
+$failureDetail = [string]$failed.action.detail
 Assert-Astro (
     $failed.action.code -ceq 'CALYX_FORGE_GPU_DEALLOCATION_QUARANTINED' -and
-    [uint64]$failed.after.allocations[0].identity.ptr.0 -eq $failedPointer -and
+    $failureDetail.Contains("tracked_ptr=$failedPointer attempted_ptr=$attemptedPointer") -and
+    $failureDetail.Contains('driver_code=CALYX_FORGE_GPU_DEALLOCATION_FAILED') -and
+    $failureDetail.Contains('CUDA_ERROR_INVALID_VALUE') -and
+    $failureDetail.Contains('numeric=1') -and
+    [uint64]$failed.after.allocations[0].identity.ptr -eq $failedPointer -and
     $failed.after.allocations[0].state -ceq 'quarantined' -and
     $failed.after.allocations[0].failure_code -ceq 'CALYX_FSV_INDUCED_CUDA_FREE_FAILURE' -and
     [uint64]$failed.after.stats.quarantined_bytes -eq $allocationBytes -and
@@ -206,7 +212,7 @@ Assert-Astro (
     [bool]$failed.after.stats.accounting_equation_valid -and
     [uint64]$failed.after.physical_allocations[0].state.Present.size_bytes -eq $allocationBytes
 ) 'CALYX_FORGE_GPU_FSV_QUARANTINE_INVALID' `
-    'failed real cuMemFree did not preserve exact pointer/failure/bytes/physical allocation'
+    'real non-base cuMemFree rejection did not preserve exact attempted/tracked pointers, driver status, bytes, and physical allocation'
 
 Assert-RefusalState $admission 'CALYX_FORGE_GPU_DEALLOCATION_QUARANTINED' 'unsafe admission'
 Assert-RefusalState $wrongGeneration 'CALYX_FORGE_GPU_ALLOCATION_IDENTITY_MISMATCH' 'wrong generation'
@@ -215,12 +221,12 @@ Assert-RefusalState $wrongDevice 'CALYX_FORGE_GPU_ALLOCATION_IDENTITY_MISMATCH' 
 Assert-RefusalState $unavailableDevice 'CALYX_FSV_INDUCED_DEVICE_UNAVAILABLE' 'unavailable real device context'
 
 Assert-Astro (
-    [uint64]$recovery.before.allocations[0].identity.ptr.0 -eq $failedPointer -and
+    [uint64]$recovery.before.allocations[0].identity.ptr -eq $failedPointer -and
     @($recovery.after.allocations).Count -eq 0 -and
     [uint64]$recovery.after.stats.reserved_bytes -eq 0 -and
     [uint64]$recovery.after.stats.quarantined_bytes -eq 0 -and
     [bool]$recovery.after.stats.accounting_equation_valid -and
-    [uint64]$recovery.action.release_receipt.identity.ptr.0 -eq $failedPointer -and
+    [uint64]$recovery.action.release_receipt.identity.ptr -eq $failedPointer -and
     [int]$recovery.action.physical_absence.Absent.driver_status -eq 500 -and
     $recovery.action.physical_absence.Absent.driver_status_name -ceq 'CUDA_ERROR_NOT_FOUND' -and
     $recovery.after.device.free_bytes -ge $recovery.before.device.free_bytes
@@ -281,6 +287,7 @@ $analysis = [ordered]@{
     device_uuid = $deviceUuid
     allocation_bytes = $allocationBytes
     quarantined_pointer = $failedPointer
+    rejected_non_base_pointer = $attemptedPointer
     journal_entries = $journalLines.Count
     journal_head_sha256 = $previous
     happy_path = 'verified'

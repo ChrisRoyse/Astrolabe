@@ -110,23 +110,35 @@ mod enabled {
             if !self.fail_free_once.swap(false, Ordering::AcqRel) {
                 return self.raw.free(ptr, size_bytes);
             }
-            self.detach_current_context()?;
-            let observed = unsafe { result::free_sync(ptr.0) };
-            self.restore_current_context()?;
+            let rejected_ptr = DevicePtr(ptr.0.checked_add(1).ok_or_else(|| {
+                ForgeError::RuntimeBoundary {
+                    code: "CALYX_FSV_CUDA_FAILURE_INDUCTION_FAILED",
+                    detail: format!(
+                        "tracked CUDA base pointer cannot produce an interior address: tracked_ptr={}",
+                        ptr.0
+                    ),
+                    remediation: "do not accept this FSV run; inspect the allocator pointer identity",
+                }
+            })?);
+            let observed = self.raw.free(rejected_ptr, size_bytes);
             match observed {
                 Err(error) => Err(ForgeError::RuntimeBoundary {
                     code: FAILURE_CODE,
                     detail: format!(
-                        "real cuMemFree with no current CUDA context failed as induced: status={:?} numeric={}",
-                        error.0, error.0 as i32
+                        "real cuMemFree rejected a non-base pointer while the tracked base remained unchanged: tracked_ptr={} attempted_ptr={} driver_code={} driver_detail={error}",
+                        ptr.0,
+                        rejected_ptr.0,
+                        error.code(),
                     ),
-                    remediation: "retain the exact allocation and restore the pinned CUDA context before explicit recovery",
+                    remediation: "retain the exact base allocation and use only its exact pointer for explicit recovery",
                 }),
                 Ok(()) => Err(ForgeError::RuntimeBoundary {
                     code: "CALYX_FSV_CUDA_FAILURE_INDUCTION_FAILED",
-                    detail: "cuMemFree unexpectedly succeeded with no current CUDA context"
-                        .to_string(),
-                    remediation: "do not accept this FSV run; inspect the installed CUDA driver context semantics",
+                    detail: format!(
+                        "cuMemFree unexpectedly accepted a non-base pointer: tracked_ptr={} attempted_ptr={}",
+                        ptr.0, rejected_ptr.0
+                    ),
+                    remediation: "do not accept this FSV run; inspect the installed CUDA driver allocation semantics",
                 }),
             }
         }
