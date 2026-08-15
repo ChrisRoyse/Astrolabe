@@ -3,7 +3,7 @@
     Manual full-state verification for #1099 cross-LSP canonical identity.
 
 .DESCRIPTION
-    Stages and runs the real native bridge example, then independently reads
+    Stages and runs the real native server example, then independently reads
     both physical SQLite stores and the persisted receipt files. This is a
     manual FSV instrument, not a test or gate.
 #>

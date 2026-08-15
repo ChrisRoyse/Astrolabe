@@ -27,6 +27,7 @@ calyx-aster.workspace = true
 calyx-assay.workspace = true
 calyx-core.workspace = true
 calyx-ledger.workspace = true
+cbm-sys.workspace = true
 blake3 = "1"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +36,14 @@ sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [lib]
 path = "src/lib.rs"
@@ -49,4 +58,8 @@ path = "src/codebase_memory_mcp_shim.rs"
 
 [[example]]
 name = "issue_1127_empty_transaction_fsv"
+required-features = ["manual-fsv"]
+
+[[example]]
+name = "issue_1099_cross_lsp_fsv"
 required-features = ["manual-fsv"]

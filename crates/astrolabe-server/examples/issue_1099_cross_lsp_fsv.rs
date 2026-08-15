@@ -565,7 +565,14 @@ fn run_index(repo: &Path, database: &Path, output: &Path) -> Value {
 }
 
 fn main() {
-    let mut args = std::env::args_os().skip(1);
+    let process_args = std::env::args_os().collect::<Vec<_>>();
+    if process_args
+        .get(1)
+        .is_some_and(|argument| argument == "cli")
+    {
+        std::process::exit(astrolabe_server::run_from_env_on_sized_host_thread());
+    }
+    let mut args = process_args.into_iter().skip(1);
     let first = args.next().unwrap_or_else(|| {
         fail(
             "ISSUE_1099_FSV_PAYLOAD_REQUIRED",
@@ -607,7 +614,21 @@ fn main() {
             "use one absent direct payload child of the staged session",
         )
     });
-    initialize_cbm_host_process(None).unwrap_or_else(|error| {
+    let executable = std::env::current_exe().unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_EXE_PATH_FAILED",
+            error,
+            "repair current executable discovery before production host initialization",
+        )
+    });
+    let executable = executable.to_str().unwrap_or_else(|| {
+        fail(
+            "ISSUE_1099_FSV_EXE_PATH_INVALID",
+            executable.display(),
+            "run the staged FSV artifact from a UTF-8 workspace path",
+        )
+    });
+    initialize_cbm_host_process(Some(executable)).unwrap_or_else(|error| {
         fail(
             "ISSUE_1099_FSV_HOST_INIT_FAILED",
             error,
