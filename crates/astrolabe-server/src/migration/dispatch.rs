@@ -870,7 +870,7 @@ fn overlay_get_architecture_extensions(tool: &mut Value) -> Result<(), DynError>
     aspects.insert(
         "description".to_string(),
         Value::String(
-            "Aspects to include. Omit for the complete legacy CBM architecture without extra Calyx reads; overview is the compact legacy summary; all includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. signal_ranking reads the exact committed Assay transaction and returns a structured tool error for a validated preserved failed publication even when the live shadow dial is absent. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
+            "Aspects to include. Omit for the complete legacy CBM architecture without extra Calyx reads; overview is the compact legacy summary; all includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. search_scale serves the exact Calyx backend/admission plan; weave serves the exact Weave/Loom family, cross-term, association, Sextant quantization, and Forge commissioning receipts. signal_ranking reads the exact committed Assay transaction and returns a structured tool error for a validated preserved failed publication even when the live shadow dial is absent. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
                 .to_string(),
         ),
     );
@@ -2480,6 +2480,20 @@ pub(crate) fn handle_measure_bits(args_json: &str) -> Result<String, DynError> {
         .get("refresh")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if refresh && mode != "calibration" {
+        return ToolFault::new(
+            "ASTRO_MEASURE_BITS_REFRESH_UNSUPPORTED",
+            format!(
+                "refresh=true is implemented only for mode=calibration, received mode={mode:?}"
+            ),
+            format!(
+                "omit refresh to read the persisted {mode} card, or use mode=calibration with refresh=true to recompute and persist calibration"
+            ),
+        )
+        .with_detail("mode", mode)
+        .with_detail("refresh", true)
+        .into_result();
+    }
     let value = match measure_bits_json_at(&cache_dir, &project, mode, axis, scope, refresh) {
         Ok(value) => value,
         Err(error) => {

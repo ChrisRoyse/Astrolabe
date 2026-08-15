@@ -41,9 +41,11 @@ pub(crate) const CBM_ARCHITECTURE_ASPECTS: [&str; 13] = [
 
 /// Public Astrolabe selectors. `kernel`/`kernel_context` and
 /// `n_eff`/`redundancy` are explicit aliases for one physical read each.
-pub(crate) const ASTROLABE_ARCHITECTURE_ASPECTS: [&str; 12] = [
+pub(crate) const ASTROLABE_ARCHITECTURE_ASPECTS: [&str; 14] = [
     "skill_tree",
     "bridges",
+    "search_scale",
+    "weave",
     "kernel",
     "kernel_context",
     "anomalies",
@@ -56,9 +58,11 @@ pub(crate) const ASTROLABE_ARCHITECTURE_ASPECTS: [&str; 12] = [
     "signal_ranking",
 ];
 
-const ASTROLABE_ARCHITECTURE_OUTPUTS: [&str; 10] = [
+const ASTROLABE_ARCHITECTURE_OUTPUTS: [&str; 12] = [
     "skill_tree",
     "bridges",
+    "search_scale",
+    "weave",
     "kernel_context",
     "anomalies",
     "provenance",
@@ -165,6 +169,8 @@ impl ArchitectureRequestPlan {
             let output = match aspect {
                 "skill_tree" => "skill_tree",
                 "bridges" => "bridges",
+                "search_scale" => "search_scale",
+                "weave" => "weave",
                 "kernel" | "kernel_context" => "kernel_context",
                 "anomalies" => "anomalies",
                 "provenance" => "provenance",
@@ -247,6 +253,20 @@ pub(crate) fn read_astrolabe_architecture_aspects(
         let value = match output {
             "skill_tree" => read_skill_tree_metadata(cache_dir, project)?,
             "bridges" => read_bridges_metadata(cache_dir, project)?,
+            "search_scale" => read_persisted_architecture_surface(
+                cache_dir,
+                project,
+                "search_scale",
+                "search_scale_json",
+                "planned",
+            )?,
+            "weave" => read_persisted_architecture_surface(
+                cache_dir,
+                project,
+                "weave",
+                "weave_json",
+                "reconciled",
+            )?,
             "kernel_context" => read_kernel_context_metadata(cache_dir, project)?,
             "anomalies" => read_anomaly_report(cache_dir, project)?,
             "provenance" => read_provenance_metadata(cache_dir, project)?,
@@ -277,6 +297,7 @@ fn validate_architecture_aspect_state(output: &str, value: &Value) -> Result<(),
         "skill_tree" | "bridges" | "kernel_context" | "provenance" | "layout_map" => {
             status == "built"
         }
+        "search_scale" | "weave" => status == "served",
         "anomalies" | "agreement_graph" => matches!(status, "built" | "empty"),
         "redundancy" => status == "measured",
         "grounding_gaps" | "signal_ranking" => status == "served",
@@ -297,6 +318,99 @@ fn validate_architecture_aspect_state(output: &str, value: &Value) -> Result<(),
         "ASTRO_ARCHITECTURE_ASPECT_UNAVAILABLE: aspect={output}, status={status}, reason={reason}; remediation: {remediation}"
     )
     .into())
+}
+
+const PERSISTED_ARCHITECTURE_SURFACE_SCHEMA: &str =
+    "astrolabe.get_architecture.persisted_surface.v1";
+
+/// Read one explicitly selected project Config row and return both its exact
+/// physical identity and decoded value. This is the dedicated post-index reader
+/// promised by `astrolabe.shadow_surface_ref.v1`; it performs no graph, vault,
+/// or unrelated Config read (#1120; #1064 PC-07/PC-13/PC-43).
+fn read_persisted_architecture_surface(
+    cache_dir: &Path,
+    project: &str,
+    surface: &str,
+    metadata_name: &str,
+    expected_status: &str,
+) -> Result<Value, DynError> {
+    let key = metadata_key(project, metadata_name);
+    let raw = read_config_value(cache_dir, &key)?
+        .filter(|raw| !raw.trim().is_empty())
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHITECTURE_SURFACE_MISSING: project {project:?} has no persisted {surface} row at {key:?}; remediation: rerun index_repository with calyx=\"shadow\" and preserve the failed generation if publication does not complete"
+            )
+            .into()
+        })?;
+    let value: Value = serde_json::from_str(&raw).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHITECTURE_SURFACE_INVALID: project {project:?} persisted {surface} row {key:?} is not exact JSON: {error}; remediation: preserve the row and rebuild it from the authoritative index source"
+        )
+        .into()
+    })?;
+    let object = value.as_object().ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_ARCHITECTURE_SURFACE_INVALID: project {project:?} persisted {surface} row {key:?} is not a JSON object; remediation: preserve the row and rebuild it from the authoritative index source"
+        )
+        .into()
+    })?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHITECTURE_SURFACE_INVALID: project {project:?} persisted {surface} row {key:?} has no string status; remediation: preserve the row and repair its canonical producer"
+            )
+            .into()
+        })?;
+    if status != expected_status {
+        return Err(format!(
+            "ASTRO_ARCHITECTURE_SURFACE_INCOMPLETE: project {project:?} persisted {surface} row {key:?} reports status={status:?}, expected {expected_status:?}; remediation: preserve the row and rerun its canonical producer before serving it"
+        )
+        .into());
+    }
+    let trust = object
+        .get("trust")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHITECTURE_SURFACE_INVALID: project {project:?} persisted {surface} row {key:?} has no non-empty trust label; remediation: preserve the row and repair its canonical producer"
+            )
+            .into()
+        })?;
+    let freshness = object
+        .get("freshness")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHITECTURE_SURFACE_INVALID: project {project:?} persisted {surface} row {key:?} has no non-empty freshness label; remediation: preserve the row and repair its canonical producer"
+            )
+            .into()
+        })?;
+    let json_sha256 = hex_lower(&Sha256::digest(raw.as_bytes()));
+    Ok(json!({
+        "schema": PERSISTED_ARCHITECTURE_SURFACE_SCHEMA,
+        "status": "served",
+        "surface": surface,
+        "project": project,
+        "storage": {
+            "store": "config",
+            "key": key,
+            "json_bytes": raw.len(),
+            "json_sha256": json_sha256,
+        },
+        "payload_status": status,
+        "payload": value,
+        "trust": trust,
+        "freshness": freshness,
+        "provenance": format!("exact persisted Config row {key}"),
+    }))
 }
 
 /// Schema tag for the `signal_ranking` architecture aspect envelope.

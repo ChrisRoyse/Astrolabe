@@ -156,10 +156,6 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
                     "type": "string",
                     "description": "Fleet catalog vault root for fleet scopes. Defaults to the declared production catalog root."
                 },
-                "budget": {
-                    "type": "integer",
-                    "description": "Optional member budget hint for mode=build. The on-demand build currently uses the registry-default kernel budget; a per-request budget override is a future refinement (this hint is not yet applied)."
-                }
             },
             "required": [],
             "additionalProperties": false
@@ -454,7 +450,7 @@ pub(crate) fn measure_bits_tool_definition() -> Value {
     json!({
         "name": "measure_bits",
         "title": "Measure Bits",
-        "description": "Serve per-repo measured assay cards for a shadow-indexed project, replacing CBM's fixed constants with measured values. Six modes: signals (per-slot bits ± CI ranked about an axis), sufficiency (I(panel;axis) vs H(axis) with the deficit breakdown), redundancy (total correlation + effective rank n_eff + the pairwise redundancy map), synergy (three-way interaction information over designed triples), causality (transfer-entropy DRIVES edges with a lag sweep), and calibration (each edge-resolution strategy's measured empirical precision vs its CBM prior, with a Wilson CI; measured supersedes the prior above quorum, the prior is retained as a labeled fallback below it). Every response carries trust/freshness/provenance. signals also diagnoses an exact validated preserved failed Assay publication when its live shadow dial is absent, returning the prepared/unpublished/corrupt cause as a structured tool error rather than hiding it behind the generic admission failure. refresh:true recomputes the calibration card on demand from persisted observations (re-persisted with an incremented seq and reset freshness, write-then-readback verified); other modes' recompute is owned by the background assay lane and refresh is labeled accordingly. Fails closed with {code,message,remediation} on an unknown mode, a malformed axis, or an absent/corrupt card.",
+        "description": "Serve per-repo measured assay cards for a shadow-indexed project, replacing CBM's fixed constants with measured values. Six modes: signals (per-slot bits ± CI ranked about an axis), sufficiency (I(panel;axis) vs H(axis) with the deficit breakdown), redundancy (total correlation + effective rank n_eff + the pairwise redundancy map), synergy (three-way interaction information over designed triples), causality (transfer-entropy DRIVES edges with a lag sweep), and calibration (each edge-resolution strategy's measured empirical precision vs its CBM prior, with a Wilson CI; measured supersedes the prior above quorum, the prior is retained as a labeled fallback below it). Every response carries trust/freshness/provenance. signals also diagnoses an exact validated preserved failed Assay publication when its live shadow dial is absent, returning the prepared/unpublished/corrupt cause as a structured tool error rather than hiding it behind the generic admission failure. refresh:true recomputes only the calibration card on demand from persisted observations (re-persisted with an incremented seq and reset freshness, write-then-readback verified); refresh=true with any other mode fails closed instead of pretending to recompute. Fails closed with {code,message,remediation} on an unknown mode, a malformed axis, an unsupported refresh, or an absent/corrupt card.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -477,7 +473,7 @@ pub(crate) fn measure_bits_tool_definition() -> Value {
                 },
                 "refresh": {
                     "type": "boolean",
-                    "description": "If true, recompute on demand. Wired for mode=\"calibration\" (recomputes from persisted observations, bumps the card seq, resets freshness); other modes serve the cached card and label refresh as lane-owned."
+                    "description": "If true, recompute mode=\"calibration\" from persisted observations, bump the card seq, reset freshness, and verify write/readback. Any other mode with refresh=true fails closed."
                 }
             },
             "required": ["project", "mode"],
