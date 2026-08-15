@@ -37,6 +37,12 @@ function Get-Sha256([string]$Path) {
 }
 
 function Invoke-SqliteRaw([string]$Sqlite, [string]$Database, [string]$Query) {
+    $databasePath = [IO.Path]::GetFullPath($Database)
+    $sqliteDatabase = if ($databasePath.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        $databasePath
+    } else {
+        '\\?\' + $databasePath
+    }
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $Sqlite
     $start.UseShellExecute = $false
@@ -44,7 +50,7 @@ function Invoke-SqliteRaw([string]$Sqlite, [string]$Database, [string]$Query) {
     $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    foreach ($argument in @('-readonly', '-json', $Database, $Query)) {
+    foreach ($argument in @('-readonly', '-json', $sqliteDatabase, $Query)) {
         [void]$start.ArgumentList.Add([string]$argument)
     }
     $process = [Diagnostics.Process]::new()
@@ -164,9 +170,7 @@ Assert-Astro ([string]$report.schema -ceq 'astrolabe.issue-1099.cross-lsp-fsv.v2
     'ISSUE_1099_FSV_REPORT_INVALID' 'report schema does not identify the issue-1099 contract'
 Assert-Astro (
     [string]$firstChild.schema -ceq 'astrolabe.issue-1099.index-child.v1' -and
-    [string]$secondChild.schema -ceq 'astrolabe.issue-1099.index-child.v1' -and
-    [string]$firstChild.cache_requested -ceq [string]$firstChild.cache_readback -and
-    [string]$secondChild.cache_requested -ceq [string]$secondChild.cache_readback
+    [string]$secondChild.schema -ceq 'astrolabe.issue-1099.index-child.v1'
 ) 'ISSUE_1099_FSV_INDEX_CHILD_RECEIPT_INVALID' `
     'an index child did not read back its exact isolated native cache binding'
 $firstStore = [IO.Path]::GetFullPath((Join-Path $payload 'first-store'))
@@ -174,8 +178,10 @@ $secondStore = [IO.Path]::GetFullPath((Join-Path $payload 'second-store'))
 $firstDb = [IO.Path]::GetFullPath([string]$firstChild.database)
 $secondDb = [IO.Path]::GetFullPath([string]$secondChild.database)
 Assert-Astro (
+    [IO.Path]::GetFullPath([string]$firstChild.cache_requested) -ceq $firstStore -and
     [IO.Path]::GetFullPath([string]$firstChild.cache_readback) -ceq $firstStore -and
     [IO.Path]::GetDirectoryName($firstDb) -ceq $firstStore -and
+    [IO.Path]::GetFullPath([string]$secondChild.cache_requested) -ceq $secondStore -and
     [IO.Path]::GetFullPath([string]$secondChild.cache_readback) -ceq $secondStore -and
     [IO.Path]::GetDirectoryName($secondDb) -ceq $secondStore -and
     $firstDb -cne $secondDb -and

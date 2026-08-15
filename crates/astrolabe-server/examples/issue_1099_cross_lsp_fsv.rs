@@ -504,11 +504,11 @@ fn write_fixture(repo: &Path) {
     );
     write_exact(
         &repo.join("Helper.java"),
-        b"package demo;\n\nfinal class Helper {\n    static int twice(int value) { return value * 2; }\n}\n",
+        b"final class Helper {\n    static int twice(int value) { return value * 2; }\n}\n",
     );
     write_exact(
         &repo.join("Caller.java"),
-        b"package demo;\n\nfinal class Caller {\n    int local(int value) { return value + 1; }\n    int invoke() { return local(1) + Helper.twice(2); }\n}\n",
+        b"final class Caller {\n    int local(int value) { return value + 1; }\n    int invoke() { return local(1) + Helper.twice(2); }\n}\n",
     );
 }
 
