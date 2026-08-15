@@ -2397,10 +2397,15 @@ function Read-AstroResidentCohortPlan {
             'phase_store_owner_contract', 'auxiliary_state_contract'
         )
     }
+    elseif ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v5') {
+        @($basePlanProperties) + @(
+            'phase_store_owner_contract', 'auxiliary_state_contract'
+        )
+    }
     else {
         Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
             "resident-cohort plan schema '$schema' is not supported" `
-            'publish an exact v1 retained-SQLite, v2 explicit phase-owner, v3 empty-tail, or v4 stable-family plan'
+            'publish an exact v1 retained-SQLite, v2 explicit phase-owner, v3 empty-tail, v4 stable-family, or v5 persistent-WAL plan'
     }
     Assert-AstroExactObjectProperties $plan $planProperties `
         'ASTRO_FSV_COHORT_PLAN_INVALID' 'resident-cohort plan'
@@ -2419,25 +2424,36 @@ function Read-AstroResidentCohortPlan {
         $contract = [ordered]@{}
         foreach ($phase in @('prime', 'reopen')) {
             $value = [string]$plan.phase_store_owner_contract.$phase
-            if ($value -cne 'residents' -and $value -cne 'absent') {
+            $validOwnerContract = $value -ceq 'residents' -or $value -ceq 'absent' -or
+                ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v5' -and
+                    $value -ceq 'advisory')
+            if (-not $validOwnerContract) {
                 Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
-                    "phase_store_owner_contract.$phase must be exactly 'residents' or 'absent', observed '$value'" `
-                    'declare the exact expected Restart Manager owner set for every resident phase'
+                    "phase_store_owner_contract.$phase is invalid for schema '$schema': '$value'" `
+                    'declare residents/absent, or v5 advisory when exact resident handles and persisted state own truth'
             }
             $contract[$phase] = $value
         }
         $contract
     }
     $auxiliaryStateContract = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v3' -or
-        $schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4') {
+        $schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4' -or
+        $schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v5') {
         $value = [string]$plan.auxiliary_state_contract
-        $valid = $value -ceq 'absent' -or $value -ceq 'read_only_tail' -or
-            ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4' -and
-                $value -ceq 'stable_wal_family')
+        $valid = if ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v3') {
+            $value -ceq 'absent' -or $value -ceq 'read_only_tail'
+        }
+        elseif ($schema -ceq 'astrolabe.native-fsv-resident-cohort-plan.v4') {
+            $value -ceq 'absent' -or $value -ceq 'read_only_tail' -or
+                $value -ceq 'stable_wal_family'
+        }
+        else {
+            $value -ceq 'stable_wal_database'
+        }
         if (-not $valid) {
             Fail-Astro 'ASTRO_FSV_COHORT_PLAN_INVALID' `
                 "auxiliary_state_contract is invalid for schema '$schema': '$value'" `
-                'declare absent/read_only_tail for v3, or absent/read_only_tail/stable_wal_family for v4'
+                'declare absent/read_only_tail for v3, stable_wal_family for v4, or stable_wal_database for v5'
         }
         $value
     }
@@ -2694,6 +2710,24 @@ function Wait-AstroCohortStoreOwners {
         'preserve the cohort/store/session and inspect the exact PID/start-ticks holder chronology'
 }
 
+function Observe-AstroCohortStoreOwners {
+    param(
+        [Parameter(Mandatory)][string[]]$StorePaths,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][object[]]$KnownExactResidents
+    )
+    $first = Get-AstroCohortStoreSnapshot -StorePaths $StorePaths
+    [Threading.Thread]::Sleep(100)
+    $second = Get-AstroCohortStoreSnapshot -StorePaths $StorePaths
+    return [ordered]@{
+        phase = $Phase
+        authority = 'advisory_only'
+        reason = 'Restart Manager does not prove SQLite WAL-index byte-range lock absence while exact resident processes remain live'
+        known_exact_residents = @($KnownExactResidents)
+        observations = @($first, $second)
+    }
+}
+
 function Get-AstroCohortExpectedStoreOwners {
     param(
         [Parameter(Mandatory)][ValidateSet('residents', 'absent')][string]$Contract,
@@ -2833,6 +2867,80 @@ function Get-AstroCohortStoreMember {
     }
 }
 
+function Get-AstroCohortStoreMemberMetadata {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $handle = $null
+    $stream = $null
+    try {
+        try {
+            $handle = [AstroLauncherLockNative]::OpenExactSharedDeleteReadFile($full)
+        }
+        catch {
+            $cause = $_.Exception
+            while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+            $nativeError = if ($cause -is [ComponentModel.Win32Exception]) {
+                [int]$cause.NativeErrorCode
+            }
+            else { -1 }
+            if ($nativeError -eq 2 -or $nativeError -eq 3) {
+                return [ordered]@{
+                    path = $full; exists = $false; bytes = 0; sha256 = $null
+                    file_id = $null; final_path = $null; link_count = 0
+                    content_observation = 'absent'
+                }
+            }
+            Fail-Astro 'ASTRO_FSV_COHORT_STORE_OPEN_FAILED' `
+                "could not retain SQLite family metadata member '$full' (native_error=$nativeError; exception=$($cause.GetType().FullName); message=$($cause.Message))" `
+                'preserve the complete family and inspect the exact native open failure; do not infer absence or retry through another path'
+        }
+
+        $fileIdBefore = [AstroLauncherLockNative]::GetFileIdentity($handle)
+        $finalPathBefore = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        $linkCountBefore = [uint32][AstroLauncherLockNative]::GetNumberOfLinks($handle)
+        if (-not [string]::Equals(
+                $finalPathBefore, $full, [StringComparison]::OrdinalIgnoreCase
+            ) -or $linkCountBefore -ne 1) {
+            Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_STATE_DRIFT' `
+                "SQLite family metadata identity changed at retained-open (expected=$full; final=$finalPathBefore; file_id=$fileIdBefore; links=$linkCountBefore)" `
+                'preserve every family byte and inspect the namespace transition before retrying'
+        }
+
+        $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::Read)
+        $lengthBefore = [uint64]$stream.Length
+        $lengthAfter = [uint64]$stream.Length
+        $fileIdAfter = [AstroLauncherLockNative]::GetFileIdentity($handle)
+        $finalPathAfter = ConvertFrom-AstroNativeFinalPath (
+            [AstroLauncherLockNative]::GetFileFinalPath($handle)
+        )
+        $linkCountAfter = [uint32][AstroLauncherLockNative]::GetNumberOfLinks($handle)
+        if ($lengthAfter -ne $lengthBefore -or $fileIdAfter -cne $fileIdBefore -or
+            $linkCountAfter -ne $linkCountBefore -or -not [string]::Equals(
+                $finalPathAfter, $finalPathBefore, [StringComparison]::OrdinalIgnoreCase
+            )) {
+            Fail-Astro 'ASTRO_FSV_COHORT_AUXILIARY_STATE_DRIFT' `
+                "SQLite family metadata changed during retained observation (path=$full; bytes=$lengthBefore->$lengthAfter; file_id=$fileIdBefore->$fileIdAfter; links=$linkCountBefore->$linkCountAfter; final=$finalPathBefore->$finalPathAfter)" `
+                'preserve every family byte and inspect the namespace or writer transition'
+        }
+        return [ordered]@{
+            path = $full
+            exists = $true
+            bytes = $lengthAfter
+            sha256 = $null
+            file_id = $fileIdAfter
+            final_path = $finalPathAfter
+            link_count = $linkCountAfter
+            content_observation = 'deferred_transient_wal_index'
+        }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        elseif ($null -ne $handle) { $handle.Dispose() }
+    }
+}
+
 function Get-AstroCohortStoreInventory {
     param([Parameter(Mandatory)][string[]]$StorePaths)
     $files = [Collections.Generic.List[object]]::new()
@@ -2845,12 +2953,28 @@ function Get-AstroCohortStoreInventory {
     }
 }
 
+function Get-AstroCohortWalDatabaseInventory {
+    param([Parameter(Mandatory)][string[]]$StorePaths)
+    $files = [Collections.Generic.List[object]]::new()
+    foreach ($path in $StorePaths[0..1]) {
+        $files.Add((Get-AstroCohortStoreMember -Path $path))
+    }
+    $files.Add((Get-AstroCohortStoreMemberMetadata -Path $StorePaths[2]))
+    return [ordered]@{
+        observed_at_utc = [DateTime]::UtcNow.ToString('o')
+        files = @($files)
+        persistent_source_members = @($StorePaths[0], $StorePaths[1])
+        transient_coordination_member = $StorePaths[2]
+    }
+}
+
 function Read-AstroCohortAuxiliaryState {
     param(
         [Parameter(Mandatory)][string[]]$StorePaths,
-        [Parameter(Mandatory)][ValidateSet('absent', 'read_only_tail', 'stable_wal_family')][string]$Contract,
+        [Parameter(Mandatory)][ValidateSet('absent', 'read_only_tail', 'stable_wal_family', 'stable_wal_database')][string]$Contract,
         [Parameter(Mandatory)][int]$TimeoutMilliseconds,
-        [Parameter(Mandatory)][string]$Phase
+        [Parameter(Mandatory)][string]$Phase,
+        [switch]$Quiescent
     )
     if ($Contract -ceq 'absent') {
         $absence = Wait-AstroCohortSidecarsAbsent $StorePaths[1..2] `
@@ -2861,13 +2985,26 @@ function Read-AstroCohortAuxiliaryState {
         }
     }
 
-    # #1124/#1125 / #1064 PC-03/04/07/13/35/38/41: after exact zero-owner proof, read the
-    # fixed three-file family twice. No timeout/poll loop depends on project or
-    # ledger N. Hashing cost is O(B), where B is the physical config-family byte
-    # count named by the plan; paths and read order are invariant.
-    $first = Get-AstroCohortStoreInventory -StorePaths $StorePaths
+    # #1124/#1125 / #1064 PC-03/04/07/13/35/38/41: read the fixed family twice.
+    # v5 hashes the persistent DB+WAL source while exact residents are live and
+    # observes only SHM identity/size because SQLite's Windows VFS uses mandatory
+    # locks within that transient wal-index. Once exact residents exit, v5 hashes
+    # all three members. Cost is O(B) in the named physical source bytes; fixed
+    # paths and read order are invariant and no retry depends on project/ledger N.
+    $deferShmContent = $Contract -ceq 'stable_wal_database' -and -not $Quiescent
+    $first = if ($deferShmContent) {
+        Get-AstroCohortWalDatabaseInventory -StorePaths $StorePaths
+    }
+    else {
+        Get-AstroCohortStoreInventory -StorePaths $StorePaths
+    }
     [Threading.Thread]::Sleep(100)
-    $second = Get-AstroCohortStoreInventory -StorePaths $StorePaths
+    $second = if ($deferShmContent) {
+        Get-AstroCohortWalDatabaseInventory -StorePaths $StorePaths
+    }
+    else {
+        Get-AstroCohortStoreInventory -StorePaths $StorePaths
+    }
     $firstBytes = $first.files | ConvertTo-Json -Depth 8 -Compress
     $secondBytes = $second.files | ConvertTo-Json -Depth 8 -Compress
     if ($firstBytes -cne $secondBytes) {
@@ -2894,10 +3031,9 @@ function Read-AstroCohortAuxiliaryState {
             "$Contract during '$Phase' observed WAL/SHM presence mismatch (wal=$([bool]$wal.exists), shm=$([bool]$shm.exists))" `
             'preserve the partial family and diagnose its exact SQLite lifecycle before retrying'
     }
-    # stable_wal_family deliberately classifies the exact representation without
-    # forcing a checkpoint. The already-required subsequent resident reopen and
-    # bound response are the SQLite-aware semantic read; hashes alone never claim
-    # that a nonempty WAL is valid or reconstruct its contents.
+    # Stable WAL contracts classify the exact representation without forcing a
+    # checkpoint. The bound resident response is the SQLite-aware semantic read;
+    # hashes alone never claim a nonempty WAL valid or reconstruct SHM contents.
     $state = if (-not [bool]$wal.exists) {
         'absent'
     }
@@ -2918,6 +3054,19 @@ function Read-AstroCohortAuxiliaryState {
         wal_empty = (-not [bool]$wal.exists) -or [uint64]$wal.bytes -eq 0
         wal_is_source_of_truth = [bool]$wal.exists -and [uint64]$wal.bytes -gt 0
         shm_trust = if ([bool]$shm.exists) { 'transient_wal_index' } else { 'absent' }
+        shm_content_observation = if (-not [bool]$shm.exists) {
+            'absent'
+        }
+        elseif ($deferShmContent) {
+            'deferred_until_exact_resident_exit'
+        }
+        elseif ($Quiescent) {
+            'hashed_after_exact_resident_exit'
+        }
+        else {
+            'hashed_by_strict_legacy_contract'
+        }
+        persistent_source_members = @($StorePaths[0], $StorePaths[1])
     }
 }
 
@@ -3526,11 +3675,16 @@ function Invoke-AstroResidentCohort {
         }
         $residentIdentities = @($processStates | Where-Object role -ceq 'resident' |
             Sort-Object ordinal | ForEach-Object { $_.identity })
-        $primeExpectedOwners = Get-AstroCohortExpectedStoreOwners `
-            $plan.phase_store_owner_contract.prime $residentIdentities
-        $primeOwners = Wait-AstroCohortStoreOwners $plan.store_paths `
-            $primeExpectedOwners $plan.holder_timeout_ms `
-            "prime-$($plan.phase_store_owner_contract.prime)"
+        $primeOwners = if ($plan.phase_store_owner_contract.prime -ceq 'advisory') {
+            Observe-AstroCohortStoreOwners $plan.store_paths 'prime-advisory' $residentIdentities
+        }
+        else {
+            $primeExpectedOwners = Get-AstroCohortExpectedStoreOwners `
+                $plan.phase_store_owner_contract.prime $residentIdentities
+            Wait-AstroCohortStoreOwners $plan.store_paths `
+                $primeExpectedOwners $plan.holder_timeout_ms `
+                "prime-$($plan.phase_store_owner_contract.prime)"
+        }
         $storeChronology.Add($primeOwners)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
             event = 'store_owner_snapshot'; phase = 'prime'
@@ -3575,11 +3729,16 @@ function Invoke-AstroResidentCohort {
                 'preserve the exact output/store generation and repair the real index mutation'
         }
 
-        $zeroAfterIndexer = Wait-AstroCohortStoreOwners $plan.store_paths @() `
-            $plan.holder_timeout_ms 'after-indexer-zero-holders'
-        $storeChronology.Add($zeroAfterIndexer)
+        $afterIndexerOwners = if ($plan.auxiliary_state_contract -ceq 'stable_wal_database') {
+            Observe-AstroCohortStoreOwners $plan.store_paths 'after-indexer-advisory' $residentIdentities
+        }
+        else {
+            Wait-AstroCohortStoreOwners $plan.store_paths @() `
+                $plan.holder_timeout_ms 'after-indexer-zero-holders'
+        }
+        $storeChronology.Add($afterIndexerOwners)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
-            event = 'store_zero_holder_transition'; owner_evidence = $zeroAfterIndexer
+            event = 'store_owner_transition'; owner_evidence = $afterIndexerOwners
         })
         $sidecarsAfterIndexer = Read-AstroCohortAuxiliaryState $plan.store_paths `
             $plan.auxiliary_state_contract $plan.holder_timeout_ms 'after-indexer'
@@ -3593,11 +3752,16 @@ function Invoke-AstroResidentCohort {
                 $state.native $plan.reopen_request $plan.reopen_expected_substring `
                 $plan.response_timeout_ms 'reopen' $state.ordinal $StandardOutputPath))
         }
-        $reopenExpectedOwners = Get-AstroCohortExpectedStoreOwners `
-            $plan.phase_store_owner_contract.reopen $residentIdentities
-        $reopenedOwners = Wait-AstroCohortStoreOwners $plan.store_paths `
-            $reopenExpectedOwners $plan.holder_timeout_ms `
-            "reopen-$($plan.phase_store_owner_contract.reopen)"
+        $reopenedOwners = if ($plan.phase_store_owner_contract.reopen -ceq 'advisory') {
+            Observe-AstroCohortStoreOwners $plan.store_paths 'reopen-advisory' $residentIdentities
+        }
+        else {
+            $reopenExpectedOwners = Get-AstroCohortExpectedStoreOwners `
+                $plan.phase_store_owner_contract.reopen $residentIdentities
+            Wait-AstroCohortStoreOwners $plan.store_paths `
+                $reopenExpectedOwners $plan.holder_timeout_ms `
+                "reopen-$($plan.phase_store_owner_contract.reopen)"
+        }
         $storeChronology.Add($reopenedOwners)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
             event = 'store_owner_snapshot'; phase = 'reopen'
@@ -3636,13 +3800,15 @@ function Invoke-AstroResidentCohort {
         }
         $finalOwners = Wait-AstroCohortStoreOwners $plan.store_paths @() `
             $plan.holder_timeout_ms 'final-zero-holders'
-        $finalSidecars = Read-AstroCohortAuxiliaryState $plan.store_paths `
-            $plan.auxiliary_state_contract $plan.holder_timeout_ms 'final'
         $storeChronology.Add($finalOwners)
+        Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
+            event = 'cohort_terminal_store_owner_state'; owner_evidence = $finalOwners
+        })
+        $finalSidecars = Read-AstroCohortAuxiliaryState $plan.store_paths `
+            $plan.auxiliary_state_contract $plan.holder_timeout_ms 'final' -Quiescent
         $storeChronology.Add($finalSidecars)
         Write-AstroFsvEventLine $StandardOutputPath ([ordered]@{
-            event = 'cohort_terminal_store_state'; owner_evidence = $finalOwners
-            sidecar_evidence = $finalSidecars
+            event = 'cohort_terminal_store_state'; sidecar_evidence = $finalSidecars
         })
 
         $artifactHashAfter = File-Sha256 $Artifact
