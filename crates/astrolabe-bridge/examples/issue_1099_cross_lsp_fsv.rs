@@ -1,4 +1,4 @@
-use astrolabe_bridge::CbmToolRunner;
+use astrolabe_bridge::{CbmToolRunner, initialize_cbm_host_process};
 use cbm_sys::{
     CBMFileResult, CBMResolvedCall, cbm_arena_destroy, cbm_arena_init, cbm_arena_strdup,
     cbm_pxc_canonicalize_appended_results, cbm_resolvedcall_push,
@@ -607,11 +607,11 @@ fn main() {
             "use one absent direct payload child of the staged session",
         )
     });
-    initialize_allocator_bindings_first().unwrap_or_else(|error| {
+    initialize_cbm_host_process(None).unwrap_or_else(|error| {
         fail(
-            "ISSUE_1099_FSV_ALLOCATOR_INIT_FAILED",
+            "ISSUE_1099_FSV_HOST_INIT_FAILED",
             error,
-            "rebuild libcbm and Rust with the pinned native GNU toolchain",
+            "repair the production host initialization boundary before indexing real data",
         )
     });
 
