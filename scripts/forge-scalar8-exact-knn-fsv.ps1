@@ -46,10 +46,8 @@ function Get-Sha256File {
 
 function ConvertTo-OneArgumentJson {
     param([Parameter(Mandatory)][string]$Value)
-    Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
-    $serializer = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
-    $json = $serializer.Serialize([object[]]@($Value))
-    $readback = $serializer.DeserializeObject($json)
+    $json = ConvertTo-Json -InputObject ([object[]]@($Value)) -Compress -Depth 3
+    $readback = ConvertFrom-Json -InputObject $json -NoEnumerate
     Assert-Astro (
         $readback -is [object[]] -and $readback.Count -eq 1 -and
         [string]$readback[0] -ceq $Value
