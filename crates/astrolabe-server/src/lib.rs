@@ -1054,7 +1054,8 @@ fn run_ingest_cbm(args: &[String]) -> Result<i32, DynError> {
         })?;
     let options = astrolabe_ingest::SqliteImportOptions::new(&project, &commit, panel_version)
         .with_workers(workers)
-        .with_available_slots(migration::shadow_available_slots());
+        .with_available_slots(migration::shadow_available_slots())
+        .with_atomic_kernel_projection(true);
     match astrolabe_ingest::import_sqlite_to_vault(
         &sqlite,
         &vault,

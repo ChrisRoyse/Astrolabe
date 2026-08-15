@@ -26,8 +26,8 @@ use calyx_aster::vault::{
     AsterVault, LedgerBoundGroupReceipt, LedgerBoundWriteGroup, OrderedCfRead, encode, input_store,
 };
 use calyx_core::{
-    AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
-    SlotVector,
+    AbsentReason, CalyxError, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality,
+    Seq, SlotId, SlotVector,
 };
 use calyx_ledger::{ActorId, EntryKind, LedgerEntryInput, LedgerRow, SubjectId, decode};
 use rusqlite::{Connection, OpenFlags, params};
@@ -36,6 +36,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::graph_projection::{
+    ASTRO_GRAPH_PROJECTION_CORRUPT, AtomicKernelProjectionReport, is_kernel_projection_key,
+    plan_atomic_kernel_projection,
+};
 use crate::{
     ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, IngestError, IngestResult,
     SERIES_ID_V1_REBUILD_REMEDIATION, SeriesVersionInput, VaultMutationPlan,
@@ -78,7 +82,7 @@ const MISSING_CBM_PROJECT_ROW_REMEDIATION: &str = "Re-import the project from it
 const EXACT_SOURCE_REMEDIATION: &str = "Preserve the vault, inspect the referenced cxinput:v1 Blob rows, and re-import the project from its exact CBM SQLite source before trusting graph source bytes.";
 const SEMANTIC_COVERAGE_REMEDIATION: &str = "Preserve the prior Calyx generation, add or correct the exact versioned typed lens rule named by this refusal, rebuild the panel, and re-ingest the same CBM source.";
 const WEAVE_SOURCE_UNBOUNDED_REMEDIATION: &str = "Open the unpublished shadow vault in latest-only mode (restore_mvcc_rows=false), require an empty MVCC overlay and a positive hard router memtable cap, then rebuild the compact weave source from the unchanged staged generation.";
-const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
+pub(crate) const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
 const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
 const PROJECT_ROW_PREFIX: &[u8] = b"astrolabe:cbm-project:v1:";
@@ -92,8 +96,8 @@ pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 /// Per-file digest manifest head and bounded identity chunks (#855).
 const FILE_DIGEST_MANIFEST_V2_PREFIX: &[u8] = b"astrolabe:file-digest:v2:head:";
 const FILE_DIGEST_CHUNK_V2_PREFIX: &[u8] = b"astrolabe:file-digest:v2:chunk:";
-const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v4";
-const LEGACY_SCHEMA_NODE_MAP_V3: &str = "astrolabe-node-map-v3";
+pub(crate) const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v4";
+pub(crate) const LEGACY_SCHEMA_NODE_MAP_V3: &str = "astrolabe-node-map-v3";
 const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v3";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v3";
 const LEGACY_SCHEMA_STRUCTURAL_NODE_V2: &str = "astrolabe-structural-node-v2";
@@ -274,6 +278,9 @@ pub struct SqliteImportOptions {
     pub quantization_gate: Option<QuantizationGateConfig>,
     /// Whether this live import also advances the durable symbol-series registry.
     pub update_series_registry: bool,
+    /// Whether a live direct import must atomically maintain the composite
+    /// Kernel CSR in the same ledger-bound commit as its Graph rows.
+    pub atomic_kernel_projection: bool,
 }
 
 impl SqliteImportOptions {
@@ -290,6 +297,7 @@ impl SqliteImportOptions {
                 .collect(),
             quantization_gate: None,
             update_series_registry: false,
+            atomic_kernel_projection: false,
         }
     }
 
@@ -317,6 +325,12 @@ impl SqliteImportOptions {
     /// Advances series and recurrence rows for every imported non-structural symbol.
     pub fn with_series_registry(mut self, enabled: bool) -> Self {
         self.update_series_registry = enabled;
+        self
+    }
+
+    /// Requires the final composite Kernel CSR in the import's atomic commit.
+    pub fn with_atomic_kernel_projection(mut self, enabled: bool) -> Self {
+        self.atomic_kernel_projection = enabled;
         self
     }
 }
@@ -488,6 +502,8 @@ pub struct SqliteImportReadback {
     /// Content-addressed Blob rows structurally decoded inside the same physical
     /// stream that verified their commit digests.
     pub blob_rows_verified: usize,
+    /// Composite Kernel projection rows verified from the atomic commit digest plan.
+    pub kernel_rows_verified: usize,
     /// Expected Base CF rows for the imported non-structural symbols.
     pub expected_base_rows: usize,
     /// Expected slot sidecar rows for the imported non-structural symbols.
@@ -500,6 +516,8 @@ pub struct SqliteImportReadback {
     pub expected_raw_guard_slot_rows: usize,
     /// Blob rows named by the exact atomic commit receipt.
     pub expected_blob_rows: usize,
+    /// Composite Kernel projection rows named by the exact atomic commit receipt.
+    pub expected_kernel_rows: usize,
     /// Persisted rows delivered by Calyx's ordered readback stream.
     pub physical_rows_read_back: u64,
     /// Persisted value bytes observed by that stream.
@@ -551,6 +569,10 @@ pub struct SqliteImportReport {
     pub graph_rows_written: usize,
     /// Typed edge Graph CF rows whose bytes changed in this run.
     pub edge_rows_written: usize,
+    /// Composite Kernel projection maintained atomically for a live direct import.
+    /// Absent for staged shadow imports whose Weave phase owns the final composite build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atomic_kernel_projection: Option<AtomicKernelProjectionReport>,
     /// Symbol versions presented to the durable series registry.
     pub series_inputs: usize,
     /// Registry/reverse/QN/recurrence rows changed by this run.
@@ -1771,6 +1793,8 @@ struct IngestLedgerPayload {
     graph_rows_written: u64,
     edge_inputs: u64,
     edge_rows_written: u64,
+    #[serde(default)]
+    atomic_kernel_projection: bool,
     edge_dangling_skipped: u64,
     edge_structural_endpoint_skipped: u64,
     expected_base_rows: u64,
@@ -2105,8 +2129,9 @@ where
     // reconciliation pass (reuse, change derivation, stale detection) reads
     // this map instead of issuing per-row MVCC point reads or re-scanning the
     // CF once per pass.
+    let existing_graph_snapshot = vault.latest_seq();
     let existing_graph: BTreeMap<Vec<u8>, Vec<u8>> = vault
-        .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)?
+        .scan_cf_at(existing_graph_snapshot, ColumnFamily::Graph)?
         .into_iter()
         .collect();
     timing_ms.push((
@@ -2152,6 +2177,11 @@ where
     phase_start = std::time::Instant::now();
 
     let before_snapshot = vault.latest_seq();
+    if before_snapshot != existing_graph_snapshot {
+        return Err(readback_mismatch(format!(
+            "vault sequence drifted from {existing_graph_snapshot} to {before_snapshot} while preparing the import; discard the prepared batch and retry against one stable generation"
+        )));
+    }
     let mut new_cx_ids = 0;
     let mut reused_cx_ids = 0;
     for prepared_cx in &prepared.constellations {
@@ -2223,16 +2253,27 @@ where
             edge_rows_written: changes.edge_rows_written,
         },
     )?;
-    let (ledger_ref, fsv, readback, graph_rows_written, edge_rows_written, write_timing_ms) =
-        write_import_rows(
-            vault,
-            &prepared,
-            input.sqlite_fingerprint,
-            payload,
-            options.quantization_gate.as_ref(),
-            &changes,
-            &existing_graph,
-        )?;
+    let (
+        ledger_ref,
+        fsv,
+        readback,
+        graph_rows_written,
+        edge_rows_written,
+        atomic_kernel_projection,
+        write_timing_ms,
+    ) = write_import_rows(
+        vault,
+        &prepared,
+        input.sqlite_fingerprint,
+        payload,
+        options.quantization_gate.as_ref(),
+        &changes,
+        ImportWriteContext {
+            existing_graph: &existing_graph,
+            expected_snapshot: before_snapshot,
+            atomic_kernel_workers: options.atomic_kernel_projection.then_some(options.workers),
+        },
+    )?;
     timing_ms.push((
         "write_import_rows",
         phase_start.elapsed().as_millis() as u64,
@@ -2282,6 +2323,7 @@ where
         semantic_coverage_witness_sha256,
         graph_rows_written,
         edge_rows_written,
+        atomic_kernel_projection,
         series_inputs,
         series_mutated_rows,
         seq: vault.latest_seq(),
@@ -7143,7 +7185,7 @@ fn graph_row_exact_source_ref(key: &[u8], value: &[u8]) -> IngestResult<Option<E
     }
 }
 
-fn supported_node_map_schema(schema: &str) -> bool {
+pub(crate) fn supported_node_map_schema(schema: &str) -> bool {
     schema == SCHEMA_NODE_MAP || schema == LEGACY_SCHEMA_NODE_MAP_V3
 }
 
@@ -7497,12 +7539,14 @@ struct ImportSemanticReadback<'a> {
     edge_rows_verified: usize,
     raw_guard_slot_rows_verified: usize,
     blob_rows_verified: usize,
+    kernel_rows_verified: usize,
     expected_base_rows: usize,
     expected_slot_rows: usize,
     expected_graph_rows: usize,
     expected_edge_rows: usize,
     expected_raw_guard_slot_rows: usize,
     expected_blob_rows: usize,
+    expected_kernel_rows: usize,
 }
 
 impl<'a> ImportSemanticReadback<'a> {
@@ -7513,6 +7557,7 @@ impl<'a> ImportSemanticReadback<'a> {
         existing_graph: &'a BTreeMap<Vec<u8>, Vec<u8>>,
         ledger_ref: &'a LedgerRef,
         expected_blob_rows: usize,
+        expected_kernel_rows: usize,
     ) -> IngestResult<Self> {
         let graph_writes = changes
             .graph_writes
@@ -7619,6 +7664,7 @@ impl<'a> ImportSemanticReadback<'a> {
             edge_rows_verified,
             raw_guard_slot_rows_verified: 0,
             blob_rows_verified: 0,
+            kernel_rows_verified: 0,
             expected_base_rows: prepared.constellations.len()
                 + prepared.semantic_constellations.len(),
             expected_slot_rows: prepared
@@ -7639,6 +7685,7 @@ impl<'a> ImportSemanticReadback<'a> {
                 .map(|gate| expected_raw_guard_slot_rows(prepared, gate))
                 .unwrap_or(0),
             expected_blob_rows,
+            expected_kernel_rows,
         })
     }
 
@@ -7648,6 +7695,16 @@ impl<'a> ImportSemanticReadback<'a> {
         key: &[u8],
         persisted: Option<&[u8]>,
     ) -> IngestResult<()> {
+        if cf == ColumnFamily::Kernel {
+            if !is_kernel_projection_key(key) {
+                return Err(readback_mismatch(format!(
+                    "SQLite import committed unexpected Kernel row {}",
+                    hex_lower(key)
+                )));
+            }
+            self.kernel_rows_verified += 1;
+            return Ok(());
+        }
         let Some(bytes) = persisted else {
             return Ok(());
         };
@@ -7806,9 +7863,10 @@ impl<'a> ImportSemanticReadback<'a> {
             || self.edge_rows_verified != self.expected_edge_rows
             || self.raw_guard_slot_rows_verified != self.expected_raw_guard_slot_rows
             || self.blob_rows_verified != self.expected_blob_rows
+            || self.kernel_rows_verified != self.expected_kernel_rows
         {
             return Err(readback_mismatch(format!(
-                "readback verified counts differ: base={}/{}, slot={}/{}, graph={}/{}, edge={}/{}, raw_guard={}/{}, blob={}/{}",
+                "readback verified counts differ: base={}/{}, slot={}/{}, graph={}/{}, edge={}/{}, raw_guard={}/{}, blob={}/{}, kernel={}/{}",
                 self.base_rows_verified,
                 self.expected_base_rows,
                 self.slot_rows_verified,
@@ -7821,6 +7879,8 @@ impl<'a> ImportSemanticReadback<'a> {
                 self.expected_raw_guard_slot_rows,
                 self.blob_rows_verified,
                 self.expected_blob_rows,
+                self.kernel_rows_verified,
+                self.expected_kernel_rows,
             )));
         }
         Ok(SqliteImportReadback {
@@ -7830,12 +7890,14 @@ impl<'a> ImportSemanticReadback<'a> {
             edge_rows_verified: self.edge_rows_verified,
             raw_guard_slot_rows_verified: self.raw_guard_slot_rows_verified,
             blob_rows_verified: self.blob_rows_verified,
+            kernel_rows_verified: self.kernel_rows_verified,
             expected_base_rows: self.expected_base_rows,
             expected_slot_rows: self.expected_slot_rows,
             expected_graph_rows: self.expected_graph_rows,
             expected_edge_rows: self.expected_edge_rows,
             expected_raw_guard_slot_rows: self.expected_raw_guard_slot_rows,
             expected_blob_rows: self.expected_blob_rows,
+            expected_kernel_rows: self.expected_kernel_rows,
             physical_rows_read_back: physical.rows_read_back,
             physical_bytes_read_back: physical.bytes_read_back,
             physical_read_batches: physical.read_batches,
@@ -7860,15 +7922,23 @@ fn cx_id_from_row_key(kind: &str, key: &[u8]) -> IngestResult<CxId> {
 /// Outcome of [`write_import_rows`]: the paired ledger ref (absent exactly when
 /// no mutation was committed), the committed-state FSV ack (also absent on that
 /// physical no-op), fused semantic readback, graph rows written, edge rows
-/// written, and labeled sub-phase timings.
+/// written, optional atomic Kernel projection evidence, and labeled sub-phase
+/// timings.
 type ImportWriteOutcome = (
     Option<LedgerRef>,
     Option<FsvAck>,
     SqliteImportReadback,
     usize,
     usize,
+    Option<AtomicKernelProjectionReport>,
     Vec<(&'static str, u64)>,
 );
+
+struct ImportWriteContext<'a> {
+    existing_graph: &'a BTreeMap<Vec<u8>, Vec<u8>>,
+    expected_snapshot: Seq,
+    atomic_kernel_workers: Option<usize>,
+}
 
 fn write_import_rows<C>(
     vault: &AsterVault<C>,
@@ -7877,7 +7947,7 @@ fn write_import_rows<C>(
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
     changes: &GraphRowChanges,
-    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    context: ImportWriteContext<'_>,
 ) -> IngestResult<ImportWriteOutcome>
 where
     C: Clock,
@@ -8043,6 +8113,26 @@ where
         rows.push((ColumnFamily::Graph, key.clone(), tombstone_value().to_vec()));
     }
 
+    // A physical source no-op may still be a legacy incomplete generation with
+    // no composite CSR. Plan that repair from the importer's existing Graph map
+    // before deciding whether there is anything to commit. When source rows are
+    // changing, planning is deferred until Calyx has attached the exact new
+    // LedgerRef to those Graph bytes under the durable commit lock.
+    let mut preplanned_atomic_projection = None;
+    if let Some(workers) = context.atomic_kernel_workers
+        && rows.is_empty()
+    {
+        let plan = plan_atomic_kernel_projection(
+            vault,
+            context.expected_snapshot,
+            context.existing_graph,
+            &[],
+            workers,
+        )?;
+        rows.extend(plan.rows);
+        preplanned_atomic_projection = Some(plan.report);
+    }
+
     write_timing_ms.push((
         "write_import_rows.stage_rows",
         sub_phase.elapsed().as_millis() as u64,
@@ -8050,13 +8140,21 @@ where
     sub_phase = std::time::Instant::now();
 
     if rows.is_empty() {
+        if vault.latest_seq() != context.expected_snapshot {
+            return Err(readback_mismatch(format!(
+                "vault sequence drifted from {} to {} before direct-ingest no-op acknowledgement",
+                context.expected_snapshot,
+                vault.latest_seq()
+            )));
+        }
         let no_commit_ref = zero_ledger_ref();
         let readback = ImportSemanticReadback::new(
             prepared,
             quantization_gate,
             changes,
-            existing_graph,
+            context.existing_graph,
             &no_commit_ref,
+            0,
             0,
         )?
         .finish(VaultMutationReadbackMetrics::default())?;
@@ -8066,6 +8164,7 @@ where
             readback,
             graph_rows_written,
             edge_rows_written,
+            preplanned_atomic_projection,
             write_timing_ms,
         ));
     }
@@ -8078,13 +8177,53 @@ where
     // snapshot seq returned by the atomic group commit and read the newest ledger row as
     // of exactly that snapshot — later concurrent commits live at higher seqs and are
     // invisible here, so the entry recovered is unambiguously this run's record.
-    let commit = vault.write_cf_batch_with_ledger_entry_with_row_digests(
-        rows,
-        EntryKind::Ingest,
-        subject.clone(),
-        payload,
-        actor.clone(),
-    )?;
+    let (commit, mut atomic_projection_report) = if let Some(workers) =
+        context.atomic_kernel_workers
+    {
+        vault.write_cf_batch_with_ledger_entry_with_row_digests_and_derived(
+            rows,
+            EntryKind::Ingest,
+            subject.clone(),
+            payload,
+            actor.clone(),
+            |_, ledger_bound_rows| {
+                let current = vault.latest_seq();
+                if current != context.expected_snapshot {
+                    return Err(CalyxError {
+                        code: ASTRO_INGEST_READBACK_MISMATCH,
+                        message: format!(
+                            "vault sequence drifted from {} to {current} before atomic Graph/Kernel publication",
+                            context.expected_snapshot
+                        ),
+                        remediation: READBACK_REMEDIATION,
+                    });
+                }
+                if let Some(report) = preplanned_atomic_projection {
+                    return Ok((Vec::new(), Some(report)));
+                }
+                let plan = plan_atomic_kernel_projection(
+                    vault,
+                    context.expected_snapshot,
+                    context.existing_graph,
+                    ledger_bound_rows,
+                    workers,
+                )
+                .map_err(atomic_projection_commit_error)?;
+                Ok((plan.rows, Some(plan.report)))
+            },
+        )?
+    } else {
+        (
+            vault.write_cf_batch_with_ledger_entry_with_row_digests(
+                rows,
+                EntryKind::Ingest,
+                subject.clone(),
+                payload,
+                actor.clone(),
+            )?,
+            None,
+        )
+    };
     let commit_seq = commit.seq;
     let ledger_ref = commit.ledger_ref.clone();
     write_timing_ms.push((
@@ -8097,6 +8236,11 @@ where
         .data_row_digests
         .iter()
         .filter(|row| row.cf == ColumnFamily::Blob)
+        .count();
+    let expected_kernel_rows = commit
+        .data_row_digests
+        .iter()
+        .filter(|row| row.cf == ColumnFamily::Kernel)
         .count();
     for row in commit.data_row_digests {
         if row.tombstoned {
@@ -8115,9 +8259,10 @@ where
         prepared,
         quantization_gate,
         changes,
-        existing_graph,
+        context.existing_graph,
         &ledger_ref,
         expected_blob_rows,
+        expected_kernel_rows,
     )?;
     let (fsv, physical) = fsv_plan.verify_committed_with_ledger_ref_observed(
         vault,
@@ -8126,6 +8271,10 @@ where
         |_, cf, key, persisted| semantic.observe(cf, key, persisted),
     )?;
     let readback = semantic.finish(physical)?;
+    if let Some(report) = &mut atomic_projection_report {
+        report.projection.rows_readback_verified = readback.kernel_rows_verified;
+        report.projection.ledger_paired = readback.kernel_rows_verified > 0;
+    }
     write_timing_ms.push((
         "write_import_rows.fsv_verify",
         sub_phase.elapsed().as_millis() as u64,
@@ -8136,8 +8285,17 @@ where
         readback,
         graph_rows_written,
         edge_rows_written,
+        atomic_projection_report,
         write_timing_ms,
     ))
+}
+
+fn atomic_projection_commit_error(error: IngestError) -> CalyxError {
+    CalyxError {
+        code: error.code().unwrap_or(ASTRO_GRAPH_PROJECTION_CORRUPT),
+        message: error.message(),
+        remediation: "Preserve the prior vault generation, correct the named Graph/projection invariant, and retry the unchanged direct ingest so Graph and Kernel publish atomically.",
+    }
 }
 
 fn verify_live_base_fields(
@@ -10211,6 +10369,7 @@ fn ingest_ledger_payload(
         graph_rows_written: stats.graph_rows_written as u64,
         edge_inputs: prepared.edge_rows.len() as u64,
         edge_rows_written: stats.edge_rows_written as u64,
+        atomic_kernel_projection: options.atomic_kernel_projection,
         edge_dangling_skipped: prepared.edge_skips.dangling as u64,
         edge_structural_endpoint_skipped: prepared.edge_skips.structural_endpoint as u64,
         expected_base_rows: (prepared.constellations.len() + prepared.semantic_constellations.len())

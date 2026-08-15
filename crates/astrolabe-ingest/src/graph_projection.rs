@@ -3,8 +3,8 @@ use std::thread;
 
 use astrolabe_domain::EdgeKind;
 use calyx_aster::cf::{ColumnFamily, prefix_range};
-use calyx_aster::mvcc::tombstone_value;
-use calyx_aster::vault::AsterVault;
+use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
+use calyx_aster::vault::{AsterVault, encode::WriteRow};
 use calyx_core::{Clock, CxId, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 use calyx_paths::AssocGraph;
@@ -13,7 +13,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::sqlite_import::{
-    ASTRO_INGEST_READBACK_MISMATCH, EDGE_ROW_PREFIX, EdgeGraphRow, SCHEMA_EDGE_ROW,
+    ASTRO_INGEST_READBACK_MISMATCH, EDGE_ROW_PREFIX, EdgeGraphRow, NODE_MAP_PREFIX,
+    SCHEMA_EDGE_ROW, supported_node_map_schema,
 };
 use crate::{IngestError, IngestResult};
 
@@ -314,6 +315,26 @@ pub struct GraphProjectionMaterializeReport {
     pub projections: Vec<GraphProjectionMaterializeEntry>,
 }
 
+/// Composite Kernel projection planned as part of a live direct-ingest commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AtomicKernelProjectionReport {
+    /// Typed CBM structural edge rows in the final ledger-bound Graph state.
+    pub source_typed_edge_rows: usize,
+    /// Persisted SIM similarity rows in that same final Graph state.
+    pub source_sim_edge_rows: usize,
+    /// Fingerprint framing every final typed and SIM source key/value byte.
+    pub source_fingerprint_blake3: [u8; 32],
+    /// Deterministic worker count used to encode independent CSR regions.
+    pub workers: usize,
+    /// Exact composite projection mutation/readback accounting.
+    pub projection: GraphProjectionMaterializeEntry,
+}
+
+pub(crate) struct AtomicKernelProjectionPlan {
+    pub(crate) rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    pub(crate) report: AtomicKernelProjectionReport,
+}
+
 /// Raw persisted-row evidence for one composite-kernel CSR region.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompositeKernelSegmentEvidence {
@@ -451,6 +472,15 @@ struct SimEdgeSourceRow {
     weight_bits: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct NodeMapProjectionRow {
+    schema: String,
+    node_id: i64,
+    atom_id: String,
+    qualified_name: String,
+    cx_id: CxId,
+}
+
 #[derive(Clone, Debug)]
 struct ProjectionBytes {
     csr: GraphProjectionCsr,
@@ -465,6 +495,14 @@ struct ProjectionSegmentBytes {
     key: Vec<u8>,
     bytes: Vec<u8>,
     manifest: ProjectionManifestRegion,
+}
+
+struct ProjectionUpdatePlan {
+    desired: ProjectionBytes,
+    segment_is_stale: Vec<bool>,
+    tombstoned_keys: Vec<Vec<u8>>,
+    rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    entry: GraphProjectionMaterializeEntry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -876,8 +914,53 @@ fn materialize_graph_projection_from_source<C>(
 where
     C: Clock,
 {
-    let desired = build_projection_bytes(kind, source, options.workers)?;
     let snapshot = vault.latest_seq();
+    let mut plan = plan_projection_update(vault, snapshot, kind, options, source)?;
+    let wrote_rows = !plan.rows.is_empty();
+    if wrote_rows {
+        let payload = serde_json::to_vec(&json!({
+            "schema": "agp_v1",
+            "projection": kind.name(),
+            "source_fingerprint_blake3_prefix": hex_prefix(&source.fingerprint, 8),
+            "node_count": plan.desired.csr.nodes.len(),
+            "edge_count": plan.desired.csr.edges.len(),
+            "association_edge_count": plan.desired.csr.association_edge_count,
+            "segments_written": plan.entry.segments_written,
+            "segments_tombstoned": plan.entry.segments_tombstoned,
+            "manifest_written": plan.entry.manifest_written,
+        }))?;
+        vault.write_cf_batch_with_ledger_entry(
+            std::mem::take(&mut plan.rows),
+            EntryKind::Kernel,
+            SubjectId::Query(kind.name().as_bytes().to_vec()),
+            payload,
+            ActorId::Service(ASTROLABE_PROJECTION_ACTOR.to_string()),
+        )?;
+        plan.entry.rows_readback_verified = verify_projection_commit_readback(
+            vault,
+            kind,
+            &plan.desired,
+            &plan.segment_is_stale,
+            plan.entry.manifest_written,
+            &plan.tombstoned_keys,
+        )?;
+        plan.entry.ledger_paired = true;
+    }
+
+    Ok(plan.entry)
+}
+
+fn plan_projection_update<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    kind: GraphProjectionKind,
+    options: &GraphProjectionBuildOptions,
+    source: &SourceEdges,
+) -> IngestResult<ProjectionUpdatePlan>
+where
+    C: Clock,
+{
+    let desired = build_projection_bytes(kind, source, options.workers)?;
     // Enumerate persisted segment keys WITHOUT loading their (potentially large) CSR byte values.
     // The prior path scanned every persisted segment's full bytes into a map that coexisted with
     // the freshly built `desired` segment bytes — old+new whole-projection copies held at once
@@ -954,42 +1037,7 @@ where
         ));
     }
 
-    let wrote_rows = !rows.is_empty();
-    if wrote_rows {
-        let payload = serde_json::to_vec(&json!({
-            "schema": "agp_v1",
-            "projection": kind.name(),
-            "source_fingerprint_blake3_prefix": hex_prefix(&source.fingerprint, 8),
-            "node_count": desired.csr.nodes.len(),
-            "edge_count": desired.csr.edges.len(),
-            "association_edge_count": desired.csr.association_edge_count,
-            "segments_written": segments_written,
-            "segments_tombstoned": segments_tombstoned,
-            "manifest_written": manifest_written,
-        }))?;
-        vault.write_cf_batch_with_ledger_entry(
-            rows,
-            EntryKind::Kernel,
-            SubjectId::Query(kind.name().as_bytes().to_vec()),
-            payload,
-            ActorId::Service(ASTROLABE_PROJECTION_ACTOR.to_string()),
-        )?;
-    }
-    let (rows_readback_verified, ledger_paired) = if wrote_rows {
-        let verified = verify_projection_commit_readback(
-            vault,
-            kind,
-            &desired,
-            &segment_is_stale,
-            manifest_written,
-            &tombstoned_keys,
-        )?;
-        (verified, true)
-    } else {
-        (0, false)
-    };
-
-    Ok(GraphProjectionMaterializeEntry {
+    let entry = GraphProjectionMaterializeEntry {
         kind,
         source_regions: desired
             .segments
@@ -1004,8 +1052,15 @@ where
         node_count: desired.csr.nodes.len(),
         edge_count: desired.csr.edges.len(),
         association_edge_count: desired.csr.association_edge_count,
-        rows_readback_verified,
-        ledger_paired,
+        rows_readback_verified: 0,
+        ledger_paired: false,
+    };
+    Ok(ProjectionUpdatePlan {
+        desired,
+        segment_is_stale,
+        tombstoned_keys,
+        rows,
+        entry,
     })
 }
 
@@ -1158,6 +1213,237 @@ where
 
     Ok(SourceEdges {
         rows: out,
+        fingerprint: *hasher.finalize().as_bytes(),
+        typed_edge_rows,
+        sim_edge_rows,
+    })
+}
+
+/// Plans the composite Kernel CSR from the exact final Graph state of a direct
+/// ingest without publishing either side independently.
+///
+/// `existing_graph` is the importer's one full Graph-CF materialization.
+/// `ledger_bound_rows` contains the current commit delta, already stamped with
+/// the exact ingest [`calyx_core::LedgerRef`]. The ordered merge below operates
+/// on the caller's existing Graph snapshot and that bound delta.
+pub(crate) fn plan_atomic_kernel_projection<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ledger_bound_rows: &[WriteRow],
+    workers: usize,
+) -> IngestResult<AtomicKernelProjectionPlan>
+where
+    C: Clock,
+{
+    let source = source_edges_from_final_graph(vault, snapshot, existing_graph, ledger_bound_rows)?;
+    let options = GraphProjectionBuildOptions::new().with_workers(workers);
+    let update = plan_projection_update(
+        vault,
+        snapshot,
+        GraphProjectionKind::KernelGraph,
+        &options,
+        &source,
+    )?;
+    Ok(AtomicKernelProjectionPlan {
+        rows: update.rows,
+        report: AtomicKernelProjectionReport {
+            source_typed_edge_rows: source.typed_edge_rows,
+            source_sim_edge_rows: source.sim_edge_rows,
+            source_fingerprint_blake3: source.fingerprint,
+            workers: options.workers,
+            projection: update.entry,
+        },
+    })
+}
+
+fn source_edges_from_final_graph<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ledger_bound_rows: &[WriteRow],
+) -> IngestResult<SourceEdges>
+where
+    C: Clock,
+{
+    let mut overlay = BTreeMap::<&[u8], Option<&[u8]>>::new();
+    for row in ledger_bound_rows
+        .iter()
+        .filter(|row| row.cf == ColumnFamily::Graph)
+    {
+        let value = (!is_tombstone_value(&row.value)).then_some(row.value.as_slice());
+        if overlay.insert(row.key.as_slice(), value).is_some() {
+            return Err(projection_corrupt(format!(
+                "direct-ingest Graph delta contains duplicate key {}",
+                hex_key(&row.key)
+            )));
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    let mut typed = Vec::new();
+    let mut resolved = BTreeMap::<String, CxId>::new();
+    let mut pending_sim = Vec::<(Vec<u8>, SimEdgeSourceRow)>::new();
+    {
+        let mut observe = |key: &[u8], value: &[u8]| -> IngestResult<()> {
+            if key.starts_with(EDGE_ROW_PREFIX) {
+                frame_hash(&mut hasher, key);
+                frame_hash(&mut hasher, value);
+                let row = serde_json::from_slice::<EdgeGraphRow>(value).map_err(|error| {
+                    projection_corrupt(format!(
+                        "decode final typed edge row {}: {error}",
+                        hex_key(key)
+                    ))
+                })?;
+                validate_source_edge_row(key, &row)?;
+                let kind = edge_kind_from_code(row.etype).ok_or_else(|| {
+                    projection_corrupt(format!(
+                        "final typed edge row {} has unknown etype {}",
+                        hex_key(key),
+                        row.etype
+                    ))
+                })?;
+                typed.push(SourceEdgeRow {
+                    src: row.src,
+                    dst: row.dst,
+                    etype: row.etype,
+                    weight: row.weight,
+                    kind,
+                    ledger_seq: row.provenance.seq,
+                    ledger_hash: row.provenance.hash,
+                    props: row.props,
+                    family: SourceFamily::Typed,
+                });
+            } else if key.starts_with(NODE_MAP_PREFIX) {
+                let row =
+                    serde_json::from_slice::<NodeMapProjectionRow>(value).map_err(|error| {
+                        projection_corrupt(format!(
+                            "decode final node-map row {}: {error}",
+                            hex_key(key)
+                        ))
+                    })?;
+                if !supported_node_map_schema(&row.schema) {
+                    return Err(projection_corrupt(format!(
+                        "final node-map row {} has wrong schema {}",
+                        row.node_id, row.schema
+                    )));
+                }
+                if row.atom_id.trim().is_empty() {
+                    return Err(projection_corrupt(format!(
+                        "final node-map row {} ({:?}) has an empty stable atom id",
+                        row.node_id, row.qualified_name
+                    )));
+                }
+                if let Some(existing) = resolved.insert(row.atom_id.clone(), row.cx_id) {
+                    return Err(projection_corrupt(format!(
+                        "stable atom id {:?} maps to multiple final node-map CxIds: {} and {}",
+                        row.atom_id, existing, row.cx_id
+                    )));
+                }
+            } else if key.starts_with(SIM_EDGE_ROW_BASE_PREFIX) {
+                frame_hash(&mut hasher, key);
+                frame_hash(&mut hasher, value);
+                if !key.starts_with(SIM_EDGE_ROW_V2_PREFIX) {
+                    return Err(projection_corrupt(format!(
+                        "SIM edge row {} carries an unknown astrolabe:sim-edge version",
+                        hex_key(key)
+                    )));
+                }
+                let row = serde_json::from_slice::<SimEdgeSourceRow>(value).map_err(|error| {
+                    projection_corrupt(format!("decode SIM edge row {}: {error}", hex_key(key)))
+                })?;
+                pending_sim.push((key.to_vec(), row));
+            }
+            Ok(())
+        };
+
+        let mut existing = existing_graph.iter().peekable();
+        let mut changed = overlay.iter().peekable();
+        loop {
+            match (existing.peek(), changed.peek()) {
+                (Some((existing_key, existing_value)), Some((changed_key, changed_value))) => {
+                    match existing_key.as_slice().cmp(changed_key) {
+                        std::cmp::Ordering::Less => {
+                            observe(existing_key, existing_value)?;
+                            existing.next();
+                        }
+                        std::cmp::Ordering::Equal => {
+                            if let Some(value) = changed_value {
+                                observe(changed_key, value)?;
+                            }
+                            existing.next();
+                            changed.next();
+                        }
+                        std::cmp::Ordering::Greater => {
+                            if let Some(value) = changed_value {
+                                observe(changed_key, value)?;
+                            }
+                            changed.next();
+                        }
+                    }
+                }
+                (Some((key, value)), None) => {
+                    observe(key, value)?;
+                    existing.next();
+                }
+                (None, Some((key, value))) => {
+                    if let Some(value) = value {
+                        observe(key, value)?;
+                    }
+                    changed.next();
+                }
+                (None, None) => break,
+            }
+        }
+    }
+
+    let typed_edge_rows = typed.len();
+    let sim_edge_rows = pending_sim.len();
+    if !pending_sim.is_empty() {
+        let (ledger_seq, ledger_hash) = newest_sim_edge_ledger_attestation(vault, snapshot)?;
+        for (key, row) in pending_sim {
+            if row.schema != SCHEMA_SIM_EDGE_ROW {
+                return Err(projection_corrupt(format!(
+                    "SIM edge row {} carries schema {:?}, expected {SCHEMA_SIM_EDGE_ROW}",
+                    hex_key(&key),
+                    row.schema
+                )));
+            }
+            let kind = edge_kind_from_code(row.etype).ok_or_else(|| {
+                projection_corrupt(format!(
+                    "SIM edge row {} has unknown etype {}",
+                    hex_key(&key),
+                    row.etype
+                ))
+            })?;
+            if !matches!(kind, EdgeKind::SimilarTo | EdgeKind::SemanticallyRelated) {
+                return Err(projection_corrupt(format!(
+                    "SIM edge row {} (family {:?}) carries non-similarity edge kind {:?}",
+                    hex_key(&key),
+                    row.family,
+                    kind
+                )));
+            }
+            let weight = f32::from_bits(row.weight_bits);
+            validate_edge_weight(weight, "SIM edge weight")?;
+            let src = resolve_sim_endpoint(&resolved, &row.source_id, &key, "source")?;
+            let dst = resolve_sim_endpoint(&resolved, &row.target_id, &key, "target")?;
+            typed.push(SourceEdgeRow {
+                src,
+                dst,
+                etype: row.etype,
+                weight,
+                kind,
+                ledger_seq,
+                ledger_hash,
+                props: serde_json::Value::Null,
+                family: SourceFamily::Similarity,
+            });
+        }
+    }
+
+    Ok(SourceEdges {
+        rows: typed,
         fingerprint: *hasher.finalize().as_bytes(),
         typed_edge_rows,
         sim_edge_rows,
@@ -2052,6 +2338,11 @@ fn projection_prefix(kind: GraphProjectionKind) -> Vec<u8> {
     key.extend_from_slice(kind.name().as_bytes());
     key.push(b':');
     key
+}
+
+pub(crate) fn is_kernel_projection_key(key: &[u8]) -> bool {
+    key.strip_prefix(GRAPH_PROJECTION_CSR_PREFIX)
+        .is_some_and(|suffix| suffix.starts_with(b"kernel_graph:"))
 }
 
 fn region_for(id: CxId) -> u8 {

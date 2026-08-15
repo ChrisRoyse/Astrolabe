@@ -23,8 +23,16 @@ where
             return Ok(self.latest_seq());
         }
 
-        self.write_cf_batch_with_ledger_entry_owned(data_rows, kind, subject, payload, actor, false)
-            .map(|commit| commit.seq)
+        self.write_cf_batch_with_ledger_entry_owned(
+            data_rows,
+            kind,
+            subject,
+            payload,
+            actor,
+            false,
+            |_, _| Ok((Vec::new(), ())),
+        )
+        .map(|(commit, ())| commit.seq)
     }
 
     /// Atomically writes one ledger-paired data batch and returns digest-only
@@ -53,10 +61,64 @@ where
                 "digest-bearing group commit requires at least one data row",
             ));
         }
-        self.write_cf_batch_with_ledger_entry_owned(data_rows, kind, subject, payload, actor, true)
+        self.write_cf_batch_with_ledger_entry_owned(
+            data_rows,
+            kind,
+            subject,
+            payload,
+            actor,
+            true,
+            |_, _| Ok((Vec::new(), ())),
+        )
+        .map(|(commit, ())| commit)
     }
 
-    fn write_cf_batch_with_ledger_entry_owned(
+    /// Atomically writes one ledger-paired data batch plus rows derived from the
+    /// exact provenance-bound source bytes.
+    ///
+    /// `derive_rows` runs under the durable commit lock after the ledger entry
+    /// has been staged and after its exact [`LedgerRef`] has been attached to
+    /// every caller-supplied Base and Graph row. The returned rows join the same
+    /// digest plan and durable commit; no source generation is observable
+    /// without its required derived state. The callback receives the staged
+    /// [`encode::WriteRow`] values by reference.
+    ///
+    /// # Errors
+    ///
+    /// The operation refuses before durable commit if source binding, derived
+    /// row construction, or the group commit fails. The combined batch must
+    /// contain at least one data row.
+    pub fn write_cf_batch_with_ledger_entry_with_row_digests_and_derived<T, F>(
+        &self,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+        derive_rows: F,
+    ) -> Result<(LedgerBoundCommit, T)>
+    where
+        F: FnOnce(
+            &LedgerRef,
+            &[encode::WriteRow],
+        ) -> Result<(Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>, T)>,
+    {
+        let data_rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        self.write_cf_batch_with_ledger_entry_owned(
+            data_rows,
+            kind,
+            subject,
+            payload,
+            actor,
+            true,
+            derive_rows,
+        )
+    }
+
+    fn write_cf_batch_with_ledger_entry_owned<T, F>(
         &self,
         mut data_rows: Vec<encode::WriteRow>,
         kind: EntryKind,
@@ -64,9 +126,16 @@ where
         payload: Vec<u8>,
         actor: ActorId,
         collect_row_digests: bool,
-    ) -> Result<LedgerBoundCommit> {
+        derive_rows: F,
+    ) -> Result<(LedgerBoundCommit, T)>
+    where
+        F: FnOnce(
+            &LedgerRef,
+            &[encode::WriteRow],
+        ) -> Result<(Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>, T)>,
+    {
         self.with_durable_commit_lock(|| {
-            let data_row_count = data_rows.len();
+            let mut derive_rows = Some(derive_rows);
             if let Some(hook) = &self.ledger_hook {
                 let mut hook = ledger_hook::lock_hook(hook)?;
                 let mut rows = Vec::with_capacity(data_rows.len() + 2);
@@ -79,6 +148,20 @@ where
                 )?;
                 let ledger_ref = staged_ledger_ref(&staged)?;
                 attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
+                let (derived_rows, derived) = derive_rows
+                    .take()
+                    .ok_or_else(|| {
+                        CalyxError::ledger_group_commit_failed(
+                            "ledger-bound derived-row callback was already consumed",
+                        )
+                    })?(&ledger_ref, &data_rows)?;
+                append_derived_rows(&mut data_rows, derived_rows, &ledger_ref)?;
+                if data_rows.is_empty() {
+                    return Err(CalyxError::ledger_group_commit_failed(
+                        "ledger-bound group commit requires at least one source or derived data row",
+                    ));
+                }
+                let data_row_count = data_rows.len();
                 let data_row_digests = collect_row_digests
                     .then(|| digest_rows(&data_rows))
                     .unwrap_or_default();
@@ -88,11 +171,14 @@ where
                 // to append the time-index row (#444 lever).
                 let seq = self.commit_rows_locked_owned(rows, false)?;
                 ledger_hook::commit_staged(&mut hook, &staged)?;
-                return Ok(LedgerBoundCommit {
-                    seq,
-                    ledger_ref,
-                    data_row_digests,
-                });
+                return Ok((
+                    LedgerBoundCommit {
+                        seq,
+                        ledger_ref,
+                        data_row_digests,
+                    },
+                    derived,
+                ));
             }
 
             let mut transient = self.transient_ledger_hook()?;
@@ -105,6 +191,20 @@ where
                 ledger_hook::stage_entry_payload(hook, &mut rows, kind, subject, payload, actor)?;
             let ledger_ref = staged_ledger_ref(&staged)?;
             attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
+            let (derived_rows, derived) = derive_rows
+                .take()
+                .ok_or_else(|| {
+                    CalyxError::ledger_group_commit_failed(
+                        "ledger-bound derived-row callback was already consumed",
+                    )
+                })?(&ledger_ref, &data_rows)?;
+            append_derived_rows(&mut data_rows, derived_rows, &ledger_ref)?;
+            if data_rows.is_empty() {
+                return Err(CalyxError::ledger_group_commit_failed(
+                    "ledger-bound group commit requires at least one source or derived data row",
+                ));
+            }
+            let data_row_count = data_rows.len();
             let data_row_digests = collect_row_digests
                 .then(|| digest_rows(&data_rows))
                 .unwrap_or_default();
@@ -112,11 +212,14 @@ where
             bind.stop("ledger_bind", data_row_count, 0);
             let seq = self.commit_rows_locked_owned(rows, false)?;
             ledger_hook::commit_staged(hook, &staged)?;
-            Ok(LedgerBoundCommit {
-                seq,
-                ledger_ref,
-                data_row_digests,
-            })
+            Ok((
+                LedgerBoundCommit {
+                    seq,
+                    ledger_ref,
+                    data_row_digests,
+                },
+                derived,
+            ))
         })
     }
 
@@ -154,6 +257,20 @@ where
             std::sync::Arc::clone(&self.clock),
         )
     }
+}
+
+fn append_derived_rows(
+    data_rows: &mut Vec<encode::WriteRow>,
+    derived_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ledger_ref: &LedgerRef,
+) -> Result<()> {
+    let mut derived_rows = derived_rows
+        .into_iter()
+        .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+        .collect::<Vec<_>>();
+    attach_ledger_ref_to_rows(&mut derived_rows, ledger_ref)?;
+    data_rows.extend(derived_rows);
+    Ok(())
 }
 
 pub(super) fn digest_rows(rows: &[encode::WriteRow]) -> Vec<LedgerBoundRowDigest> {
