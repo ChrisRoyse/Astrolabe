@@ -870,7 +870,7 @@ fn overlay_get_architecture_extensions(tool: &mut Value) -> Result<(), DynError>
     aspects.insert(
         "description".to_string(),
         Value::String(
-            "Aspects to include. Omit for the complete legacy CBM architecture without extra Calyx reads; overview is the compact legacy summary; all includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
+            "Aspects to include. Omit for the complete legacy CBM architecture without extra Calyx reads; overview is the compact legacy summary; all includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. signal_ranking reads the exact committed Assay transaction and returns a structured tool error for a validated preserved failed publication even when the live shadow dial is absent. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
                 .to_string(),
         ),
     );
@@ -1902,6 +1902,26 @@ fn tool_result_primary_text(result: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn architecture_aspect_read_failed_result(
+    project: &str,
+    outputs: &BTreeSet<&'static str>,
+    cause: String,
+) -> Result<String, DynError> {
+    ToolFault::new(
+        "ASTRO_ARCHITECTURE_ASPECT_READ_FAILED",
+        format!(
+            "get_architecture could not read the requested persisted Calyx aspect state for project {project:?}: {cause}"
+        ),
+        "inspect the named persisted generation and owning producer, repair or regenerate it, then retry the unchanged aspect request",
+    )
+    .with_detail(
+        "requested_astrolabe_aspects",
+        outputs.iter().copied().collect::<Vec<_>>(),
+    )
+    .with_detail("cause", cause)
+    .into_result()
+}
+
 pub(crate) fn handle_get_architecture(
     runner: &CbmToolRunner,
     args_json: &str,
@@ -1938,7 +1958,17 @@ pub(crate) fn handle_get_architecture(
         .and_then(Value::as_str)
         .expect("ArchitectureRequestPlan validated project")
         .to_string();
-    if read_dial(&project)? != MigrationDial::Shadow {
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if read_dial_at(&cache_dir, &project)? != MigrationDial::Shadow {
+        if plan.astrolabe_outputs.contains("signal_ranking")
+            && let Err(error) = classify_preserved_signal_card_state(&cache_dir, &project)
+        {
+            return architecture_aspect_read_failed_result(
+                &project,
+                &plan.astrolabe_outputs,
+                error.to_string(),
+            );
+        }
         if !plan.astrolabe_outputs.is_empty() {
             return ToolFault::new(
                 "ASTRO_ARCHITECTURE_SHADOW_REQUIRED",
@@ -1959,7 +1989,6 @@ pub(crate) fn handle_get_architecture(
             .expect("a request without Astrolabe aspects always retains CBM arguments");
         return Ok(runner.handle_tool_raw("get_architecture", cbm_args)?);
     }
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "get_architecture")?
     {
         return Ok(refusal);
@@ -1973,19 +2002,11 @@ pub(crate) fn handle_get_architecture(
         ) {
             Ok(value) => value,
             Err(error) => {
-                return ToolFault::new(
-                    "ASTRO_ARCHITECTURE_ASPECT_READ_FAILED",
-                    format!(
-                        "get_architecture could not read the requested persisted Calyx aspect state for project {project:?}: {error}"
-                    ),
-                    "inspect the named persisted generation and owning producer, repair or regenerate it, then retry the unchanged aspect request",
-                )
-                .with_detail(
-                    "requested_astrolabe_aspects",
-                    plan.astrolabe_outputs.iter().copied().collect::<Vec<_>>(),
-                )
-                .with_detail("cause", error.to_string())
-                .into_result();
+                return architecture_aspect_read_failed_result(
+                    &project,
+                    &plan.astrolabe_outputs,
+                    error.to_string(),
+                );
             }
         };
         return tool_json_result(json!({
@@ -1999,28 +2020,17 @@ pub(crate) fn handle_get_architecture(
     if tool_result_is_error(&result)? || plan.astrolabe_outputs.is_empty() {
         return Ok(result);
     }
-    let astrolabe = match read_astrolabe_architecture_aspects(
-        &cache_dir,
-        &project,
-        &plan.astrolabe_outputs,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return ToolFault::new(
-                "ASTRO_ARCHITECTURE_ASPECT_READ_FAILED",
-                format!(
-                    "get_architecture could not read the requested persisted Calyx aspect state for project {project:?}: {error}"
-                ),
-                "inspect the named persisted generation and owning producer, repair or regenerate it, then retry the unchanged aspect request",
-            )
-            .with_detail(
-                "requested_astrolabe_aspects",
-                plan.astrolabe_outputs.iter().copied().collect::<Vec<_>>(),
-            )
-            .with_detail("cause", error.to_string())
-            .into_result();
-        }
-    };
+    let astrolabe =
+        match read_astrolabe_architecture_aspects(&cache_dir, &project, &plan.astrolabe_outputs) {
+            Ok(value) => value,
+            Err(error) => {
+                return architecture_aspect_read_failed_result(
+                    &project,
+                    &plan.astrolabe_outputs,
+                    error.to_string(),
+                );
+            }
+        };
     augment_tool_result(
         &result,
         json!({
@@ -2409,6 +2419,24 @@ pub(crate) fn handle_get_readiness(args_json: &str) -> Result<String, DynError> 
     tool_json_result(readiness_status_json_at(&cache_dir, &project, scope, axis)?)
 }
 
+fn measure_bits_transaction_read_failed_result(
+    project: &str,
+    mode: &str,
+    cause: String,
+) -> Result<String, DynError> {
+    ToolFault::new(
+        "ASTRO_ASSAY_SIGNAL_TRANSACTION_READ_FAILED",
+        format!(
+            "measure_bits refused to serve project {project:?} because its persisted Assay state could not be verified"
+        ),
+        "preserve _config.db and signal-cards.ndjson, inspect the exact cause field, then reindex or run the explicit #885 recovery protocol",
+    )
+    .with_detail("mode", mode)
+    .with_detail("project", project)
+    .with_detail("cause", cause)
+    .into_result()
+}
+
 pub(crate) fn handle_measure_bits(args_json: &str) -> Result<String, DynError> {
     let args = serde_json::from_str::<Value>(args_json)?;
     let Some(args_obj) = args.as_object() else {
@@ -2435,7 +2463,13 @@ pub(crate) fn handle_measure_bits(args_json: &str) -> Result<String, DynError> {
             "ASTRO_ASSAY_MEASURE_BITS_AXIS_INVALID: measure_bits axis must be a non-empty string when provided; remediation: pass a named outcome axis or omit axis for a panel-wide mode",
         );
     }
-    if read_dial(&project)? != MigrationDial::Shadow {
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    if read_dial_at(&cache_dir, &project)? != MigrationDial::Shadow {
+        if mode == "signals"
+            && let Err(error) = classify_preserved_signal_card_state(&cache_dir, &project)
+        {
+            return measure_bits_transaction_read_failed_result(&project, mode, error.to_string());
+        }
         return tool_error_result(
             "measure_bits requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
         );
@@ -2446,21 +2480,10 @@ pub(crate) fn handle_measure_bits(args_json: &str) -> Result<String, DynError> {
         .get("refresh")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     let value = match measure_bits_json_at(&cache_dir, &project, mode, axis, scope, refresh) {
         Ok(value) => value,
         Err(error) => {
-            return ToolFault::new(
-                "ASTRO_ASSAY_SIGNAL_TRANSACTION_READ_FAILED",
-                format!(
-                    "measure_bits refused to serve project {project:?} because its persisted Assay state could not be verified"
-                ),
-                "preserve _config.db and signal-cards.ndjson, inspect the exact cause field, then reindex or run the explicit #885 recovery protocol",
-            )
-            .with_detail("mode", mode)
-            .with_detail("project", project)
-            .with_detail("cause", error.to_string())
-            .into_result();
+            return measure_bits_transaction_read_failed_result(&project, mode, error.to_string());
         }
     };
     if value.get("status").and_then(Value::as_str) == Some("refused") {

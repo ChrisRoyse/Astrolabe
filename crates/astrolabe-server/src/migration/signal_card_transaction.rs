@@ -477,7 +477,7 @@ pub(crate) fn read_committed_signal_card_state(
             &measure_bits_card_key(project, "signals", None, None),
         )?;
         if legacy_rows.is_empty() {
-            classify_preserved_signal_card_state(cache_dir, project, &marker_key)?;
+            classify_preserved_signal_card_state(cache_dir, project)?;
             return Ok(None);
         }
         return Err(format!(
@@ -594,11 +594,11 @@ pub(crate) fn read_committed_signal_card_state(
 /// publication. The slot is validated once and queried through one immutable
 /// SQLite connection, so reading the diagnostic state cannot add WAL/SHM bytes
 /// to the evidence directory.
-fn classify_preserved_signal_card_state(
+pub(crate) fn classify_preserved_signal_card_state(
     cache_dir: &Path,
     project: &str,
-    marker_key: &str,
 ) -> Result<(), DynError> {
+    let marker_key = signal_card_transaction_key(project);
     let Some((connection, _retained_config)) =
         open_validated_preserved_stage_config(cache_dir, project)?
     else {
@@ -607,7 +607,7 @@ fn classify_preserved_signal_card_state(
     let marker_raw = connection
         .query_row(
             "SELECT value FROM config WHERE key = ?",
-            params![marker_key],
+            params![&marker_key],
             |row| row.get::<_, String>(0),
         )
         .optional()
