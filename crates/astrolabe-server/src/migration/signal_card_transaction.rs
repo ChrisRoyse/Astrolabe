@@ -477,6 +477,7 @@ pub(crate) fn read_committed_signal_card_state(
             &measure_bits_card_key(project, "signals", None, None),
         )?;
         if legacy_rows.is_empty() {
+            classify_preserved_signal_card_state(cache_dir, project, &marker_key)?;
             return Ok(None);
         }
         return Err(format!(
@@ -587,4 +588,72 @@ pub(crate) fn read_committed_signal_card_state(
         marker: serde_json::to_value(&marker)?,
         rows,
     }))
+}
+
+/// Refuses when a canonical absence is explained by a preserved failed
+/// publication. The slot is validated once and queried through one immutable
+/// SQLite connection, so reading the diagnostic state cannot add WAL/SHM bytes
+/// to the evidence directory.
+fn classify_preserved_signal_card_state(
+    cache_dir: &Path,
+    project: &str,
+    marker_key: &str,
+) -> Result<(), DynError> {
+    let Some((connection, _retained_config)) =
+        open_validated_preserved_stage_config(cache_dir, project)?
+    else {
+        return Ok(());
+    };
+    let marker_raw = connection
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![marker_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_READ_FAILED: reading marker {marker_key:?} from the validated preserved config failed: {error}; remediation: preserve the slot and inspect its SQLite integrity"
+            )
+            .into()
+        })?;
+
+    let prefix = measure_bits_card_key(project, "signals", None, None);
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    let physical_card_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM config WHERE key LIKE ? ESCAPE '\\'",
+            params![pattern],
+            |row| row.get(0),
+        )
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_READ_FAILED: counting signal-card rows for project {project:?} in the validated preserved config failed: {error}; remediation: preserve the slot and inspect its SQLite integrity"
+            )
+            .into()
+        })?;
+
+    let Some(raw) = marker_raw else {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_STAGE_INCOMPLETE: canonical signal state for project {project:?} is absent, but its validated preserved failed publication has no transaction marker and physical_card_count={physical_card_count}; remediation: preserve the complete slot and inspect the recorded abort before explicitly rebuilding"
+        )
+        .into());
+    };
+    let marker = parse_marker(&raw, project)?;
+    if marker.state != "committed" {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_INCOMPLETE: canonical signal state for project {project:?} is absent; validated preserved transaction {} is {} with physical_card_count={physical_card_count}; preserve the marker and ledger for explicit recovery",
+            marker.transaction_id, marker.state
+        )
+        .into());
+    }
+    Err(format!(
+        "ASTRO_ASSAY_SIGNAL_TXN_UNPUBLISHED: canonical signal state for project {project:?} is absent, but validated preserved transaction {} is internally committed with physical_card_count={physical_card_count}; preserve the slot and reconcile the failed outer publication before serving it",
+        marker.transaction_id
+    )
+    .into())
 }

@@ -101,6 +101,37 @@ pub fn sqlite_open_path(path: &Path) -> std::io::Result<String> {
     }
 }
 
+/// Return a SQLite URI that opens one quiescent database image without creating
+/// or consulting rollback/WAL coordination sidecars.
+///
+/// `immutable=1` is valid only when the caller has already established that the
+/// database image cannot change for the connection lifetime. SQLite then skips
+/// locking and change detection, so using this for a live database would permit
+/// stale or corrupt answers. The URI retains the native long-path normalization
+/// from [`sqlite_open_path`] and percent-encodes every byte outside SQLite's
+/// unreserved path set.
+///
+/// # Errors
+///
+/// Returns the same path-normalization errors as [`sqlite_open_path`].
+pub fn sqlite_immutable_uri(path: &Path) -> std::io::Result<String> {
+    let open_path = sqlite_open_path(path)?;
+    let mut uri = String::with_capacity(open_path.len().saturating_mul(3).saturating_add(36));
+    uri.push_str("file:");
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in open_path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1&cache=private");
+    Ok(uri)
+}
+
 /// Non-Windows stub: extended-length prefixing is a Win32 concept, so the path is
 /// returned unchanged. (ASTROLABE is Windows-only until the deferred port phase.)
 ///

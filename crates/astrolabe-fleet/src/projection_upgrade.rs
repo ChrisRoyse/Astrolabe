@@ -1184,7 +1184,16 @@ fn read_symbol_canonical_schema(
         ));
     }
     let main_sha_before = sha256_open_file(repo, &config_path, &mut retained_main)?;
-    let immutable_uri = immutable_sqlite_uri(repo, &config_path)?;
+    let immutable_uri =
+        astrolabe_domain::winpath::sqlite_immutable_uri(&config_path).map_err(|error| {
+            refusal(
+                repo,
+                &format!(
+                    "cannot normalize config database {} for an immutable SQLite URI: {error}",
+                    config_path.display()
+                ),
+            )
+        })?;
     let key = format!("astrolabe.calyx.{index_project}.symbol_canonical_schema");
     let observation = (|| -> Result<Option<String>, CalyxError> {
         let connection = Connection::open_with_flags(
@@ -1373,38 +1382,6 @@ fn open_retained_config_main(repo: &str, config_path: &Path) -> Result<File, Cal
             ),
         )
     })
-}
-
-fn immutable_sqlite_uri(repo: &str, config_path: &Path) -> Result<String, CalyxError> {
-    let open_path = astrolabe_domain::winpath::sqlite_open_path(config_path).map_err(|error| {
-        refusal(
-            repo,
-            &format!(
-                "cannot normalize config database {} for an immutable SQLite URI: {error}",
-                config_path.display()
-            ),
-        )
-    })?;
-    let mut uri = String::with_capacity(open_path.len().saturating_mul(3).saturating_add(36));
-    uri.push_str("file:");
-    for byte in open_path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
-            uri.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(&mut uri, "%{byte:02X}").map_err(|error| {
-                refusal(
-                    repo,
-                    &format!(
-                        "cannot encode config database {} as an immutable SQLite URI: {error}",
-                        config_path.display()
-                    ),
-                )
-            })?;
-        }
-    }
-    uri.push_str("?mode=ro&immutable=1&cache=private");
-    Ok(uri)
 }
 
 fn inspect_schema(

@@ -17,6 +17,9 @@ use super::*;
 use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 pub(crate) const PRESERVED_STAGE_DIR: &str = ".astrolabe-shadow-preserved-stage";
 const PRESERVED_STAGE_MANIFEST: &str = "preserved-stage.json";
 const PRESERVED_STAGE_SCHEMA_V3: &str = "astrolabe.shadow-preserved-stage.v3";
@@ -104,6 +107,144 @@ pub(crate) fn preserved_stage_root(live_cache: &Path) -> PathBuf {
 pub(crate) fn preserved_stage_dir(live_cache: &Path, project: &str) -> PathBuf {
     let project_digest = hex_lower(&Sha256::digest(project.as_bytes()));
     preserved_stage_root(live_cache).join(&project_digest[..32])
+}
+
+/// Opens the config database inside one complete preserved-stage slot without
+/// materializing SQLite WAL/SHM sidecars in that immutable evidence directory.
+///
+/// Absence of the project slot is a normal `None`. A present slot is first
+/// validated against its complete v4 manifest (legacy v3 slots therefore fail
+/// when they do not carry the config database), and every mismatch is terminal.
+pub(crate) fn open_validated_preserved_stage_config(
+    live_cache: &Path,
+    project: &str,
+) -> Result<Option<(Connection, std::fs::File)>, DynError> {
+    let dir = preserved_stage_dir(live_cache, project);
+    let metadata = match fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_STAGE_METADATA_FAILED: could not inspect preserved stage {} for project {project:?}: {error}; remediation: preserve the slot and restore exact filesystem access before retrying",
+                dir.display()
+            )
+            .into());
+        }
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_STAGE_INVALID: preserved stage {} for project {project:?} is not an ordinary directory; remediation: preserve the namespace object and repair the exact slot before retrying",
+            dir.display()
+        )
+        .into());
+    }
+
+    let record = read_record(&dir)?;
+    if record.project != project {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_STAGE_PROJECT_MISMATCH: preserved stage {} records project {:?}, expected {project:?}; remediation: preserve the slot and reconcile its manifest identity before retrying",
+            dir.display(),
+            record.project
+        )
+        .into());
+    }
+    let recomputed_fingerprint = record.fingerprint.token_sha256()?;
+    if recomputed_fingerprint != record.fingerprint_sha256 {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_STAGE_MANIFEST_INVALID: preserved stage {} binds fingerprint {}, recomputed {recomputed_fingerprint}; remediation: preserve every byte and rebuild from authoritative source",
+            dir.display(),
+            record.fingerprint_sha256
+        )
+        .into());
+    }
+    let config_path = dir.join("_config.db");
+    let config_metadata = fs::symlink_metadata(&config_path).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_MISSING: validated preserved stage {} has no readable _config.db: {error}; remediation: preserve every byte and inspect the failed publication generation",
+            dir.display()
+        )
+        .into()
+    })?;
+    if !config_metadata.file_type().is_file() || config_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_INVALID: preserved config {} is not an ordinary file; remediation: preserve the slot and inspect the failed publication generation",
+            config_path.display()
+        )
+        .into());
+    }
+    let mut retained_options = OpenOptions::new();
+    retained_options.read(true);
+    #[cfg(windows)]
+    retained_options.share_mode(0x0000_0001);
+    let retained_config = retained_options
+        .open(&config_path)
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_RETAIN_FAILED: could not retain preserved config {} with write/delete sharing denied: {error}; remediation: preserve the slot and wait for the exact conflicting process to exit before retrying",
+                config_path.display()
+            )
+            .into()
+        })?;
+    validate_preserved_stage(
+        &dir,
+        &record,
+        "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_STAGE_PAYLOAD_MISMATCH",
+    )?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", config_path.display()));
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_SIDECAR_PRESENT: immutable preserved config {} has sidecar {} (bytes={}); remediation: preserve every byte and reconcile the exact SQLite family before reading — immutable mode never ignores a present sidecar",
+                    config_path.display(),
+                    sidecar.display(),
+                    metadata.len()
+                )
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_SIDECAR_METADATA_FAILED: could not classify sidecar {}: {error}; remediation: preserve the slot and restore exact filesystem access before retrying",
+                    sidecar.display()
+                )
+                .into());
+            }
+        }
+    }
+    let uri = astrolabe_domain::winpath::sqlite_immutable_uri(&config_path).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_PATH_INVALID: could not encode preserved config {} as an immutable SQLite URI: {error}; remediation: preserve the slot and move it to a valid native Windows path",
+                config_path.display()
+            )
+            .into()
+        },
+    )?;
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )
+    .map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_OPEN_FAILED: immutable read-only open of preserved config {} failed: {error}; remediation: preserve the slot and inspect its SQLite integrity",
+            config_path.display()
+        )
+        .into()
+    })?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_ASSAY_SIGNAL_TXN_PRESERVED_CONFIG_SETUP_FAILED: enforcing query_only on preserved config {} failed: {error}; remediation: preserve the slot and inspect the exact SQLite connection",
+                config_path.display()
+            )
+            .into()
+        })?;
+    Ok(Some((connection, retained_config)))
 }
 
 /// Every keying dimension of the CBM pass. A preserved stage is adopted only when
