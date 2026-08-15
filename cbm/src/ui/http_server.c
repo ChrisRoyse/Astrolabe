@@ -39,6 +39,7 @@
 #include <yyjson/yyjson.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -1343,36 +1344,148 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
 /* ── Handle GET /api/layout ───────────────────────────────────── */
 
-/* Find distinct target_project values from CROSS_* edges in a store.
- * Writes up to max_out project names (heap-allocated). Returns count. */
-static int find_cross_repo_targets(cbm_store_t *store, const char *project, char **out,
-                                   int max_out) {
+static void set_http_layout_error(cbm_layout_error_t *error, struct sqlite3 *db,
+                                  const char *code, const char *operation, const char *message,
+                                  const char *remediation) {
+    const char *sqlite_message = db ? sqlite3_errmsg(db) : NULL;
+    int sqlite_code = db ? sqlite3_errcode(db) : 0;
+    if (error) {
+        memset(error, 0, sizeof(*error));
+        snprintf(error->code, sizeof(error->code), "%s", code ? code : "CBM_LAYOUT_FAILED");
+        snprintf(error->operation, sizeof(error->operation), "%s",
+                 operation ? operation : "layout");
+        if (sqlite_message && sqlite_message[0] && sqlite_code != SQLITE_OK) {
+            snprintf(error->message, sizeof(error->message), "%s: %s",
+                     message ? message : "layout operation failed", sqlite_message);
+        } else {
+            snprintf(error->message, sizeof(error->message), "%s",
+                     message ? message : "layout operation failed");
+        }
+        snprintf(error->remediation, sizeof(error->remediation), "%s",
+                 remediation ? remediation : "inspect the layout failure and retry");
+        error->store_error_code = sqlite_code;
+    }
+
+    char sqlite_code_text[32];
+    snprintf(sqlite_code_text, sizeof(sqlite_code_text), "%d", sqlite_code);
+    cbm_log_error("http.layout.failed", "code", code ? code : "CBM_LAYOUT_FAILED", "operation",
+                  operation ? operation : "layout", "message",
+                  message ? message : "layout operation failed", "sqlite_error",
+                  sqlite_message ? sqlite_message : "", "sqlite_error_code", sqlite_code_text,
+                  "remediation", remediation ? remediation : "inspect the layout failure and retry");
+}
+
+static void free_cross_repo_targets(char **targets, int count) {
+    if (!targets)
+        return;
+    for (int i = 0; i < count; i++) {
+        free(targets[i]);
+        targets[i] = NULL;
+    }
+}
+
+/* Find distinct target_project values from CROSS_* edges in deterministic
+ * order. The persisted CROSS_* rows are the source of truth. A missing DB,
+ * malformed row, allocation failure, SQL failure, or a 17th distinct project
+ * is terminal: returning a shorter roster would publish a partial graph. */
+static bool find_cross_repo_targets(cbm_store_t *store, const char *project, char **out,
+                                    int max_out, int *out_count, cbm_layout_error_t *error) {
+    if (out_count)
+        *out_count = 0;
+    if (!store || !project || !project[0] || !out || max_out <= 0 || !out_count) {
+        set_http_layout_error(error, NULL, "CBM_LAYOUT_LINK_ROSTER_INPUT_INVALID",
+                              "query_linked_projects",
+                              "linked-project discovery received an invalid input",
+                              "open the exact project store and retry the same layout request");
+        return false;
+    }
+    for (int i = 0; i < max_out; i++)
+        out[i] = NULL;
+
     struct sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
-        return 0;
+        set_http_layout_error(error, NULL, "CBM_LAYOUT_LINK_ROSTER_DB_UNAVAILABLE",
+                              "query_linked_projects",
+                              "linked-project discovery could not access the project database",
+                              "reopen the project store and retry the request");
+        return false;
     }
     sqlite3_stmt *s = NULL;
     if (sqlite3_prepare_v2(
             db,
             "SELECT DISTINCT json_extract(properties, '$.target_project') FROM edges "
             "WHERE project = ?1 AND type LIKE 'CROSS_%' "
-            "AND json_extract(properties, '$.target_project') IS NOT NULL",
+            "AND json_extract(properties, '$.target_project') IS NOT NULL "
+            "ORDER BY 1 LIMIT ?2",
             -1, &s, NULL) != SQLITE_OK) {
-        return 0;
+        set_http_layout_error(error, db, "CBM_LAYOUT_LINK_ROSTER_PREPARE_FAILED",
+                              "query_linked_projects",
+                              "linked-project roster query could not be prepared",
+                              "inspect and repair the edges table or JSON1 runtime, then retry");
+        return false;
     }
-    sqlite3_bind_text(s, 1, project, -1, SQLITE_STATIC);
+    if (sqlite3_bind_text(s, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int(s, 2, max_out + 1) != SQLITE_OK) {
+        set_http_layout_error(error, db, "CBM_LAYOUT_LINK_ROSTER_BIND_FAILED",
+                              "query_linked_projects",
+                              "linked-project roster parameters could not be bound",
+                              "inspect the SQLite diagnostic and retry the exact request");
+        sqlite3_finalize(s);
+        return false;
+    }
+
     int count = 0;
-    while (sqlite3_step(s) == SQLITE_ROW && count < max_out) {
+    int step = SQLITE_OK;
+    while ((step = sqlite3_step(s)) == SQLITE_ROW) {
         const char *tp = (const char *)sqlite3_column_text(s, 0);
-        if (tp && tp[0]) {
-            size_t len = strlen(tp);
-            out[count] = malloc(len + 1);
-            memcpy(out[count], tp, len + 1);
-            count++;
+        if (sqlite3_column_type(s, 0) != SQLITE_TEXT || !tp || !tp[0]) {
+            set_http_layout_error(error, db, "CBM_LAYOUT_LINK_ROSTER_ROW_INVALID",
+                                  "query_linked_projects",
+                                  "a CROSS_* edge has a non-text or empty target_project",
+                                  "repair that edge's target_project property, then retry");
+            goto fail;
         }
+        if (count >= max_out) {
+            set_http_layout_error(error, NULL, "CBM_LAYOUT_LINK_ROSTER_LIMIT_EXCEEDED",
+                                  "query_linked_projects",
+                                  "the project links to more projects than one layout can render",
+                                  "reduce the project fan-out below 17 linked projects before retrying");
+            goto fail;
+        }
+        size_t len = strlen(tp);
+        out[count] = malloc(len + 1);
+        if (!out[count]) {
+            set_http_layout_error(error, NULL, "CBM_LAYOUT_LINK_ROSTER_ALLOCATION_FAILED",
+                                  "query_linked_projects",
+                                  "a linked-project name could not be retained",
+                                  "free memory and retry the exact layout request");
+            goto fail;
+        }
+        memcpy(out[count], tp, len + 1);
+        count++;
     }
+    if (step != SQLITE_DONE) {
+        set_http_layout_error(error, db, "CBM_LAYOUT_LINK_ROSTER_STEP_FAILED",
+                              "query_linked_projects",
+                              "linked-project roster query did not reach a complete result",
+                              "inspect the SQLite diagnostic and repair the edges table before retrying");
+        goto fail;
+    }
+    if (sqlite3_finalize(s) != SQLITE_OK) {
+        set_http_layout_error(error, db, "CBM_LAYOUT_LINK_ROSTER_FINALIZE_FAILED",
+                              "query_linked_projects",
+                              "linked-project roster statement did not finalize cleanly",
+                              "inspect the SQLite diagnostic and retry the exact request");
+        free_cross_repo_targets(out, count);
+        return false;
+    }
+    *out_count = count;
+    return true;
+
+fail:
     sqlite3_finalize(s);
-    return count;
+    free_cross_repo_targets(out, count);
+    return false;
 }
 
 enum { LAYOUT_MAX_LINKED = 16 };
@@ -1400,6 +1513,55 @@ static double layout_radius(const cbm_layout_result_t *r) {
     return sqrt(max_r2);
 }
 
+static void reply_layout_error(cbm_http_conn_t *c, int status, const cbm_layout_error_t *error) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *detail = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root || !detail) {
+        if (doc)
+            yyjson_mut_doc_free(doc);
+        cbm_log_error("http.layout.error_response_failed", "code",
+                      "CBM_LAYOUT_ERROR_SERIALIZATION_FAILED", "message",
+                      "layout error response document could not be allocated", "remediation",
+                      "free memory and retry the request");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":{\"code\":\"CBM_LAYOUT_ERROR_SERIALIZATION_FAILED\","
+                        "\"message\":\"layout error response could not be allocated\","
+                        "\"remediation\":\"free memory and retry the request\"}}");
+        return;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, detail, "code",
+                              error && error->code[0] ? error->code : "CBM_LAYOUT_FAILED");
+    yyjson_mut_obj_add_strcpy(doc, detail, "operation",
+                              error && error->operation[0] ? error->operation : "layout");
+    yyjson_mut_obj_add_strcpy(doc, detail, "message",
+                              error && error->message[0] ? error->message
+                                                        : "layout computation failed");
+    yyjson_mut_obj_add_strcpy(doc, detail, "remediation",
+                              error && error->remediation[0]
+                                  ? error->remediation
+                                  : "inspect the layout failure and retry");
+    yyjson_mut_obj_add_int(doc, detail, "store_error_code", error ? error->store_error_code : 0);
+    yyjson_mut_obj_add_val(doc, root, "error", detail);
+    size_t length = 0;
+    char *json = yyjson_mut_write(doc, 0, &length);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        cbm_log_error("http.layout.error_response_failed", "code",
+                      "CBM_LAYOUT_ERROR_SERIALIZATION_FAILED", "message",
+                      "layout error response could not be serialized", "remediation",
+                      "inspect allocator state and retry the request");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":{\"code\":\"CBM_LAYOUT_ERROR_SERIALIZATION_FAILED\","
+                        "\"message\":\"layout error response could not be serialized\","
+                        "\"remediation\":\"inspect allocator state and retry the request\"}}");
+        return;
+    }
+    cbm_http_replyf(c, status, g_cors_json, "%s", json);
+    free(json);
+}
+
 static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char project[256] = {0};
     char max_str[32] = {0};
@@ -1412,9 +1574,30 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     int max_nodes = 0; /* 0 → layout default budget */
     if (cbm_http_query_param(req->query, "max_nodes", max_str, (int)sizeof(max_str))) {
-        int v = atoi(max_str);
-        if (v > 0)
-            max_nodes = v;
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(max_str, &end, 10);
+        if (errno != 0 || end == max_str || !end || *end != '\0' || value <= 0 ||
+            value > INT_MAX) {
+            cbm_layout_error_t input_error;
+            set_http_layout_error(&input_error, NULL, "CBM_LAYOUT_MAX_NODES_INVALID",
+                                  "validate_max_nodes",
+                                  "max_nodes must be one complete positive base-10 integer",
+                                  "pass max_nodes between 1 and the supported integer ceiling");
+            reply_layout_error(c, 400, &input_error);
+            return;
+        }
+        max_nodes = (int)value;
+    }
+
+    if (!cbm_validate_project_name(project)) {
+        cbm_layout_error_t input_error;
+        set_http_layout_error(&input_error, NULL, "CBM_LAYOUT_PROJECT_INVALID",
+                              "validate_project",
+                              "project is not a valid persisted project name",
+                              "pass the exact name returned by list_projects");
+        reply_layout_error(c, 400, &input_error);
+        return;
     }
 
     char db_path[1024];
@@ -1431,18 +1614,26 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
+    cbm_layout_error_t layout_error;
     cbm_layout_result_t *layout =
-        cbm_layout_compute(store, project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+        cbm_layout_compute(store, project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes, &layout_error);
+
+    if (!layout) {
+        cbm_store_close_required(&store, "http.layout.query_failed");
+        reply_layout_error(c, 500, &layout_error);
+        return;
+    }
 
     /* Find linked projects from CROSS_* edges. Keep `store` open through the
      * linked-projects loop below so we can resolve target Route QNs against
      * the linked stores when populating cross_edges. */
-    char *linked[LAYOUT_MAX_LINKED];
-    int linked_count = find_cross_repo_targets(store, project, linked, LAYOUT_MAX_LINKED);
-
-    if (!layout) {
-        cbm_store_close_required(&store, "http.layout.query_failed");
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"layout computation failed\"}");
+    char *linked[LAYOUT_MAX_LINKED] = {0};
+    int linked_count = 0;
+    if (!find_cross_repo_targets(store, project, linked, LAYOUT_MAX_LINKED, &linked_count,
+                                 &layout_error)) {
+        cbm_layout_free(layout);
+        cbm_store_close_required(&store, "http.layout.link_roster_failed");
+        reply_layout_error(c, 500, &layout_error);
         return;
     }
 
@@ -1450,11 +1641,12 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     double primary_radius = layout_radius(layout);
 
     /* Build JSON: primary layout + linked_projects */
-    char *primary_json = cbm_layout_to_json(layout);
+    char *primary_json = cbm_layout_to_json(layout, &layout_error);
     cbm_layout_free(layout);
     if (!primary_json) {
+        free_cross_repo_targets(linked, linked_count);
         cbm_store_close_required(&store, "http.layout.query_empty");
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
+        reply_layout_error(c, 500, &layout_error);
         return;
     }
 
@@ -1469,75 +1661,124 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     yyjson_doc *pdoc = yyjson_read(primary_json, strlen(primary_json), 0);
     free(primary_json);
     if (!pdoc) {
+        free_cross_repo_targets(linked, linked_count);
         cbm_store_close_required(&store, "http.layout.root_invalid");
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON parse failed\"}");
+        set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_PRIMARY_JSON_INVALID",
+                              "parse_primary_layout",
+                              "the freshly serialized primary layout JSON could not be parsed",
+                              "inspect the layout serializer and retry after repairing it");
+        reply_layout_error(c, 500, &layout_error);
         return;
     }
 
     yyjson_mut_doc *mdoc = yyjson_doc_mut_copy(pdoc, NULL);
     yyjson_doc_free(pdoc);
-    yyjson_mut_val *mroot = yyjson_mut_doc_get_root(mdoc);
+    yyjson_mut_val *mroot = mdoc ? yyjson_mut_doc_get_root(mdoc) : NULL;
+    yyjson_mut_val *lp_arr = mdoc ? yyjson_mut_arr(mdoc) : NULL;
+    if (!mdoc || !mroot || !lp_arr) {
+        if (mdoc)
+            yyjson_mut_doc_free(mdoc);
+        free_cross_repo_targets(linked, linked_count);
+        cbm_store_close_required(&store, "http.layout.response_allocation_failed");
+        set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_RESPONSE_ALLOCATION_FAILED",
+                              "allocate_layout_response",
+                              "the complete layout response document could not be allocated",
+                              "free memory and retry the exact layout request");
+        reply_layout_error(c, 500, &layout_error);
+        return;
+    }
 
-    yyjson_mut_val *lp_arr = yyjson_mut_arr(mdoc);
+    cbm_store_t *lp_store = NULL;
+    cbm_layout_result_t *lp_layout = NULL;
+    char *lp_json = NULL;
+    yyjson_doc *lpdoc = NULL;
+    yyjson_mut_doc *lm = NULL;
+    sqlite3_stmt *eq = NULL;
+    sqlite3_stmt *lookup = NULL;
 
     for (int li = 0; li < linked_count; li++) {
         char lp_path[1024];
         db_path_for_project(linked[li], lp_path, sizeof(lp_path));
         if (!cbm_file_exists(lp_path)) {
-            free(linked[li]);
-            continue;
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_STORE_MISSING",
+                                  "open_linked_project",
+                                  "a persisted CROSS_* edge names a project whose store is absent",
+                                  "index the named linked project or remove the stale CROSS_* edge, then retry");
+            goto linked_failure;
         }
 
-        cbm_store_t *lp_store = cbm_store_open_path(lp_path);
+        lp_store = cbm_store_open_path(lp_path);
         if (!lp_store) {
-            free(linked[li]);
-            continue;
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_STORE_OPEN_FAILED",
+                                  "open_linked_project",
+                                  "a linked-project store exists but could not be opened",
+                                  "inspect that exact store and retry after it opens cleanly");
+            goto linked_failure;
         }
 
         /* Keep lp_store open through cross_edges resolution below. */
-        cbm_layout_result_t *lp_layout =
-            cbm_layout_compute(lp_store, linked[li], CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+        cbm_layout_error_t linked_layout_error;
+        lp_layout = cbm_layout_compute(
+            lp_store, linked[li], CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes, &linked_layout_error);
 
         if (!lp_layout) {
+            layout_error = linked_layout_error;
             cbm_store_close_required(&lp_store, "http.layout.lp_project_missing");
-            free(linked[li]);
-            continue;
+            goto linked_failure;
         }
 
         double sat_radius = layout_radius(lp_layout);
-        char *lp_json = cbm_layout_to_json(lp_layout);
+        lp_json = cbm_layout_to_json(lp_layout, &linked_layout_error);
         cbm_layout_free(lp_layout);
+        lp_layout = NULL;
         if (!lp_json) {
+            layout_error = linked_layout_error;
             cbm_store_close_required(&lp_store, "http.layout.lp_node_query_failed");
-            free(linked[li]);
-            continue;
+            goto linked_failure;
         }
 
         /* Parse linked project layout */
-        yyjson_doc *lpdoc = yyjson_read(lp_json, strlen(lp_json), 0);
+        lpdoc = yyjson_read(lp_json, strlen(lp_json), 0);
         free(lp_json);
+        lp_json = NULL;
         if (!lpdoc) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_JSON_INVALID",
+                                  "parse_linked_layout",
+                                  "a freshly serialized linked layout JSON document could not be parsed",
+                                  "inspect the layout serializer and repair it before retrying");
             cbm_store_close_required(&lp_store, "http.layout.lp_edge_query_failed");
-            free(linked[li]);
-            continue;
+            goto linked_failure;
         }
 
-        yyjson_mut_doc *lm = yyjson_doc_mut_copy(lpdoc, NULL);
+        lm = yyjson_doc_mut_copy(lpdoc, NULL);
         yyjson_doc_free(lpdoc);
-        yyjson_mut_val *lmroot = yyjson_mut_doc_get_root(lm);
+        lpdoc = NULL;
+        yyjson_mut_val *lmroot = lm ? yyjson_mut_doc_get_root(lm) : NULL;
 
         /* Build linked project entry */
         yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
-        yyjson_mut_obj_add_strcpy(mdoc, entry, "project", linked[li]);
+        if (!lm || !lmroot || !entry ||
+            !yyjson_mut_obj_add_strcpy(mdoc, entry, "project", linked[li])) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_RESPONSE_ALLOCATION_FAILED",
+                                  "allocate_linked_response",
+                                  "a linked-project response entry could not be allocated",
+                                  "free memory and retry the exact layout request");
+            goto linked_failure;
+        }
 
         /* Copy nodes and edges from linked layout */
         yyjson_mut_val *ln = yyjson_mut_obj_get(lmroot, "nodes");
         yyjson_mut_val *le = yyjson_mut_obj_get(lmroot, "edges");
-        if (ln) {
-            yyjson_mut_obj_add_val(mdoc, entry, "nodes", yyjson_mut_val_mut_copy(mdoc, ln));
-        }
-        if (le) {
-            yyjson_mut_obj_add_val(mdoc, entry, "edges", yyjson_mut_val_mut_copy(mdoc, le));
+        yyjson_mut_val *ln_copy = ln ? yyjson_mut_val_mut_copy(mdoc, ln) : NULL;
+        yyjson_mut_val *le_copy = le ? yyjson_mut_val_mut_copy(mdoc, le) : NULL;
+        if (!ln || !le || !ln_copy || !le_copy ||
+            !yyjson_mut_obj_add_val(mdoc, entry, "nodes", ln_copy) ||
+            !yyjson_mut_obj_add_val(mdoc, entry, "edges", le_copy)) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_RESPONSE_INVALID",
+                                  "copy_linked_response",
+                                  "a linked layout is missing its complete nodes or edges array",
+                                  "repair the linked layout serializer and retry the exact request");
+            goto linked_failure;
         }
 
         /* Compute galaxy offset: evenly spaced around primary, far enough out
@@ -1550,10 +1791,16 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             dist = LAYOUT_GALAXY_SPACING;
         }
         yyjson_mut_val *offset = yyjson_mut_obj(mdoc);
-        yyjson_mut_obj_add_real(mdoc, offset, "x", cos(angle) * dist);
-        yyjson_mut_obj_add_real(mdoc, offset, "y", sin(angle) * dist);
-        yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0);
-        yyjson_mut_obj_add_val(mdoc, entry, "offset", offset);
+        if (!offset || !yyjson_mut_obj_add_real(mdoc, offset, "x", cos(angle) * dist) ||
+            !yyjson_mut_obj_add_real(mdoc, offset, "y", sin(angle) * dist) ||
+            !yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0) ||
+            !yyjson_mut_obj_add_val(mdoc, entry, "offset", offset)) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_OFFSET_ALLOCATION_FAILED",
+                                  "allocate_linked_offset",
+                                  "a linked-project galaxy offset could not be retained",
+                                  "free memory and retry the exact layout request");
+            goto linked_failure;
+        }
 
         /* Populate cross_edges connecting primary→this linked galaxy. Each
          * entry: {source: <primary node id>, target: <linked node id>, type}.
@@ -1566,69 +1813,200 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         yyjson_mut_val *cross_arr = yyjson_mut_arr(mdoc);
         struct sqlite3 *src_db = cbm_store_get_db(store);
         struct sqlite3 *lp_db = cbm_store_get_db(lp_store);
-        if (src_db && lp_db) {
-            sqlite3_stmt *eq = NULL;
-            if (sqlite3_prepare_v2(src_db,
-                                   "SELECT e.source_id, e.type, n.qualified_name "
-                                   "FROM edges e JOIN nodes n "
-                                   "  ON n.id = e.target_id AND n.project = e.project "
-                                   "WHERE e.project = ?1 AND e.type LIKE 'CROSS_%' "
-                                   "  AND json_extract(e.properties, '$.target_project') = ?2 "
-                                   "  AND n.qualified_name IS NOT NULL",
-                                   -1, &eq, NULL) == SQLITE_OK) {
-                sqlite3_bind_text(eq, 1, project, -1, SQLITE_STATIC);
-                sqlite3_bind_text(eq, 2, linked[li], -1, SQLITE_STATIC);
+        if (!cross_arr || !src_db || !lp_db) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_CROSS_DB_UNAVAILABLE",
+                                  "resolve_cross_edges",
+                                  "cross-edge resolution could not access both project databases",
+                                  "reopen both exact project stores and retry the request");
+            goto linked_failure;
+        }
+        if (sqlite3_prepare_v2(src_db,
+                               "SELECT e.source_id, e.type, n.qualified_name "
+                               "FROM edges e JOIN nodes n "
+                               "  ON n.id = e.target_id AND n.project = e.project "
+                               "WHERE e.project = ?1 AND e.type LIKE 'CROSS_%' "
+                               "  AND json_extract(e.properties, '$.target_project') = ?2 "
+                               "  AND n.qualified_name IS NOT NULL "
+                               "ORDER BY e.id",
+                               -1, &eq, NULL) != SQLITE_OK) {
+            set_http_layout_error(&layout_error, src_db, "CBM_LAYOUT_CROSS_QUERY_PREPARE_FAILED",
+                                  "resolve_cross_edges",
+                                  "cross-edge source query could not be prepared",
+                                  "inspect the source edges and nodes tables, then retry");
+            goto linked_failure;
+        }
+        if (sqlite3_bind_text(eq, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
+            sqlite3_bind_text(eq, 2, linked[li], -1, SQLITE_STATIC) != SQLITE_OK) {
+            set_http_layout_error(&layout_error, src_db, "CBM_LAYOUT_CROSS_QUERY_BIND_FAILED",
+                                  "resolve_cross_edges",
+                                  "cross-edge source query parameters could not be bound",
+                                  "inspect the SQLite diagnostic and retry the exact request");
+            goto linked_failure;
+        }
+        if (sqlite3_prepare_v2(lp_db,
+                               "SELECT id FROM nodes WHERE project = ?1 AND qualified_name = ?2 "
+                               "ORDER BY id LIMIT 2",
+                               -1, &lookup, NULL) != SQLITE_OK) {
+            set_http_layout_error(&layout_error, lp_db, "CBM_LAYOUT_CROSS_LOOKUP_PREPARE_FAILED",
+                                  "resolve_cross_edges",
+                                  "linked-node lookup could not be prepared",
+                                  "inspect the linked nodes table, then retry");
+            goto linked_failure;
+        }
 
-                sqlite3_stmt *lookup = NULL;
-                sqlite3_prepare_v2(lp_db, "SELECT id FROM nodes WHERE qualified_name = ?1 LIMIT 1",
-                                   -1, &lookup, NULL);
-
-                while (sqlite3_step(eq) == SQLITE_ROW) {
-                    int64_t src_id = sqlite3_column_int64(eq, 0);
-                    const char *etype = (const char *)sqlite3_column_text(eq, 1);
-                    const char *qn = (const char *)sqlite3_column_text(eq, 2);
-                    if (!qn || !etype || !lookup) {
-                        continue;
-                    }
-                    sqlite3_reset(lookup);
-                    sqlite3_clear_bindings(lookup);
-                    sqlite3_bind_text(lookup, 1, qn, -1, SQLITE_STATIC);
-                    if (sqlite3_step(lookup) != SQLITE_ROW) {
-                        continue;
-                    }
-                    int64_t tgt_id = sqlite3_column_int64(lookup, 0);
-                    yyjson_mut_val *ce = yyjson_mut_obj(mdoc);
-                    yyjson_mut_obj_add_int(mdoc, ce, "source", src_id);
-                    yyjson_mut_obj_add_int(mdoc, ce, "target", tgt_id);
-                    yyjson_mut_obj_add_strcpy(mdoc, ce, "type", etype);
-                    yyjson_mut_arr_append(cross_arr, ce);
-                }
-                if (lookup)
-                    sqlite3_finalize(lookup);
-                sqlite3_finalize(eq);
+        int edge_step = SQLITE_OK;
+        while ((edge_step = sqlite3_step(eq)) == SQLITE_ROW) {
+            int64_t src_id = sqlite3_column_int64(eq, 0);
+            const char *etype = (const char *)sqlite3_column_text(eq, 1);
+            const char *qn = (const char *)sqlite3_column_text(eq, 2);
+            if (sqlite3_column_type(eq, 1) != SQLITE_TEXT ||
+                sqlite3_column_type(eq, 2) != SQLITE_TEXT || !qn || !qn[0] || !etype ||
+                !etype[0]) {
+                set_http_layout_error(&layout_error, src_db, "CBM_LAYOUT_CROSS_ROW_INVALID",
+                                      "resolve_cross_edges",
+                                      "a CROSS_* edge lacks a non-empty type or target qualified name",
+                                      "repair that persisted edge and route node, then retry");
+                goto linked_failure;
+            }
+            if (sqlite3_reset(lookup) != SQLITE_OK ||
+                sqlite3_clear_bindings(lookup) != SQLITE_OK ||
+                sqlite3_bind_text(lookup, 1, linked[li], -1, SQLITE_STATIC) != SQLITE_OK ||
+                sqlite3_bind_text(lookup, 2, qn, -1, SQLITE_STATIC) != SQLITE_OK) {
+                set_http_layout_error(&layout_error, lp_db, "CBM_LAYOUT_CROSS_LOOKUP_BIND_FAILED",
+                                      "resolve_cross_edges",
+                                      "linked-node lookup could not be reset and bound",
+                                      "inspect the SQLite diagnostic and retry the exact request");
+                goto linked_failure;
+            }
+            int lookup_step = sqlite3_step(lookup);
+            if (lookup_step == SQLITE_DONE) {
+                set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_CROSS_TARGET_MISSING",
+                                      "resolve_cross_edges",
+                                      "a CROSS_* edge target qualified name is absent from the linked store",
+                                      "index the matching route in the linked project or remove the stale edge, then retry");
+                goto linked_failure;
+            }
+            if (lookup_step != SQLITE_ROW) {
+                set_http_layout_error(&layout_error, lp_db, "CBM_LAYOUT_CROSS_LOOKUP_STEP_FAILED",
+                                      "resolve_cross_edges",
+                                      "linked-node lookup did not produce a complete result",
+                                      "inspect the linked nodes table and retry after repair");
+                goto linked_failure;
+            }
+            int64_t tgt_id = sqlite3_column_int64(lookup, 0);
+            int uniqueness_step = sqlite3_step(lookup);
+            if (uniqueness_step == SQLITE_ROW) {
+                set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_CROSS_TARGET_AMBIGUOUS",
+                                      "resolve_cross_edges",
+                                      "a cross-edge target qualified name resolves to multiple linked nodes",
+                                      "deduplicate that qualified name in the linked project, then retry");
+                goto linked_failure;
+            }
+            if (uniqueness_step != SQLITE_DONE) {
+                set_http_layout_error(&layout_error, lp_db, "CBM_LAYOUT_CROSS_LOOKUP_STEP_FAILED",
+                                      "resolve_cross_edges",
+                                      "linked-node uniqueness lookup did not reach a complete result",
+                                      "inspect the linked nodes table and retry after repair");
+                goto linked_failure;
+            }
+            yyjson_mut_val *ce = yyjson_mut_obj(mdoc);
+            if (!ce || !yyjson_mut_obj_add_int(mdoc, ce, "source", src_id) ||
+                !yyjson_mut_obj_add_int(mdoc, ce, "target", tgt_id) ||
+                !yyjson_mut_obj_add_strcpy(mdoc, ce, "type", etype) ||
+                !yyjson_mut_arr_append(cross_arr, ce)) {
+                set_http_layout_error(&layout_error, NULL,
+                                      "CBM_LAYOUT_CROSS_RESPONSE_ALLOCATION_FAILED",
+                                      "serialize_cross_edges",
+                                      "a resolved cross edge could not be retained in the response",
+                                      "free memory and retry the exact layout request");
+                goto linked_failure;
             }
         }
-        yyjson_mut_obj_add_val(mdoc, entry, "cross_edges", cross_arr);
+        if (edge_step != SQLITE_DONE) {
+            set_http_layout_error(&layout_error, src_db, "CBM_LAYOUT_CROSS_QUERY_STEP_FAILED",
+                                  "resolve_cross_edges",
+                                  "cross-edge source query did not reach a complete result",
+                                  "inspect the source edges table and retry after repair");
+            goto linked_failure;
+        }
+        int lookup_finalize = sqlite3_finalize(lookup);
+        lookup = NULL;
+        int edge_finalize = sqlite3_finalize(eq);
+        eq = NULL;
+        if (lookup_finalize != SQLITE_OK || edge_finalize != SQLITE_OK) {
+            set_http_layout_error(&layout_error,
+                                  lookup_finalize != SQLITE_OK ? lp_db : src_db,
+                                  "CBM_LAYOUT_CROSS_QUERY_FINALIZE_FAILED",
+                                  "resolve_cross_edges",
+                                  "a cross-edge statement did not finalize cleanly",
+                                  "inspect the SQLite diagnostic and retry the exact request");
+            goto linked_failure;
+        }
+        if (!yyjson_mut_obj_add_val(mdoc, entry, "cross_edges", cross_arr)) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_CROSS_RESPONSE_ALLOCATION_FAILED",
+                                  "serialize_cross_edges",
+                                  "the complete cross-edge array could not be attached to the response",
+                                  "free memory and retry the exact layout request");
+            goto linked_failure;
+        }
 
         cbm_store_close_required(&lp_store, "http.layout.lp_complete");
-        yyjson_mut_arr_append(lp_arr, entry);
+        if (!yyjson_mut_arr_append(lp_arr, entry)) {
+            set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_LINKED_RESPONSE_ALLOCATION_FAILED",
+                                  "append_linked_response",
+                                  "a complete linked-project entry could not be attached",
+                                  "free memory and retry the exact layout request");
+            goto linked_failure;
+        }
         yyjson_mut_doc_free(lm);
+        lm = NULL;
         free(linked[li]);
+        linked[li] = NULL;
     }
 
+    if (!yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr)) {
+        set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_RESPONSE_ALLOCATION_FAILED",
+                              "append_linked_projects",
+                              "the complete linked-project roster could not be attached",
+                              "free memory and retry the exact layout request");
+        goto linked_failure;
+    }
     cbm_store_close_required(&store, "http.layout.complete");
-    yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
 
     size_t len = 0;
     char *final_json = yyjson_mut_write(mdoc, 0, &len);
     yyjson_mut_doc_free(mdoc);
+    mdoc = NULL;
 
     if (final_json) {
         cbm_http_replyf(c, 200, g_cors_json, "%s", final_json);
         free(final_json);
     } else {
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON write failed\"}");
+        set_http_layout_error(&layout_error, NULL, "CBM_LAYOUT_RESPONSE_SERIALIZATION_FAILED",
+                              "serialize_layout_response",
+                              "the complete layout response could not be serialized",
+                              "free memory and retry the exact layout request");
+        reply_layout_error(c, 500, &layout_error);
     }
+    return;
+
+linked_failure:
+    if (lookup)
+        sqlite3_finalize(lookup);
+    if (eq)
+        sqlite3_finalize(eq);
+    if (lpdoc)
+        yyjson_doc_free(lpdoc);
+    free(lp_json);
+    cbm_layout_free(lp_layout);
+    if (lm)
+        yyjson_mut_doc_free(lm);
+    if (mdoc)
+        yyjson_mut_doc_free(mdoc);
+    cbm_store_close_required(&lp_store, "http.layout.linked_failure");
+    cbm_store_close_required(&store, "http.layout.failure");
+    free_cross_repo_targets(linked, linked_count);
+    reply_layout_error(c, 500, &layout_error);
 }
 
 /* ── Handle JSON-RPC request ──────────────────────────────────── */

@@ -18,6 +18,7 @@
 
 #include <math.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -243,7 +244,7 @@ static void child_center(octree_node_t *n, int o, float *cx, float *cy, float *c
     *cy = n->oy + ((o & 2) ? q : -q);
     *cz = n->oz + ((o & 4) ? q : -q);
 }
-static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, float mass,
+static bool octree_insert(octree_node_t *n, int idx, float x, float y, float z, float mass,
                           int depth) {
     if (n->total_mass == 0.0f && n->body_index == -1) {
         n->body_index = idx;
@@ -252,7 +253,7 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         n->cy = y;
         n->cz = z;
         n->total_mass = mass;
-        return;
+        return true;
     }
     /* OOM guard: when bodies share (or nearly share) a position, subdivision
      * never separates them, so half_size shrinks toward zero and we allocate
@@ -266,7 +267,7 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         n->cz = (n->cz * n->total_mass + z * mass) / nm;
         n->total_mass = nm;
         n->body_index = -1;
-        return;
+        return true;
     }
     if (n->body_index >= 0) {
         int oi = n->body_index;
@@ -278,8 +279,10 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
             child_center(n, o, &a, &b, &c);
             n->children[o] = octree_new(a, b, c, n->half_size * 0.5f);
         }
-        if (n->children[o])
-            octree_insert(n->children[o], oi, ox, oy, oz, om, depth + 1);
+        if (!n->children[o] ||
+            !octree_insert(n->children[o], oi, ox, oy, oz, om, depth + 1)) {
+            return false;
+        }
     }
     float nm = n->total_mass + mass;
     n->cx = (n->cx * n->total_mass + x * mass) / nm;
@@ -292,8 +295,11 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         child_center(n, o, &a, &b, &c);
         n->children[o] = octree_new(a, b, c, n->half_size * 0.5f);
     }
-    if (n->children[o])
-        octree_insert(n->children[o], idx, x, y, z, mass, depth + 1);
+    if (!n->children[o] ||
+        !octree_insert(n->children[o], idx, x, y, z, mass, depth + 1)) {
+        return false;
+    }
+    return true;
 }
 static void octree_repulse(octree_node_t *n, float px, float py, float pz, float mm, int si,
                            float kr, float *fx, float *fy, float *fz) {
@@ -325,7 +331,7 @@ typedef struct {
 
 /* ── Local optimization (gentle, anchor-preserving) ───────────── */
 
-static void local_optimize(body_t *b, int n, const int *es, const int *ed, int ne) {
+static bool local_optimize(body_t *b, int n, const int *es, const int *ed, int ne) {
     /* Scale iteration effort down for very large graphs: each iteration is
      * O(n log n) octree work, and past ~100k bodies the anchor layout already
      * dominates the visible structure — fewer refinement passes keep huge
@@ -365,9 +371,13 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
         octree_node_t *root =
             octree_new((mnx + mxx) * 0.5f, (mny + mxy) * 0.5f, (mnz + mxz) * 0.5f, half);
         if (!root)
-            break;
-        for (int i = 0; i < n; i++)
-            octree_insert(root, i, b[i].x, b[i].y, b[i].z, b[i].mass, 0);
+            return false;
+        for (int i = 0; i < n; i++) {
+            if (!octree_insert(root, i, b[i].x, b[i].y, b[i].z, b[i].mass, 0)) {
+                octree_free(root);
+                return false;
+            }
+        }
         for (int i = 0; i < n; i++)
             octree_repulse(root, b[i].x, b[i].y, b[i].z, b[i].mass, i, LOCAL_REPULSION, &b[i].fx,
                            &b[i].fy, &b[i].fz);
@@ -405,11 +415,12 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
             b[i].z += b[i].fz * speed;
         }
     }
+    return true;
 }
 
 /* ── Call depth via BFS ───────────────────────────────────────── */
 
-static void compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
+static bool compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
                                int *depth) {
     /* #229/#273: `n` is a search-result count, already clamped to <= HARD_MAX_NODES
      * by clamp_max_nodes() before the query that produced it — but the compiler
@@ -426,14 +437,14 @@ static void compute_call_depth(int n, const int *es, const int *ed, int ne, cons
                       "remediation",
                       "lower the layout node ceiling (CBM_UI_MAX_RENDER_NODES) or the "
                       "requested max_nodes so the result set stays within HARD_MAX_NODES");
-        return;
+        return false;
     }
     for (int i = 0; i < n; i++)
         depth[i] = -1;
     int *q = malloc((size_t)n * sizeof(int));
     int head = 0, tail = 0;
     if (!q)
-        return;
+        return false;
 
     /* Entry points at depth 0 */
     for (int i = 0; i < n; i++) {
@@ -445,19 +456,21 @@ static void compute_call_depth(int n, const int *es, const int *ed, int ne, cons
     }
     if (tail == 0) {
         int *in_d = calloc((size_t)n, sizeof(int));
-        if (in_d) {
-            for (int e = 0; e < ne; e++) {
-                int t = ed[e];
-                if (t >= 0 && t < n)
-                    in_d[t]++;
-            }
-            for (int i = 0; i < n; i++)
-                if (in_d[i] == 0) {
-                    depth[i] = 0;
-                    q[tail++] = i;
-                }
-            free(in_d);
+        if (!in_d) {
+            free(q);
+            return false;
         }
+        for (int e = 0; e < ne; e++) {
+            int t = ed[e];
+            if (t >= 0 && t < n)
+                in_d[t]++;
+        }
+        for (int i = 0; i < n; i++)
+            if (in_d[i] == 0) {
+                depth[i] = 0;
+                q[tail++] = i;
+            }
+        free(in_d);
     }
     while (head < tail) {
         int c = q[head++], cd = depth[c];
@@ -474,6 +487,7 @@ static void compute_call_depth(int n, const int *es, const int *ed, int ne, cons
         if (depth[i] == -1)
             depth[i] = 0;
     free(q);
+    return true;
 }
 
 /* ── Helpers ──────────────────────────────────────────────────── */
@@ -487,6 +501,90 @@ static void free_edge_array(cbm_edge_t *edges, int count) {
         free((void *)edges[i].properties_json);
     }
     free(edges);
+}
+
+static void layout_error_clear(cbm_layout_error_t *error) {
+    if (error)
+        memset(error, 0, sizeof(*error));
+}
+
+static void layout_fail(cbm_layout_error_t *error, cbm_store_t *store, const char *code,
+                        const char *operation, const char *message, const char *remediation) {
+    const char *store_message = store ? cbm_store_error(store) : NULL;
+    int store_code = store ? cbm_store_error_code(store) : 0;
+    if (error) {
+        snprintf(error->code, sizeof(error->code), "%s", code ? code : "CBM_LAYOUT_FAILED");
+        snprintf(error->operation, sizeof(error->operation), "%s",
+                 operation ? operation : "layout");
+        if (store_message && store_message[0]) {
+            snprintf(error->message, sizeof(error->message), "%s: %s",
+                     message ? message : "layout operation failed", store_message);
+        } else {
+            snprintf(error->message, sizeof(error->message), "%s",
+                     message ? message : "layout operation failed");
+        }
+        snprintf(error->remediation, sizeof(error->remediation), "%s",
+                 remediation ? remediation : "inspect the layout failure and retry");
+        error->store_error_code = store_code;
+    }
+
+    char store_code_text[32];
+    snprintf(store_code_text, sizeof(store_code_text), "%d", store_code);
+    cbm_log_error("layout3d.failed", "code", code ? code : "CBM_LAYOUT_FAILED", "operation",
+                  operation ? operation : "layout", "message",
+                  message ? message : "layout operation failed", "store_error",
+                  store_message ? store_message : "", "store_error_code", store_code_text,
+                  "remediation", remediation ? remediation : "inspect the layout failure and retry");
+}
+
+/* Grow the three arrays representing one logical edge vector as a single
+ * transaction. No live pointer or capacity changes until all checked
+ * replacement allocations and prefix copies succeed. */
+static bool grow_edge_vectors(cbm_edge_t **edges, int **sources, int **targets, int count,
+                              int *capacity, cbm_layout_error_t *error) {
+    if (!edges || !sources || !targets || !capacity || count < 0 || *capacity <= 0 ||
+        count > *capacity || *capacity > INT_MAX / PAIR_LEN) {
+        layout_fail(error, NULL, "CBM_LAYOUT_EDGE_CAPACITY_INVALID", "grow_edge_vectors",
+                    "layout edge capacity cannot be doubled without integer overflow",
+                    "lower the layout node ceiling or repair the corrupt edge-vector state");
+        return false;
+    }
+    int next = *capacity * PAIR_LEN;
+    if ((size_t)next > SIZE_MAX / sizeof(**edges) ||
+        (size_t)next > SIZE_MAX / sizeof(**sources) ||
+        (size_t)next > SIZE_MAX / sizeof(**targets)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_EDGE_CAPACITY_OVERFLOW", "grow_edge_vectors",
+                    "layout edge allocation size overflows size_t",
+                    "lower the layout node ceiling and retry");
+        return false;
+    }
+
+    cbm_edge_t *new_edges = malloc((size_t)next * sizeof(*new_edges));
+    int *new_sources = malloc((size_t)next * sizeof(*new_sources));
+    int *new_targets = malloc((size_t)next * sizeof(*new_targets));
+    if (!new_edges || !new_sources || !new_targets) {
+        free(new_edges);
+        free(new_sources);
+        free(new_targets);
+        layout_fail(error, NULL, "CBM_LAYOUT_EDGE_ALLOCATION_FAILED", "grow_edge_vectors",
+                    "layout edge vectors could not grow as one coherent allocation transaction",
+                    "free memory or request a smaller layout, then retry");
+        return false;
+    }
+
+    if (count > 0) {
+        memcpy(new_edges, *edges, (size_t)count * sizeof(*new_edges));
+        memcpy(new_sources, *sources, (size_t)count * sizeof(*new_sources));
+        memcpy(new_targets, *targets, (size_t)count * sizeof(*new_targets));
+    }
+    free(*edges);
+    free(*sources);
+    free(*targets);
+    *edges = new_edges;
+    *sources = new_sources;
+    *targets = new_targets;
+    *capacity = next;
+    return true;
 }
 
 /* ── Node ID → index map (for O(log n) edge filtering) ───────── */
@@ -523,9 +621,14 @@ static int find_node_index(const node_id_entry_t *map, int count, int64_t id) {
 
 cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         cbm_layout_level_t level, const char *center_node,
-                                        int radius, int max_nodes) {
-    if (!store || !project)
+                                        int radius, int max_nodes, cbm_layout_error_t *error) {
+    layout_error_clear(error);
+    if (!store || !project || !project[0]) {
+        layout_fail(error, store, "CBM_LAYOUT_INPUT_INVALID", "validate_input",
+                    "layout requires an open store and a non-empty project name",
+                    "open the exact project store and pass its persisted project name");
         return NULL;
+    }
     max_nodes = clamp_max_nodes(max_nodes);
     (void)center_node;
     (void)radius;
@@ -541,27 +644,65 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
 
     cbm_search_output_t search_out;
     memset(&search_out, 0, sizeof(search_out));
-    if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK)
-        return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
+    if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK) {
+        layout_fail(error, store, "CBM_LAYOUT_NODE_QUERY_FAILED", "query_nodes",
+                    "layout node query failed", "inspect the store diagnostic, repair the project "
+                    "store, and retry without changing the layout budget");
+        cbm_store_search_free(&search_out);
+        return NULL;
+    }
 
     int n = search_out.count, total_count = search_out.total;
+    if (n < 0 || n > max_nodes || n > HARD_MAX_NODES || total_count < n ||
+        (n > 0 && !search_out.results)) {
+        layout_fail(error, store, "CBM_LAYOUT_NODE_COUNT_INVALID", "query_nodes",
+                    "layout node query returned an impossible count",
+                    "repair the project store or search contract, then retry");
+        cbm_store_search_free(&search_out);
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        const cbm_node_t *node = &search_out.results[i].node;
+        if (!node->label || !node->name || !node->qualified_name) {
+            layout_fail(error, store, "CBM_LAYOUT_NODE_RESULT_INVALID", "query_nodes",
+                        "layout node query returned a row without its mandatory identity fields",
+                        "repair the persisted node row and retry the exact request");
+            cbm_store_search_free(&search_out);
+            return NULL;
+        }
+    }
     if (n == 0) {
         cbm_store_search_free(&search_out);
         cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
-        if (r)
-            r->total_nodes = total_count;
+        if (!r) {
+            layout_fail(error, NULL, "CBM_LAYOUT_RESULT_ALLOCATION_FAILED", "allocate_empty_result",
+                        "zero-node layout result could not be allocated",
+                        "free memory and retry the same layout request");
+            return NULL;
+        }
+        r->total_nodes = total_count;
         return r;
+    }
+
+    if ((size_t)n > SIZE_MAX / sizeof(node_id_entry_t) ||
+        (size_t)n > SIZE_MAX / sizeof(int) || (size_t)n > SIZE_MAX / sizeof(int64_t) ||
+        (size_t)n > SIZE_MAX / sizeof(body_t) ||
+        (size_t)n > SIZE_MAX / sizeof(cbm_layout_node_t)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_NODE_ALLOCATION_OVERFLOW", "measure_node_buffers",
+                    "layout node-buffer size overflows size_t",
+                    "lower the layout node ceiling and retry");
+        cbm_store_search_free(&search_out);
+        return NULL;
     }
 
     /* 2. Build sorted node-ID → index map for O(log n) edge filtering */
     node_id_entry_t *id_map = malloc((size_t)n * sizeof(node_id_entry_t));
     if (!id_map) {
+        layout_fail(error, NULL, "CBM_LAYOUT_NODE_MAP_ALLOCATION_FAILED", "allocate_node_map",
+                    "layout node-id map could not be allocated",
+                    "free memory or request a smaller layout, then retry");
         cbm_store_search_free(&search_out);
-        cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
-        if (r) {
-            r->total_nodes = total_count;
-        }
-        return r;
+        return NULL;
     }
     for (int i = 0; i < n; i++) {
         id_map[i].id = search_out.results[i].node.id;
@@ -578,84 +719,121 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     int *ed = malloc((size_t)edge_cap * sizeof(int));
     cbm_schema_info_t schema;
     memset(&schema, 0, sizeof(schema));
-    if (deg && all_edges && es && ed &&
-        cbm_store_get_schema(store, project, &schema) == CBM_STORE_OK) {
-        for (int t = 0; t < schema.edge_type_count; t++) {
-            cbm_edge_t *te = NULL;
-            int tc = 0;
-            if (cbm_store_find_edges_by_type(store, project, schema.edge_types[t].type, &te, &tc) ==
+    if (!deg || !all_edges || !es || !ed) {
+        layout_fail(error, NULL, "CBM_LAYOUT_EDGE_BUFFER_ALLOCATION_FAILED",
+                    "allocate_edge_buffers", "layout edge buffers could not be allocated",
+                    "free memory or request a smaller layout, then retry");
+        goto fail_before_result;
+    }
+    if (cbm_store_get_schema(store, project, &schema) != CBM_STORE_OK) {
+        layout_fail(error, store, "CBM_LAYOUT_SCHEMA_QUERY_FAILED", "query_schema",
+                    "layout schema query failed",
+                    "inspect the store diagnostic, repair the project schema, and retry");
+        goto fail_before_result;
+    }
+    if (schema.edge_type_count < 0 ||
+        (schema.edge_type_count > 0 && !schema.edge_types)) {
+        layout_fail(error, store, "CBM_LAYOUT_SCHEMA_INVALID", "query_schema",
+                    "layout schema returned an invalid edge-type roster",
+                    "repair the project schema and retry");
+        goto fail_before_result;
+    }
+    for (int t = 0; t < schema.edge_type_count; t++) {
+        cbm_edge_t *te = NULL;
+        int tc = 0;
+        if (!schema.edge_types[t].type || !schema.edge_types[t].type[0] ||
+            cbm_store_find_edges_by_type(store, project, schema.edge_types[t].type, &te, &tc) !=
                 CBM_STORE_OK) {
-                for (int e = 0; e < tc; e++) {
-                    int si = find_node_index(id_map, n, te[e].source_id);
-                    int di = find_node_index(id_map, n, te[e].target_id);
-                    if (si >= 0 && di >= 0) {
-                        if (mapped >= edge_cap) {
-                            int nc = edge_cap * PAIR_LEN;
-                            cbm_edge_t *te2 = realloc(all_edges, (size_t)nc * sizeof(cbm_edge_t));
-                            int *ts = realloc(es, (size_t)nc * sizeof(int));
-                            int *td = realloc(ed, (size_t)nc * sizeof(int));
-                            if (!te2 || !ts || !td) {
-                                if (te2)
-                                    all_edges = te2;
-                                if (ts)
-                                    es = ts;
-                                if (td)
-                                    ed = td;
-                                free_edge_array(te + e, tc - e);
-                                goto edges_done;
-                            }
-                            all_edges = te2;
-                            es = ts;
-                            ed = td;
-                            edge_cap = nc;
-                        }
-                        all_edges[mapped] = te[e];
-                        memset(&te[e], 0, sizeof(cbm_edge_t));
-                        es[mapped] = si;
-                        ed[mapped] = di;
-                        deg[si]++;
-                        deg[di]++;
-                        mapped++;
-                    } else {
-                        free((void *)te[e].project);
-                        free((void *)te[e].type);
-                        free((void *)te[e].properties_json);
-                    }
-                }
+            if (tc > 0)
+                free_edge_array(te, tc);
+            else
                 free(te);
+            layout_fail(error, store, "CBM_LAYOUT_EDGE_QUERY_FAILED", "query_edges",
+                        "layout edge query failed",
+                        "inspect the store diagnostic and repair the exact edge family before retrying");
+            goto fail_before_result;
+        }
+        if (tc < 0 || (tc > 0 && !te)) {
+            free(te);
+            layout_fail(error, store, "CBM_LAYOUT_EDGE_RESULT_INVALID", "query_edges",
+                        "layout edge query returned an invalid row vector",
+                        "repair the store edge-query contract and retry");
+            goto fail_before_result;
+        }
+        for (int e = 0; e < tc; e++) {
+            int si = find_node_index(id_map, n, te[e].source_id);
+            int di = find_node_index(id_map, n, te[e].target_id);
+            if (si >= 0 && di >= 0) {
+                if (mapped >= edge_cap &&
+                    !grow_edge_vectors(&all_edges, &es, &ed, mapped, &edge_cap, error)) {
+                    free_edge_array(te, tc);
+                    goto fail_before_result;
+                }
+                all_edges[mapped] = te[e];
+                memset(&te[e], 0, sizeof(cbm_edge_t));
+                es[mapped] = si;
+                ed[mapped] = di;
+                deg[si]++;
+                deg[di]++;
+                mapped++;
+            } else {
+                free((void *)te[e].project);
+                free((void *)te[e].type);
+                free((void *)te[e].properties_json);
+                memset(&te[e], 0, sizeof(cbm_edge_t));
             }
         }
-    edges_done:
-        cbm_store_schema_free(&schema);
+        free_edge_array(te, tc);
     }
+    cbm_store_schema_free(&schema);
     free(id_map);
+    id_map = NULL;
 
     /* 4. Call depth for z-axis */
     int *cdepth = calloc((size_t)n, sizeof(int));
     const char **lbls = malloc((size_t)n * sizeof(char *));
-    if (lbls) {
-        for (int i = 0; i < n; i++)
-            lbls[i] = search_out.results[i].node.label;
-        if (cdepth)
-            compute_call_depth(n, es, ed, mapped, lbls, cdepth);
+    if (!cdepth || !lbls) {
+        layout_fail(error, NULL, "CBM_LAYOUT_CALL_DEPTH_ALLOCATION_FAILED",
+                    "allocate_call_depth", "layout call-depth buffers could not be allocated",
+                    "free memory or request a smaller layout, then retry");
+        free(cdepth);
         free(lbls);
+        goto fail_after_schema;
     }
+    for (int i = 0; i < n; i++)
+        lbls[i] = search_out.results[i].node.label;
+    if (!compute_call_depth(n, es, ed, mapped, lbls, cdepth)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_CALL_DEPTH_ALLOCATION_FAILED", "compute_call_depth",
+                    "layout call-depth computation could not allocate its working queue",
+                    "free memory or request a smaller layout, then retry");
+        free(lbls);
+        free(cdepth);
+        goto fail_after_schema;
+    }
+    free(lbls);
 
     /* 5. Seed positions: ring by directory cluster key + z from call depth */
     body_t *bodies = calloc((size_t)n, sizeof(body_t));
     cbm_layout_result_t *result = calloc(CBM_ALLOC_ONE, sizeof(*result));
     if (!result || !bodies) {
+        layout_fail(error, NULL, "CBM_LAYOUT_RESULT_ALLOCATION_FAILED", "allocate_result",
+                    "layout result or body vector could not be allocated",
+                    "free memory or request a smaller layout, then retry");
         free(bodies);
-        free(deg);
-        free(es);
-        free(ed);
         free(cdepth);
         cbm_layout_free(result);
-        free_edge_array(all_edges, mapped);
-        cbm_store_search_free(&search_out);
-        return NULL;
+        goto fail_after_schema;
     }
     result->nodes = calloc((size_t)n, sizeof(cbm_layout_node_t));
+    if (!result->nodes) {
+        layout_fail(error, NULL, "CBM_LAYOUT_NODE_OUTPUT_ALLOCATION_FAILED",
+                    "allocate_node_output", "layout node output could not be allocated",
+                    "free memory or request a smaller layout, then retry");
+        free(bodies);
+        free(cdepth);
+        cbm_layout_free(result);
+        goto fail_after_schema;
+    }
     result->node_count = n;
     result->total_nodes = total_count;
 
@@ -668,15 +846,24 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     int *in_calls = calloc((size_t)n, sizeof(int));
     int *in_usage = calloc((size_t)n, sizeof(int));
     int *deg_dummy = calloc((size_t)n, sizeof(int));
-    if (node_ids && in_calls && in_usage && deg_dummy) {
-        for (int i = 0; i < n; i++)
-            node_ids[i] = search_out.results[i].node.id;
-        for (int off = 0; off < n; off += DEAD_DEGREE_CHUNK) {
-            int cnt = (n - off < DEAD_DEGREE_CHUNK) ? (n - off) : DEAD_DEGREE_CHUNK;
-            cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALLS", in_calls + off,
-                                          deg_dummy + off);
+    if (!node_ids || !in_calls || !in_usage || !deg_dummy) {
+        layout_fail(error, NULL, "CBM_LAYOUT_DEGREE_ALLOCATION_FAILED", "allocate_degree_buffers",
+                    "layout degree buffers could not be allocated",
+                    "free memory or request a smaller layout, then retry");
+        goto fail_with_result;
+    }
+    for (int i = 0; i < n; i++)
+        node_ids[i] = search_out.results[i].node.id;
+    for (int off = 0; off < n; off += DEAD_DEGREE_CHUNK) {
+        int cnt = (n - off < DEAD_DEGREE_CHUNK) ? (n - off) : DEAD_DEGREE_CHUNK;
+        if (cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALLS", in_calls + off,
+                                          deg_dummy + off) != CBM_STORE_OK ||
             cbm_store_batch_count_degrees(store, node_ids + off, cnt, "USAGE", in_usage + off,
-                                          deg_dummy + off);
+                                          deg_dummy + off) != CBM_STORE_OK) {
+            layout_fail(error, store, "CBM_LAYOUT_DEGREE_QUERY_FAILED", "query_degrees",
+                        "layout degree query failed",
+                        "inspect the store diagnostic and repair degree state before retrying");
+            goto fail_with_result;
         }
     }
 
@@ -722,6 +909,14 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         result->nodes[i].name = sn->name ? strdup(sn->name) : NULL;
         result->nodes[i].qualified_name = sn->qualified_name ? strdup(sn->qualified_name) : NULL;
         result->nodes[i].file_path = sn->file_path ? strdup(sn->file_path) : NULL;
+        if ((sn->label && !result->nodes[i].label) || (sn->name && !result->nodes[i].name) ||
+            (sn->qualified_name && !result->nodes[i].qualified_name) ||
+            (sn->file_path && !result->nodes[i].file_path)) {
+            layout_fail(error, NULL, "CBM_LAYOUT_NODE_STRING_ALLOCATION_FAILED",
+                        "copy_node_output", "layout node string could not be copied",
+                        "free memory or request a smaller layout, then retry");
+            goto fail_with_result;
+        }
         result->nodes[i].start_line = sn->start_line;
         result->nodes[i].end_line = sn->end_line;
         result->nodes[i].color = stellar_color(deg[i]);
@@ -731,14 +926,13 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         result->nodes[i].size = base_size + deg_boost;
 
         /* Dead-code classification. Only Function/Method are candidates; other
-         * labels are structural. Default to non-dead (1) if the batch degree
-         * query failed, so a query error never masquerades as dead code. */
+         * labels are structural. Degree-query failure is terminal above. */
         node_flags_t nf = parse_node_flags(sn->properties_json);
         bool is_fn =
             sn->label && (strcmp(sn->label, "Function") == 0 || strcmp(sn->label, "Method") == 0);
         bool testish = nf.is_test || (sn->file_path && cbm_is_test_file_path(sn->file_path));
-        int ic = in_calls ? in_calls[i] : 1;
-        int iu = in_usage ? in_usage[i] : 1;
+        int ic = in_calls[i];
+        int iu = in_usage[i];
         const char *status;
         if (!is_fn)
             status = "structural";
@@ -759,7 +953,12 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     }
 
     /* 6. Gentle local optimization (anchor-preserving) */
-    local_optimize(bodies, n, es, ed, mapped);
+    if (!local_optimize(bodies, n, es, ed, mapped)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_OCTREE_ALLOCATION_FAILED", "local_optimize",
+                    "layout octree could not retain every body",
+                    "free memory or request a smaller layout, then retry");
+        goto fail_with_result;
+    }
 
     /* 7. Copy positions */
     for (int i = 0; i < n; i++) {
@@ -771,11 +970,23 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     /* 8. Output edges */
     if (mapped > 0) {
         result->edges = calloc((size_t)mapped, sizeof(cbm_layout_edge_t));
+        if (!result->edges) {
+            layout_fail(error, NULL, "CBM_LAYOUT_EDGE_OUTPUT_ALLOCATION_FAILED",
+                        "allocate_edge_output", "layout edge output could not be allocated",
+                        "free memory or request a smaller layout, then retry");
+            goto fail_with_result;
+        }
         result->edge_count = mapped;
-        for (int e = 0; e < mapped && result->edges; e++) {
+        for (int e = 0; e < mapped; e++) {
             result->edges[e].source = search_out.results[es[e]].node.id;
             result->edges[e].target = search_out.results[ed[e]].node.id;
             result->edges[e].type = all_edges[e].type ? strdup(all_edges[e].type) : NULL;
+            if (all_edges[e].type && !result->edges[e].type) {
+                layout_fail(error, NULL, "CBM_LAYOUT_EDGE_STRING_ALLOCATION_FAILED",
+                            "copy_edge_output", "layout edge type could not be copied",
+                            "free memory or request a smaller layout, then retry");
+                goto fail_with_result;
+            }
         }
     }
 
@@ -791,6 +1002,27 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     free_edge_array(all_edges, mapped);
     cbm_store_search_free(&search_out);
     return result;
+
+fail_with_result:
+    free(bodies);
+    free(cdepth);
+    free(node_ids);
+    free(in_calls);
+    free(in_usage);
+    free(deg_dummy);
+    cbm_layout_free(result);
+fail_after_schema:
+    free(deg);
+    free(es);
+    free(ed);
+    free_edge_array(all_edges, mapped);
+    cbm_store_search_free(&search_out);
+    return NULL;
+
+fail_before_result:
+    cbm_store_schema_free(&schema);
+    free(id_map);
+    goto fail_after_schema;
 }
 
 void cbm_layout_free(cbm_layout_result_t *r) {
@@ -809,58 +1041,124 @@ void cbm_layout_free(cbm_layout_result_t *r) {
     free(r);
 }
 
-char *cbm_layout_to_json(const cbm_layout_result_t *r) {
-    if (!r)
+char *cbm_layout_to_json(const cbm_layout_result_t *r, cbm_layout_error_t *error) {
+    layout_error_clear(error);
+    if (!r || r->node_count < 0 || r->edge_count < 0 || r->total_nodes < r->node_count ||
+        (r->node_count > 0 && !r->nodes) || (r->edge_count > 0 && !r->edges)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_INPUT_INVALID", "serialize_layout",
+                    "layout serialization requires complete node and edge vectors",
+                    "repair the layout result producer and retry");
         return NULL;
+    }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        if (doc)
+            yyjson_mut_doc_free(doc);
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                    "allocate_layout_json", "layout JSON document could not be allocated",
+                    "free memory and retry the exact layout request");
+        return NULL;
+    }
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_val *na = yyjson_mut_arr(doc);
+    if (!na) {
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                    "allocate_layout_nodes_json", "layout JSON node array could not be allocated",
+                    "free memory and retry the exact layout request");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
     for (int i = 0; i < r->node_count; i++) {
         yyjson_mut_val *nd = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_int(doc, nd, "id", r->nodes[i].id);
-        double nx = isfinite(r->nodes[i].x) ? (double)r->nodes[i].x : 0.0;
-        double ny = isfinite(r->nodes[i].y) ? (double)r->nodes[i].y : 0.0;
-        double nz = isfinite(r->nodes[i].z) ? (double)r->nodes[i].z : 0.0;
-        yyjson_mut_obj_add_real(doc, nd, "x", nx);
-        yyjson_mut_obj_add_real(doc, nd, "y", ny);
-        yyjson_mut_obj_add_real(doc, nd, "z", nz);
+        if (!isfinite(r->nodes[i].x) || !isfinite(r->nodes[i].y) ||
+            !isfinite(r->nodes[i].z) || !isfinite(r->nodes[i].size)) {
+            layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_NUMERIC_INVALID",
+                        "serialize_layout_node",
+                        "layout node coordinates or size are not finite",
+                        "inspect the layout numeric diagnostic and repair the computation before retrying");
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
+        bool complete = nd && yyjson_mut_obj_add_int(doc, nd, "id", r->nodes[i].id) &&
+                        yyjson_mut_obj_add_real(doc, nd, "x", (double)r->nodes[i].x) &&
+                        yyjson_mut_obj_add_real(doc, nd, "y", (double)r->nodes[i].y) &&
+                        yyjson_mut_obj_add_real(doc, nd, "z", (double)r->nodes[i].z);
         if (r->nodes[i].label)
-            yyjson_mut_obj_add_str(doc, nd, "label", r->nodes[i].label);
+            complete = complete && yyjson_mut_obj_add_str(doc, nd, "label", r->nodes[i].label);
         if (r->nodes[i].name)
-            yyjson_mut_obj_add_str(doc, nd, "name", r->nodes[i].name);
+            complete = complete && yyjson_mut_obj_add_str(doc, nd, "name", r->nodes[i].name);
         if (r->nodes[i].file_path)
-            yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
+            complete = complete &&
+                       yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
         if (r->nodes[i].qualified_name)
-            yyjson_mut_obj_add_str(doc, nd, "qualified_name", r->nodes[i].qualified_name);
+            complete = complete && yyjson_mut_obj_add_str(doc, nd, "qualified_name",
+                                                          r->nodes[i].qualified_name);
         if (r->nodes[i].start_line > 0)
-            yyjson_mut_obj_add_int(doc, nd, "start_line", r->nodes[i].start_line);
+            complete = complete &&
+                       yyjson_mut_obj_add_int(doc, nd, "start_line", r->nodes[i].start_line);
         if (r->nodes[i].end_line > 0)
-            yyjson_mut_obj_add_int(doc, nd, "end_line", r->nodes[i].end_line);
-        double nsz = isfinite(r->nodes[i].size) ? (double)r->nodes[i].size : 1.0;
-        yyjson_mut_obj_add_real(doc, nd, "size", nsz);
+            complete = complete &&
+                       yyjson_mut_obj_add_int(doc, nd, "end_line", r->nodes[i].end_line);
+        complete = complete && yyjson_mut_obj_add_real(doc, nd, "size", (double)r->nodes[i].size);
         char hex[CBM_SZ_8];
         snprintf(hex, sizeof(hex), "#%06x", r->nodes[i].color);
-        yyjson_mut_obj_add_strcpy(doc, nd, "color", hex);
-        yyjson_mut_obj_add_int(doc, nd, "in_calls", r->nodes[i].in_calls);
+        complete = complete && yyjson_mut_obj_add_strcpy(doc, nd, "color", hex) &&
+                   yyjson_mut_obj_add_int(doc, nd, "in_calls", r->nodes[i].in_calls);
         if (r->nodes[i].status)
-            yyjson_mut_obj_add_str(doc, nd, "status", r->nodes[i].status);
-        yyjson_mut_arr_append(na, nd);
+            complete = complete &&
+                       yyjson_mut_obj_add_str(doc, nd, "status", r->nodes[i].status);
+        if (!complete || !yyjson_mut_arr_append(na, nd)) {
+            layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                        "serialize_layout_node",
+                        "a complete layout node could not be retained in JSON",
+                        "free memory and retry the exact layout request");
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
     }
-    yyjson_mut_obj_add_val(doc, root, "nodes", na);
+    if (!yyjson_mut_obj_add_val(doc, root, "nodes", na)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                    "attach_layout_nodes_json",
+                    "the complete layout node array could not be attached",
+                    "free memory and retry the exact layout request");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
 
     yyjson_mut_val *ea = yyjson_mut_arr(doc);
+    if (!ea) {
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                    "allocate_layout_edges_json", "layout JSON edge array could not be allocated",
+                    "free memory and retry the exact layout request");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
     for (int i = 0; i < r->edge_count; i++) {
         yyjson_mut_val *ed = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_int(doc, ed, "source", r->edges[i].source);
-        yyjson_mut_obj_add_int(doc, ed, "target", r->edges[i].target);
+        bool complete = ed && yyjson_mut_obj_add_int(doc, ed, "source", r->edges[i].source) &&
+                        yyjson_mut_obj_add_int(doc, ed, "target", r->edges[i].target);
         if (r->edges[i].type)
-            yyjson_mut_obj_add_str(doc, ed, "type", r->edges[i].type);
-        yyjson_mut_arr_append(ea, ed);
+            complete = complete && yyjson_mut_obj_add_str(doc, ed, "type", r->edges[i].type);
+        if (!complete || !yyjson_mut_arr_append(ea, ed)) {
+            layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                        "serialize_layout_edge",
+                        "a complete layout edge could not be retained in JSON",
+                        "free memory and retry the exact layout request");
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
     }
-    yyjson_mut_obj_add_val(doc, root, "edges", ea);
-    yyjson_mut_obj_add_int(doc, root, "total_nodes", r->total_nodes);
+    if (!yyjson_mut_obj_add_val(doc, root, "edges", ea) ||
+        !yyjson_mut_obj_add_int(doc, root, "total_nodes", r->total_nodes)) {
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_ALLOCATION_FAILED",
+                    "attach_layout_edges_json",
+                    "the complete edge array or total node count could not be attached",
+                    "free memory and retry the exact layout request");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
 
     size_t len = 0;
     yyjson_write_err write_err = {0};
@@ -868,10 +1166,11 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
         yyjson_mut_write_opts(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL, &len, &write_err);
     yyjson_mut_doc_free(doc);
     if (!json) {
-        char code[CBM_SZ_32];
-        snprintf(code, sizeof(code), "%u", write_err.code);
-        cbm_log_error("layout.json.fail", "code", code, "msg",
-                      write_err.msg ? write_err.msg : "unknown");
+        char message[CBM_SZ_512];
+        snprintf(message, sizeof(message), "layout JSON write failed (%u): %s", write_err.code,
+                 write_err.msg ? write_err.msg : "unknown");
+        layout_fail(error, NULL, "CBM_LAYOUT_SERIALIZATION_WRITE_FAILED", "write_layout_json",
+                    message, "inspect allocator state and retry the exact layout request");
     }
     return json;
 }

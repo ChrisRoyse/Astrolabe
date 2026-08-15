@@ -50,6 +50,17 @@ typedef struct {
     int total_nodes; /* total in project (may exceed returned) */
 } cbm_layout_result_t;
 
+/* Caller-owned failure channel. `cbm_layout_compute` clears this structure on
+ * entry and fills it for every refusal, including failures that prevent a
+ * result allocation. A zero-node result is success and leaves `code` empty. */
+typedef struct {
+    char code[64];
+    char operation[64];
+    char message[512];
+    char remediation[256];
+    int store_error_code;
+} cbm_layout_error_t;
+
 /* ── API ──────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -63,12 +74,14 @@ typedef enum {
  * max_nodes: cap on returned nodes */
 cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         cbm_layout_level_t level, const char *center_node,
-                                        int radius, int max_nodes);
+                                        int radius, int max_nodes, cbm_layout_error_t *error);
 
 /* Free a layout result. */
 void cbm_layout_free(cbm_layout_result_t *result);
 
-/* Serialize layout result to JSON string. Caller must free(). */
-char *cbm_layout_to_json(const cbm_layout_result_t *result);
+/* Serialize a complete, finite layout result. Caller must free(). Every
+ * allocation, shape, or numeric failure is reported through `error`; no
+ * replacement coordinates or partial arrays are emitted. */
+char *cbm_layout_to_json(const cbm_layout_result_t *result, cbm_layout_error_t *error);
 
 #endif /* CBM_UI_LAYOUT3D_H */
