@@ -82,6 +82,15 @@ pub(crate) struct SignalCardTransactionPlan {
     rows: Vec<SignalCardConfigRow>,
 }
 
+pub(crate) struct SignalCardTransactionContext<'a> {
+    pub(crate) project: &'a str,
+    pub(crate) vault_id: VaultId,
+    pub(crate) panel_version: u32,
+    pub(crate) base_seq: u64,
+    pub(crate) produced_at: u64,
+    pub(crate) backend: SignalCardBackendIdentity,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalCardPrepareDisposition {
     PreparedWritten,
@@ -127,14 +136,18 @@ pub(crate) fn signal_card_transaction_key(project: &str) -> String {
 
 impl SignalCardTransactionPlan {
     pub(crate) fn build(
-        project: &str,
-        vault_id: VaultId,
-        panel_version: u32,
-        base_seq: u64,
-        produced_at: u64,
-        backend: SignalCardBackendIdentity,
+        context: SignalCardTransactionContext<'_>,
         prepared_ledger: &astrolabe_assay::PreparedAssayCardBatch,
+        published_ledger_path: &Path,
     ) -> Result<Self, DynError> {
+        let SignalCardTransactionContext {
+            project,
+            vault_id,
+            panel_version,
+            base_seq,
+            produced_at,
+            backend,
+        } = context;
         if prepared_ledger.entries.len() != prepared_ledger.lines.len() {
             return Err("ASTRO_ASSAY_SIGNAL_TXN_PLAN_INVALID: prepared ledger entries and physical lines differ in count".into());
         }
@@ -208,7 +221,7 @@ impl SignalCardTransactionPlan {
             });
             rows.push(SignalCardConfigRow { key, value });
         }
-        let ledger_path = prepared_ledger.path().to_string_lossy().into_owned();
+        let ledger_path = published_ledger_path.to_string_lossy().into_owned();
         let mut prepared = SignalCardTransactionMarker {
             schema: SIGNAL_CARD_TRANSACTION_SCHEMA.to_string(),
             state: "prepared".to_string(),

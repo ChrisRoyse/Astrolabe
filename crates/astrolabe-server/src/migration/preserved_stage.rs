@@ -1,15 +1,17 @@
 //! Preserved staged CBM stores for aborted shadow publications (#1037).
 //!
 //! A publication abort deletes its whole transaction tree, which used to include
-//! the multi-hour CBM product `stage/<project>.db`. This module keeps exactly one
-//! preserved stage per project in its own store-root namespace, records why it was
-//! preserved, and lets an explicitly requested retry adopt it only when every
-//! keying dimension matches exactly.
+//! the multi-hour CBM product and every staged state family that explains the
+//! abort. This module keeps exactly one complete stage per project in its own
+//! store-root namespace, records why it was preserved, and lets an explicitly
+//! requested retry adopt the CBM database only when every keying dimension
+//! matches exactly. The remaining staged files stay available for diagnosis until
+//! that successful adoption consumes the slot.
 //!
 //! Namespace: `<store>/.astrolabe-shadow-preserved-stage/<sha256(project)[..32]>/`
-//! holding `<project>.db` plus `preserved-stage.json`. Deliberately a sibling of
-//! `.astrolabe-shadow-publication` because `ShadowPublication::begin` refuses a
-//! non-empty project transaction root.
+//! holding the complete former `stage/` tree plus `preserved-stage.json`.
+//! Deliberately a sibling of `.astrolabe-shadow-publication` because
+//! `ShadowPublication::begin` refuses a non-empty project transaction root.
 
 use super::*;
 use rusqlite::OpenFlags;
@@ -17,8 +19,10 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const PRESERVED_STAGE_DIR: &str = ".astrolabe-shadow-preserved-stage";
 const PRESERVED_STAGE_MANIFEST: &str = "preserved-stage.json";
-const PRESERVED_STAGE_SCHEMA: &str = "astrolabe.shadow-preserved-stage.v3";
+const PRESERVED_STAGE_SCHEMA_V3: &str = "astrolabe.shadow-preserved-stage.v3";
+const PRESERVED_STAGE_SCHEMA: &str = "astrolabe.shadow-preserved-stage.v4";
 const PRESERVED_STAGE_FINGERPRINT_SCHEMA: &str = "astrolabe.shadow-preserved-stage.fingerprint.v3";
+const PRESERVED_STAGE_INVENTORY_SCHEMA: &str = "astrolabe.shadow-preserved-stage.inventory.v1";
 const PERSISTED_STAGE_ARMING_SCHEMA: &str = "astrolabe.shadow-stage-arming.v3";
 
 /// Registry-declared retention: at most this many preserved stages per project.
@@ -352,7 +356,144 @@ impl PersistedStageArming {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreservedStageInventoryEntry {
+    relative_path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreservedStageInventory {
+    schema: String,
+    files: Vec<PreservedStageInventoryEntry>,
+    file_count: u64,
+    bytes: u64,
+    sha256: String,
+}
+
+/// Binds the complete staged state family in deterministic relative-path order.
+/// #885/#1064: this failure-only pass reads every staged byte once; production B
+/// and F are unknown as of 2026-08-14. The path order and fixed read buffer are
+/// invariant across the pass (PC-03/PC-04/PC-07/PC-13/PC-35/PC-38/PC-41).
+fn stage_inventory(root: &Path, failure_code: &str) -> Result<PreservedStageInventory, DynError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| -> DynError {
+        format!(
+            "{failure_code}: staged family root {} is unreadable: {error}; remediation: preserve the publication transaction and inspect the stage root",
+            root.display()
+        )
+        .into()
+    })?;
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{failure_code}: staged family root {} is not an ordinary directory; remediation: preserve the publication transaction and inspect the stage root",
+            root.display()
+        )
+        .into());
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(|error| -> DynError {
+            format!(
+                "{failure_code}: reading staged family directory {} failed: {error}; remediation: preserve the publication transaction and inspect the complete stage",
+                directory.display()
+            )
+            .into()
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| -> DynError {
+                format!(
+                    "{failure_code}: enumerating staged family directory {} failed: {error}; remediation: preserve the publication transaction and inspect the complete stage",
+                    directory.display()
+                )
+                .into()
+            })?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|error| -> DynError {
+                format!(
+                    "{failure_code}: staged family path {} is not beneath {}: {error}; remediation: preserve the publication transaction and inspect the stage layout",
+                    path.display(),
+                    root.display()
+                )
+                .into()
+            })?;
+            let relative_path = relative.to_string_lossy().replace('\\', "/");
+            let metadata = fs::symlink_metadata(&path).map_err(|error| -> DynError {
+                format!(
+                    "{failure_code}: staged family entry {} is unreadable: {error}; remediation: preserve the publication transaction and inspect the complete stage",
+                    path.display()
+                )
+                .into()
+            })?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "{failure_code}: staged family entry {} is a symbolic link or reparse-backed link; remediation: preserve the publication transaction and replace it with ordinary staged state before retrying",
+                    path.display()
+                )
+                .into());
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(format!(
+                    "{failure_code}: staged family entry {} is neither an ordinary file nor directory; remediation: preserve the publication transaction and inspect the exact entry",
+                    path.display()
+                )
+                .into());
+            }
+            if relative_path == PRESERVED_STAGE_MANIFEST {
+                continue;
+            }
+            files.push(PreservedStageInventoryEntry {
+                relative_path,
+                bytes: metadata.len(),
+                sha256: sha256_file_hex(&path)?,
+            });
+        }
+    }
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
+    let bytes = files.iter().try_fold(0_u64, |total, entry| {
+        total.checked_add(entry.bytes).ok_or_else(|| -> DynError {
+            format!(
+                "{failure_code}: staged family byte count overflowed u64; remediation: preserve the publication transaction and inspect the stage inventory"
+            )
+            .into()
+        })
+    })?;
+    let file_count = u64::try_from(files.len()).map_err(|error| -> DynError {
+        format!(
+            "{failure_code}: staged family file count does not fit u64: {error}; remediation: preserve the publication transaction and inspect the stage inventory"
+        )
+        .into()
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"astrolabe.shadow-preserved-stage.inventory.v1\0");
+    for entry in &files {
+        let relative_path = entry.relative_path.as_bytes();
+        hasher.update((relative_path.len() as u64).to_be_bytes());
+        hasher.update(relative_path);
+        hasher.update(entry.bytes.to_be_bytes());
+        hasher.update((entry.sha256.len() as u64).to_be_bytes());
+        hasher.update(entry.sha256.as_bytes());
+    }
+    Ok(PreservedStageInventory {
+        schema: PRESERVED_STAGE_INVENTORY_SCHEMA.to_string(),
+        files,
+        file_count,
+        bytes,
+        sha256: hex_lower(&hasher.finalize()),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreservedStageRecord {
     schema: String,
@@ -368,6 +509,8 @@ pub(crate) struct PreservedStageRecord {
     source_file: String,
     source_bytes: u64,
     source_sha256: String,
+    #[serde(default)]
+    stage_inventory: Option<PreservedStageInventory>,
     index_tool_result: String,
     index_tool_result_sha256: String,
     superseded_generation: Option<String>,
@@ -420,12 +563,114 @@ fn write_json_durably(path: &Path, bytes: &[u8]) -> Result<(), DynError> {
     Ok(())
 }
 
-/// Moves the staged CBM store out of a dying transaction into the project's
-/// preserved-stage slot, replacing any prior slot atomically. Returns the labeled
-/// evidence the abort error carries.
+fn validate_preserved_stage(
+    dir: &Path,
+    record: &PreservedStageRecord,
+    failure_code: &str,
+) -> Result<Option<PreservedStageInventory>, DynError> {
+    let source_component = Path::new(&record.source_file);
+    if source_component.components().count() != 1
+        || !matches!(
+            source_component.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(format!(
+            "{failure_code}: preserved source file {:?} is not one ordinary root-relative component; remediation: preserve the directory and inspect its manifest",
+            record.source_file
+        )
+        .into());
+    }
+    let source = dir.join(source_component);
+    let metadata = fs::symlink_metadata(&source).map_err(|error| -> DynError {
+        format!(
+            "{failure_code}: preserved source {} is unreadable: {error}; remediation: preserve the directory and inspect the storage device",
+            source.display()
+        )
+        .into()
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{failure_code}: preserved source {} is not an ordinary file; remediation: preserve the directory and inspect the exact entry",
+            source.display()
+        )
+        .into());
+    }
+    if record.schema == PRESERVED_STAGE_SCHEMA_V3 {
+        let source_sha256 = sha256_file_hex(&source)?;
+        if metadata.len() != record.source_bytes || source_sha256 != record.source_sha256 {
+            return Err(format!(
+                "{failure_code}: preserved source {} is bytes={} sha256={source_sha256}, but its manifest binds bytes={} sha256={}; remediation: preserve every byte and inspect the storage device before retrying",
+                source.display(),
+                metadata.len(),
+                record.source_bytes,
+                record.source_sha256
+            )
+            .into());
+        }
+        return Ok(None);
+    }
+    let expected = record.stage_inventory.as_ref().ok_or_else(|| -> DynError {
+        format!(
+            "{failure_code}: preserved-stage v4 manifest at {} omits its complete staged-family inventory; remediation: preserve every byte and inspect the producer",
+            dir.display()
+        )
+        .into()
+    })?;
+    if expected.schema != PRESERVED_STAGE_INVENTORY_SCHEMA {
+        return Err(format!(
+            "{failure_code}: preserved-stage inventory at {} declares schema {:?}, expected {PRESERVED_STAGE_INVENTORY_SCHEMA:?}; remediation: preserve every byte and inspect the producer",
+            dir.display(),
+            expected.schema
+        )
+        .into());
+    }
+    let actual = stage_inventory(dir, failure_code)?;
+    if actual != *expected {
+        return Err(format!(
+            "{failure_code}: complete staged-family readback at {} is files={} bytes={} sha256={}, but its manifest binds files={} bytes={} sha256={}; remediation: preserve every byte and inspect the exact per-file inventory before retrying",
+            dir.display(),
+            actual.file_count,
+            actual.bytes,
+            actual.sha256,
+            expected.file_count,
+            expected.bytes,
+            expected.sha256
+        )
+        .into());
+    }
+    let source_entry = actual
+        .files
+        .iter()
+        .find(|entry| entry.relative_path == record.source_file)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "{failure_code}: complete staged-family inventory at {} omits preserved source {:?}; remediation: preserve every byte and inspect the exact per-file inventory",
+                dir.display(),
+                record.source_file
+            )
+            .into()
+        })?;
+    if source_entry.bytes != record.source_bytes || source_entry.sha256 != record.source_sha256 {
+        return Err(format!(
+            "{failure_code}: preserved source {} is bytes={} sha256={}, but its manifest binds bytes={} sha256={}; remediation: preserve every byte and inspect the storage device before retrying",
+            source.display(),
+            source_entry.bytes,
+            source_entry.sha256,
+            record.source_bytes,
+            record.source_sha256
+        )
+        .into());
+    }
+    Ok(Some(actual))
+}
+
+/// Moves the complete staged cache family out of a dying transaction into the
+/// project's preserved-stage slot, replacing any prior slot atomically. Returns
+/// the labeled evidence the abort error carries.
 ///
-/// The payload is moved with `fs::rename` inside the same store root, so this
-/// never needs a second copy of a multi-GB database and never doubles peak disk.
+/// The directory is moved with `fs::rename` inside the same store root, so this
+/// never needs a second copy of the potentially multi-GB staged family.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn preserve_stage(
     live_cache: &Path,
@@ -458,8 +703,6 @@ pub(crate) fn preserve_stage(
             .into());
         }
     }
-    let source_bytes = fs::metadata(&staged_source)?.len();
-    let source_sha256 = sha256_file_hex(&staged_source)?;
     let file_name = staged_source
         .file_name()
         .ok_or_else(|| -> DynError {
@@ -471,6 +714,19 @@ pub(crate) fn preserve_stage(
         })?
         .to_string_lossy()
         .into_owned();
+    let inventory = stage_inventory(stage_cache, ASTRO_SHADOW_STAGE_PRESERVE_FAILED)?;
+    let source_entry = inventory
+        .files
+        .iter()
+        .find(|entry| entry.relative_path == file_name)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "{ASTRO_SHADOW_STAGE_PRESERVE_FAILED}: complete staged-family inventory omitted source {file_name:?}; remediation: preserve the publication transaction and inspect the stage enumerator"
+            )
+            .into()
+        })?;
+    let source_bytes = source_entry.bytes;
+    let source_sha256 = source_entry.sha256.clone();
 
     let record = PreservedStageRecord {
         schema: PRESERVED_STAGE_SCHEMA.to_string(),
@@ -486,6 +742,7 @@ pub(crate) fn preserve_stage(
         source_file: file_name,
         source_bytes,
         source_sha256,
+        stage_inventory: Some(inventory),
         index_tool_result: arming.index_tool_result.clone(),
         index_tool_result_sha256: arming.index_tool_result_sha256.clone(),
         superseded_generation: None,
@@ -493,6 +750,7 @@ pub(crate) fn preserve_stage(
     };
     publish_preserved_slot(
         live_cache,
+        stage_cache,
         &staged_source,
         record,
         ASTRO_SHADOW_STAGE_PRESERVE_FAILED,
@@ -506,18 +764,19 @@ fn preserved_at_unix_nanos(failure_code: &str) -> Result<u128, DynError> {
         .as_nanos())
 }
 
-/// Moves one verified staged CBM store into the project's preserved-stage slot and
-/// reads the published payload back before returning. The caller owns every check
-/// that decides whether `staged_source` is worth preserving; this function owns the
-/// atomic swap and the independent readback, so the abort path (#1037) and the
-/// orphan-rescue path (#1040) can never drift apart.
+/// Moves one verified complete stage into the project's preserved-stage slot and
+/// reads the whole published family back before returning. The caller owns every
+/// check that decides whether `staged_source` is worth preserving; this function
+/// owns the atomic directory swap and independent readback, so the abort path
+/// (#1037) and orphan-rescue path (#1040) can never drift apart.
 ///
 /// `failure_code` labels every error this publication can raise, because the two
 /// callers are answering different questions and must be distinguishable in logs.
 fn publish_preserved_slot(
     live_cache: &Path,
+    stage_root: &Path,
     staged_source: &Path,
-    record: PreservedStageRecord,
+    mut record: PreservedStageRecord,
     failure_code: &str,
 ) -> Result<Value, DynError> {
     let root = preserved_stage_root(live_cache);
@@ -532,68 +791,164 @@ fn publish_preserved_slot(
         target.display(),
         record.generation
     ));
-    let source_bytes = record.source_bytes;
-    let source_sha256 = record.source_sha256.clone();
+    if staged_source.parent() != Some(stage_root) || !stage_root.is_dir() {
+        return Err(format!(
+            "{failure_code}: staged source {} is not a direct child of ordinary stage root {}; remediation: preserve the publication transaction and inspect the stage layout",
+            staged_source.display(),
+            stage_root.display()
+        )
+        .into());
+    }
+    if stage_root.starts_with(&root) {
+        return Err(format!(
+            "{failure_code}: staged family root {} is already inside preservation namespace {}; remediation: preserve every byte and inspect the caller's stage binding",
+            stage_root.display(),
+            root.display()
+        )
+        .into());
+    }
+    for reserved in [
+        stage_root.join(PRESERVED_STAGE_MANIFEST),
+        stage_root.join(format!("{PRESERVED_STAGE_MANIFEST}.pending")),
+    ] {
+        if reserved.exists() {
+            return Err(format!(
+                "{failure_code}: staged family root {} already contains reserved preservation entry {}; remediation: preserve the publication transaction and correct the stage producer before retrying",
+                stage_root.display(),
+                reserved.display()
+            )
+            .into());
+        }
+    }
+    let staged_inventory = record.stage_inventory.as_ref().ok_or_else(|| -> DynError {
+        format!(
+            "{failure_code}: complete staged-family record for {} omitted its inventory; remediation: preserve the publication transaction and inspect the preservation caller",
+            stage_root.display()
+        )
+        .into()
+    })?;
+    if staged_inventory.schema != PRESERVED_STAGE_INVENTORY_SCHEMA {
+        return Err(format!(
+            "{failure_code}: complete staged-family record for {} declares inventory schema {:?}, expected {PRESERVED_STAGE_INVENTORY_SCHEMA:?}; remediation: preserve the publication transaction and inspect the preservation caller",
+            stage_root.display(),
+            staged_inventory.schema
+        )
+        .into());
+    }
     fs::create_dir_all(&root)?;
     if incoming.exists() {
-        fs::remove_dir_all(&incoming)?;
-    }
-    fs::create_dir(&incoming)?;
-
-    let published = (|| -> Result<PreservedStageRecord, DynError> {
-        fs::rename(staged_source, incoming.join(&record.source_file))?;
-        let mut record = record;
-        if target.exists() {
-            record.superseded_generation = read_record(&target).ok().map(|prior| prior.generation);
-        }
-        write_json_durably(
-            &incoming.join(PRESERVED_STAGE_MANIFEST),
-            &serde_json::to_vec_pretty(&record)?,
-        )?;
-        // RocksDB-checkpoint style swap: a crash inside this window leaves either
-        // the prior preserved stage or the new one, never a torn slot.
-        if target.exists() {
-            fs::rename(&target, &superseded)?;
-        }
-        fs::rename(&incoming, &target)?;
-        if superseded.exists() {
-            fs::remove_dir_all(&superseded)?;
-        }
-        Ok(record)
-    })();
-
-    let record = match published {
-        Ok(record) => record,
-        Err(error) => {
-            // Never leave a half-published slot behind; the abort error carries the
-            // labeled failure so this is a disclosed loss, not a silent one.
-            let _ = fs::remove_dir_all(&incoming);
-            return Err(error);
-        }
-    };
-
-    // Independent readback of the published slot before the transaction tree dies.
-    let published_source = target.join(&record.source_file);
-    let published_bytes = fs::metadata(&published_source)?.len();
-    let published_sha256 = sha256_file_hex(&published_source)?;
-    if published_bytes != source_bytes || published_sha256 != source_sha256 {
         return Err(format!(
-            "{failure_code}: preserved payload readback at {} is bytes={published_bytes} sha256={published_sha256}, expected bytes={source_bytes} sha256={source_sha256}; remediation: preserve every byte of {} by hand and inspect the storage device before retrying",
-            published_source.display(),
+            "{failure_code}: incoming preserved-stage transaction already exists at {}; remediation: preserve every byte and reconcile that exact interrupted transition before retrying",
+            incoming.display()
+        )
+        .into());
+    }
+    if superseded.exists() {
+        return Err(format!(
+            "{failure_code}: superseded preserved-stage transaction already exists at {}; remediation: preserve every byte and reconcile that exact interrupted transition before retrying",
+            superseded.display()
+        )
+        .into());
+    }
+    if target.exists() {
+        let prior = read_record(&target)?;
+        validate_preserved_stage(&target, &prior, failure_code)?;
+        record.superseded_generation = Some(prior.generation);
+    }
+
+    fs::rename(stage_root, &incoming).map_err(|error| -> DynError {
+        format!(
+            "{failure_code}: moving complete staged family {} to incoming slot {} failed: {error}; remediation: preserve both paths and inspect the same-volume rename boundary",
+            stage_root.display(),
+            incoming.display()
+        )
+        .into()
+    })?;
+    write_json_durably(
+        &incoming.join(PRESERVED_STAGE_MANIFEST),
+        &serde_json::to_vec_pretty(&record)?,
+    )
+    .map_err(|error| -> DynError {
+        format!(
+            "{failure_code}: writing the preservation manifest in {} failed after the complete stage was moved: {error}; remediation: preserve the incoming directory byte-for-byte and reconcile this interrupted transaction",
+            incoming.display()
+        )
+        .into()
+    })?;
+    if target.exists() {
+        fs::rename(&target, &superseded).map_err(|error| -> DynError {
+            format!(
+                "{failure_code}: moving prior preserved slot {} to {} failed while new state remains at {}; error={error}; remediation: preserve every path and reconcile this interrupted transaction",
+                target.display(),
+                superseded.display(),
+                incoming.display()
+            )
+            .into()
+        })?;
+    }
+    fs::rename(&incoming, &target).map_err(|error| -> DynError {
+        format!(
+            "{failure_code}: publishing incoming complete stage {} to {} failed while any prior stage remains at {}; error={error}; remediation: preserve every path and reconcile this interrupted transaction",
+            incoming.display(),
+            target.display(),
+            superseded.display()
+        )
+        .into()
+    })?;
+
+    // Independent readback of every published file before the prior slot is retired.
+    let published_record = read_record(&target)?;
+    if published_record != record {
+        return Err(format!(
+            "{failure_code}: preserved-stage manifest readback at {} does not equal the record submitted for publication; remediation: preserve the target and any superseded directory byte-for-byte and inspect the durable manifest",
             target.display()
         )
         .into());
     }
+    let published_inventory = validate_preserved_stage(&target, &published_record, failure_code)?
+        .ok_or_else(|| -> DynError {
+            format!(
+                "{failure_code}: newly published preserved stage at {} was not a v4 complete-family record; remediation: preserve every byte and inspect the publisher",
+                target.display()
+            )
+            .into()
+        })?;
+    if superseded.exists() {
+        fs::remove_dir_all(&superseded).map_err(|error| -> DynError {
+            format!(
+                "{failure_code}: new preserved stage at {} read back successfully, but retiring superseded slot {} failed: {error}; remediation: preserve both directories and remove neither by hand",
+                target.display(),
+                superseded.display()
+            )
+            .into()
+        })?;
+    }
+    let published_source = target.join(&published_record.source_file);
+    let manifest_path = target.join(PRESERVED_STAGE_MANIFEST);
+    let manifest_bytes = fs::metadata(&manifest_path)?.len();
+    let manifest_sha256 = sha256_file_hex(&manifest_path)?;
+    let config_path = target.join("_config.db");
+    let ledger_path = vault_dir(&target, &published_record.project).join("signal-cards.ndjson");
     Ok(json!({
-        "schema": "astrolabe.shadow-preserved-stage-evidence.v1",
+        "schema": "astrolabe.shadow-preserved-stage-evidence.v2",
         "preserved_stage_dir": target,
         "source_path": published_source,
-        "source_bytes": published_bytes,
-        "source_sha256": published_sha256,
-        "resume_token": record.fingerprint_sha256,
-        "generation": record.generation,
-        "superseded_generation": record.superseded_generation,
-        "abort_phase": record.abort_phase,
+        "source_bytes": published_record.source_bytes,
+        "source_sha256": published_record.source_sha256,
+        "stage_file_count": published_inventory.file_count,
+        "stage_bytes": published_inventory.bytes,
+        "stage_sha256": published_inventory.sha256,
+        "manifest_path": manifest_path,
+        "manifest_bytes": manifest_bytes,
+        "manifest_sha256": manifest_sha256,
+        "config_path": config_path,
+        "config_present": config_path.is_file(),
+        "signal_card_ledger_path": ledger_path,
+        "signal_card_ledger_present": ledger_path.is_file(),
+        "resume_token": published_record.fingerprint_sha256,
+        "generation": published_record.generation,
+        "superseded_generation": published_record.superseded_generation,
+        "abort_phase": published_record.abort_phase,
         "retention": PRESERVED_STAGE_RETENTION,
     }))
 }
@@ -721,8 +1076,30 @@ pub(crate) fn rescue_orphaned_stage(
         )
         .into());
     }
-    let source_bytes = metadata.len();
-    let source_sha256 = sha256_file_hex(&staged_source)?;
+    let source_file = staged_source
+        .file_name()
+        .ok_or_else(|| -> DynError {
+            format!(
+                "{ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED}: orphaned staged source path {} has no file name; remediation: preserve the transaction and inspect the stage layout",
+                staged_source.display()
+            )
+            .into()
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let inventory = stage_inventory(stage_cache, ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED)?;
+    let source_entry = inventory
+        .files
+        .iter()
+        .find(|entry| entry.relative_path == source_file)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "{ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED}: complete staged-family inventory omitted source {source_file:?}; remediation: preserve the transaction and inspect the stage enumerator"
+            )
+            .into()
+        })?;
+    let source_bytes = source_entry.bytes;
+    let source_sha256 = source_entry.sha256.clone();
     if source_bytes != arming.stage_source_bytes || source_sha256 != arming.stage_source_sha256 {
         return Err(format!(
             "{ASTRO_SHADOW_ORPHANED_STAGE_SOURCE_HASH_MISMATCH}: orphaned staged CBM store {} is bytes={source_bytes} sha256={source_sha256}, but its journal binds bytes={} sha256={}; remediation: preserve the transaction — a store that no longer equals the completed CBM pass is never published into the preserved slot",
@@ -752,7 +1129,6 @@ pub(crate) fn rescue_orphaned_stage(
         )
         .into());
     }
-
     let record = PreservedStageRecord {
         schema: PRESERVED_STAGE_SCHEMA.to_string(),
         project: project.to_string(),
@@ -766,19 +1142,10 @@ pub(crate) fn rescue_orphaned_stage(
         abort_error: owner_state.to_string(),
         fingerprint: arming.fingerprint.clone(),
         fingerprint_sha256: arming.fingerprint_sha256.clone(),
-        source_file: staged_source
-            .file_name()
-            .ok_or_else(|| -> DynError {
-                format!(
-                    "{ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED}: orphaned staged source path {} has no file name; remediation: preserve the transaction and inspect the stage layout",
-                    staged_source.display()
-                )
-                .into()
-            })?
-            .to_string_lossy()
-            .into_owned(),
+        source_file,
         source_bytes,
         source_sha256,
+        stage_inventory: Some(inventory),
         index_tool_result: arming.index_tool_result.clone(),
         index_tool_result_sha256: arming.index_tool_result_sha256.clone(),
         superseded_generation: None,
@@ -786,6 +1153,7 @@ pub(crate) fn rescue_orphaned_stage(
     };
     let preserved = publish_preserved_slot(
         live_cache,
+        stage_cache,
         &staged_source,
         record,
         ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED,
@@ -825,6 +1193,7 @@ fn preserved_slot_state_for_arming(
     let record = read_record(&dir)?;
     if record.fingerprint_sha256 != arming.fingerprint_sha256
         || record.source_sha256 != arming.stage_source_sha256
+        || record.source_bytes != arming.stage_source_bytes
     {
         return Ok((
             "superseded",
@@ -837,34 +1206,20 @@ fn preserved_slot_state_for_arming(
             }),
         ));
     }
+    let inventory =
+        validate_preserved_stage(&dir, &record, ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED)?;
     let payload = dir.join(&record.source_file);
-    let payload_bytes = fs::metadata(&payload)
-        .map_err(|error| -> DynError {
-            format!(
-                "{ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED}: preserved payload {} is unreadable: {error}; remediation: preserve the preserved-stage directory and the transaction it came from",
-                payload.display()
-            )
-            .into()
-        })?
-        .len();
-    let payload_sha256 = sha256_file_hex(&payload)?;
-    if payload_bytes != arming.stage_source_bytes || payload_sha256 != arming.stage_source_sha256 {
-        return Err(format!(
-            "{ASTRO_SHADOW_ORPHANED_STAGE_RESCUE_FAILED}: preserved payload {} is bytes={payload_bytes} sha256={payload_sha256}, but the transaction journal bound bytes={} sha256={}; remediation: preserve every byte and inspect the storage device",
-            payload.display(),
-            arming.stage_source_bytes,
-            arming.stage_source_sha256
-        )
-        .into());
-    }
     Ok((
         "present_verified",
         json!({
             "preserved_slot_state": "present_verified",
             "preserved_stage_dir": dir,
             "source_path": payload,
-            "source_bytes": payload_bytes,
-            "source_sha256": payload_sha256,
+            "source_bytes": record.source_bytes,
+            "source_sha256": record.source_sha256,
+            "stage_file_count": inventory.as_ref().map(|value| value.file_count),
+            "stage_bytes": inventory.as_ref().map(|value| value.bytes),
+            "stage_sha256": inventory.as_ref().map(|value| value.sha256.as_str()),
             "resume_token": record.fingerprint_sha256,
             "preserved_generation": record.generation,
         }),
@@ -921,11 +1276,25 @@ fn read_record(dir: &Path) -> Result<PreservedStageRecord, DynError> {
         )
         .into()
     })?;
-    if record.schema != PRESERVED_STAGE_SCHEMA {
+    if record.schema != PRESERVED_STAGE_SCHEMA && record.schema != PRESERVED_STAGE_SCHEMA_V3 {
         return Err(format!(
-            "{ASTRO_SHADOW_PRESERVED_STAGE_MANIFEST_INVALID}: preserved stage manifest {} declares schema {:?}, this build adopts only {PRESERVED_STAGE_SCHEMA:?}; remediation: preserve the directory and rebuild from authoritative source",
+            "{ASTRO_SHADOW_PRESERVED_STAGE_MANIFEST_INVALID}: preserved stage manifest {} declares schema {:?}, this build adopts only {PRESERVED_STAGE_SCHEMA_V3:?} or {PRESERVED_STAGE_SCHEMA:?}; remediation: preserve the directory and rebuild from authoritative source",
             manifest.display(),
             record.schema
+        )
+        .into());
+    }
+    if record.schema == PRESERVED_STAGE_SCHEMA && record.stage_inventory.is_none() {
+        return Err(format!(
+            "{ASTRO_SHADOW_PRESERVED_STAGE_MANIFEST_INVALID}: preserved stage manifest {} declares {PRESERVED_STAGE_SCHEMA:?} but omits the complete staged-family inventory; remediation: preserve the directory and inspect the producer",
+            manifest.display()
+        )
+        .into());
+    }
+    if record.schema == PRESERVED_STAGE_SCHEMA_V3 && record.stage_inventory.is_some() {
+        return Err(format!(
+            "{ASTRO_SHADOW_PRESERVED_STAGE_MANIFEST_INVALID}: preserved stage manifest {} declares legacy {PRESERVED_STAGE_SCHEMA_V3:?} while carrying v4 inventory state; remediation: preserve the directory and inspect the producer",
+            manifest.display()
         )
         .into());
     }
@@ -972,26 +1341,8 @@ pub(crate) fn adopt_preserved_stage(
         )
         .into());
     }
+    validate_preserved_stage(&dir, &record, ASTRO_SHADOW_PRESERVED_STAGE_PAYLOAD_MISMATCH)?;
     let payload = dir.join(&record.source_file);
-    let payload_bytes = fs::metadata(&payload)
-        .map_err(|error| -> DynError {
-            format!(
-                "{ASTRO_SHADOW_PRESERVED_STAGE_PAYLOAD_MISMATCH}: preserved payload {} is unreadable: {error}; remediation: preserve the directory and rebuild from authoritative source",
-                payload.display()
-            )
-            .into()
-        })?
-        .len();
-    let payload_sha256 = sha256_file_hex(&payload)?;
-    if payload_bytes != record.source_bytes || payload_sha256 != record.source_sha256 {
-        return Err(format!(
-            "{ASTRO_SHADOW_PRESERVED_STAGE_PAYLOAD_MISMATCH}: preserved payload {} is bytes={payload_bytes} sha256={payload_sha256}, but its manifest binds bytes={} sha256={}; remediation: preserve the directory, inspect the storage device, and rebuild from authoritative source",
-            payload.display(),
-            record.source_bytes,
-            record.source_sha256
-        )
-        .into());
-    }
     let recomputed_result = hex_lower(&Sha256::digest(record.index_tool_result.as_bytes()));
     if recomputed_result != record.index_tool_result_sha256 {
         return Err(format!(

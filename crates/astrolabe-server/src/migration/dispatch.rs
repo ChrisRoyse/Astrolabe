@@ -1510,6 +1510,7 @@ pub(crate) fn handle_index_repository(
                 publication.journal_stage_completion()?;
                 let outcome = import_shadow_vault_with_archaeology_at(ShadowImportRequest {
                     cache_dir: publication.stage_cache(),
+                    live_cache: &cache_dir,
                     project: &project,
                     row_sink,
                     search_scale_settings: &search_scale_settings,

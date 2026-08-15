@@ -999,6 +999,7 @@ fn index_time_signal_cards_summary<C>(
     vault: &AsterVault<C>,
     project: &str,
     vault_dir: &Path,
+    published_vault_dir: &Path,
     generation_clock: GenerationClock,
 ) -> Result<Value, DynError>
 where
@@ -1045,13 +1046,16 @@ where
         .map_err(|error| stage_error("ledger_prepare", error))?;
     let produced_at = generation_clock.observed_at_seconds();
     let plan = SignalCardTransactionPlan::build(
-        project,
-        vault.vault_id(),
-        SHADOW_PANEL_VERSION,
-        production.readback.session_snapshot_seq,
-        produced_at,
-        SignalCardBackendIdentity::shipping_cpu(),
+        SignalCardTransactionContext {
+            project,
+            vault_id: vault.vault_id(),
+            panel_version: SHADOW_PANEL_VERSION,
+            base_seq: production.readback.session_snapshot_seq,
+            produced_at,
+            backend: SignalCardBackendIdentity::shipping_cpu(),
+        },
         &prepared_ledger,
+        &published_vault_dir.join("signal-cards.ndjson"),
     )
     .map_err(|error| stage_error("plan", error))?;
     let prepare_disposition = persist_signal_card_prepared(cache_dir, plan.prepared_marker())
@@ -2065,6 +2069,7 @@ pub(crate) fn shadow_graph_freshness_refusal(
 
 pub(crate) struct ShadowImportRequest<'a> {
     pub(crate) cache_dir: &'a Path,
+    pub(crate) live_cache: &'a Path,
     pub(crate) project: &'a str,
     pub(crate) row_sink: RowSinkImportCandidate,
     pub(crate) search_scale_settings: &'a SearchScaleSettings,
@@ -2079,6 +2084,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 ) -> Result<ShadowImportOutcome, DynError> {
     let ShadowImportRequest {
         cache_dir,
+        live_cache,
         project,
         row_sink,
         search_scale_settings,
@@ -2108,6 +2114,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let content_freshness_watermark_sha256 =
         astrolabe_ingest::fingerprint_sqlite_hex(&sqlite_path)?;
 
+    let published_vault_dir = vault_dir(live_cache, project);
     let vault_dir = vault_dir(cache_dir, project);
     fs::create_dir_all(&vault_dir)?;
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID)?;
@@ -2665,8 +2672,14 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // so its exact graph/slot snapshot exists. #885 publishes one prepared/commit
     // transaction over the external ledger and SQLite config rows; a transaction
     // failure aborts indexing instead of hiding split state as telemetry.
-    let signal_cards =
-        index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir, generation_clock)?;
+    let signal_cards = index_time_signal_cards_summary(
+        cache_dir,
+        &vault,
+        project,
+        &vault_dir,
+        &published_vault_dir,
+        generation_clock,
+    )?;
     shadow_phase!("signal_cards");
     // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
     // propagation. ── EXACT INSERTION POINT ── one post-import call, placed

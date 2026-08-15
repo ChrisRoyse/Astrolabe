@@ -1403,10 +1403,11 @@ impl ShadowPublication {
         Ok(())
     }
 
-    /// Preserves the staged CBM store when this publication was armed, returning
-    /// the label the abort error carries (#1037). Preservation happens BEFORE the
-    /// transaction tree is unlinked and moves the database by rename inside the
-    /// same store root, so it needs no second multi-GB copy. A preservation
+    /// Preserves the complete staged cache family when this publication was armed,
+    /// returning the label the abort error carries (#1037/#885). Preservation
+    /// happens BEFORE the transaction tree is unlinked and moves the stage
+    /// directory by rename inside the same store root, so it needs no second
+    /// multi-GB copy. A preservation
     /// failure is labeled and surfaced, never silently swallowed; it does not
     /// block cleanup, because leaving a half-published transaction behind is the
     /// worse outcome.
@@ -1442,11 +1443,16 @@ impl ShadowPublication {
                     self.project
                 );
                 format!(
-                    "; {ASTRO_SHADOW_STAGE_PRESERVED}: the staged CBM store was preserved at {} (resume_token={}, source_sha256={}, bytes={}); remediation: after fixing the named phase error, retry with ASTRO_SHADOW_RESUME_PRESERVED_STAGE=1 to adopt it instead of re-running the CBM pass — adoption refuses unless every input fingerprint still matches",
+                    "; {ASTRO_SHADOW_STAGE_PRESERVED}: the complete staged cache family was preserved at {} (resume_token={}, source_sha256={}, source_bytes={}, stage_sha256={}, stage_bytes={}, stage_files={}, config_path={}, signal_card_ledger_path={}); remediation: inspect the staged _config.db marker and ledger at that root; after fixing the named phase error, retry with ASTRO_SHADOW_RESUME_PRESERVED_STAGE=1 to adopt the CBM store instead of re-running that pass — adoption refuses unless every input fingerprint still matches",
                     evidence["preserved_stage_dir"],
                     evidence["resume_token"],
                     evidence["source_sha256"],
                     evidence["source_bytes"],
+                    evidence["stage_sha256"],
+                    evidence["stage_bytes"],
+                    evidence["stage_file_count"],
+                    evidence["config_path"],
+                    evidence["signal_card_ledger_path"],
                 )
             }
             Err(preserve_error) => {
