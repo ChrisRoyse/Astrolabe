@@ -279,7 +279,7 @@ struct VramDispatchReadback {
 }
 
 fn run_vram_dispatches(
-    controller: &AdmissionController<'_, StaticProbe, NoopDealloc>,
+    controller: &AdmissionController<'_, StaticProbe, UnavailableDeallocator>,
 ) -> VramDispatchReadback {
     thread::scope(|scope| {
         let handles = (0..20)

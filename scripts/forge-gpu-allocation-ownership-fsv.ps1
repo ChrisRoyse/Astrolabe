@@ -144,6 +144,7 @@ Assert-Astro (
 ) 'CALYX_FORGE_GPU_FSV_RUN_RECORD_INVALID' `
     'run record does not prove a stable artifact, repository, launcher, and exit 0'
 
+$driverDispatch = Read-Json (Join-Path $payload '00-driver-dispatch.json')
 $initial = Read-Json (Join-Path $payload '00-initial.json')
 $happy = Read-Json (Join-Path $payload '10-happy.json')
 $failed = Read-Json (Join-Path $payload '20-induced-free-failure.json')
@@ -161,6 +162,24 @@ Assert-Astro (
     $report.schema -ceq 'calyx.forge.gpu-allocation-ownership-fsv.v1' -and
     [int]$report.issue -eq 872 -and $hashRecord -ceq "$reportHash  report.json"
 ) 'CALYX_FORGE_GPU_FSV_REPORT_INVALID' 'report identity or SHA-256 readback failed'
+
+$expectedDriverSymbols = @('cuMemGetInfo', 'cuMemAlloc', 'cuMemFree', 'cuMemGetAddressRange')
+Assert-Astro (
+    $driverDispatch.schema -ceq 'calyx.forge.cuda-driver-memory-api.v1' -and
+    [int]$driverDispatch.driver_version -ge 3020 -and
+    [int]$driverDispatch.requested_abi_version -eq 3020 -and
+    [uint64]$driverDispatch.flags -eq 0 -and
+    @($driverDispatch.entries).Count -eq $expectedDriverSymbols.Count -and
+    (@($driverDispatch.entries.symbol) -join ',') -ceq ($expectedDriverSymbols -join ',') -and
+    @($driverDispatch.entries | Where-Object {
+        [int]$_.requested_abi_version -ne 3020 -or
+        [uint32]$_.query_status -ne 0 -or
+        [uint64]$_.function_address -eq 0
+    }).Count -eq 0 -and
+    [int]$report.driver_dispatch.driver_version -eq [int]$driverDispatch.driver_version -and
+    (@($report.driver_dispatch.entries.symbol) -join ',') -ceq ($expectedDriverSymbols -join ',')
+) 'CALYX_FORGE_GPU_FSV_DRIVER_DISPATCH_INVALID' `
+    'persisted CUDA driver dispatch did not prove four exact ABI-3020 entries with nonzero addresses'
 
 $allocationBytes = [uint64]$report.allocation_bytes
 Assert-Astro (
@@ -264,7 +283,10 @@ $analysis = [ordered]@{
     failed_free_quarantine = 'verified'
     refusal_edges = @('admission', 'wrong_generation', 'wrong_pointer', 'wrong_device', 'unavailable_device')
     recovery = 'verified'
-    physical_source = 'cuMemGetAddressRange_v2 + cuMemGetInfo + nvidia-smi'
+    cuda_driver_version = [int]$driverDispatch.driver_version
+    cuda_memory_abi_version = [int]$driverDispatch.requested_abi_version
+    cuda_memory_symbols = $expectedDriverSymbols
+    physical_source = 'cuGetProcAddress_v2 exact ABI 3020 dispatch + cuMemGetAddressRange + cuMemGetInfo + nvidia-smi'
     run_record = $runRecordPath
     payload = $payload
 }

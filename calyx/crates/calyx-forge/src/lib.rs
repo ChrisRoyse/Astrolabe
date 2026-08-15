@@ -44,16 +44,17 @@ pub use compression_report::{
 pub use cpu::{CpuBackend, gemm_mxfp4_packed, gemm_mxfp8_packed};
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    AbsentSlotSentinel, CUDA_KERNEL_POLICY_JSON, CudaBackend, CudaContext, CudaGreenContextStream,
-    CudaKernelBuildAttestation, CudaKernelModuleAttestation, CudaKernelRuntimeAttestation,
-    CudaPrimaryContextStream, GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan,
-    MxFp4GemmPlan, MxFp8GemmPlan, MxPackedGemmEvidence, RaggedBatch, attest_cuda_driver_ordinal,
-    attest_cudarc_context, build_grouped_gemm_plan, build_ragged_batch,
-    build_ragged_batch_from_slabs, cuda_kernel_build_attestation, driver_ordinal_for_pci_bus_id,
-    execute_grouped_gemm, execute_grouped_gemm_strict, extract_ragged_results, init_cuda,
-    init_cuda_by_pci_bus_id, init_cuda_native_kernel, pack_mxfp4_a_row_major,
-    pack_mxfp4_b_column_major, pack_mxfp8_a_row_major, pack_mxfp8_b_column_major,
-    query_device_info, read_grouped_gemm_output, try_extract_ragged_results,
+    AbsentSlotSentinel, CUDA_KERNEL_POLICY_JSON, CudaBackend, CudaContext, CudaDriverEntryReceipt,
+    CudaDriverMemoryApiReceipt, CudaGreenContextStream, CudaKernelBuildAttestation,
+    CudaKernelModuleAttestation, CudaKernelRuntimeAttestation, CudaPrimaryContextStream,
+    GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan, MxFp4GemmPlan, MxFp8GemmPlan,
+    MxPackedGemmEvidence, RaggedBatch, attest_cuda_driver_ordinal, attest_cudarc_context,
+    build_grouped_gemm_plan, build_ragged_batch, build_ragged_batch_from_slabs,
+    cuda_kernel_build_attestation, driver_ordinal_for_pci_bus_id, execute_grouped_gemm,
+    execute_grouped_gemm_strict, extract_ragged_results, init_cuda, init_cuda_by_pci_bus_id,
+    init_cuda_native_kernel, pack_mxfp4_a_row_major, pack_mxfp4_b_column_major,
+    pack_mxfp8_a_row_major, pack_mxfp8_b_column_major, query_device_info, read_grouped_gemm_output,
+    try_extract_ragged_results,
 };
 #[cfg(feature = "cuda-policy-measurement")]
 pub use cuda::{CUDA_KERNEL_MEASUREMENT_ARTIFACTS, CudaKernelMeasurementArtifact};

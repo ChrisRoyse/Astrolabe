@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +17,8 @@ use crate::{ForgeError, PinnedCudaDeviceIdentity, Result};
 
 const DEALLOCATION_REMEDIATION: &str = "preserve the exact allocation journal and process; inspect the recorded CUDA error and pointer readback, then recover only with the same block generation, pointer, and device identity";
 const IDENTITY_REMEDIATION: &str = "use the exact nonzero allocation generation, pointer, byte count, owner, and pinned physical CUDA device recorded when the allocation was created";
+#[cfg(feature = "cuda")]
+const CUDA_MEMORY_REMEDIATION: &str = "preserve the exact allocation and CUDA driver dispatch receipt; inspect the recorded operation, status, pinned device, and context before retrying the same allocation generation";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 /// Logical identity assigned by the Forge allocation owner.
@@ -120,27 +124,64 @@ pub trait BlockDeallocator: Send + Sync {
 #[derive(Clone)]
 /// CUDA Driver API implementation of exact allocation readback and release.
 pub struct RawCudaBlockDeallocator {
-    ctx: std::sync::Arc<crate::cuda::CudaContext>,
+    ctx: Arc<crate::cuda::CudaContext>,
+    memory: Arc<crate::cuda::driver_memory::CudaDriverMemoryApi>,
 }
 
 #[cfg(feature = "cuda")]
 impl RawCudaBlockDeallocator {
-    /// Bind deallocation operations to an already pinned CUDA context.
-    pub fn new(ctx: std::sync::Arc<crate::cuda::CudaContext>) -> Self {
-        Self { ctx }
+    /// Resolve one exact-ABI memory dispatch and bind it to a pinned context.
+    pub fn new(ctx: Arc<crate::cuda::CudaContext>) -> Result<Self> {
+        let memory = crate::cuda::driver_memory::CudaDriverMemoryApi::resolve()?;
+        Ok(Self {
+            ctx,
+            memory: Arc::new(memory),
+        })
     }
 
     /// Return the pinned context used for all physical operations.
-    pub fn context(&self) -> &std::sync::Arc<crate::cuda::CudaContext> {
+    pub fn context(&self) -> &Arc<crate::cuda::CudaContext> {
         &self.ctx
+    }
+
+    /// Return physical provenance for the exact driver entries in use.
+    pub fn driver_api_receipt(&self) -> &crate::CudaDriverMemoryApiReceipt {
+        self.memory.receipt()
+    }
+
+    /// Allocate through the same exact-ABI dispatch used for ownership probes and release.
+    pub fn allocate(&self, size_bytes: usize) -> Result<DevicePtr> {
+        if size_bytes == 0 {
+            return Err(identity_error("CUDA allocation size is zero"));
+        }
+        self.ctx
+            .inner()
+            .bind_to_thread()
+            .map_err(|error| cuda_operation_error("allocate.bind_context", error))?;
+        let ptr = self
+            .memory
+            .allocate(size_bytes)
+            .map_err(|error| cuda_operation_error("allocate.cuMemAlloc", error))?;
+        if ptr == 0 {
+            return Err(identity_error(
+                "cuMemAlloc returned success with a zero device pointer",
+            ));
+        }
+        Ok(DevicePtr(ptr))
     }
 }
 
 #[cfg(feature = "cuda")]
 impl BlockDeallocator for RawCudaBlockDeallocator {
     fn device_observation(&self) -> Result<DeviceMemoryObservation> {
-        self.ctx.inner().bind_to_thread().map_err(cuda_error)?;
-        let (free_bytes, total_bytes) = self.ctx.inner().mem_get_info().map_err(cuda_error)?;
+        self.ctx
+            .inner()
+            .bind_to_thread()
+            .map_err(|error| cuda_operation_error("observe.bind_context", error))?;
+        let (free_bytes, total_bytes) = self
+            .memory
+            .get_info()
+            .map_err(|error| cuda_operation_error("observe.cuMemGetInfo", error))?;
         Ok(DeviceMemoryObservation {
             device: self.ctx.physical_identity(),
             free_bytes: u64::try_from(free_bytes)
@@ -151,31 +192,34 @@ impl BlockDeallocator for RawCudaBlockDeallocator {
     }
 
     fn allocation_state(&self, ptr: DevicePtr) -> Result<DeviceAllocationState> {
-        use cudarc::driver::{result, sys};
-        self.ctx.inner().bind_to_thread().map_err(cuda_error)?;
-        let mut base = 0_u64;
-        let mut size_bytes = 0_usize;
-        let status = unsafe { sys::cuMemGetAddressRange_v2(&mut base, &mut size_bytes, ptr.0) };
-        if status == sys::CUresult::CUDA_SUCCESS {
-            return Ok(DeviceAllocationState::Present {
+        use cudarc::driver::sys;
+        self.ctx
+            .inner()
+            .bind_to_thread()
+            .map_err(|error| cuda_operation_error("probe.bind_context", error))?;
+        match self.memory.get_address_range(ptr.0) {
+            Ok((base, size_bytes)) => Ok(DeviceAllocationState::Present {
                 base: DevicePtr(base),
                 size_bytes,
-            });
+            }),
+            Err(error) if error.0 == sys::CUresult::CUDA_ERROR_INVALID_VALUE => {
+                Ok(DeviceAllocationState::Absent)
+            }
+            Err(error) => Err(cuda_operation_error("probe.cuMemGetAddressRange", error)),
         }
-        if status == sys::CUresult::CUDA_ERROR_INVALID_VALUE {
-            return Ok(DeviceAllocationState::Absent);
-        }
-        Err(cuda_error(result::DriverError(status)))
     }
 
     fn free(&self, ptr: DevicePtr, _size_bytes: usize) -> Result<()> {
-        self.ctx.inner().bind_to_thread().map_err(cuda_error)?;
-        unsafe { cudarc::driver::result::free_sync(ptr.0) }.map_err(cuda_error)
+        self.ctx
+            .inner()
+            .bind_to_thread()
+            .map_err(cuda_deallocation_error)?;
+        self.memory.free(ptr.0).map_err(cuda_deallocation_error)
     }
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_error(error: cudarc::driver::result::DriverError) -> ForgeError {
+fn cuda_deallocation_error(error: cudarc::driver::result::DriverError) -> ForgeError {
     ForgeError::RuntimeBoundary {
         code: "CALYX_FORGE_GPU_DEALLOCATION_FAILED",
         detail: format!(
@@ -183,6 +227,21 @@ fn cuda_error(error: cudarc::driver::result::DriverError) -> ForgeError {
             error.0, error.0 as i32
         ),
         remediation: DEALLOCATION_REMEDIATION,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_operation_error(
+    operation: &'static str,
+    error: cudarc::driver::result::DriverError,
+) -> ForgeError {
+    ForgeError::RuntimeBoundary {
+        code: "CALYX_FORGE_CUDA_MEMORY_OPERATION_FAILED",
+        detail: format!(
+            "operation={operation} CUDA driver status={:?} numeric={}",
+            error.0, error.0 as i32
+        ),
+        remediation: CUDA_MEMORY_REMEDIATION,
     }
 }
 

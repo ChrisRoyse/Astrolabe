@@ -148,7 +148,9 @@ mod enabled {
             .inner()
             .synchronize()
             .map_err(driver_boundary_error)?;
-        let raw = RawCudaBlockDeallocator::new(Arc::clone(&context));
+        let raw = RawCudaBlockDeallocator::new(Arc::clone(&context))?;
+        let driver_dispatch = serde_json::to_value(raw.driver_api_receipt())?;
+        write_state(&output_dir, "00-driver-dispatch.json", &driver_dispatch)?;
         let injected = InducedFailureDeallocator::new(raw.clone());
         let budgeter =
             VramBudgeter::with_soft_cap(SOFT_CAP_BYTES, CudaVramProbe::new(Arc::clone(&context)));
@@ -168,8 +170,14 @@ mod enabled {
             block_id: BlockId(872_001),
             allocation_generation: 1,
         };
-        let happy_ptr =
-            allocate_tracked(&context, &budgeter, &registry, happy_key, "issue-872-happy")?;
+        let happy_ptr = allocate_tracked(
+            &context,
+            &raw,
+            &budgeter,
+            &registry,
+            happy_key,
+            "issue-872-happy",
+        )?;
         let happy_before = capture_locked_state("happy_before", &registry, &raw)?;
         let happy_receipt = lock_registry(&registry)?
             .evict_lru()?
@@ -195,6 +203,7 @@ mod enabled {
         };
         let quarantine_ptr = allocate_tracked(
             &context,
+            &raw,
             &budgeter,
             &registry,
             quarantine_key,
@@ -305,6 +314,7 @@ mod enabled {
             "issue": 872,
             "physical_device": context.physical_identity(),
             "device_name": context.name(),
+            "driver_dispatch": driver_dispatch,
             "allocation_bytes": ALLOCATION_BYTES,
             "final_stats": final_stats,
             "journal_readback": {
@@ -362,8 +372,7 @@ mod enabled {
             },
         )?;
 
-        context.inner().bind_to_thread()?;
-        let other_ptr = DevicePtr(unsafe { result::malloc_sync(ALLOCATION_BYTES) }?);
+        let other_ptr = raw.allocate(ALLOCATION_BYTES)?;
         require(
             other_ptr != ptr,
             "second live CUDA allocation reused the still-present quarantined pointer",
@@ -463,14 +472,14 @@ mod enabled {
 
     fn allocate_tracked<'b>(
         context: &Arc<calyx_forge::CudaContext>,
+        raw: &RawCudaBlockDeallocator,
         budgeter: &'b VramBudgeter<CudaVramProbe>,
         registry: &Arc<Mutex<GpuBlockRegistry<'b, CudaVramProbe, InducedFailureDeallocator>>>,
         key: AllocationKey,
         owner: &str,
     ) -> AnyResult<DevicePtr> {
         let guard = budgeter.reserve(ALLOCATION_BYTES)?;
-        context.inner().bind_to_thread()?;
-        let ptr = DevicePtr(unsafe { result::malloc_sync(ALLOCATION_BYTES) }?);
+        let ptr = raw.allocate(ALLOCATION_BYTES)?;
         lock_registry(registry)?.insert(
             GpuAllocationIdentity {
                 key,

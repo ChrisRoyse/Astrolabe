@@ -214,12 +214,18 @@ impl<'b, P: VramProbe, D: BlockDeallocator, A: CudaMalloc> OomGuard<'b, P, D, A>
 #[derive(Clone)]
 pub struct RawCudaMalloc {
     ctx: std::sync::Arc<crate::cuda::CudaContext>,
+    memory: std::sync::Arc<crate::cuda::driver_memory::CudaDriverMemoryApi>,
 }
 
 #[cfg(feature = "cuda")]
 impl RawCudaMalloc {
-    pub fn new(ctx: std::sync::Arc<crate::cuda::CudaContext>) -> Self {
-        Self { ctx }
+    /// Resolve the exact CUDA memory ABI before admitting allocation attempts.
+    pub fn new(ctx: std::sync::Arc<crate::cuda::CudaContext>) -> crate::Result<Self> {
+        let memory = crate::cuda::driver_memory::CudaDriverMemoryApi::resolve()?;
+        Ok(Self {
+            ctx,
+            memory: std::sync::Arc::new(memory),
+        })
     }
 }
 
@@ -230,8 +236,7 @@ impl CudaMalloc for RawCudaMalloc {
             .inner()
             .bind_to_thread()
             .map_err(driver_alloc_error)?;
-        let ptr =
-            unsafe { cudarc::driver::result::malloc_sync(size) }.map_err(driver_alloc_error)?;
+        let ptr = self.memory.allocate(size).map_err(driver_alloc_error)?;
         Ok(ptr as usize as *mut u8)
     }
 }

@@ -1,5 +1,6 @@
 pub mod context;
 pub mod distance;
+pub(crate) mod driver_memory;
 pub mod gemm;
 pub mod green_context;
 pub mod grouped_gemm;
@@ -26,6 +27,7 @@ pub use context::{
     query_device_info,
 };
 pub use distance::{cosine_batch_gpu, dot_batch_gpu, l2_batch_gpu, normalize_rows_gpu};
+pub use driver_memory::{CudaDriverEntryReceipt, CudaDriverMemoryApiReceipt};
 pub use gemm::{
     MxFp4GemmPlan, MxFp8GemmPlan, MxPackedGemmEvidence, bench_gemm_cublas,
     bench_gemm_reference_cublas, gemm_cublas, gemm_mxfp4_fp32_accum, gemm_mxfp8_fp32_accum,
