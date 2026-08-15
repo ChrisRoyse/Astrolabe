@@ -3269,11 +3269,12 @@ where
                 vault,
                 run_directory,
                 format!(
-                    "project={project};compact_source_snapshot_seq={source_snapshot_seq};slot={};slot_generation={source_slot_generation};weave_registry={};dense_ann_strategy={};dense_ann_exact_max_dim={};similarity_workers_requested={};similarity_workers_resolved={}",
+                    "project={project};compact_source_snapshot_seq={source_snapshot_seq};slot={};slot_generation={source_slot_generation};weave_registry={};dense_ann_strategy={};dense_ann_exact_max_dim={};exact_knn_executor={};similarity_workers_requested={};similarity_workers_resolved={}",
                     family.slot().get(),
                     similarity_config.runtime.registry_version(),
                     similarity_config.runtime.dense_ann_strategy(),
                     similarity_config.runtime.dense_ann_exact_max_dim(),
+                    similarity_config.runtime.exact_knn_executor(),
                     similarity_config.runtime.similarity_workers_requested(),
                     similarity_config.runtime.similarity_workers_resolved(),
                 ),
@@ -3800,7 +3801,7 @@ where
 
 /// Persist the exact candidate-generator and quantization facts an agent needs
 /// to tell which Weave/Sextant path physically produced one family. Forge is
-/// named only as uncommissioned until a Forge-owned producer actually executes.
+/// named as commissioned only when a Forge-owned producer actually executed.
 /// The scalar8 scale is emitted as both the exact IEEE-754 bits and its decoded
 /// value; the bits remain the reproducibility contract.
 fn similarity_candidate_generation_receipt(
@@ -3825,6 +3826,9 @@ fn similarity_candidate_generation_receipt(
     let mut providers = vec!["astrolabe-weave"];
     if !ann.quant_scale_measurements.is_empty() {
         providers.push("calyx-sextant");
+    }
+    if !ann.forge_exact_knn_measurements.is_empty() {
+        providers.push("calyx-forge");
     }
     let quantization = if ann.quant_scale_measurements.is_empty() {
         json!({
@@ -3852,17 +3856,45 @@ fn similarity_candidate_generation_receipt(
             "reason": "no dense dimension group contained at least two rows"
         })
     } else {
+        let mut dense_providers = Vec::new();
+        if ann.dense_strategy_measurements.iter().any(|measurement| {
+            measurement.strategy == astrolabe_weave::DenseCandidateStrategy::SeededHnsw
+        }) {
+            dense_providers.push("calyx-sextant");
+        }
+        if ann.dense_strategy_measurements.iter().any(|measurement| {
+            measurement.strategy == astrolabe_weave::DenseCandidateStrategy::ExactKnn
+        }) {
+            dense_providers.push("calyx-forge");
+        }
         json!({
             "status": "used",
-            "provider": "calyx-sextant",
+            "providers": dense_providers,
             "pool_nodes": ann.dense_pool_nodes,
             "dimension_groups": ann.hnsw_dim_groups,
             "candidate_pairs": ann.dense_candidate_pairs,
             "strategies": ann.dense_strategy_measurements.iter().map(|measurement| json!({
                 "dim": measurement.dim,
                 "pool_nodes": measurement.pool_nodes,
+                "provider": match measurement.strategy {
+                    astrolabe_weave::DenseCandidateStrategy::SeededHnsw => "calyx-sextant",
+                    astrolabe_weave::DenseCandidateStrategy::ExactKnn => "calyx-forge",
+                },
                 "algorithm": measurement.strategy.wire_name(),
             })).collect::<Vec<_>>(),
+        })
+    };
+    let forge = if ann.forge_exact_knn_measurements.is_empty() {
+        json!({
+            "status": "not_commissioned",
+            "reason": "no dense group physically executed a Forge-owned exact-kNN producer"
+        })
+    } else {
+        json!({
+            "status": "commissioned",
+            "provider": "calyx-forge",
+            "operation": "scalar8_exact_knn",
+            "receipts": ann.forge_exact_knn_measurements,
         })
     };
     json!({
@@ -3878,10 +3910,7 @@ fn similarity_candidate_generation_receipt(
         },
         "dense": dense,
         "quantization": quantization,
-        "forge": {
-            "status": "not_commissioned",
-            "reason": "no Forge-owned candidate or quantization producer is wired into this path; track commissioning under #1057"
-        },
+        "forge": forge,
     })
 }
 

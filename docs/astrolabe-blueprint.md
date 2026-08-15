@@ -89,7 +89,7 @@ codebase-memory-mcp                          Calyx
 | D7 | CBM's `SIMILAR_TO`/`SEMANTICALLY_RELATED` passes retained as candidate generators; *scoring/admission* moves to measured (Assay + Anneal) | 07, 08 |
 | D8 | MCP tool surface: 14 legacy tools retained (behavior-compatible), ~16 new tools, consolidated via modes | 15 |
 | D9 | One vendored mimalloc implementation with platform-specific routing and strict cross-boundary ownership | 19 |
-| D10 | Ship CPU-only by default (nomic vectors are lookup tables; Calyx CPU paths); GPU strictly opt-in | 03, 17 |
+| D10 | GPU is the required production executor wherever the operation is genuinely GPU-applicable; CPU is permitted only as an explicit parity oracle or where GPU execution is technically impossible. Missing capability, attestation drift, allocation failure, non-finite output, or parity failure aborts publication; no CPU fallback. | 03, 17 |
 
 ## Terminology bridge (both projects' words for the same things)
 
@@ -589,7 +589,7 @@ Current row-sink integration status: vendored CBM exposes borrowed dump-row node
 - **Determinism.** Seeded RNG only, injected clocks, content-addressed ids. The vault layer is order-independent (content addressing absorbs CBM's known parallel-vs-sequential graph divergence â€” same symbols â‡’ same CxIds regardless of worker interleave; edge sets still parity-checked, see 20).
 - **Memory.** One process-RSS budget: CBM's `cbm_mem` tiered 25/35/50% limits govern extraction; Calyx bounded allocators/caches govern the intelligence lane. Allocator routing is platform-specific and ownership boundaries remain explicit. Backpressure naps preserved.
 - **Security.** stdio MCP unauthenticated by design (agent-local), loopback-only UI, secrets never ledgered (redaction), CBM secret filters retained, `cbm_validate_shell_arg` discipline retained for all subprocess spawns.
-- **GPU strictly optional (D10).** Default build: CPU-only â€” nomic vectors are a lookup table; Assay/kernels/guard are CPU. Optional features: `cuda` (Forge kernels), `tei` (resident embedder endpoints), `onnx` (real model lenses). Fail-loud when enabled but unavailable; never silent fallback.
+- **GPU-required where applicable (D10).** The shipping Windows build includes Forge CUDA. GPU-applicable Weave/Assay/kernel work uses its attested production executor; CPU is an explicitly selected parity oracle or a documented technically-impossible exception, never an automatic fallback. `tei` and `onnx` remain separately commissioned model-runtime capabilities. Every enabled executor fails loud before publication when unavailable or unverifiable.
 - **Platforms.** macOS (arm64/x64), Linux (arm64/x64, musl static), Windows (x64). Windows is a first-class target (both parents support it; cuVS/Linux-only paths excluded from default).
 
 ## 8. What is intentionally NOT built
@@ -1660,7 +1660,7 @@ All registry/queue/audit caps bounded (1024/4096/64K); every evaluation audited;
 
 Honest accounting: what the fusion costs, where the quadratic traps are, and the controls that keep a Linux-kernel-scale repo tractable on a laptop. Reference envelopes: **S** = 2K symbols/20K edges (typical service), **M** = 50K/500K (large app), **L** = 500K/5M (Linux-kernel class; CBM proven; Calyx kernel proven at 199K/2.44M).
 
-## 1. Wall-time budgets (CPU-only, 8 workers)
+## 1. Wall-time budgets (shipping executors; GPU where applicable)
 
 | Stage | S | M | L | Controls |
 |---|---|---|---|---|
@@ -1701,9 +1701,9 @@ Serving targets: `search_graph` p99 â‰¤ 50ms warm (tripwire 200ms); `get_con
 
 Content addressing makes vault state order-independent (fixes the class of CBM's known seq/parallel divergence at the record level); edge-set determinism preserved by CBM's existing merge-order fixes; all sampling (assay/pivots/replay) seeded ChaCha8; clocks injected. Determinism probes are CI gates (20).
 
-## 5. GPU posture (strictly optional)
+## 5. GPU posture (required where applicable)
 
-Default CPU: nomic lookup + SIMD (wide/AVX) covers everything. Optional features: `tei` (real embedder endpoints for S23+), `cuda` (Forge GEMM/topk for massive re-embeds, cuVS Linux-only) â€” fail-loud, never silent fallback, never required for any Tier 1â€“11 capability.
+The shipping Windows artifact includes Forge CUDA. GPU-applicable dense similarity, statistical, propagation, and kernel operations must use an attested GPU executor. A deliberately selected CPU backend is a parity oracle; a CPU production implementation requires a recorded finding that GPU execution is technically impossible. Any CUDA capability, identity, attestation, allocation, numerical, or readback failure aborts the derived generation with structured diagnostics and no alternate executor. `tei` and `onnx` remain separately commissioned model-runtime capabilities.
 
 ## 6. Benchmark harness (gate-blocking, local)
 
@@ -1823,7 +1823,7 @@ C binds tree-sitter/SQLite to mimalloc through `cbm_alloc_init` (which must run 
 | macOS arm64/x64 | clang | `aarch64/x86_64-apple-darwin` | ad-hoc codesign step inherited from CBM installer |
 | Windows x64 | **MinGW** (CBM's supported path) | `x86_64-pc-windows-gnu` | ABI-consistent with MinGW-built C. MSVC target deferred (mixing MSVC Rust + MinGW C is the classic trap â€” explicitly out of scope v1; document `-gnu` toolchain requirement) |
 
-CUDA/TEI/ONNX features excluded from default builds on all platforms.
+CUDA is included in the shipping Windows build. TEI/ONNX remain capability-gated model-runtime integrations. Non-Windows build policy is deferred to the final port phase.
 
 ## 7. Verification pipeline *(design correction 2026-07-11: local gates only — hosted CI is banned; see 00_INDEX. Further superseded 2026-07-14: the gate stages below are deleted — verification is manual Full State Verification against the real artifact only; see §20 head.)*
 

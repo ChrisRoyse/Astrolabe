@@ -38,6 +38,7 @@ cbm-sys = { path = "crates/cbm-sys" }
 calyx-aster = { path = "calyx/crates/calyx-aster" }
 calyx-assay = { path = "calyx/crates/calyx-assay" }
 calyx-core = { path = "calyx/crates/calyx-core" }
+calyx-forge = { path = "calyx/crates/calyx-forge", features = ["cuda"] }
 calyx-ledger = { path = "calyx/crates/calyx-ledger" }
 calyx-lodestar = { path = "calyx/crates/calyx-lodestar" }
 calyx-loom = { path = "calyx/crates/calyx-loom" }

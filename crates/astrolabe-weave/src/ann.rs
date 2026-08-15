@@ -5,28 +5,25 @@
 //! - **MinHash/LSH banding** for sparse slot vectors (S1-style trigram and
 //!   hashed-set shapes) — the CBM candidate generator retained as an O(n)
 //!   pass, re-derived deterministically from the configured seed.
-//! - **Seeded, scalar8-quantized HNSW** (`calyx-sextant`) for dense slot
-//!   vectors, where set-based LSH does not apply. The index receives raw input
-//!   once, physically stores one-byte scalar codes, and scores those codes
-//!   directly with the per-pool measured scale. Construction order is sorted
-//!   qualified name, which makes construction and search deterministic.
+//! - **Scalar8 dense candidates** for dense slot vectors. The shipping exact
+//!   path packs one-byte scalar codes and hands that physical matrix to Forge's
+//!   resident CUDA operation; seeded HNSW remains an explicit comparison
+//!   strategy.
 //!
 //! Both generators only *propose* pairs; every proposed pair is re-scored with
 //! the exact cosine on the raw vectors and admitted under the same canonical
 //! ownership (lower qualified name owns), sorted admission, and per-node cap
 //! as the exhaustive planner. Candidate *recording* is single-threaded, so the
-//! proposed set is worker-count invariant; the compute-heavy stages (MinHash
-//! signatures, HNSW queries, and — under the `weave_dense_ann_strategy` exact
-//! build (#441) — the per-source exact kNN scans) shard across the declared
-//! worker count over frozen, read-only inputs.
+//! proposed set is worker-count invariant. MinHash signatures and HNSW queries
+//! shard over the declared worker count; Forge exact-kNN instead uses one
+//! process-serial attested CUDA context/default stream so concurrent callers
+//! cannot reorder device work.
 
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap},
-};
+use std::collections::BTreeMap;
 
 use calyx_core::{CxId, SlotVector};
-use calyx_sextant::{HnswIndex, QuantConfig, SextantIndex};
+use calyx_forge::{Scalar8ExactKnnReceipt, scalar8_exact_knn_cpu, scalar8_exact_knn_cuda};
+use calyx_sextant::{HnswIndex, PackedVector, QuantConfig, SextantIndex};
 
 use crate::{
     AnnCandidateConfig, IndexedVector, NormalizedVector, ParallelScheduleTelemetry,
@@ -63,6 +60,9 @@ pub struct AnnFamilyReport {
     pub dense_strategy_measurements: Vec<DenseStrategyMeasurement>,
     /// Measured scalar8 quantization scales, one per dense dimension group.
     pub quant_scale_measurements: Vec<QuantScaleMeasurement>,
+    /// Stable Forge receipts for every physically executed exact-kNN group.
+    /// Volatile VRAM observations are intentionally not persisted here.
+    pub forge_exact_knn_measurements: Vec<Scalar8ExactKnnReceipt>,
 }
 
 /// The physically executed dense candidate generator.
@@ -189,6 +189,7 @@ pub(crate) fn generate_family_candidates(
             &mut per_source,
             &mut report.dense_strategy_measurements,
             &mut report.quant_scale_measurements,
+            &mut report.forge_exact_knn_measurements,
             &mut scheduler_telemetry,
         )?;
         report.dense_candidate_pairs = report
@@ -455,18 +456,14 @@ fn minhash_params(seed: u64, family: SimilarityFamily, permutation: usize) -> (u
 /// knob (#441) then selects the build, routing on this group's `dim` via
 /// [`ResolvedSimilarityKnobs::dense_ann_use_exact`]:
 ///
-/// - **Sequential seeded HNSW** ([`hnsw_dense_candidates`]): the #433 build/query —
-///   deterministic because inserts run once per ordinal and mutate the shared graph
-///   in that fixed order. Selected for high-dim groups under the dim-aware default
-///   (e.g. `SIM_SEMANTIC` dim=768, where the wave-24 matrix measured exact kNN
-///   regressing ~9% at bevy n=41,311), or globally under strategy `0`.
-/// - **Exact blocked kNN** ([`exact_dense_candidates`]): a deterministic, parallel,
-///   graph-free per-source exact top-k scan over the identical quantized pool —
-///   byte-identical across runs and worker counts, and a strict recall improvement
-///   over the approximate HNSW graph search on the same pool (see the knob). Selected
-///   for low-dim groups under the dim-aware default (e.g. `SIM_PROFILE` dim=24, the
-///   dominant #441 cost, measured 7.7–20× faster than HNSW), or globally under
-///   strategy `1`.
+/// - **Sequential seeded HNSW** ([`hnsw_dense_candidates`]): the explicit #433
+///   comparison build/query. Inserts run once per ordinal and mutate the shared graph
+///   in that fixed order, so the resulting approximate graph is deterministic.
+/// - **Forge exact kNN** ([`forge_exact_dense_candidates`]): the shipping strategy.
+///   It performs exact top-k over the identical scalar8 pool through the separately
+///   declared physical executor. CUDA is the production default; CPU is an explicit
+///   parity oracle only, never an automatic fallback. The fixed exact domain is
+///   byte-deterministic and removes HNSW's graph-approximation error layer.
 #[expect(
     clippy::too_many_arguments,
     reason = "single private call site; splitting into a context struct adds indirection without reuse"
@@ -482,6 +479,7 @@ fn dense_candidates(
     per_source: &mut [Vec<usize>],
     strategy_measurements: &mut Vec<DenseStrategyMeasurement>,
     scale_measurements: &mut Vec<QuantScaleMeasurement>,
+    forge_measurements: &mut Vec<Scalar8ExactKnnReceipt>,
     scheduler_telemetry: &mut Vec<ParallelScheduleTelemetry>,
 ) -> Result<usize, SimilarityPlanError> {
     let mut max_abs = 0.0f32;
@@ -519,22 +517,38 @@ fn dense_candidates(
         },
     });
     if use_exact {
-        let mut approximations = Vec::new();
-        approximations
-            .try_reserve_exact(group.len())
+        let dim_usize = usize::try_from(dim).map_err(|error| {
+            SimilarityPlanError::AnnCandidateFailure {
+                family,
+                message: format!(
+                    "ASTRO_WEAVE_EXACT_KNN_DIM_RANGE: dim={dim} cannot be represented on this target: {error}; no partial similarity plan was published"
+                ),
+            }
+        })?;
+        let code_count = group.len().checked_mul(dim_usize).ok_or_else(|| {
+            SimilarityPlanError::AnnCandidateFailure {
+                family,
+                message: format!(
+                    "ASTRO_WEAVE_EXACT_KNN_SHAPE_OVERFLOW: pool={} times dim={dim} exceeded usize; no partial similarity plan was published",
+                    group.len()
+                ),
+            }
+        })?;
+        let mut codes = Vec::new();
+        codes
+            .try_reserve_exact(code_count)
             .map_err(|error| SimilarityPlanError::AnnCandidateFailure {
                 family,
                 message: format!(
-                    "ASTRO_WEAVE_EXACT_KNN_CAPACITY_EXHAUSTED: scalar8 approximation row-table reserve failed for {family} dim {dim}, pool={}, requested_rows={}: {error}; no partial similarity plan was published",
+                    "ASTRO_WEAVE_EXACT_KNN_CAPACITY_EXHAUSTED: scalar8 code matrix reserve failed for {family} dim {dim}, pool={}, requested_items={code_count}: {error}; no partial similarity plan was published",
                     group.len(),
-                    group.len()
                 ),
             })?;
         for &index in group {
             let NormalizedVector::Dense { data, .. } = &vectors[index].vector else {
                 unreachable!("dense group holds only dense vectors");
             };
-            let row =
+            let packed =
                 quant
                     .pack(data)
                     .map_err(|error| SimilarityPlanError::AnnCandidateFailure {
@@ -544,28 +558,43 @@ fn dense_candidates(
                             error.message, error.code
                         ),
                     })?;
-            let approximation = quant.approx_f32(&row).map_err(|error| {
-                SimilarityPlanError::AnnCandidateFailure {
+            let PackedVector::Scalar8 {
+                codes: packed_codes,
+                scale: packed_scale,
+                ..
+            } = packed
+            else {
+                return Err(SimilarityPlanError::AnnCandidateFailure {
                     family,
                     message: format!(
-                        "exact scalar8 approximation failed for dim {dim}: {} ({})",
-                        error.message, error.code
+                        "ASTRO_WEAVE_EXACT_KNN_CODEC_DRIFT: scalar8 pack returned a different physical encoding for dim {dim}; no partial similarity plan was published"
                     ),
-                }
-            })?;
-            approximations.push(approximation);
+                });
+            };
+            if packed_codes.len() != dim_usize || packed_scale.to_bits() != scale.to_bits() {
+                return Err(SimilarityPlanError::AnnCandidateFailure {
+                    family,
+                    message: format!(
+                        "ASTRO_WEAVE_EXACT_KNN_CODEC_DRIFT: scalar8 row readback differed for dim {dim}: codes={} expected={dim_usize}, scale_bits={} expected_scale_bits={}; no partial similarity plan was published",
+                        packed_codes.len(),
+                        packed_scale.to_bits(),
+                        scale.to_bits()
+                    ),
+                });
+            }
+            codes.extend(packed_codes.into_iter().map(|code| code as i8));
         }
-        let (pairs, telemetry) = exact_dense_candidates(
+        let (pairs, receipt) = forge_exact_dense_candidates(
             family,
             dim,
-            &approximations,
+            &codes,
             group,
             span,
-            runtime.similarity_workers_resolved(),
+            runtime.exact_knn_executor(),
             per_source,
         )
         .map_err(|message| SimilarityPlanError::AnnCandidateFailure { family, message })?;
-        scheduler_telemetry.push(telemetry);
+        forge_measurements.push(receipt);
         return Ok(pairs);
     }
     hnsw_dense_candidates(
@@ -590,36 +619,6 @@ fn dense_group_row<'a>(vectors: &'a [IndexedVector], group: &[usize], ordinal: u
         unreachable!("dense group holds only dense vectors");
     };
     data
-}
-
-/// Formats the single fail-closed resource-exhaustion code for exact kNN.
-#[derive(Clone, Copy)]
-struct ExactKnnContext {
-    family: SimilarityFamily,
-    dim: u32,
-    pool: usize,
-    k: usize,
-}
-
-fn exact_knn_capacity_error(
-    context: ExactKnnContext,
-    component: &str,
-    requested_items: usize,
-    source: Option<usize>,
-    error: &impl std::fmt::Display,
-) -> String {
-    let ExactKnnContext {
-        family,
-        dim,
-        pool,
-        k,
-    } = context;
-    let source = source
-        .map(|ordinal| ordinal.to_string())
-        .unwrap_or_else(|| "none".to_owned());
-    format!(
-        "ASTRO_WEAVE_EXACT_KNN_CAPACITY_EXHAUSTED: {component} reserve failed for {family} dim {dim}, pool={pool}, k={k}, source_ordinal={source}, requested_items={requested_items}: {error}; no partial similarity plan was published"
-    )
 }
 
 /// Immutable inputs for one seeded-HNSW dense candidate build.
@@ -762,65 +761,20 @@ fn hnsw_dense_candidates(
     Ok(new_pairs)
 }
 
-/// Heap row for exact kNN selection. A max-heap surfaces the least-preferred
-/// retained candidate: lower score first, then larger ordinal.
-#[derive(Debug)]
-struct ExactCandidate {
-    score: f32,
-    target: usize,
-}
-
-impl PartialEq for ExactCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for ExactCandidate {}
-
-impl PartialOrd for ExactCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ExactCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .score
-            .total_cmp(&self.score)
-            .then_with(|| self.target.cmp(&other.target))
-    }
-}
-
-/// Deterministic, parallel, **exact** blocked kNN dense candidate build (#441).
-///
-/// For every source ordinal `s` this computes the exact cosine of its quantized
-/// approximation against every pool member, takes the top `k = span + 1`
-/// (self-inclusive, the identical candidate breadth the HNSW query uses), drops
-/// self, and records the surviving neighbors as candidate pairs. The tie-break is
-/// (score descending, ordinal ascending) — ordinals are qualified-name order, so it
-/// is fully deterministic with no RNG.
-///
-/// Production diagnosis (#441, 2026-08-12): the physical self-host graph had
-/// 192,873 nodes and the prior contiguous-range/capacity-one topology exposed
-/// 1.119 effective workers on a 32-thread host. This implementation assigns
-/// strided ordinals and accepts one row from each worker per canonical round.
-/// Each worker reuses one `k`-entry heap; at most one completed row per worker is
-/// buffered, so retained candidate scratch is O(workers * k), invariant in pool
-/// N (PC-17/PC-22/PC-29/PC-38/PC-41).
-fn exact_dense_candidates(
+/// Executes Forge's exact scalar8 kNN producer and records canonical candidate
+/// pairs. Executor `0` is the explicit CPU oracle; executor `1` is the
+/// GPU-required production path. A CUDA failure is returned unchanged and never
+/// invokes the CPU oracle.
+fn forge_exact_dense_candidates(
     family: SimilarityFamily,
     dim: u32,
-    approximations: &[Vec<f32>],
+    codes: &[i8],
     group: &[usize],
     span: usize,
-    worker_count: usize,
+    executor: u64,
     per_source: &mut [Vec<usize>],
-) -> Result<(usize, ParallelScheduleTelemetry), String> {
-    let pool = approximations.len();
-    // Same candidate breadth as the HNSW query (`span + 1`, self included), clamped
-    // to the pool so a tiny group asks for at most `pool` neighbors.
+) -> Result<(usize, Scalar8ExactKnnReceipt), String> {
+    let pool = group.len();
     let k = span
         .checked_add(1)
         .ok_or_else(|| {
@@ -829,165 +783,55 @@ fn exact_dense_candidates(
             )
         })?
         .min(pool);
-    let context = ExactKnnContext {
-        family,
-        dim,
-        pool,
-        k,
-    };
-    let mut new_pairs = 0usize;
-    let telemetry = run_ordered_parallel(
-        format!("ann_generate.{family}.exact_knn.dim{dim}"),
-        pool,
-        worker_count,
-        |_| {
-            let mut top = BinaryHeap::new();
-            top.try_reserve_exact(k).map_err(|error| {
-                exact_knn_capacity_error(context, "worker top-k heap", k, None, &error)
-            })?;
-            Ok::<_, String>(top)
-        },
-        |top, source| {
-            top.clear();
-            let query = &approximations[source];
-            for (target, approximation) in approximations.iter().enumerate() {
-                let candidate = ExactCandidate {
-                    score: cosine(query, approximation),
-                    target,
-                };
-                if top.len() < k {
-                    top.push(candidate);
-                } else if top
-                    .peek()
-                    .is_some_and(|worst| candidate.cmp(worst) == Ordering::Less)
-                {
-                    top.pop();
-                    top.push(candidate);
-                }
-            }
-
-            let mut neighbors = Vec::new();
-            neighbors.try_reserve_exact(k).map_err(|error| {
-                exact_knn_capacity_error(
-                    context,
-                    "neighbor row",
-                    k,
-                    Some(source),
-                    &error,
-                )
-            })?;
-            // `pop` yields worst-to-best under `ExactCandidate::cmp`; reversing
-            // restores the historical `(score desc, ordinal asc)` row order.
-            while let Some(candidate) = top.pop() {
-                if candidate.target != source {
-                    neighbors.push(candidate.target);
-                }
-            }
-            neighbors.reverse();
-            Ok(neighbors)
-        },
-        |source, neighbors| {
-            for target in neighbors {
-                if record_pair(per_source, group[source], group[target]) {
-                    new_pairs = new_pairs.checked_add(1).ok_or_else(|| {
-                        format!(
-                            "ASTRO_WEAVE_EXACT_KNN_PAIR_COUNT_OVERFLOW: {family} dim {dim}, pool={pool}, k={k}, source_ordinal={source}; no partial similarity plan was published"
-                        )
-                    })?;
-                }
-            }
-            Ok::<_, String>(())
-        },
-    )
-    .map_err(|failure| exact_ordered_failure_message(context, *failure))?;
-    Ok((new_pairs, telemetry))
-}
-
-fn exact_ordered_failure_message(
-    context: ExactKnnContext,
-    failure: OrderedParallelFailure<String>,
-) -> String {
-    let ExactKnnContext {
-        family,
-        dim,
-        pool,
-        k,
-    } = context;
-    let telemetry = failure.telemetry;
-    let topology = format!(
-        "requested_workers={}, effective_workers={}, started_workers={}, completed_sources={}/{}",
-        telemetry.requested_workers,
-        telemetry.effective_workers,
-        telemetry.started_workers,
-        telemetry.completed_sources,
-        telemetry.source_count
-    );
-    match failure.kind {
-        OrderedParallelFailureKind::InvalidWorkerCount => format!(
-            "ASTRO_WEAVE_EXACT_KNN_WORKER_COUNT_INVALID: {family} dim {dim}, pool={pool}, k={k}, {topology}; set the declared similarity worker count to a positive resolved value; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::Capacity {
-            component,
-            requested_items,
-            message,
-        } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_CAPACITY_EXHAUSTED: {component} reserve failed for {family} dim {dim}, pool={pool}, k={k}, requested_items={requested_items}, {topology}: {message}; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::Telemetry { field, message } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_TELEMETRY_INVALID: {family} dim {dim}, pool={pool}, k={k}, field={field}, {topology}: {message}; preserve the corpus and diagnose the native monotonic clock/accounting fault; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::Spawn {
-            worker_index,
-            message,
-        } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_WORKER_SPAWN_FAILED: {family} dim {dim}, pool={pool}, k={k}, worker_index={worker_index}, {topology}: {message}; inspect the native thread-creation error and host resource state, then retry the unchanged corpus; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::Compute { source, error } => {
-            format!("{error}; failed_source_ordinal={source}; {topology}")
+    let execution = match executor {
+        crate::knobs::WEAVE_EXACT_KNN_EXECUTOR_CPU => {
+            scalar8_exact_knn_cpu(codes, pool, dim as usize, k)
         }
-        OrderedParallelFailureKind::Accept { source, error } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_ACCEPT_FAILED: {family} dim {dim}, pool={pool}, k={k}, source_ordinal={source}, {topology}: {error}; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::Disconnected {
-            worker_index,
-            expected_source,
-            message,
-        } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_WORKER_DISCONNECTED: {family} dim {dim}, pool={pool}, k={k}, worker_index={worker_index}, expected_source_ordinal={expected_source}, {topology}: {message}; inspect the worker panic/resource diagnostics and retry the unchanged corpus; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::OrderDrift {
-            worker_index,
-            expected_source,
-            observed_source,
-        } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_ORDER_DRIFT: {family} dim {dim}, pool={pool}, k={k}, worker_index={worker_index}, expected_source_ordinal={expected_source}, observed_source_ordinal={observed_source}, {topology}; preserve the corpus and scheduler telemetry for diagnosis; no partial similarity plan was published"
-        ),
-        OrderedParallelFailureKind::WorkerPanicked {
-            worker_index,
-            message,
-        } => format!(
-            "ASTRO_WEAVE_EXACT_KNN_WORKER_PANICKED: {family} dim {dim}, pool={pool}, k={k}, worker_index={worker_index}, {topology}: {message}; inspect the exact worker generation and retry the unchanged corpus; no partial similarity plan was published"
-        ),
+        crate::knobs::WEAVE_EXACT_KNN_EXECUTOR_CUDA => {
+            scalar8_exact_knn_cuda(codes, pool, dim as usize, k)
+        }
+        observed => {
+            return Err(format!(
+                "ASTRO_WEAVE_EXACT_KNN_EXECUTOR_INVALID: executor={observed}, accepted={}..={}; no partial similarity plan was published",
+                crate::knobs::WEAVE_MIN_EXACT_KNN_EXECUTOR,
+                crate::knobs::WEAVE_MAX_EXACT_KNN_EXECUTOR
+            ));
+        }
     }
-}
-
-/// Cosine similarity over two equal-length dense vectors, byte-identical to the
-/// `calyx-sextant` `util::cosine` the HNSW path scores with, so the exact strategy
-/// ranks candidates in the same quantized space as the sequential build.
-fn cosine(left: &[f32], right: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut left_norm = 0.0f32;
-    let mut right_norm = 0.0f32;
-    for (x, y) in left.iter().zip(right) {
-        dot += x * y;
-        left_norm += x * x;
-        right_norm += y * y;
+    .map_err(|error| {
+        format!(
+            "ASTRO_WEAVE_FORGE_EXACT_KNN_FAILED: family={family}, dim={dim}, pool={pool}, k={k}, executor={executor}, forge_code={}: {error}; no partial similarity plan was published",
+            error.code()
+        )
+    })?;
+    if execution.neighbors.len() != pool {
+        return Err(format!(
+            "ASTRO_WEAVE_FORGE_EXACT_KNN_READBACK_MISMATCH: family={family}, dim={dim}, pool={pool}, returned_rows={}; no partial similarity plan was published",
+            execution.neighbors.len()
+        ));
     }
-    if left_norm == 0.0 || right_norm == 0.0 {
-        0.0
-    } else {
-        dot / (left_norm.sqrt() * right_norm.sqrt())
+    let mut new_pairs = 0usize;
+    for (source, neighbors) in execution.neighbors.iter().enumerate() {
+        for neighbor in neighbors {
+            if neighbor.index == source {
+                continue;
+            }
+            if neighbor.index >= pool {
+                return Err(format!(
+                    "ASTRO_WEAVE_FORGE_EXACT_KNN_READBACK_MISMATCH: family={family}, dim={dim}, pool={pool}, source={source}, target={}; no partial similarity plan was published",
+                    neighbor.index
+                ));
+            }
+            if record_pair(per_source, group[source], group[neighbor.index]) {
+                new_pairs = new_pairs.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "ASTRO_WEAVE_EXACT_KNN_PAIR_COUNT_OVERFLOW: {family} dim {dim}, pool={pool}, k={k}, source_ordinal={source}; no partial similarity plan was published"
+                    )
+                })?;
+            }
+        }
     }
+    Ok((new_pairs, execution.receipt))
 }
 
 /// Maps a pool ordinal to a synthetic, deterministic `CxId` (big-endian u128).

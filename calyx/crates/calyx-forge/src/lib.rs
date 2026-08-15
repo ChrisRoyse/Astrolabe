@@ -19,6 +19,7 @@ pub mod cuda_runtime;
 #[path = "cuda/system_trust.rs"]
 mod cuda_system_trust;
 mod error;
+mod exact_knn;
 #[path = "cuda/mxfp4.rs"]
 pub mod mxfp4;
 #[path = "cuda/mxfp8.rs"]
@@ -70,6 +71,13 @@ pub use cuda_runtime::{
     select_pinned_cuda_device_by_identity, select_pinned_cuda_device_for_native_kernel,
 };
 pub use error::ForgeError;
+#[cfg(feature = "cuda")]
+pub use exact_knn::scalar8_exact_knn_cuda;
+pub use exact_knn::{
+    SCALAR8_EXACT_KNN_MAX_DIM, Scalar8ExactKnnExecution, Scalar8ExactKnnKernelReceipt,
+    Scalar8ExactKnnNeighbor, Scalar8ExactKnnObservation, Scalar8ExactKnnReceipt,
+    scalar8_exact_knn_cpu,
+};
 pub use mxfp4::{
     MXFP4_BLOCK_BYTES, MXFP4_BLOCK_SIZE, MXFP4_MAX_DIM, MXFP4_PACKED_BYTES, MxFp4Block,
     decode_e2m1, decode_e8m0, decode_mxfp4, decode_mxfp4_block, dot_norm_mxfp4, encode_mxfp4,

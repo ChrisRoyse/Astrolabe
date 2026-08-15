@@ -16,11 +16,11 @@ pub const FORGE_SHIPPED_BACKEND_OPS: &[&str] = &[
     "normalize",
     "topk",
     "device_info",
+    "scalar8_exact_knn",
 ];
 
 /// PRD-listed Forge operations that are intentionally not part of the Stage 2 trait yet.
 pub const FORGE_DEFERRED_BACKEND_OPS: &[&str] = &[
-    "knn",
     "histogram_nmi",
     "spmm_sparse_ops",
     "bilinear_cross_term",

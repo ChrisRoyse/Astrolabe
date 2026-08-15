@@ -33,6 +33,34 @@ pub fn cosine_batch_gpu(
     check_device_output(ctx, "cosine_batch_gpu", out, true)
 }
 
+/// Launches the attested cosine kernel over already-resident validated scalar8
+/// values without copying the complete score row to the host.
+///
+/// This is intentionally crate-private. The scalar8 exact-kNN operation proves
+/// every input row finite, non-empty, non-zero, and within the exact f32 integer
+/// accumulation range before calling it; its following exact top-k pass checks
+/// the kernel's NaN sentinel across every score chunk. General callers must use
+/// [`cosine_batch_gpu`], which performs a complete output readback.
+pub(crate) fn cosine_batch_gpu_validated_scalar8(
+    ctx: &CudaContext,
+    query: &CudaSlice<f32>,
+    candidates: &CudaSlice<f32>,
+    dim: usize,
+    n_cands: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    launch_distance(
+        ctx,
+        "scalar8_exact_knn.cosine",
+        "cosine_batch_f32",
+        query,
+        candidates,
+        dim,
+        n_cands,
+        out,
+    )
+}
+
 pub fn dot_batch_gpu(
     ctx: &CudaContext,
     query: &CudaSlice<f32>,
@@ -299,7 +327,7 @@ fn launch_normalize(
     Ok(())
 }
 
-fn distance_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
+pub(crate) fn distance_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
     load_embedded_cubin(ctx, "distance", DISTANCE_CUBIN, ctx.distance_module_cache())
 }
 

@@ -1,8 +1,8 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
-use crate::Result;
 use crate::cpu::guard::check_finite;
+use crate::{ForgeError, Result};
 
 pub fn topk_f32(scores: &[f32], k: usize) -> Result<Vec<(usize, f32)>> {
     if k == 0 || scores.is_empty() {
@@ -10,7 +10,14 @@ pub fn topk_f32(scores: &[f32], k: usize) -> Result<Vec<(usize, f32)>> {
     }
     check_finite(scores, "topk")?;
 
-    let mut heap: BinaryHeap<Reverse<RankedScore>> = BinaryHeap::with_capacity(k.min(scores.len()));
+    let capacity = k.min(scores.len());
+    let mut heap: BinaryHeap<Reverse<RankedScore>> = BinaryHeap::new();
+    heap.try_reserve_exact(capacity)
+        .map_err(|error| ForgeError::CapacityExhausted {
+            operation: "topk_f32".to_string(),
+            detail: format!("top-k heap reserve failed: requested_items={capacity}: {error}"),
+            remediation: "Free host memory or reduce the requested top-k breadth".to_string(),
+        })?;
     for (index, score) in scores.iter().copied().enumerate() {
         let ranked = RankedScore { index, score };
         if heap.len() < k {

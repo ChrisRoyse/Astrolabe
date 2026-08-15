@@ -25,6 +25,18 @@ pub enum ForgeError {
         detail: String,
         remediation: String,
     },
+    CapacityExhausted {
+        operation: String,
+        detail: String,
+        remediation: String,
+    },
+    OperationFailure {
+        code: &'static str,
+        operation: &'static str,
+        phase: &'static str,
+        detail: String,
+        remediation: String,
+    },
     ShapeMismatch {
         expected: Vec<usize>,
         got: Vec<usize>,
@@ -76,6 +88,8 @@ impl ForgeError {
             Self::NumericalInvariant { .. } => "CALYX_FORGE_NUMERICAL_INVARIANT",
             Self::DeviceUnavailable { .. } => "CALYX_FORGE_DEVICE_UNAVAILABLE",
             Self::GpuError { .. } => "CALYX_GPU_ERROR",
+            Self::CapacityExhausted { .. } => "CALYX_FORGE_CAPACITY_EXHAUSTED",
+            Self::OperationFailure { code, .. } => code,
             Self::ShapeMismatch { .. } => "CALYX_FORGE_SHAPE_MISMATCH",
             Self::Unimplemented { .. } => "CALYX_FORGE_UNIMPLEMENTED",
             Self::QuantError { .. } => "CALYX_FORGE_QUANT_ERROR",
@@ -93,6 +107,8 @@ impl ForgeError {
             Self::NumericalInvariant { remediation, .. }
             | Self::DeviceUnavailable { remediation, .. }
             | Self::GpuError { remediation, .. }
+            | Self::CapacityExhausted { remediation, .. }
+            | Self::OperationFailure { remediation, .. }
             | Self::ShapeMismatch { remediation, .. }
             | Self::Unimplemented { remediation, .. }
             | Self::QuantError { remediation, .. }
@@ -118,6 +134,21 @@ impl fmt::Display for ForgeError {
                 format!("{} device={} detail={}", self.code(), device, detail)
             }
             Self::GpuError { detail, .. } => format!("{} detail={}", self.code(), detail),
+            Self::CapacityExhausted {
+                operation, detail, ..
+            } => format!("{} operation={} detail={}", self.code(), operation, detail),
+            Self::OperationFailure {
+                operation,
+                phase,
+                detail,
+                ..
+            } => format!(
+                "{} operation={} phase={} detail={}",
+                self.code(),
+                operation,
+                phase,
+                detail
+            ),
             Self::ShapeMismatch { expected, got, .. } => {
                 format!("{} expected={expected:?} got={got:?}", self.code())
             }

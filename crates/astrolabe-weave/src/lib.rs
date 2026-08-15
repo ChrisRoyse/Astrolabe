@@ -3469,6 +3469,20 @@ fn validate_plan_request(
             requirement: "must be within the declared exact-kNN dimension interval",
         });
     }
+    let Some(executor) = knobs::weave_knob(knobs::WEAVE_EXACT_KNN_EXECUTOR_KNOB) else {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "exact_knn_executor",
+            value: runtime.exact_knn_executor().to_string(),
+            requirement: "the active weave registry must declare the exact-kNN executor",
+        });
+    };
+    if !executor.accepts(runtime.exact_knn_executor()) {
+        return Err(SimilarityPlanError::InvalidRuntimeConfig {
+            field: "exact_knn_executor",
+            value: runtime.exact_knn_executor().to_string(),
+            requirement: "must be within the declared exact-kNN executor interval",
+        });
+    }
     let Some(workers) = knobs::weave_knob(knobs::WEAVE_SIMILARITY_WORKERS_KNOB) else {
         return Err(SimilarityPlanError::InvalidRuntimeConfig {
             field: "similarity_workers_requested",

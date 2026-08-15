@@ -13,7 +13,7 @@ use astrolabe_domain::knobs::U64KnobDeclaration;
 use serde::Serialize;
 
 /// Registry version tag for the weave performance knobs (#433).
-pub const WEAVE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-knobs-v1";
+pub const WEAVE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-knobs-v2";
 
 /// Name of the neighborhood cross-term peer sample-cap knob.
 pub const WEAVE_NEIGHBORHOOD_SAMPLE_CAP_KNOB: &str = "weave_neighborhood_sample_cap";
@@ -23,6 +23,10 @@ pub const WEAVE_SIMILARITY_WORKERS_KNOB: &str = "weave_similarity_workers";
 pub const WEAVE_SIMILARITY_WORKERS_ENV: &str = "ASTRO_WEAVE_SIMILARITY_WORKERS";
 /// Name of the dense ANN candidate-build strategy knob (#441).
 pub const WEAVE_DENSE_ANN_STRATEGY_KNOB: &str = "weave_dense_ann_strategy";
+/// Name of the exact-kNN physical executor knob (#1057).
+pub const WEAVE_EXACT_KNN_EXECUTOR_KNOB: &str = "weave_exact_knn_executor";
+/// Environment override for the exact-kNN physical executor.
+pub const WEAVE_EXACT_KNN_EXECUTOR_ENV: &str = "ASTRO_WEAVE_EXACT_KNN_EXECUTOR";
 
 /// Default neighborhood peer sample-cap (#433): the largest peer set the O(n²)
 /// per-symbol neighborhood-agreement cross-term profiles run over before a seeded
@@ -112,40 +116,26 @@ pub const WEAVE_MAX_SIMILARITY_WORKERS: u64 = 4_096;
 /// until the exact strategy is proven byte-parity on the orchestrator's real-corpus
 /// edge_dump probe.
 pub const WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW: u64 = 0;
-/// Dense ANN candidate-build strategy (#441): deterministic, parallel, **exact**
-/// blocked kNN over the identical scalar8-quantized approximations.
+/// Dense ANN candidate-build strategy (#441/#1057): deterministic, **exact**
+/// kNN over the identical scalar8-quantized approximations.
 ///
-/// `1` replaces the sequential HNSW build+query with a per-source exact top-k scan
-/// over the same quantized pool the HNSW path scores (`k = per_node_cap ×
-/// candidate_multiplier + 1`, the identical candidate breadth), sharded across the
-/// `weave_similarity_workers` count exactly as #433 shards the HNSW queries. It has
-/// **no graph, no RNG, and no cross-source mutation**: every source's neighbor list
-/// is a pure function of the frozen quantized pool, so the pass is embarrassingly
-/// parallel, byte-identical across runs and worker counts, and cannot deadlock or
-/// reorder. Rationale (#441): the seeded-HNSW *build* is the remaining superlinear
-/// weave sub-stage (`ann_generate.SIM_PROFILE` 136,956ms at n=45,557, ~O(n²) from
-/// the exhaustive-construction prefix and per-insert back-edge pruning), and exact
-/// blocked kNN is Θ(dim·n²) with a tiny SIMD-friendly constant and perfect
-/// parallelism — for the sizes involved (< ~50k dense vectors, RECORD_VEC dim=24 /
-/// embedding dim) brute-force exact kNN is both cheaper in wall-clock than the
-/// already-O(n²) graph build and *exact* where HNSW is approximate (myscale.com,
-/// marqo.ai: brute force has zero build overhead and 100% recall for <50k vectors;
-/// HNSW never reaches 100% recall). Candidate-recall argument (standing invariant 3
-/// / #441 output-equivalence): the exact top-k over the quantized pool is a strict
-/// improvement in approximation of the exhaustive raw-cosine ground truth over
-/// HNSW's approximate graph search on the *same* quantized pool — it removes the
-/// graph-approximation error layer while keeping the shared quantization layer — so
-/// recall against the exhaustive planner cannot drop; specific edges the HNSW graph
-/// missed are *added*, and the rescoring per-node cap admits the higher raw-cosine
-/// pairs. Any resulting edge_dump drift is therefore a labeled, recall-improving
-/// change, disclosed and measured on the driving issue — never silent.
+/// `1` replaces HNSW build+query with Forge exact top-k over the same physical
+/// scalar8 pool (`k = per_node_cap × candidate_multiplier + 1`, self included).
+/// The separately declared executor chooses explicit CPU oracle or required CUDA;
+/// the shipping CUDA executor uploads the pool once, reuses one query/score/top-k
+/// workspace, and serializes callers around its attested context/default stream.
+/// It has no graph or RNG, so every neighbor row is a pure function of the frozen
+/// codes. Removing HNSW's graph-approximation layer cannot reduce candidate recall
+/// relative to approximate search on those same codes; raw vectors are still the
+/// final admission authority.
 pub const WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN: u64 = 1;
 /// Dense ANN candidate-build strategy (#441): **dim-aware routing** — per dense
 /// dimension group, use the exact blocked kNN when the group's dimensionality is
 /// `<= weave_dense_ann_exact_max_dim`, else the sequential HNSW build.
 ///
-/// `2` is the measured default (the #441 wave-24 real-corpus probe). Strategies 0
-/// and 1 are global (all dense groups one way); this routes **per group by dim**,
+/// `2` is the historical #441 CPU-routing policy and remains an explicit diagnostic
+/// mode. Strategies 0 and 1 are global (all dense groups one way); this routes
+/// **per group by dim**,
 /// because the wave-24 scaling matrix (astrolabe binary, ASTRO_SHADOW_TIMING, four
 /// real Rust corpora zoxide n=471 → bevy n=41,311) showed the two paths cross over
 /// with dimensionality:
@@ -174,26 +164,20 @@ pub const WEAVE_DENSE_ANN_STRATEGY_DIM_AWARE: u64 = 2;
 pub const WEAVE_MIN_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW;
 /// Largest legal dense ANN strategy ordinal (dim-aware routing).
 pub const WEAVE_MAX_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_DIM_AWARE;
-/// Default dense ANN strategy: **dim-aware routing** (#441, wave-24 measured). Exact
-/// kNN for low-dim dense groups (`SIM_PROFILE` dim=24 — the dominant #441 sub-stage,
-/// 7.7× faster at bevy n=41,311 and recall-non-decreasing), sequential HNSW for
-/// high-dim groups (`SIM_SEMANTIC` dim=768 — byte-identical to the pre-#441 default,
-/// avoiding the measured ~9% large-n exact-kNN regression). The
-/// `ASTRO_WEAVE_DENSE_ANN_STRATEGY` override still selects a global strategy (0 or 1)
-/// for benches/probes. Recall note: the profile family flips to the exact top-k over
-/// the quantized pool, which removes only HNSW's graph-approximation error over the
-/// shared quantization layer, so candidate recall vs the exhaustive planner cannot
-/// drop — the wave-24 readback confirmed exact ≥ HNSW edges at fixed input (zoxide:
-/// 5,354 vs 5,353 persisted SIM rows, identical mean weights, one extra true-neighbor
-/// profile edge HNSW's approximate query missed).
-pub const WEAVE_DEFAULT_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_DIM_AWARE;
+/// Default dense ANN strategy: global exact kNN (#1057). The earlier #441 CPU
+/// matrix routed dim=768 to HNSW because CPU exact regressed at production N;
+/// Forge's required CUDA executor removes that CPU wall-clock premise and buys
+/// back exact candidate recall. Strategy `0` remains an explicit deterministic
+/// HNSW comparison mode and strategy `2` remains an explicit dimension-aware
+/// diagnostic mode; neither is selected after a CUDA failure.
+pub const WEAVE_DEFAULT_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN;
 /// Environment override for the dense ANN strategy knob. A declared operator/probe
 /// channel (not a hidden constant): the value is parsed as the knob ordinal and
 /// **validated against the declaration's closed interval**. Unset selects the
 /// declared default; present invalid input returns a structured refusal and no
 /// weave generation may begin. This is the mechanism the #441 probe uses to exercise
 /// global OFF (0, sequential HNSW) vs global ON (1, exact kNN) on one consolidated
-/// binary; unset selects the dim-aware default (2).
+/// binary; unset selects the global exact default (1).
 pub const WEAVE_DENSE_ANN_STRATEGY_ENV: &str = "ASTRO_WEAVE_DENSE_ANN_STRATEGY";
 
 /// Name of the dim-aware exact-kNN dimensionality cutoff knob (#441).
@@ -203,23 +187,25 @@ pub const WEAVE_DENSE_ANN_EXACT_MAX_DIM_ENV: &str = "ASTRO_WEAVE_DENSE_ANN_EXACT
 /// Largest dense-group dimensionality for which the dim-aware strategy (2) selects
 /// exact blocked kNN; groups with a larger dim use sequential HNSW (#441).
 ///
-/// Default `256`: the wave-24 scaling matrix placed the exact-vs-HNSW crossover
-/// strictly between the only two dense families in play — `SIM_PROFILE` (dim=24,
-/// exact wins at every measured size) and `SIM_SEMANTIC` (dim=768, exact regresses
-/// ~9% at n≈41k). `256` is a power-of-two midpoint comfortably above every low-dim
-/// structural/profile record vector (`RECORD_VEC` dim=24) and below the 768-dim
-/// code embedding, so it routes profile→exact and semantic→HNSW. It is a declared
-/// cutoff, not a magic constant: replace it with the measured per-dim crossover
-/// point once exact-kNN wall-clock is benchmarked across intermediate embedding
-/// dimensionalities.
-pub const WEAVE_DEFAULT_DENSE_ANN_EXACT_MAX_DIM: u64 = 256;
+/// Default `1040`: the largest dimension for which signed-int8 dot/norm sums
+/// remain strictly below `2^24`, making Forge's attested f32 reduction an exact
+/// integer accumulation independent of reduction order. Wider dimensions need a
+/// separately attested wider-accumulator kernel and therefore fail closed on the
+/// global exact strategy.
+pub const WEAVE_DEFAULT_DENSE_ANN_EXACT_MAX_DIM: u64 = 1_040;
 /// Smallest legal cutoff: `24` (`RECORD_VEC` dim), so the low-dim profile family is
 /// always eligible for exact kNN under the dim-aware strategy.
 pub const WEAVE_MIN_DENSE_ANN_EXACT_MAX_DIM: u64 = 24;
-/// Largest legal cutoff: `4096` bounds the request; a group with a larger dim than
-/// the cutoff uses HNSW regardless, so this caps the exact-eligible band, not
-/// correctness.
-pub const WEAVE_MAX_DENSE_ANN_EXACT_MAX_DIM: u64 = 4_096;
+/// Largest legal cutoff is the exact signed-int8 accumulation domain (`1040`).
+pub const WEAVE_MAX_DENSE_ANN_EXACT_MAX_DIM: u64 = 1_040;
+
+/// Explicit CPU parity/oracle mode. It is never selected after a CUDA error.
+pub const WEAVE_EXACT_KNN_EXECUTOR_CPU: u64 = 0;
+/// GPU-required production mode using Forge's attested resident CUDA operation.
+pub const WEAVE_EXACT_KNN_EXECUTOR_CUDA: u64 = 1;
+pub const WEAVE_DEFAULT_EXACT_KNN_EXECUTOR: u64 = WEAVE_EXACT_KNN_EXECUTOR_CUDA;
+pub const WEAVE_MIN_EXACT_KNN_EXECUTOR: u64 = WEAVE_EXACT_KNN_EXECUTOR_CPU;
+pub const WEAVE_MAX_EXACT_KNN_EXECUTOR: u64 = WEAVE_EXACT_KNN_EXECUTOR_CUDA;
 
 /// The weave performance knob registry (#433).
 pub const WEAVE_KNOBS: &[U64KnobDeclaration] = &[
@@ -251,7 +237,7 @@ pub const WEAVE_KNOBS: &[U64KnobDeclaration] = &[
         max: WEAVE_MAX_DENSE_ANN_STRATEGY,
         unit: "strategy_ordinal",
         source: "ASTROLABE #441 wave-24 real-corpus scaling matrix (astrolabe binary, ASTRO_SHADOW_TIMING, four real Rust corpora zoxide n=471 / ripgrep n=4,511 / atuin n=6,865 / bevy n=41,311): the seeded-HNSW candidate-index BUILD is the ~O(n²) weave sub-stage (bevy reproduced #441: ann_generate.SIM_PROFILE 135,951ms + SIM_SEMANTIC 121,571ms), and the exact-vs-HNSW crossover is dimensionality-dependent — exact kNN beats HNSW on low-dim SIM_PROFILE (dim=24) at every size (bevy 7.7×) but regresses ~9% on high-dim SIM_SEMANTIC (dim=768) at bevy scale; Zhu et al. 'SHINE: A Scalable HNSW Index in Disaggregated Memory' (arXiv:2507.17647) and hnswlib/usearch per-node-lock construction (parallel insert order is non-deterministic → different graph); myscale.com HNSW-vs-KNN and marqo.ai 'Understanding Recall in HNSW' (brute-force exact kNN is Θ(dim·n²), zero build overhead, 100% recall; HNSW never reaches 100%)",
-        rationale: "selects the dense ANN candidate-index build: 0 = the #433 sequential seeded-HNSW build/query (strictly sequential because each insert mutates earlier rows' back-edges; a parallel insert reorders those mutations into a different graph), 1 = global deterministic parallel EXACT blocked kNN over the identical scalar8-quantized pool with the identical candidate breadth (k = per_node_cap·candidate_multiplier+1), 2 = dim-aware routing (default) = exact for dense groups with dim <= weave_dense_ann_exact_max_dim else HNSW; all three are deterministic and the routing is a pure function of each group's dim, so the pass is byte-identical across runs and worker counts; the exact path removes only the graph-approximation error over the shared quantization layer, so candidate recall vs the exhaustive planner cannot drop (wave-24 readback: exact 5,354 vs HNSW 5,353 persisted SIM rows at fixed input, identical mean weights); default 2 was chosen from the wave-24 matrix because a global flip to 1 regresses high-dim semantic at scale while dim-aware captures the profile win with zero semantic regression; the ASTRO_WEAVE_DENSE_ANN_STRATEGY env override (clamped to this declaration) forces a global strategy for benches/probes",
+        rationale: "selects the dense candidate producer: 0 = deterministic seeded HNSW comparison mode, 1 = global exact scalar8 kNN through the separately declared Forge executor (shipping default), 2 = explicit dimension-aware diagnostic routing; the #441 CPU-only crossover justified the old dim-aware default, but #1057 commissions the resident attested CUDA operation for both dim=24 and dim=768, so CPU wall-clock no longer selects an approximate graph; no strategy is selected as a fallback after executor failure",
     },
     U64KnobDeclaration {
         registry_version: WEAVE_KNOB_REGISTRY_VERSION,
@@ -260,8 +246,18 @@ pub const WEAVE_KNOBS: &[U64KnobDeclaration] = &[
         min: WEAVE_MIN_DENSE_ANN_EXACT_MAX_DIM,
         max: WEAVE_MAX_DENSE_ANN_EXACT_MAX_DIM,
         unit: "dimensions",
-        source: "ASTROLABE #441 wave-24 scaling matrix: exact-kNN beats HNSW on the dim=24 SIM_PROFILE family at every size (bevy n=41,311 7.7×) and regresses ~9% on the dim=768 SIM_SEMANTIC family at bevy scale, placing the exact-vs-HNSW wall-clock crossover strictly between 24 and 768",
-        rationale: "largest dense-group dimensionality for which the dim-aware strategy (2) selects exact blocked kNN; larger groups use sequential HNSW; 256 is a power-of-two midpoint above every low-dim structural/profile RECORD_VEC (dim=24) and below the 768-dim code embedding, so it routes SIM_PROFILE->exact and SIM_SEMANTIC->HNSW; a declared cutoff, replace with the measured per-dim crossover once exact-kNN wall-clock is benchmarked across intermediate embedding dimensionalities",
+        source: "ASTROLABE #1057 signed-int8 exactness bound: 127^2 * 1040 = 16,774,160 < 2^24; Forge cuda-kernel-policy-v1 fixed reduction tree with fmad=false",
+        rationale: "largest dense dimension eligible for Forge's exact scalar8 f32 accumulation contract; at or below 1040 every integer dot/norm partial sum is exactly representable regardless of reduction order; a wider group requires a separately attested wider-accumulator kernel and the global exact strategy fails closed",
+    },
+    U64KnobDeclaration {
+        registry_version: WEAVE_KNOB_REGISTRY_VERSION,
+        name: WEAVE_EXACT_KNN_EXECUTOR_KNOB,
+        default: WEAVE_DEFAULT_EXACT_KNN_EXECUTOR,
+        min: WEAVE_MIN_EXACT_KNN_EXECUTOR,
+        max: WEAVE_MAX_EXACT_KNN_EXECUTOR,
+        unit: "executor_ordinal",
+        source: "ASTROLABE #1057 owner GPU directive and the 2026-08-12 self-host receipt (45,159 semantic vectors at dim=768); Forge cuda-kernel-policy-v1 exact sm_120a distance/topk attestation",
+        rationale: "physical executor for every exact scalar8 kNN group: 0 is an explicit CPU oracle, 1 is the GPU-required production default; CUDA failure is returned unchanged and never selects CPU; the Forge operation uploads the pool once, reuses one query/score/top-k workspace, and persists a stable device/kernel/transfer receipt",
     },
 ];
 
@@ -291,6 +287,7 @@ pub struct ResolvedSimilarityKnobs {
     registry_version: &'static str,
     dense_ann_strategy: u64,
     dense_ann_exact_max_dim: usize,
+    exact_knn_executor: u64,
     similarity_workers_requested: u64,
     similarity_workers_resolved: usize,
 }
@@ -306,6 +303,10 @@ impl ResolvedSimilarityKnobs {
 
     pub const fn dense_ann_exact_max_dim(&self) -> usize {
         self.dense_ann_exact_max_dim
+    }
+
+    pub const fn exact_knn_executor(&self) -> u64 {
+        self.exact_knn_executor
     }
 
     pub const fn similarity_workers_requested(&self) -> u64 {
@@ -478,6 +479,8 @@ pub fn resolve_similarity_knobs() -> Result<ResolvedSimilarityKnobs, WeaveRuntim
         WEAVE_DENSE_ANN_EXACT_MAX_DIM_KNOB,
         WEAVE_DENSE_ANN_EXACT_MAX_DIM_ENV,
     )?;
+    let exact_knn_executor =
+        resolve_declared_override(WEAVE_EXACT_KNN_EXECUTOR_KNOB, WEAVE_EXACT_KNN_EXECUTOR_ENV)?;
     let similarity_workers_requested =
         resolve_declared_override(WEAVE_SIMILARITY_WORKERS_KNOB, WEAVE_SIMILARITY_WORKERS_ENV)?;
     let similarity_workers_resolved = if similarity_workers_requested == 0 {
@@ -503,6 +506,7 @@ pub fn resolve_similarity_knobs() -> Result<ResolvedSimilarityKnobs, WeaveRuntim
         registry_version: WEAVE_KNOB_REGISTRY_VERSION,
         dense_ann_strategy,
         dense_ann_exact_max_dim: usize_value(WEAVE_DENSE_ANN_EXACT_MAX_DIM_KNOB, exact_max_dim)?,
+        exact_knn_executor,
         similarity_workers_requested,
         similarity_workers_resolved,
     })
