@@ -28,9 +28,10 @@ pub use calyx_loom::reactive::{
 };
 pub use calyx_loom::{
     AuditEntry as ReactiveAuditEntry, CALYX_REACTIVE_ROW_CORRUPT,
-    CALYX_REACTIVE_SUBSCRIPTION_NOT_FOUND, NoveltyVerdict, ReactiveEngine, ReactiveRowKind,
-    ReactiveSignalSet, ReactiveSignals, SeriesStore, SubscriptionId, TriggerCondition,
-    TriggerFired, TriggerId, decode_audit_entry, decode_trigger_fired, reactive_row_key,
+    CALYX_REACTIVE_SUBSCRIPTION_NOT_FOUND, EXPECTED_GAIN_SCHEMA, ExpectedGain, ExpectedGainInput,
+    NoveltyVerdict, ReactiveEngine, ReactiveRowKind, ReactiveSignalSet, ReactiveSignals,
+    SeriesStore, SubscriptionId, TriggerCondition, TriggerFired, TriggerId,
+    calculate_expected_gains, decode_audit_entry, decode_trigger_fired, reactive_row_key,
 };
 use calyx_loom::{CrossTermKind as LoomCrossTermKind, CrossTermValue as LoomCrossTermValue};
 use serde::{Deserialize, Serialize};

@@ -1,7 +1,5 @@
 //! Aster-backed Assay adapter for Loom materialization planning.
 
-use std::sync::Mutex;
-
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, CalyxError, CxId, Result, Seq, SlotId, SlotVector, VaultStore,
 };
@@ -17,7 +15,6 @@ pub struct AsterAssayMaterializationGate<'a, S: VaultStore + ?Sized> {
     cx_ids: Vec<CxId>,
     anchor_kind: AnchorKind,
     assay: AssayGate,
-    last_error: Mutex<Option<CalyxError>>,
 }
 
 impl<'a, S> AsterAssayMaterializationGate<'a, S>
@@ -40,7 +37,6 @@ where
             cx_ids,
             anchor_kind,
             assay: AssayGate::default(),
-            last_error: Mutex::new(None),
         }
     }
 
@@ -58,36 +54,6 @@ where
         plan_cross_terms_checked(slots, |a, b| {
             self.pair_gain(a, b).map(|gain| gain.gain_bits)
         })
-        .inspect_err(|error| self.record_error(error.clone()))
-    }
-
-    pub fn materialization_plan_fail_safe_lazy(&self, slots: &[SlotId]) -> MaterializationPlan {
-        plan_cross_terms_checked(slots, |a, b| Ok(self.pair_gain_bits_fail_safe_lazy(a, b)))
-            .expect("fail-safe lazy materialization planner is infallible")
-    }
-
-    pub fn pair_gain_bits_fail_safe_lazy(&self, a: SlotId, b: SlotId) -> f32 {
-        match self.pair_gain(a, b) {
-            Ok(gain) => gain.gain_bits,
-            Err(error) => {
-                self.record_error(error);
-                0.0
-            }
-        }
-    }
-
-    pub fn last_error(&self) -> Option<CalyxError> {
-        self.last_error
-            .lock()
-            .expect("materialization gate error mutex poisoned")
-            .clone()
-    }
-
-    fn record_error(&self, error: CalyxError) {
-        *self
-            .last_error
-            .lock()
-            .expect("materialization gate error mutex poisoned") = Some(error);
     }
 
     fn load_pair_samples(&self, a: SlotId, b: SlotId) -> Result<PairSamples> {

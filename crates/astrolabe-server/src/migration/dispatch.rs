@@ -38,6 +38,8 @@ fn handle_tool_raw_admitted(
         "optimizer_status" => handle_optimizer_status(args_json),
         "get_readiness" => handle_get_readiness(args_json),
         "measure_bits" => handle_measure_bits(args_json),
+        "causal_analysis" => handle_causal_analysis(args_json),
+        "expected_gain" => handle_expected_gain(args_json),
         "impute_fields" => handle_impute_fields(args_json),
         "anchor_outcome" => handle_anchor_outcome(args_json),
         "anchor_erase" => handle_anchor_erase(args_json),
@@ -632,8 +634,8 @@ pub(crate) fn handle_tools_list_jsonrpc(
 
 /// Compose the one authoritative public roster from both immutable registries.
 ///
-/// #1110 / #1064 PC-35 + PC-38: production N is 38 definitions (14 CBM + 24
-/// Rust-native, measured 2026-08-13). This performs one deterministic O(N)
+/// #1110/#1132 / #1064 PC-35 + PC-38: N is the compile-time registry size,
+/// currently 40 definitions (14 CBM + 26 Rust-native). This performs one deterministic O(N)
 /// pass over generation-invariant schema values, opens no project/vault store,
 /// and writes no state. CBM order comes first for legacy compatibility; a name
 /// present in both registries keeps the CBM definition, after which Astrolabe's

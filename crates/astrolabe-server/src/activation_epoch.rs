@@ -673,6 +673,8 @@ fn retired_read_call_allowed(tool_name: &str, args_json: &str) -> bool {
                 != Some(true)
         }
         "discover_associations" => json_mode(args_json).as_deref() == Some("read"),
+        "causal_analysis" => json_mode(args_json).as_deref() == Some("read"),
+        "expected_gain" => true,
         _ => false,
     }
 }

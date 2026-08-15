@@ -204,6 +204,9 @@ use readiness::*;
 mod measure_bits;
 use measure_bits::*;
 
+mod causal_analysis;
+use causal_analysis::*;
+
 mod signal_card_transaction;
 use signal_card_transaction::*;
 

@@ -110,3 +110,8 @@ pub const ASTRO_ASSAY_CALIBRATION_BELOW_FLOOR: &str = "ASTRO_ASSAY_CALIBRATION_B
 /// (every observation identical), so no threshold can separate an anomaly from
 /// the bulk — the zero-signal negative-control case.
 pub const ASTRO_ASSAY_CALIBRATION_DEGENERATE: &str = "ASTRO_ASSAY_CALIBRATION_DEGENERATE";
+/// A causal-effect request was malformed, incomplete, or internally inconsistent.
+pub const ASTRO_ASSAY_CAUSAL_INPUT_INVALID: &str = "ASTRO_ASSAY_CAUSAL_INPUT_INVALID";
+/// A requested observational effect was not identifiable under the declared
+/// adjustment set because empirical treatment overlap was absent or inadequate.
+pub const ASTRO_ASSAY_CAUSAL_NOT_IDENTIFIABLE: &str = "ASTRO_ASSAY_CAUSAL_NOT_IDENTIFIABLE";

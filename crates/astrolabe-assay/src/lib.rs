@@ -30,6 +30,7 @@
 
 pub mod bits;
 pub mod calibration;
+pub mod causal_effect;
 pub mod causality;
 pub mod changepoint;
 pub mod deficits;
@@ -67,6 +68,11 @@ pub use calibration::{
     CalibrationCard, CalibrationConfig, CalibrationLedger, CalibrationLedgerEntry,
     CalibrationSource, MeasuredPrecision, StrategyCalibration, StrategyObservation,
     build_calibration_card, calibration_input_fingerprint,
+};
+pub use causal_effect::{
+    CAUSAL_EFFECT_SCHEMA, CausalAnalysisConfig, CausalAnalysisInput, CausalAssumption,
+    CausalEffectArtifact, CausalEffectEstimate, CausalObservation, CausalPairSpec,
+    CausalStratumDiagnostic, estimate_causal_effects,
 };
 pub use causality::{
     CausalityCard, CausalityConfig, CausalityEdge, CausalityEdgeInput, CausalityLag,

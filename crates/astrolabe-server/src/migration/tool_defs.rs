@@ -4,10 +4,10 @@ use super::*;
 ///
 /// `tools/list`, native CLI help, public-name membership, and runtime argument
 /// validation all borrow these exact values. Keeping one process-scope instance
-/// prevents both schema drift and per-request reconstruction of the 24 schema
+/// prevents both schema drift and per-request reconstruction of the 26 schema
 /// trees (#1120; #1064 PC-03/PC-43).
-pub(crate) fn astrolabe_tool_definitions() -> &'static [Value; 24] {
-    static DEFINITIONS: OnceLock<[Value; 24]> = OnceLock::new();
+pub(crate) fn astrolabe_tool_definitions() -> &'static [Value; 26] {
+    static DEFINITIONS: OnceLock<[Value; 26]> = OnceLock::new();
     DEFINITIONS.get_or_init(|| {
         [
             get_provenance_tool_definition(),
@@ -38,7 +38,169 @@ pub(crate) fn astrolabe_tool_definitions() -> &'static [Value; 24] {
             discover_latent_links_tool_definition(),
             // #1012/#1097: composed, association-contextualized discovery generation.
             discover_associations_tool_definition(),
+            // #1132: identifiable causal effects and Loom expected-net-gain readback.
+            causal_analysis_tool_definition(),
+            expected_gain_tool_definition(),
         ]
+    })
+}
+
+pub(crate) fn causal_analysis_tool_definition() -> Value {
+    json!({
+        "name": "causal_analysis",
+        "title": "Identify Causal Effects",
+        "description": "Estimates every declared binary-treatment × numeric-outcome pair with exact discrete-strata AIPW/backdoor standardization, while keeping the unadjusted association separately labeled. prepare requires explicit consistency, conditional-exchangeability, positivity, and no-interference assumptions; both treatment arms and the caller-declared minimum propensity/count must hold in every categorical adjustment stratum. It calculates uncertainty and Loom expected net gain from explicit outcome value, action cost, and unit, ranks only values with the same exact unit, then atomically persists the canonical observation/effect artifact to Assay, the compact intervention kernel to Kernel, and a paired Ledger entry. read independently point-reads and hashes that physical generation. Missing support is non-identifiable and refuses with no partial publication; no regression, imputation, extrapolation, cross-unit comparison, or fallback exists.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Exact project indexed with calyx=\"shadow\"."},
+                "mode": {"type": "string", "enum": ["prepare", "read"], "description": "prepare estimates and persists one generation; read independently reads the current or named physical generation."},
+                "artifact_sha256": {"type": "string", "description": "read only: optional exact causal artifact hash; omit to follow the project's current pointer."},
+                "observations": {
+                    "type": "array",
+                    "description": "prepare only: real observational rows. Treatments/outcomes live in values; exact categorical confounders live in strata.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "row_id": {"type": "string"},
+                            "values": {"type": "object", "additionalProperties": {"type": "number"}},
+                            "strata": {"type": "object", "additionalProperties": {"type": "string"}}
+                        },
+                        "required": ["row_id", "values"],
+                        "additionalProperties": false
+                    }
+                },
+                "treatments": {"type": "array", "items": {"type": "string"}, "description": "prepare only: complete binary-treatment roster."},
+                "outcomes": {"type": "array", "items": {"type": "string"}, "description": "prepare only: complete numeric-outcome roster."},
+                "pairs": {
+                    "type": "array",
+                    "description": "prepare only: exactly one adjustment set for every treatment × outcome pair.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "treatment": {"type": "string"},
+                            "outcome": {"type": "string"},
+                            "adjustment_set": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["treatment", "outcome", "adjustment_set"],
+                        "additionalProperties": false
+                    }
+                },
+                "assumptions": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["consistency", "conditional_exchangeability", "positivity", "no_interference"]},
+                    "description": "prepare only: all four identifying assumptions, each exactly once."
+                },
+                "minimum_propensity": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 0.5},
+                "minimum_arm_count": {"type": "integer", "minimum": 2},
+                "confidence_level": {"type": "number", "minimum": 0.5, "maximum": 0.999},
+                "decisions": {
+                    "type": "array",
+                    "description": "prepare only: exactly one explicit value/cost/unit record for every treatment × outcome effect.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "treatment": {"type": "string"},
+                            "outcome": {"type": "string"},
+                            "outcome_value": {"type": "number", "exclusiveMinimum": 0.0},
+                            "action_cost": {"type": "number", "minimum": 0.0},
+                            "unit": {"type": "string"}
+                        },
+                        "required": ["treatment", "outcome", "outcome_value", "action_cost", "unit"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["project", "mode"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "schema": {"type": "string", "const": "astrolabe.causal_analysis.v1"},
+                "status": {"type": "string", "const": "success"},
+                "mode": {"type": "string", "enum": ["prepare", "read"]},
+                "project": {"type": "string"},
+                "artifact_sha256": {"type": "string"},
+                "artifact": {"type": "object"},
+                "trust": {"type": "string", "const": "verified"},
+                "freshness": {"type": "string", "enum": ["current", "retained"]},
+                "provenance": {"type": "array", "items": {"type": "string"}},
+                "persistence": {"type": "object"}
+            },
+            "required": ["schema", "status", "mode", "project", "artifact_sha256", "artifact", "trust", "freshness", "provenance", "persistence"],
+            "additionalProperties": false
+        },
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
+pub(crate) fn expected_gain_tool_definition() -> Value {
+    json!({
+        "name": "expected_gain",
+        "title": "Rank Expected Intervention Gain",
+        "description": "Reads the persisted Loom intervention kernel produced by causal_analysis and returns every identified effect ranked within its exact unit by expected net gain = effect × explicit outcome value − explicit action cost, with uncertainty bounds and break-even effect. Values carrying different units are never compared. This tool is read-only and independently verifies the Assay artifact, Kernel row, manifest, current pointer, and exact paired Ledger entry before serving. Information-gain bits are never treated as money or utility; absent/corrupt/non-identifiable state refuses fail-closed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Exact project indexed with calyx=\"shadow\"."},
+                "artifact_sha256": {"type": "string", "description": "Optional exact causal artifact hash; omit to follow the current pointer."}
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "schema": {"type": "string", "const": "calyx.loom.expected_gain.v1"},
+                "status": {"type": "string", "const": "success"},
+                "project": {"type": "string"},
+                "artifact_sha256": {"type": "string"},
+                "observation_count": {"type": "integer", "minimum": 1},
+                "pair_count": {"type": "integer", "minimum": 1},
+                "expected_gains": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "schema": {"type": "string", "const": "calyx.loom.expected_gain.v1"},
+                            "effect_id": {"type": "string"},
+                            "treatment": {"type": "string"},
+                            "outcome": {"type": "string"},
+                            "effect": {"type": "number"},
+                            "outcome_value": {"type": "number"},
+                            "action_cost": {"type": "number"},
+                            "expected_gross_gain": {"type": "number"},
+                            "expected_net_gain": {"type": "number"},
+                            "expected_net_gain_lower": {"type": "number"},
+                            "expected_net_gain_upper": {"type": "number"},
+                            "break_even_effect": {"type": "number"},
+                            "unit": {"type": "string"},
+                            "rank_within_unit": {"type": "integer", "minimum": 1}
+                        },
+                        "required": ["schema", "effect_id", "treatment", "outcome", "effect", "outcome_value", "action_cost", "expected_gross_gain", "expected_net_gain", "expected_net_gain_lower", "expected_net_gain_upper", "break_even_effect", "unit", "rank_within_unit"],
+                        "additionalProperties": false
+                    }
+                },
+                "trust": {"type": "string", "const": "verified"},
+                "freshness": {"type": "string", "enum": ["current", "retained"]},
+                "provenance": {"type": "array", "items": {"type": "string"}},
+                "persistence": {"type": "object"}
+            },
+            "required": ["schema", "status", "project", "artifact_sha256", "observation_count", "pair_count", "expected_gains", "trust", "freshness", "provenance", "persistence"],
+            "additionalProperties": false
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
     })
 }
 
