@@ -3,8 +3,8 @@ use calyx_aster::gc::GcRateLimit;
 use calyx_aster::mvcc::{Freshness, VersionedCfStore};
 use calyx_core::Clock;
 use calyx_forge::{
-    AdmissionController, BlockDeallocator, DevicePtr, GpuBlockRegistry, Result as ForgeResult,
-    VramBudgeter, VramProbe,
+    AdmissionController, BlockDeallocator, DeviceAllocationState, DeviceMemoryObservation,
+    DevicePtr, ForgeError, GpuBlockRegistry, Result as ForgeResult, VramBudgeter, VramProbe,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -126,16 +126,22 @@ fn probe_h6_long_reader(root: &Path) -> ProbeResult {
 }
 
 fn probe_h7_vram_oom(root: &Path) -> ProbeResult {
-    let _dir = case_dir(root, "h7_vram_oom")?;
+    let dir = case_dir(root, "h7_vram_oom")?;
     let budgeter = VramBudgeter::with_soft_cap(2 * GIB, StaticProbe { free: 64 * GIB });
-    let registry = GpuBlockRegistry::new(&budgeter, NoopDealloc, 16);
+    let registry = GpuBlockRegistry::open(
+        &budgeter,
+        UnavailableDeallocator,
+        16,
+        dir.join("allocation-journal.ndjson"),
+    )
+    .map_err(err)?;
     let controller = AdmissionController::new(&budgeter, Arc::new(Mutex::new(registry)), 0, 1);
-    let before = budgeter.stats();
+    let before = budgeter.stats().map_err(err)?;
     let nvidia_before = query_nvidia_smi();
     let outcomes = run_vram_dispatches(&controller);
-    let after = budgeter.stats();
+    let after = budgeter.stats().map_err(err)?;
     let nvidia_after = query_nvidia_smi();
-    let zero_budget_error = zero_budget_error_code();
+    let zero_budget_error = zero_budget_error_code(&dir)?;
     let oom_lines = command_text("sh", &["-lc", "dmesg 2>/dev/null | grep -i oom || true"]);
     let max_memory_delta_mib = nvidia_before
         .memory_used_mib
@@ -239,11 +245,27 @@ impl VramProbe for StaticProbe {
 }
 
 #[derive(Clone, Default)]
-struct NoopDealloc;
+struct UnavailableDeallocator;
 
-impl BlockDeallocator for NoopDealloc {
+impl BlockDeallocator for UnavailableDeallocator {
+    fn device_observation(&self) -> ForgeResult<DeviceMemoryObservation> {
+        Err(unavailable_deallocator_error("device observation"))
+    }
+
+    fn allocation_state(&self, _ptr: DevicePtr) -> ForgeResult<DeviceAllocationState> {
+        Err(unavailable_deallocator_error("allocation-state readback"))
+    }
+
     fn free(&self, _ptr: DevicePtr, _size: usize) -> ForgeResult<()> {
-        Ok(())
+        Err(unavailable_deallocator_error("physical deallocation"))
+    }
+}
+
+fn unavailable_deallocator_error(operation: &str) -> ForgeError {
+    ForgeError::RuntimeBoundary {
+        code: "CALYX_HAZARD_SOAK_GPU_DEALLOCATOR_UNAVAILABLE",
+        detail: format!("{operation} is unavailable in the non-CUDA hazard-soak process"),
+        remediation: "run physical GPU allocation lifecycle evidence through calyx-forge's native CUDA FSV artifact",
     }
 }
 
@@ -307,11 +329,17 @@ fn classify_vram_result(outcome: std::thread::Result<ForgeResult<()>>) -> VramOu
     }
 }
 
-fn zero_budget_error_code() -> String {
+fn zero_budget_error_code(dir: &Path) -> Result<String, String> {
     let budgeter = VramBudgeter::with_soft_cap(0, StaticProbe { free: 64 * GIB });
-    let registry = GpuBlockRegistry::new(&budgeter, NoopDealloc, 1);
+    let registry = GpuBlockRegistry::open(
+        &budgeter,
+        UnavailableDeallocator,
+        1,
+        dir.join("zero-budget-allocation-journal.ndjson"),
+    )
+    .map_err(err)?;
     let controller = AdmissionController::new(&budgeter, Arc::new(Mutex::new(registry)), 0, 1);
-    controller
+    Ok(controller
         .run_with_admission(
             1,
             1,
@@ -320,7 +348,7 @@ fn zero_budget_error_code() -> String {
         )
         .expect_err("zero VRAM budget must fail closed")
         .code()
-        .to_string()
+        .to_string())
 }
 
 #[derive(Serialize)]

@@ -19,6 +19,7 @@
 //! on real bytes; only the external GPU reading is injected.
 
 pub mod admission;
+mod allocation_journal;
 pub mod budget;
 pub mod lru_evict;
 pub mod oom_guard;
@@ -28,12 +29,17 @@ pub use admission::{
     AdmissionController, AdmissionOutput, AdmitDecision, LENS_VRAM_BUDGET_REMEDIATION,
     LensAdmission, LensAdmissionPlacement, LensAdmissionRequest, QueuedDispatch, admit_lens,
 };
+pub use allocation_journal::{AllocationJournal, AllocationJournalEvent};
 pub use budget::{
     Category, DEFAULT_SOFT_CAP_BYTES, RESERVED_HEADROOM_BYTES, VRAM_BUDGET_ENV,
     VRAM_BUDGET_REMEDIATION, VramBudgeter, VramGuard,
 };
+#[cfg(feature = "cuda")]
+pub use lru_evict::RawCudaBlockDeallocator;
 pub use lru_evict::{
-    BlockDeallocator, BlockId, BlockKind, DevicePtr, GpuBlockRegistry, GpuBlockStats,
+    AllocationKey, BlockDeallocator, BlockId, BlockKind, DeviceAllocationState,
+    DeviceMemoryObservation, DevicePtr, GpuAllocationIdentity, GpuAllocationReleaseReceipt,
+    GpuBlockRegistry, GpuBlockSnapshot, GpuBlockStats,
 };
 #[cfg(feature = "cuda")]
 pub use oom_guard::RawCudaMalloc;
@@ -74,9 +80,8 @@ pub struct VramStats {
     pub serving_allocated_bytes: usize,
     /// Anneal/autotune/background reserved bytes.
     pub anneal_allocated_bytes: usize,
-    /// Live free device VRAM (bytes) at snapshot time; `0` if the probe failed
-    /// (a failure is logged at warn level — `0` is a visible alarm, never a
-    /// silent success).
+    /// Live free device VRAM (bytes) at snapshot time. The snapshot call
+    /// returns the exact probe error when this value cannot be read.
     pub device_free_bytes: usize,
     /// Cumulative admission decisions that proceeded immediately. A full-batch
     /// admission is recorded as a no-op split with `sub_batch_size == batch`.

@@ -120,6 +120,12 @@ impl<P: VramProbe> VramBudgeter<P> {
         Ok(())
     }
 
+    /// Read the hardware probe without translating an unavailable device into
+    /// a capacity error. Admission uses this before any eviction mutation.
+    pub fn free_device_vram_bytes(&self) -> Result<usize> {
+        self.probe.free_device_vram()
+    }
+
     /// Reserve serving/default VRAM, returning an RAII guard.
     pub fn reserve(&self, bytes: usize) -> Result<VramGuard<'_, P>> {
         self.reserve_category(bytes, Category::Serving)
@@ -168,19 +174,9 @@ impl<P: VramProbe> VramBudgeter<P> {
     }
 
     /// Snapshot accounting + live device free VRAM.
-    pub fn stats(&self) -> VramStats {
-        let device_free_bytes = match self.probe.free_device_vram() {
-            Ok(free) => free,
-            Err(err) => {
-                tracing::warn!(
-                    target: "calyx_forge::vram",
-                    error = %err,
-                    "free-VRAM probe failed during stats(); reporting device_free_bytes=0"
-                );
-                0
-            }
-        };
-        VramStats {
+    pub fn stats(&self) -> Result<VramStats> {
+        let device_free_bytes = self.free_device_vram_bytes()?;
+        Ok(VramStats {
             soft_cap_bytes: self.soft_cap_bytes,
             allocated_bytes: self.allocated_bytes.load(Ordering::Acquire),
             serving_allocated_bytes: self.allocated_bytes_for(Category::Serving),
@@ -198,7 +194,7 @@ impl<P: VramProbe> VramBudgeter<P> {
                 anneal_throttle_events: self.anneal_throttle_events_total.load(Ordering::Acquire),
                 anneal_vram_rejections: self.anneal_vram_rejections_total.load(Ordering::Acquire),
             },
-        }
+        })
     }
 
     pub(crate) fn record_admission_split(&self) {
@@ -307,11 +303,7 @@ impl<P: VramProbe> VramBudgeter<P> {
     }
 
     fn check_device_headroom(&self, bytes: usize) -> Result<()> {
-        let free = self.probe.free_device_vram().map_err(|err| {
-            budget_err(format!(
-                "device free-VRAM query failed; treating unknown device state as over-budget: {err}"
-            ))
-        })?;
+        let free = self.free_device_vram_bytes()?;
         let usable = free.saturating_sub(RESERVED_HEADROOM_BYTES);
         if bytes > usable {
             return Err(budget_err(format!(

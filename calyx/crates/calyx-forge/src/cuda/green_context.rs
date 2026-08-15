@@ -466,21 +466,21 @@ fn cleanup_green_context_resources(
         }
     }
 
-    if !green_ctx.is_null() {
-        if let Err(error) = unsafe { sys::cuGreenCtxDestroy(green_ctx).result() } {
-            tracing::error!(
-                code = "CALYX_FORGE_GREEN_CONTEXT_CLEANUP_FAILED",
-                cleanup_stage = "destroy_green_context",
-                cleanup_origin = origin,
-                driver_device_idx,
-                green_ctx_id = green_ctx_id.unwrap_or_default(),
-                green_ctx_id_known = green_ctx_id.is_some(),
-                green_ctx_address = green_ctx as usize,
-                green_cu_ctx_address = green_cu_ctx as usize,
-                error = %error,
-                "failed to destroy a CUDA green context"
-            );
-        }
+    if !green_ctx.is_null()
+        && let Err(error) = unsafe { sys::cuGreenCtxDestroy(green_ctx).result() }
+    {
+        tracing::error!(
+            code = "CALYX_FORGE_GREEN_CONTEXT_CLEANUP_FAILED",
+            cleanup_stage = "destroy_green_context",
+            cleanup_origin = origin,
+            driver_device_idx,
+            green_ctx_id = green_ctx_id.unwrap_or_default(),
+            green_ctx_id_known = green_ctx_id.is_some(),
+            green_ctx_address = green_ctx as usize,
+            green_cu_ctx_address = green_cu_ctx as usize,
+            error = %error,
+            "failed to destroy a CUDA green context"
+        );
     }
 }
 

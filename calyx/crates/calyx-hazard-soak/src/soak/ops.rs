@@ -110,7 +110,7 @@ pub(super) fn vram_dispatch_op<P: VramProbe>(
         let _guard = budgeter
             .reserve_category(MIB, Category::Serving)
             .map_err(err)?;
-        let _readback = budgeter.stats().allocated_bytes;
+        let _readback = budgeter.stats().map_err(err)?.allocated_bytes;
     }
     counts.vram_dispatches += 1;
     Ok(())
@@ -138,7 +138,7 @@ pub(super) fn sample<P: VramProbe>(
     Ok(SoakSample {
         op,
         rss_kib: heap_rss_bytes().map_err(err)? / 1024,
-        vram_mib: (budgeter.stats().allocated_bytes / MIB) as u64,
+        vram_mib: (budgeter.stats().map_err(err)?.allocated_bytes / MIB) as u64,
         tombstone_ratio,
         wal_bytes_active: dir_bytes(wal_dir),
         oldest_pinned_seq_gap,

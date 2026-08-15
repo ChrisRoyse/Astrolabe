@@ -174,9 +174,9 @@ impl RotationGeometry {
         match self {
             Self::Dense(rotation) => {
                 let (starts, factors, signs) = rotation.geometry_parts();
-                starts.len() * std::mem::size_of::<usize>()
-                    + factors.len() * std::mem::size_of::<f32>()
-                    + signs.len() * std::mem::size_of::<f32>()
+                std::mem::size_of_val(starts)
+                    + std::mem::size_of_val(factors)
+                    + std::mem::size_of_val(signs)
             }
             Self::Structured(rotation) => rotation.physical_bytes(),
         }
@@ -317,7 +317,7 @@ impl ProjectionGeometry {
 
     fn physical_bytes(&self) -> usize {
         match self {
-            Self::Dense(projection) => projection.values().len() * std::mem::size_of::<f32>(),
+            Self::Dense(projection) => std::mem::size_of_val(projection.values()),
             Self::Structured(projection) => projection.physical_bytes(),
         }
     }
@@ -628,8 +628,9 @@ impl TurboQuantV1MigrationVerifier {
 /// holds its `Arc`, so cache memory is bounded by live registered-slot usage —
 /// there is no tuned capacity constant and no unbounded retention. Dead entries
 /// are reaped on every insert.
-static SHARED_GEOMETRY_CACHE: OnceLock<Mutex<HashMap<(SeedId, u8, u8), Weak<TurboQuantCodec>>>> =
-    OnceLock::new();
+type SharedGeometryKey = (SeedId, u8, u8);
+type SharedGeometryCache = Mutex<HashMap<SharedGeometryKey, Weak<TurboQuantCodec>>>;
+static SHARED_GEOMETRY_CACHE: OnceLock<SharedGeometryCache> = OnceLock::new();
 
 impl TurboQuantCodec {
     /// Returns the shared frozen geometry for `(seed, level)`, deriving the
@@ -638,7 +639,7 @@ impl TurboQuantCodec {
     ///
     /// Repeated codec opens for the same registered slot (streaming ingest,
     /// column reads, searches) share one geometry instead of re-deriving the
-    /// O(d^2) material per open. Fail-closed: a cached entry whose seed
+    /// dense material per open. Fail-closed: a cached entry whose seed
     /// dimension or level disagrees with the request is a corruption error,
     /// never silently replaced.
     pub fn shared(seed: RotationSeed, level: QuantLevel) -> Result<Arc<Self>> {
@@ -1041,14 +1042,14 @@ impl TurboQuantCodec {
         let mut pair = 0_usize;
         while pair + 4 <= pairs {
             let mut products = [0.0_f64; 4];
-            for lane in 0..4 {
+            for (lane, product) in products.iter_mut().enumerate() {
                 let current_pair = pair + lane;
                 let index = current_pair * 2;
                 let (high_code, low_code) =
                     read_code_pair_fast(scalar, current_pair * pair_bits, high_bits, low_bits);
-                products[lane] = lut[index * stride + usize::from(high_code)];
+                *product = lut[index * stride + usize::from(high_code)];
                 if index + 1 < self.seed.dim {
-                    products[lane] += lut[(index + 1) * stride + usize::from(low_code)];
+                    *product += lut[(index + 1) * stride + usize::from(low_code)];
                 }
             }
             sum += f64x4::from(products).reduce_add();
@@ -1176,7 +1177,7 @@ impl TurboQuantCodec {
     }
 
     fn codebook_for_index(&self, index: usize) -> &LloydMaxCodebook {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             &self.high_codebook
         } else {
             &self.low_codebook

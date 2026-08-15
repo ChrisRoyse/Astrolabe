@@ -15,11 +15,10 @@ use crate::vram::{
 };
 use crate::{ForgeError, Result};
 
-pub const LENS_VRAM_BUDGET_REMEDIATION: &str = "Lower lens precision, move the lens to CPU, evict cold GPU lenses, or raise CALYX_FORGE_VRAM_BUDGET";
+pub const LENS_VRAM_BUDGET_REMEDIATION: &str = "Lower the explicitly requested GPU precision, evict an exact cold GPU allocation, or set a measured CALYX_FORGE_VRAM_BUDGET";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LensAdmissionPlacement {
-    Cpu,
     Gpu,
 }
 
@@ -27,7 +26,6 @@ pub enum LensAdmissionPlacement {
 pub struct LensAdmissionRequest {
     pub lens_vram_bytes: usize,
     pub tei_reserved_bytes: usize,
-    pub allow_cpu_fallback: bool,
 }
 
 pub struct LensAdmission<'b, P: VramProbe> {
@@ -45,27 +43,18 @@ pub fn admit_lens<'b, P: VramProbe>(
         return Ok(LensAdmission {
             placement: LensAdmissionPlacement::Gpu,
             requested_vram_bytes: 0,
-            available_vram_bytes: available_after_tei(budgeter, request.tei_reserved_bytes),
+            available_vram_bytes: available_after_tei(budgeter, request.tei_reserved_bytes)?,
             guard: None,
         });
     }
 
-    let available = available_after_tei(budgeter, request.tei_reserved_bytes);
+    let available = available_after_tei(budgeter, request.tei_reserved_bytes)?;
     if request.lens_vram_bytes <= available {
         return Ok(LensAdmission {
             placement: LensAdmissionPlacement::Gpu,
             requested_vram_bytes: request.lens_vram_bytes,
             available_vram_bytes: available,
             guard: Some(budgeter.reserve(request.lens_vram_bytes)?),
-        });
-    }
-
-    if request.allow_cpu_fallback {
-        return Ok(LensAdmission {
-            placement: LensAdmissionPlacement::Cpu,
-            requested_vram_bytes: request.lens_vram_bytes,
-            available_vram_bytes: available,
-            guard: None,
         });
     }
 
@@ -81,8 +70,8 @@ pub fn admit_lens<'b, P: VramProbe>(
 fn available_after_tei<P: VramProbe>(
     budgeter: &VramBudgeter<P>,
     tei_reserved_bytes: usize,
-) -> usize {
-    let stats = budgeter.stats();
+) -> Result<usize> {
+    let stats = budgeter.stats()?;
     let soft_available = stats
         .soft_cap_bytes
         .saturating_sub(stats.allocated_bytes)
@@ -91,7 +80,7 @@ fn available_after_tei<P: VramProbe>(
         .device_free_bytes
         .saturating_sub(RESERVED_HEADROOM_BYTES)
         .saturating_sub(tei_reserved_bytes);
-    soft_available.min(device_available)
+    Ok(soft_available.min(device_available))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,24 +141,27 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
         requested_bytes: usize,
         batch_size: usize,
         deadline: Instant,
-    ) -> AdmitDecision {
+    ) -> Result<AdmitDecision> {
         if requested_bytes == 0 {
-            return self.split(batch_size);
+            return Ok(self.split(batch_size));
         }
         if batch_size == 0 {
-            return self.fail();
+            return Ok(self.fail());
         }
         if deadline <= Instant::now() {
-            return self.fail();
+            return Ok(self.fail());
         }
-        if self.budgeter.can_allocate(requested_bytes).is_ok() {
-            return self.split(batch_size);
+        self.ensure_registry_admission_safe()?;
+        match self.budgeter.can_allocate(requested_bytes) {
+            Ok(()) => return Ok(self.split(batch_size)),
+            Err(error) if error.code() == "CALYX_FORGE_VRAM_BUDGET" => {}
+            Err(error) => return Err(error),
         }
-        if self.evict_then_can_allocate(requested_bytes) {
-            return self.split(batch_size);
+        if self.evict_then_can_allocate(requested_bytes)? {
+            return Ok(self.split(batch_size));
         }
         if let Some(sub_batch_size) = self.next_split(batch_size) {
-            return self.split(sub_batch_size);
+            return Ok(self.split(sub_batch_size));
         }
         self.queue_or_fail(requested_bytes, batch_size, deadline)
     }
@@ -188,15 +180,22 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
         self.run_range(bytes, batch, 0, deadline, &mut f)
     }
 
-    pub fn queue_len(&self) -> usize {
-        self.queue.lock().map(|queue| queue.len()).unwrap_or(0)
+    pub fn queue_len(&self) -> Result<usize> {
+        Ok(self
+            .queue
+            .lock()
+            .map_err(|_| admission_state_error("dispatch queue lock is poisoned"))?
+            .len())
     }
 
-    pub fn queued_snapshot(&self) -> Vec<QueuedDispatch> {
-        self.queue
+    pub fn queued_snapshot(&self) -> Result<Vec<QueuedDispatch>> {
+        Ok(self
+            .queue
             .lock()
-            .map(|queue| queue.iter().copied().collect())
-            .unwrap_or_default()
+            .map_err(|_| admission_state_error("dispatch queue lock is poisoned"))?
+            .iter()
+            .copied()
+            .collect())
     }
 
     fn run_range<F, R>(
@@ -211,7 +210,7 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
         F: FnMut(usize, usize) -> Result<R>,
         R: AdmissionOutput,
     {
-        match self.decide(bytes, batch, deadline) {
+        match self.decide(bytes, batch, deadline)? {
             AdmitDecision::Split { sub_batch_size } if sub_batch_size >= batch => {
                 let _guard = self.budgeter.reserve(bytes)?;
                 f(offset, batch)
@@ -230,17 +229,36 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
                 bytes,
                 batch,
                 "dispatch queued; synchronous run_with_admission has no completed result",
-            )),
-            AdmitDecision::Fail => Err(self.budget_error(bytes, batch, "admission failed closed")),
+            )?),
+            AdmitDecision::Fail => {
+                Err(self.budget_error(bytes, batch, "admission failed closed")?)
+            }
         }
     }
 
-    fn evict_then_can_allocate(&self, requested_bytes: usize) -> bool {
-        let Ok(mut registry) = self.registry.lock() else {
-            return false;
-        };
-        registry.evict_until(requested_bytes).is_ok()
-            && self.budgeter.can_allocate(requested_bytes).is_ok()
+    fn ensure_registry_admission_safe(&self) -> Result<()> {
+        self.registry
+            .lock()
+            .map_err(|_| admission_state_error("GPU allocation registry lock is poisoned"))?
+            .ensure_admission_safe()
+    }
+
+    fn evict_then_can_allocate(&self, requested_bytes: usize) -> Result<bool> {
+        self.budgeter.free_device_vram_bytes()?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| admission_state_error("GPU allocation registry lock is poisoned"))?;
+        match registry.evict_until(requested_bytes) {
+            Ok(()) => {}
+            Err(error) if error.code() == "CALYX_FORGE_VRAM_BUDGET" => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        match self.budgeter.can_allocate(requested_bytes) {
+            Ok(()) => Ok(true),
+            Err(error) if error.code() == "CALYX_FORGE_VRAM_BUDGET" => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn next_split(&self, batch_size: usize) -> Option<usize> {
@@ -256,12 +274,13 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
         requested_bytes: usize,
         batch_size: usize,
         deadline: Instant,
-    ) -> AdmitDecision {
-        let Ok(mut queue) = self.queue.lock() else {
-            return self.fail();
-        };
+    ) -> Result<AdmitDecision> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| admission_state_error("dispatch queue lock is poisoned"))?;
         if queue.len() >= self.queue_cap {
-            return self.fail();
+            return Ok(self.fail());
         }
         queue.push_back(QueuedDispatch {
             requested_bytes,
@@ -270,7 +289,7 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
             enqueued_at: Instant::now(),
         });
         self.budgeter.record_admission_queued();
-        AdmitDecision::Queue { deadline }
+        Ok(AdmitDecision::Queue { deadline })
     }
 
     fn split(&self, sub_batch_size: usize) -> AdmitDecision {
@@ -283,13 +302,18 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
         AdmitDecision::Fail
     }
 
-    fn budget_error(&self, requested_bytes: usize, batch_size: usize, reason: &str) -> ForgeError {
-        let stats = self.budgeter.stats();
+    fn budget_error(
+        &self,
+        requested_bytes: usize,
+        batch_size: usize,
+        reason: &str,
+    ) -> Result<ForgeError> {
+        let stats = self.budgeter.stats()?;
         let soft_available = stats.soft_cap_bytes.saturating_sub(stats.allocated_bytes);
         let device_available = stats
             .device_free_bytes
             .saturating_sub(RESERVED_HEADROOM_BYTES);
-        ForgeError::VramBudget {
+        Ok(ForgeError::VramBudget {
             detail: format!(
                 "{reason}: requested_bytes={requested_bytes} available_bytes={} budget_bytes={} allocated_bytes={} device_free_bytes={} batch_size={batch_size}",
                 soft_available.min(device_available),
@@ -298,7 +322,7 @@ impl<'b, P: VramProbe, D: BlockDeallocator> AdmissionController<'b, P, D> {
                 stats.device_free_bytes
             ),
             remediation: VRAM_BUDGET_REMEDIATION.to_string(),
-        }
+        })
     }
 }
 
@@ -311,4 +335,12 @@ fn proportional_bytes(total_bytes: usize, total_batch: usize, sub_batch: usize) 
     per_item
         .saturating_mul(sub_batch)
         .saturating_add(remainder.min(sub_batch))
+}
+
+fn admission_state_error(detail: &'static str) -> ForgeError {
+    ForgeError::RuntimeBoundary {
+        code: "CALYX_FORGE_GPU_ADMISSION_STATE_UNAVAILABLE",
+        detail: detail.to_string(),
+        remediation: "preserve the process and allocation journal, then inspect the exact poisoned owner before admitting more GPU work",
+    }
 }

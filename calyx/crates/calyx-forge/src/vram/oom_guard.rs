@@ -168,7 +168,7 @@ impl<'b, P: VramProbe, D: BlockDeallocator, A: CudaMalloc> OomGuard<'b, P, D, A>
                 "OOM guard could not lock GPU block registry after cudaMalloc OOM: requested_bytes={size} attempt={attempt}"
             ))
         })?;
-        if registry.evict_lru().is_none() {
+        if registry.evict_lru()?.is_none() {
             return Err(self.final_budget_failure(format!(
                 "cudaMalloc OOM and no GPU blocks were evictable: requested_bytes={size} attempt={attempt}"
             )));

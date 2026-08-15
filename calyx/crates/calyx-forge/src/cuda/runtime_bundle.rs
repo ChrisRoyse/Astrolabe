@@ -216,7 +216,7 @@ struct OwnedModule {
 
 enum ModuleFileGuard {
     Bundle { _verified: VerifiedBundleFile },
-    System { _verified: VerifiedSystemFile },
+    System { _verified: Box<VerifiedSystemFile> },
 }
 
 struct VerifiedBundleFile {
@@ -971,7 +971,7 @@ fn load_verified_system_module(
     load_exact_library(
         &path,
         ModuleFileGuard::System {
-            _verified: verified,
+            _verified: Box::new(verified),
         },
     )
 }
@@ -1397,7 +1397,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         let handle = load_exact_library(
             &path,
             ModuleFileGuard::System {
-                _verified: verified,
+                _verified: Box::new(verified),
             },
         )?;
         if system_module_handles
@@ -2048,17 +2048,15 @@ fn reject_ambient_modules(
         {
             Some(required) if same_path(&canonical, required) => {}
             Some(required) => {
-                if require_cuda {
-                    if let Some(policy) = driver_store_companion_policy(lock, &lower) {
-                        let owner = verify_locked_system_module(lock, system32, &policy.owner)?;
-                        let _companion = verify_locked_driver_store_companion(
-                            system32,
-                            policy,
-                            &canonical,
-                            owner.attestation(),
-                        )?;
-                        continue;
-                    }
+                if require_cuda && let Some(policy) = driver_store_companion_policy(lock, &lower) {
+                    let owner = verify_locked_system_module(lock, system32, &policy.owner)?;
+                    let _companion = verify_locked_driver_store_companion(
+                        system32,
+                        policy,
+                        &canonical,
+                        owner.attestation(),
+                    )?;
+                    continue;
                 }
                 return Err(runtime_error(
                     "CALYX_ONNX_RUNTIME_AMBIENT_MODULE",
@@ -2124,15 +2122,15 @@ fn attest_modules(
         allow_ort_managed,
     )?;
     let expected = expected_module_paths(lock, root, system32, require_cuda)?;
-    let companion_names = require_cuda
-        .then(|| {
-            lock.loaded_module_policy
-                .driver_store_companions
-                .iter()
-                .map(|policy| policy.name.to_ascii_lowercase())
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+    let companion_names = if require_cuda {
+        lock.loaded_module_policy
+            .driver_store_companions
+            .iter()
+            .map(|policy| policy.name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let mut loaded = BTreeMap::<String, Vec<&PathBuf>>::new();
     for module in modules {
         let Some(name) = module.file_name().and_then(OsStr::to_str) else {
@@ -2294,7 +2292,7 @@ fn attest_modules(
             let retained_handle = load_exact_library(
                 &canonical,
                 ModuleFileGuard::System {
-                    _verified: verified,
+                    _verified: Box::new(verified),
                 },
             )?;
             out.push(PinnedCudaModuleAttestation {
