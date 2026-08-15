@@ -168,7 +168,7 @@ impl LatentRelation {
     }
 
     /// Intermediaries reachable from a node under this relation.
-    fn expand<'g>(self, graph: &'g IndexedGraph, index: usize) -> &'g [usize] {
+    fn expand(self, graph: &IndexedGraph, index: usize) -> &[usize] {
         match self {
             Self::Coupling => graph.out_neighbors(index),
             Self::CoCitation => graph.in_neighbors(index),
@@ -178,7 +178,7 @@ impl LatentRelation {
 
     /// Nodes that share an intermediary under this relation. This is the set the
     /// rarity denominator counts.
-    fn sharers<'g>(self, graph: &'g IndexedGraph, intermediary: usize) -> &'g [usize] {
+    fn sharers(self, graph: &IndexedGraph, intermediary: usize) -> &[usize] {
         match self {
             Self::Coupling => graph.in_neighbors(intermediary),
             Self::CoCitation => graph.out_neighbors(intermediary),

@@ -161,11 +161,14 @@ pub const CBM_SQLITE_SCHEMA_VERSION: i64 = 6;
 const CBM_SEMANTIC_VECTOR_DIMENSION: i64 = 768;
 const CBM_SEMANTIC_MIN_ELIGIBLE_NODES: i64 = 2;
 
+type SemanticSourceColumn = (&'static str, &'static str, i64);
+type SemanticSourceTable = (&'static str, &'static [SemanticSourceColumn]);
+
 /// Frozen semantic source-column contract for the seven CBM product tables.
 /// `(name, declared_type, hidden)` is compared in exact `cid` order against
 /// `pragma_table_xinfo`; an added, removed, reordered, retyped, or differently
 /// generated column is schema drift and refuses before any source row is read.
-const CBM_SEMANTIC_SOURCE_TABLES: &[(&str, &[(&str, &str, i64)])] = &[
+const CBM_SEMANTIC_SOURCE_TABLES: &[SemanticSourceTable] = &[
     (
         "projects",
         &[
@@ -1180,6 +1183,12 @@ struct PreparedConstellation {
     semantic_value_slots: Vec<SlotId>,
 }
 
+struct NodeConstellationInput {
+    node: ExtractedNode,
+    identity: SymbolIdentity,
+    semantic_values: BTreeMap<SlotId, SemanticValue>,
+}
+
 #[derive(Debug, Clone)]
 struct PreparedLiveSymbol {
     node_id: i64,
@@ -1199,12 +1208,16 @@ struct PreparedLiveSymbol {
 struct PreparedSemanticConstellation {
     family: SemanticFamily,
     source_key: String,
-    links: Vec<CxId>,
     canonical_input_bytes: Vec<u8>,
     input_hash: [u8; 32],
     cx_id: CxId,
     slot_ids: Vec<SlotId>,
     measured: Option<Constellation>,
+}
+
+struct PreparedSemanticConstellations {
+    constellations: Vec<PreparedSemanticConstellation>,
+    graph_rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1457,11 +1470,10 @@ struct PreparedBatch {
     structural_only: usize,
     sqlite_edges: usize,
     edge_skips: EdgeSkipCounters,
-    /// Exact source payloads referenced by v4/v3 node rows. Non-structural
-    /// payloads remain owned by their prepared constellation and are addressed
-    /// by index; structural payloads move here when their temporary node is
-    /// consumed. The map therefore adds no full-corpus source clone.
-    exact_sources: BTreeMap<[u8; 32], PreparedExactSource>,
+    /// Exact source payloads referenced by v4 node rows. Every structural label
+    /// is a measured constellation, so the map owns only constellation indices
+    /// and never clones the source corpus.
+    exact_sources: BTreeMap<[u8; 32], usize>,
     /// Persisted Graph CF keys this batch reuses byte-for-byte from unchanged files (#372):
     /// node-map rows for digest-reused symbols, typed/raw edge rows whose endpoints are both
     /// reused, manifest rows for unchanged files, and their file-hash rows. These keys were
@@ -1473,12 +1485,6 @@ struct PreparedBatch {
     encode_skip: EncodeSkipReport,
     /// Per-phase wall-clock millis of batch preparation (#23 latency telemetry).
     timing_ms: Vec<(&'static str, u64)>,
-}
-
-#[derive(Debug, Clone)]
-enum PreparedExactSource {
-    Constellation(usize),
-    Structural(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -4642,7 +4648,7 @@ where
     }
     let semantic_inputs =
         build_non_node_semantic_inputs(&metadata, &edges, &constellations, options.panel_version)?;
-    let (semantic_constellations, semantic_graph_rows) = prepare_non_node_semantic_constellations(
+    let prepared_semantic = prepare_non_node_semantic_constellations(
         vault,
         runtime,
         options,
@@ -4672,7 +4678,7 @@ where
         &mut encode_skip,
         &mut project_digests,
     )?;
-    graph_rows.extend(semantic_graph_rows);
+    graph_rows.extend(prepared_semantic.graph_rows);
     let coverage_witness = coverage.finish(
         &options.project,
         options.panel_version,
@@ -4782,13 +4788,13 @@ where
         register_exact_source(
             &mut exact_sources,
             &constellations,
-            PreparedExactSource::Constellation(constellation_index),
+            constellation_index,
             &constellations[constellation_index].symbol.qualified_name,
         )?;
     }
     Ok(PreparedBatch {
         constellations,
-        semantic_constellations,
+        semantic_constellations: prepared_semantic.constellations,
         semantic_coverage: coverage_witness,
         graph_rows,
         edge_rows,
@@ -4828,41 +4834,37 @@ where
     items.par_iter_mut().try_for_each(f)
 }
 
-fn prepared_exact_source_bytes<'a>(
-    source: &'a PreparedExactSource,
-    constellations: &'a [PreparedLiveSymbol],
-) -> IngestResult<&'a [u8]> {
-    match source {
-        PreparedExactSource::Constellation(index) => constellations
-            .get(*index)
-            .map(|prepared| prepared.symbol.source_snippet_bytes.as_slice())
-            .ok_or_else(|| {
-                IngestError::InvalidInput(format!(
-                    "prepared exact-source constellation index {index} is out of range"
-                ))
-            }),
-        PreparedExactSource::Structural(bytes) => Ok(bytes),
-    }
+fn prepared_exact_source_bytes(
+    constellation_index: usize,
+    constellations: &[PreparedLiveSymbol],
+) -> IngestResult<&[u8]> {
+    constellations
+        .get(constellation_index)
+        .map(|prepared| prepared.symbol.source_snippet_bytes.as_slice())
+        .ok_or_else(|| {
+            IngestError::InvalidInput(format!(
+                "prepared exact-source constellation index {constellation_index} is out of range"
+            ))
+        })
 }
 
 fn register_exact_source(
-    sources: &mut BTreeMap<[u8; 32], PreparedExactSource>,
+    sources: &mut BTreeMap<[u8; 32], usize>,
     constellations: &[PreparedLiveSymbol],
-    candidate: PreparedExactSource,
+    candidate_index: usize,
     qualified_name: &str,
 ) -> IngestResult<()> {
-    let hash = *blake3::hash(prepared_exact_source_bytes(&candidate, constellations)?).as_bytes();
-    if let Some(existing) = sources.get(&hash) {
-        if prepared_exact_source_bytes(existing, constellations)?
-            != prepared_exact_source_bytes(&candidate, constellations)?
-        {
+    let candidate_bytes = prepared_exact_source_bytes(candidate_index, constellations)?;
+    let hash = *blake3::hash(candidate_bytes).as_bytes();
+    if let Some(existing_index) = sources.get(&hash) {
+        if prepared_exact_source_bytes(*existing_index, constellations)? != candidate_bytes {
             return Err(IngestError::InvalidInput(format!(
                 "exact-source BLAKE3 collision while preparing symbol {qualified_name}"
             )));
         }
         return Ok(());
     }
-    sources.insert(hash, candidate);
+    sources.insert(hash, candidate_index);
     Ok(())
 }
 
@@ -5640,9 +5642,11 @@ where
             runtime,
             options,
             driver,
-            node,
-            identity,
-            semantic_values,
+            NodeConstellationInput {
+                node,
+                identity,
+                semantic_values,
+            },
             retention,
         )
     })
@@ -5722,9 +5726,11 @@ where
         runtime,
         options,
         driver,
-        node,
-        identity,
-        semantic_values,
+        NodeConstellationInput {
+            node,
+            identity,
+            semantic_values,
+        },
         retention,
     )?;
     Ok(PreparedLiveSymbol {
@@ -6050,22 +6056,24 @@ fn semantic_modality(values: &BTreeMap<SlotId, SemanticValue>) -> IngestResult<M
     Ok(Modality::Structured)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn measure_semantic_constellation<C, R>(
     vault: &AsterVault<C>,
     runtime: &R,
     options: &SqliteImportOptions,
     driver: &PanelDriver,
-    family: SemanticFamily,
-    source_key: String,
-    links: Vec<CxId>,
-    values: BTreeMap<SlotId, SemanticValue>,
+    input: SemanticInputRow,
     retention: InputRetention,
 ) -> IngestResult<PreparedSemanticConstellation>
 where
     C: Clock,
     R: SlotRuntime,
 {
+    let SemanticInputRow {
+        family,
+        source_key,
+        links: _,
+        values,
+    } = input;
     let canonical_input_bytes = semantic_canonical_input_bytes(family, &source_key, &values)?;
     let mut slot_ids = Vec::with_capacity(values.len() + 1);
     slot_ids.push(family.presence_slot());
@@ -6154,7 +6162,6 @@ where
     Ok(PreparedSemanticConstellation {
         family,
         source_key,
-        links,
         canonical_input_bytes,
         input_hash,
         cx_id,
@@ -6717,7 +6724,7 @@ fn prepare_non_node_semantic_constellations<C, R>(
     preserved_keys: &mut BTreeSet<Vec<u8>>,
     coverage: &mut SemanticCoverageAccumulator,
     retention: InputRetention,
-) -> IngestResult<(Vec<PreparedSemanticConstellation>, Vec<(Vec<u8>, Vec<u8>)>)>
+) -> IngestResult<PreparedSemanticConstellations>
 where
     C: Clock,
     R: SlotRuntime + Sync,
@@ -6774,7 +6781,6 @@ where
             reused.push(PreparedSemanticConstellation {
                 family: input.family,
                 source_key: input.source_key,
-                links: input.links,
                 canonical_input_bytes: Vec::new(),
                 input_hash,
                 cx_id,
@@ -6789,17 +6795,8 @@ where
         to_measure,
         options.workers,
         |(input, expected_cx, expected_slots, key, value)| {
-            let prepared = measure_semantic_constellation(
-                vault,
-                runtime,
-                options,
-                driver,
-                input.family,
-                input.source_key,
-                input.links,
-                input.values,
-                retention,
-            )?;
+            let prepared =
+                measure_semantic_constellation(vault, runtime, options, driver, input, retention)?;
             if prepared.cx_id != expected_cx {
                 return Err(semantic_coverage_refusal(
                     format!(
@@ -6832,7 +6829,10 @@ where
             .then_with(|| left.source_key.cmp(&right.source_key))
     });
     graph_rows.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok((reused, graph_rows))
+    Ok(PreparedSemanticConstellations {
+        constellations: reused,
+        graph_rows,
+    })
 }
 
 fn prepare_constellation<C, R>(
@@ -6840,15 +6840,18 @@ fn prepare_constellation<C, R>(
     runtime: &R,
     options: &SqliteImportOptions,
     driver: &PanelDriver,
-    node: ExtractedNode,
-    identity: SymbolIdentity,
-    semantic_values: BTreeMap<SlotId, SemanticValue>,
+    input: NodeConstellationInput,
     retention: InputRetention,
 ) -> IngestResult<PreparedConstellation>
 where
     C: Clock,
     R: SlotRuntime,
 {
+    let NodeConstellationInput {
+        node,
+        identity,
+        semantic_values,
+    } = input;
     let semantic_value_slots = semantic_values.keys().copied().collect::<Vec<_>>();
     let legacy_slots_enabled = !node.label.is_structural();
     let mut input = PanelInput::with_available_slots(node.label, options.available_slots.clone())
@@ -7031,39 +7034,6 @@ fn node_map_graph_row(
     };
     Ok((
         graph_key(NODE_MAP_PREFIX, &prepared.symbol.project, prepared.node_id)?,
-        serde_json::to_vec(&row)?,
-    ))
-}
-
-fn structural_graph_row(
-    options: &SqliteImportOptions,
-    node: &ExtractedNode,
-) -> IngestResult<(Vec<u8>, Vec<u8>)> {
-    let (source_present, source_ref, source_sha256, start_byte, end_byte) =
-        symbol_exact_source_contract(&node.symbol)?;
-    let row = StructuralNodeRow {
-        schema: SCHEMA_STRUCTURAL_NODE.to_string(),
-        project: node.symbol.project.clone(),
-        node_id: node.id,
-        atom_id: node.atom_id.clone(),
-        qualified_name: node.symbol.qualified_name.clone(),
-        label: node.symbol.label.clone(),
-        name: node.name.clone(),
-        file_path: node.symbol.rel_file_path.clone(),
-        commit: options.commit.clone(),
-        start_line: i64::from(node.symbol.start_line),
-        end_line: i64::from(node.symbol.end_line),
-        source_present,
-        source_bytes: Vec::new(),
-        source_ref,
-        source_sha256,
-        start_byte,
-        end_byte,
-        properties_json: Some(node.properties_json.clone()),
-        node_vector: node.node_vector.clone(),
-    };
-    Ok((
-        graph_key(STRUCTURAL_NODE_PREFIX, &node.symbol.project, node.id)?,
         serde_json::to_vec(&row)?,
     ))
 }
@@ -7798,7 +7768,7 @@ impl<'a> ImportSemanticReadback<'a> {
                                 ))
                             })?;
                         let source = prepared_exact_source_bytes(
-                            prepared_source,
+                            *prepared_source,
                             &self.prepared.constellations,
                         )?;
                         if source.len() as u64 != reference.byte_len
@@ -8025,7 +7995,7 @@ where
                 hex_lower(&input_hash)
             ))
         })?;
-        let source_bytes = prepared_exact_source_bytes(prepared_source, &prepared.constellations)?;
+        let source_bytes = prepared_exact_source_bytes(*prepared_source, &prepared.constellations)?;
         if blake3::hash(source_bytes).as_bytes() != &input_hash {
             return Err(IngestError::InvalidInput(format!(
                 "prepared exact source {} no longer matches its BLAKE3 address",

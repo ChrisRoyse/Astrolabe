@@ -350,13 +350,13 @@ impl GitHistoryState {
         match self {
             Self::Committed { oid, symbolic_ref } => {
                 validate_oid(oid)?;
-                if let Some(symbolic_ref) = symbolic_ref {
-                    if !valid_branch_ref(symbolic_ref) {
-                        return Err(ArchaeologyError::new(
-                            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-                            format!("invalid committed symbolic branch ref {symbolic_ref:?}"),
-                        ));
-                    }
+                if let Some(symbolic_ref) = symbolic_ref
+                    && !valid_branch_ref(symbolic_ref)
+                {
+                    return Err(ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!("invalid committed symbolic branch ref {symbolic_ref:?}"),
+                    ));
                 }
                 Ok(())
             }

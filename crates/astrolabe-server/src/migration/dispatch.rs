@@ -78,6 +78,10 @@ pub fn handle_jsonrpc_raw(
     let Some(method) = request_obj.get("method").and_then(Value::as_str) else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
+    if let Err(fault) = validate_mcp_request_metadata(method, request_obj) {
+        tracing::warn!(method, code = fault.code(), "mcp.request_metadata_invalid");
+        return request_invalid_params_response(request_obj, fault);
+    }
     if method == "tools/list" {
         return handle_tools_list_jsonrpc(runner, request_json);
     }
@@ -119,6 +123,52 @@ pub fn handle_jsonrpc_raw(
 
     let result_raw = handle_tool_raw_admitted(runner, tool_name, &args_json)?;
     Ok(Some(jsonrpc_result_response(id.clone(), &result_raw)?))
+}
+
+/// Validate the common MCP request envelope before method-specific validation
+/// or tool dispatch. `_meta` is protocol metadata, not a tool argument: its
+/// object may carry extension keys and values, but the field itself must keep
+/// the object shape declared by MCP RequestParams.
+fn validate_mcp_request_metadata(
+    method: &str,
+    request: &Map<String, Value>,
+) -> Result<(), ToolFault> {
+    let Some(params) = request.get("params").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(metadata) = params.get("_meta") else {
+        return Ok(());
+    };
+    if metadata.is_object() {
+        return Ok(());
+    }
+
+    Err(ToolFault::new(
+        "ASTRO_MCP_REQUEST_META_INVALID",
+        format!(
+            "{method} params._meta must be a JSON object; received {}",
+            json_type_name(metadata)
+        ),
+        "send params._meta as an object containing protocol metadata, or omit it when the negotiated MCP protocol permits omission",
+    )
+    .with_argument("params._meta", "object or omitted", metadata)
+    .with_detail("method", method))
+}
+
+fn request_invalid_params_response(
+    request: &Map<String, Value>,
+    fault: ToolFault,
+) -> Result<Option<String>, DynError> {
+    let Some(id) = request
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number() || id.is_null())
+        .cloned()
+    else {
+        // JSON-RPC notifications never receive a response. The structured
+        // warning emitted by the caller is the durable process diagnostic.
+        return Ok(None);
+    };
+    Ok(Some(jsonrpc_invalid_params_response(id, fault)?))
 }
 
 pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
@@ -524,22 +574,29 @@ pub(crate) fn handle_tools_list_jsonrpc(
                 actual_type = json_type_name(params),
                 "mcp.tools_list_invalid_params"
             );
-            return Ok(Some(tools_list_invalid_params_response(id, fault)?));
+            return Ok(Some(jsonrpc_invalid_params_response(id, fault)?));
         };
-        if let Some((name, value)) = params.iter().find(|(name, _)| name.as_str() != "cursor") {
+        if let Some((name, value)) = params
+            .iter()
+            .find(|(name, _)| !matches!(name.as_str(), "cursor" | "_meta"))
+        {
             let fault = ToolFault::new(
                 "ASTRO_MCP_TOOLS_LIST_ARGUMENT_UNKNOWN",
                 format!("tools/list received unknown parameter {name:?}"),
-                "remove the unknown parameter; only a server-issued cursor is defined, and this executable returns its complete bounded roster without issuing one",
+                "remove the unknown parameter; only protocol _meta or a server-issued cursor is defined, and this executable returns its complete bounded roster without issuing one",
             )
-            .with_argument(format!("params.{name}"), "cursor or omitted", value);
+            .with_argument(
+                format!("params.{name}"),
+                "_meta, cursor, or omitted",
+                value,
+            );
             tracing::warn!(
                 code = fault.code(),
                 parameter = name.as_str(),
                 actual_type = json_type_name(value),
                 "mcp.tools_list_unknown_param"
             );
-            return Ok(Some(tools_list_invalid_params_response(id, fault)?));
+            return Ok(Some(jsonrpc_invalid_params_response(id, fault)?));
         }
         if let Some(cursor) = params.get("cursor") {
             let mut fault = ToolFault::new(
@@ -556,7 +613,7 @@ pub(crate) fn handle_tools_list_jsonrpc(
                 actual_type = json_type_name(cursor),
                 "mcp.tools_list_invalid_cursor"
             );
-            return Ok(Some(tools_list_invalid_params_response(id, fault)?));
+            return Ok(Some(jsonrpc_invalid_params_response(id, fault)?));
         }
     }
 
@@ -647,7 +704,7 @@ fn tool_definition_name<'a>(definition: &'a Value, registry: &str) -> Result<&'a
         })
 }
 
-fn tools_list_invalid_params_response(id: Value, fault: ToolFault) -> Result<String, DynError> {
+fn jsonrpc_invalid_params_response(id: Value, fault: ToolFault) -> Result<String, DynError> {
     Ok(serde_json::to_string(&json!({
         "jsonrpc": "2.0",
         "id": id,

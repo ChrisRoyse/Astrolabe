@@ -1147,12 +1147,7 @@ fn build_candidates(
                 c: pair.c,
                 novelty,
                 cross_community,
-                grounded_confidence: grounded_confidence(
-                    &concepts,
-                    pair.a,
-                    intermediary.id,
-                    pair.c,
-                ),
+                grounded_confidence: grounded_confidence(concepts, pair.a, intermediary.id, pair.c),
                 claim: format!(
                     "{} and {} may share a latent code relationship through {} ({})",
                     concepts[&pair.a].qualified_name,
@@ -1754,17 +1749,12 @@ fn validation_fold(
             .len()
             .saturating_sub(held_out_candidates),
     );
-    let binary_brier_at_k = Some(
-        (false_positives_at_k + false_negatives_at_k) as f64 / evaluation_pair_count.max(1) as f64,
-    );
+    let binary_brier_at_k =
+        (false_positives_at_k + false_negatives_at_k) as f64 / evaluation_pair_count.max(1) as f64;
     let prevalence = plan.held_out_pairs.len() as f64 / evaluation_pair_count.max(1) as f64;
-    let no_skill_binary_brier = Some(prevalence * (1.0 - prevalence));
-    let binary_brier_skill_at_k = if no_skill_binary_brier.is_some_and(|score| score > f64::EPSILON)
-    {
-        Some(
-            1.0 - binary_brier_at_k.expect("defined evaluation universe")
-                / no_skill_binary_brier.expect("positive no-skill Brier"),
-        )
+    let no_skill_binary_brier = prevalence * (1.0 - prevalence);
+    let binary_brier_skill_at_k = if no_skill_binary_brier > f64::EPSILON {
+        Some(1.0 - binary_brier_at_k / no_skill_binary_brier)
     } else {
         None
     };
@@ -1801,8 +1791,8 @@ fn validation_fold(
         reciprocal_rank,
         candidate_coverage_at_k: k as f64 / predicted.len().max(1) as f64,
         held_out_candidate_coverage: held_out_candidates as f64 / plan.held_out_pairs.len() as f64,
-        binary_brier_at_k,
-        no_skill_binary_brier,
+        binary_brier_at_k: Some(binary_brier_at_k),
+        no_skill_binary_brier: Some(no_skill_binary_brier),
         binary_brier_skill_at_k,
         rank_score_semantics: "resource_allocation_rank_score_not_a_calibrated_probability"
             .to_string(),
