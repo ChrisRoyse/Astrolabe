@@ -217,7 +217,7 @@ Assert-Astro (
     [string]$direct.happy.after.contexts[0] -ceq '' -and
     [string]$direct.happy.after.contexts[1] -ceq 'ctx-B' -and
     [string]$direct.happy.after.rows[0].strategy -ceq 'cross-higher-confidence' -and
-    [double]$direct.happy.after.rows[0].confidence -eq 0.95 -and
+    [single]$direct.happy.after.rows[0].confidence -eq [single]0.95 -and
     [bool]$direct.happy.after.rows[0].context_is_null -and
     [string]$direct.happy.after.rows[1].strategy -ceq 'cross-distinct-context' -and
     -not [bool]$direct.happy.after.rows[1].context_is_null
