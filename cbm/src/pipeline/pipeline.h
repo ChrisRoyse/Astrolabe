@@ -106,13 +106,22 @@ typedef struct {
  * workers join; a successful measured result requires
  * completed == denominator == recounted. Dynamic cross-LSP rows are processed
  * normally but owned by the already-counted cross-LSP units, so both quantities
- * remain explicit instead of being hidden in an ephemeral worker log. */
+ * remain explicit instead of being hidden in an ephemeral worker log. The
+ * same post-join pass folds every committed per-file cross-LSP merge receipt;
+ * accounted_units == cross_lsp_units, seen == seeded + source, and
+ * source == duplicate + appended are required for publication. */
 typedef struct {
     uint64_t completed;
     uint64_t denominator;
     uint64_t recounted;
     uint64_t dynamic_lsp_items;
     uint64_t cross_lsp_units;
+    uint64_t cross_lsp_accounted_units;
+    uint64_t cross_lsp_seen_rows;
+    uint64_t cross_lsp_seeded_rows;
+    uint64_t cross_lsp_source_rows;
+    uint64_t cross_lsp_duplicate_rows;
+    uint64_t cross_lsp_appended_rows;
 } cbm_pipeline_parallel_resolver_accounting_t;
 
 /* Exact successful execution route. Route describes the persisted operation;

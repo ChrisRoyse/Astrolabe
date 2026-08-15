@@ -8555,7 +8555,19 @@ static bool add_pipeline_parallel_resolver_accounting(
     bool required = expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO;
     bool internally_consistent = !present ||
                                  (accounting.completed == accounting.denominator &&
-                                  accounting.recounted == accounting.denominator);
+                                  accounting.recounted == accounting.denominator &&
+                                  accounting.cross_lsp_accounted_units ==
+                                      accounting.cross_lsp_units &&
+                                  accounting.cross_lsp_seeded_rows <=
+                                      UINT64_MAX - accounting.cross_lsp_source_rows &&
+                                  accounting.cross_lsp_seen_rows ==
+                                      accounting.cross_lsp_seeded_rows +
+                                          accounting.cross_lsp_source_rows &&
+                                  accounting.cross_lsp_duplicate_rows <=
+                                      accounting.cross_lsp_source_rows &&
+                                  accounting.cross_lsp_appended_rows ==
+                                      accounting.cross_lsp_source_rows -
+                                          accounting.cross_lsp_duplicate_rows);
 
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     if (!item ||
@@ -8568,7 +8580,19 @@ static bool add_pipeline_parallel_resolver_accounting(
          !yyjson_mut_obj_add_uint(doc, item, "denominator", accounting.denominator) ||
          !yyjson_mut_obj_add_uint(doc, item, "recounted", accounting.recounted) ||
          !yyjson_mut_obj_add_uint(doc, item, "dynamic_lsp_items", accounting.dynamic_lsp_items) ||
-         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_units", accounting.cross_lsp_units))) {
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_units", accounting.cross_lsp_units) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_accounted_units",
+                                 accounting.cross_lsp_accounted_units) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_seen_rows",
+                                 accounting.cross_lsp_seen_rows) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_seeded_rows",
+                                 accounting.cross_lsp_seeded_rows) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_source_rows",
+                                 accounting.cross_lsp_source_rows) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_duplicate_rows",
+                                 accounting.cross_lsp_duplicate_rows) ||
+         !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_appended_rows",
+                                 accounting.cross_lsp_appended_rows))) {
         return false;
     }
     if (!yyjson_mut_obj_add_val(doc, root, "parallel_resolver_accounting", item)) {
@@ -8616,6 +8640,18 @@ static char *build_index_parallel_resolver_accounting_error(
         yyjson_mut_obj_add_uint(doc, root, "recounted", accounting->recounted);
         yyjson_mut_obj_add_uint(doc, root, "dynamic_lsp_items", accounting->dynamic_lsp_items);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_units", accounting->cross_lsp_units);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_accounted_units",
+                               accounting->cross_lsp_accounted_units);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_seen_rows",
+                               accounting->cross_lsp_seen_rows);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_seeded_rows",
+                               accounting->cross_lsp_seeded_rows);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_source_rows",
+                               accounting->cross_lsp_source_rows);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_duplicate_rows",
+                               accounting->cross_lsp_duplicate_rows);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_appended_rows",
+                               accounting->cross_lsp_appended_rows);
     }
     yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
     char *json = yyjson_mut_write(doc, 0, NULL);

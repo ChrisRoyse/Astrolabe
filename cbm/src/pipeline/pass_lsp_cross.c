@@ -404,7 +404,10 @@ static char *pxc_resolved_call_identity(CBMArena *keys, const CBMResolvedCall *c
         return NULL;
     }
 
-    const char *context = call->preprocess_context_id ? call->preprocess_context_id : "";
+    const char *context =
+        call->preprocess_context_id && call->preprocess_context_id[0]
+            ? call->preprocess_context_id
+            : "";
     char *identity = cbm_arena_sprintf(
         keys, "%llu:%s\x1f%llu:%s\x1f%llu:%s", (unsigned long long)strlen(context), context,
         (unsigned long long)strlen(call->caller_qn), call->caller_qn,
@@ -419,123 +422,188 @@ static char *pxc_resolved_call_identity(CBMArena *keys, const CBMResolvedCall *c
     return identity;
 }
 
-/* Append cross-file results from `src_out` (allocated in a scratch arena
- * about to be destroyed) into `dst_calls` (lives in cache_entry->arena),
- * copying every string field into dst_arena. Skips entries whose
- * (preprocess_context_id, caller_qn, callee_qn) is already present — avoids
- * inflating the array with cross-file duplicates of per-file LSP output while
- * preserving otherwise-identical calls from distinct compiler contexts.
- *
- * Dedup uses a hash set keyed by pxc_resolved_call_identity, giving expected
- * O(1) membership.
- * The previous linear strcmp scan made each append O(n), so a file that
- * resolved very many cross-calls turned the whole append into O(n^2) and could
- * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
- * The key strings live in a scratch arena that is destroyed after the table. */
-static bool pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
-                               const CBMResolvedCallArray *src_out) {
-    if (!dst_arena || !dst_calls || !src_out || dst_calls->count < 0 || src_out->count < 0)
-        return false;
+static bool pxc_fail_result(CBMFileResult *result, const char *code, const char *operation,
+                            size_t requested, const char *message, const char *remediation) {
+    cbm_log_error("lsp_cross.append_failed", "code", code, "component",
+                  "lsp_cross.resolved_call_dedup", "operation", operation, "key", "", "message",
+                  message, "remediation", remediation);
+    cbm_file_result_set_error(result, code, operation, "cross_file_lsp", requested, message,
+                              remediation);
+    return false;
+}
 
-    uint64_t requested_capacity =
-        (uint64_t)(unsigned int)dst_calls->count + (uint64_t)(unsigned int)src_out->count + 1u;
+/* Copy scratch-owned resolver output into the retained file arena. All
+ * identity decisions deliberately happen later at the single post-dispatch
+ * boundary shared with the direct shared-registry paths. */
+static bool pxc_clone_results(CBMFileResult *result, const CBMResolvedCallArray *src_out) {
+    if (!result || !src_out || src_out->count < 0 ||
+        (src_out->count > 0 && !src_out->items)) {
+        return pxc_fail_result(
+            result, "CBM_LSP_RESULT_ARRAY_INVALID", "clone_results", 0,
+            "cross-LSP returned an invalid resolved-call array",
+            "repair the producing LSP array contract, then retry the complete corpus");
+    }
+    for (int j = 0; j < src_out->count; j++) {
+        const CBMResolvedCall *src = &src_out->items[j];
+        if (!src->caller_qn || !src->callee_qn) {
+            return pxc_fail_result(
+                result, "CBM_LSP_DEDUP_IDENTITY_INVALID", "clone_results", (size_t)j,
+                "resolved-call identity requires caller_qn and callee_qn",
+                "repair the producing LSP so every resolved call carries its exact caller and "
+                "callee qualified names, then retry");
+        }
+        CBMResolvedCall dst = {0};
+        dst.caller_qn = cbm_arena_strdup(&result->arena, src->caller_qn);
+        dst.callee_qn = cbm_arena_strdup(&result->arena, src->callee_qn);
+        dst.strategy = src->strategy ? cbm_arena_strdup(&result->arena, src->strategy) : NULL;
+        dst.confidence = src->confidence;
+        dst.reason = src->reason ? cbm_arena_strdup(&result->arena, src->reason) : NULL;
+        dst.preprocess_context_id =
+            src->preprocess_context_id
+                ? cbm_arena_strdup(&result->arena, src->preprocess_context_id)
+                : NULL;
+        if (!dst.caller_qn || !dst.callee_qn || (src->strategy && !dst.strategy) ||
+            (src->reason && !dst.reason) ||
+            (src->preprocess_context_id && !dst.preprocess_context_id) ||
+            !cbm_resolvedcall_push(&result->resolved_calls, &result->arena, dst)) {
+            return pxc_fail_result(
+                result, cbm_arena_failure_code(&result->arena),
+                cbm_arena_failure_operation(&result->arena), (size_t)j,
+                "resolved-call clone allocation failed",
+                "free memory or reduce repository size, then retry the complete corpus");
+        }
+    }
+    return true;
+}
+
+/* Canonicalize exactly the rows appended by one cross-LSP dispatch. This is
+ * the only identity boundary for both scratch-output and shared-registry
+ * resolvers. The pre-dispatch prefix is never reordered or collapsed; source
+ * rows retain first-seen order, and equal calls in different preprocessing
+ * contexts remain distinct. The receipt is committed only after array-count
+ * readback proves seeded + appended == retained. */
+bool cbm_pxc_canonicalize_appended_results(CBMFileResult *result, int seeded_count) {
+    if (!result || result->cross_lsp_accounting_present || seeded_count < 0 ||
+        result->resolved_calls.count < seeded_count ||
+        (result->resolved_calls.count > 0 && !result->resolved_calls.items)) {
+        return pxc_fail_result(
+            result, "CBM_LSP_DEDUP_STATE_INVALID", "canonicalize", 0,
+            "cross-LSP canonicalization received an invalid or duplicate merge state",
+            "preserve the generation and repair the single-dispatch accounting boundary");
+    }
+
+    uint64_t requested_capacity = (uint64_t)(unsigned int)result->resolved_calls.count + 1u;
     if (requested_capacity > UINT32_MAX) {
-        cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_CAPACITY_OVERFLOW",
-                      "component", "lsp_cross.resolved_call_dedup", "operation", "create",
-                      "key", "", "message", "resolved-call dedup capacity exceeds uint32",
-                      "remediation", "reduce repository size, then retry");
-        return false;
+        return pxc_fail_result(result, "CBM_LSP_DEDUP_CAPACITY_OVERFLOW", "create",
+                               (size_t)requested_capacity,
+                               "resolved-call dedup capacity exceeds uint32",
+                               "reduce repository size, then retry the complete corpus");
     }
 
     CBMArena keys;
     cbm_arena_init(&keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)requested_capacity);
     if (!seen) {
-        cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_ALLOC_FAILED", "component",
-                      "lsp_cross.resolved_call_dedup", "operation", "create", "key", "", "message",
-                      "resolved-call dedup index could not be allocated", "remediation",
-                      "free memory or reduce repository size, then retry");
         cbm_arena_destroy(&keys);
-        return false;
+        return pxc_fail_result(result, "CBM_LSP_DEDUP_ALLOC_FAILED", "create",
+                               (size_t)requested_capacity,
+                               "resolved-call dedup index could not be allocated",
+                               "free memory or reduce repository size, then retry");
     }
 
-    int seeded_rows = 0;
-    int source_rows = 0;
-    int duplicate_rows = 0;
-    int appended_rows = 0;
-    for (int i = 0; i < dst_calls->count; i++) {
-        const CBMResolvedCall *rc = &dst_calls->items[i];
-        char *k = pxc_resolved_call_identity(&keys, rc, "seed_identity");
-        if (!k || !cbm_ht_set_checked(seen, k, (void *)1, NULL)) {
-            if (k) {
-                cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_INSERT_FAILED",
-                              "component", "lsp_cross.resolved_call_dedup", "operation", "seed",
-                              "key", k, "message",
-                              "resolved-call dedup index could not retain an entry", "remediation",
-                              "free memory or reduce repository size, then retry");
+    for (int i = 0; i < seeded_count; i++) {
+        CBMResolvedCall *call = &result->resolved_calls.items[i];
+        if (call->preprocess_context_id && !call->preprocess_context_id[0]) {
+            call->preprocess_context_id = NULL;
+        }
+        char *key = pxc_resolved_call_identity(&keys, call, "seed_identity");
+        bool already_seen = key && cbm_ht_has(seen, key);
+        if (!key || (!already_seen && !cbm_ht_set_checked(seen, key, call, NULL))) {
+            const char *code = key ? "CBM_LSP_DEDUP_INSERT_FAILED"
+                                   : (call->caller_qn && call->callee_qn
+                                          ? cbm_arena_failure_code(&keys)
+                                          : "CBM_LSP_DEDUP_IDENTITY_INVALID");
+            cbm_ht_free(seen);
+            cbm_arena_destroy(&keys);
+            return pxc_fail_result(
+                result, code, key ? "seed" : "seed_identity", (size_t)i,
+                key ? "resolved-call dedup index could not retain a seeded entry"
+                    : "a seeded resolved call has no canonical identity",
+                key ? "free memory or reduce repository size, then retry"
+                    : "repair the per-file resolver identity, then retry the complete corpus");
+        }
+    }
+
+    int original_count = result->resolved_calls.count;
+    int write = seeded_count;
+    uint64_t duplicate_rows = 0;
+    for (int read = seeded_count; read < original_count; read++) {
+        CBMResolvedCall *call = &result->resolved_calls.items[read];
+        if (call->preprocess_context_id && !call->preprocess_context_id[0]) {
+            call->preprocess_context_id = NULL;
+        }
+        char *key = pxc_resolved_call_identity(&keys, call, "probe_identity");
+        if (!key) {
+            const char *code = call->caller_qn && call->callee_qn
+                                   ? cbm_arena_failure_code(&keys)
+                                   : "CBM_LSP_DEDUP_IDENTITY_INVALID";
+            cbm_ht_free(seen);
+            cbm_arena_destroy(&keys);
+            return pxc_fail_result(
+                result, code, "probe_identity", (size_t)read,
+                "a cross-LSP resolved call has no canonical identity",
+                "repair the cross-LSP resolver identity or memory pressure, then retry the "
+                "complete corpus");
+        }
+        CBMResolvedCall *retained = (CBMResolvedCall *)cbm_ht_get(seen, key);
+        if (retained) {
+            /* Stable first-observation order and highest-confidence lookup
+             * both predate this physical dedup. Preserve both: only a
+             * strictly better duplicate updates the non-identity payload. */
+            if (call->confidence > retained->confidence) {
+                retained->strategy = call->strategy;
+                retained->confidence = call->confidence;
+                retained->reason = call->reason;
             }
-            cbm_ht_free(seen);
-            cbm_arena_destroy(&keys);
-            return false;
-        }
-        seeded_rows++;
-    }
-
-    for (int j = 0; j < src_out->count; j++) {
-        const CBMResolvedCall *src = &src_out->items[j];
-        source_rows++;
-        char *k = pxc_resolved_call_identity(&keys, src, "probe_identity");
-        if (!k) {
-            cbm_ht_free(seen);
-            cbm_arena_destroy(&keys);
-            return false;
-        }
-        if (cbm_ht_has(seen, k)) {
             duplicate_rows++;
             continue;
         }
-        if (!cbm_ht_set_checked(seen, k, (void *)1, NULL)) {
-            cbm_log_error("lsp_cross.append_failed", "code", "CBM_LSP_DEDUP_INSERT_FAILED",
-                          "component", "lsp_cross.resolved_call_dedup", "operation", "insert",
-                          "key", k, "message",
-                          "resolved-call dedup index could not retain an entry", "remediation",
-                          "free memory or reduce repository size, then retry");
+        if (write != read) {
+            result->resolved_calls.items[write] = *call;
+        }
+        retained = &result->resolved_calls.items[write];
+        if (!cbm_ht_set_checked(seen, key, retained, NULL)) {
             cbm_ht_free(seen);
             cbm_arena_destroy(&keys);
-            return false;
+            return pxc_fail_result(result, "CBM_LSP_DEDUP_INSERT_FAILED", "insert",
+                                   (size_t)read,
+                                   "resolved-call dedup index could not retain a source entry",
+                                   "free memory or reduce repository size, then retry");
         }
-        CBMResolvedCall dst = {0};
-        dst.caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-        dst.callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-        dst.strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
-        dst.confidence = src->confidence;
-        dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-        dst.preprocess_context_id =
-            src->preprocess_context_id
-                ? cbm_arena_strdup(dst_arena, src->preprocess_context_id)
-                : NULL;
-        if (!dst.caller_qn || !dst.callee_qn || (src->strategy && !dst.strategy) ||
-            (src->reason && !dst.reason) ||
-            (src->preprocess_context_id && !dst.preprocess_context_id) ||
-            !cbm_resolvedcall_push(dst_calls, dst_arena, dst)) {
-            cbm_log_error("lsp_cross.append_failed", "code", cbm_arena_failure_code(dst_arena),
-                          "component", "lsp_cross.resolved_calls", "operation",
-                          cbm_arena_failure_operation(dst_arena), "key", src->caller_qn, "message",
-                          "resolved-call clone allocation failed", "remediation",
-                          "free memory or reduce repository size, then retry");
-            cbm_ht_free(seen);
-            cbm_arena_destroy(&keys);
-            return false;
-        }
-        appended_rows++;
+        write++;
     }
-
-    cbm_log_info("lsp_cross.resolved_call_dedup", "seeded_rows", itoa_buf(seeded_rows),
-                 "source_rows", itoa_buf(source_rows), "duplicate_rows", itoa_buf(duplicate_rows),
-                 "appended_rows", itoa_buf(appended_rows), "identity",
-                 "preprocess_context_id+caller_qn+callee_qn");
     cbm_ht_free(seen);
     cbm_arena_destroy(&keys);
+
+    uint64_t source_rows = (uint64_t)(unsigned int)(original_count - seeded_count);
+    uint64_t appended_rows = source_rows - duplicate_rows;
+    result->resolved_calls.count = write;
+    if ((uint64_t)(unsigned int)write != (uint64_t)(unsigned int)seeded_count + appended_rows) {
+        return pxc_fail_result(
+            result, "CBM_LSP_DEDUP_READBACK_MISMATCH", "readback", (size_t)write,
+            "canonical resolved-call count does not equal seeded plus appended rows",
+            "preserve the generation and repair cross-LSP canonicalization before retrying");
+    }
+
+    result->cross_lsp_seeded_rows = (uint64_t)(unsigned int)seeded_count;
+    result->cross_lsp_source_rows = source_rows;
+    result->cross_lsp_duplicate_rows = duplicate_rows;
+    result->cross_lsp_appended_rows = appended_rows;
+    result->cross_lsp_accounting_present = true;
+    cbm_log_info("lsp_cross.resolved_call_dedup", "seeded_rows", itoa_buf(seeded_count),
+                 "source_rows", itoa_buf((int)source_rows), "duplicate_rows",
+                 itoa_buf((int)duplicate_rows), "appended_rows", itoa_buf((int)appended_rows),
+                 "identity", "preprocess_context_id+caller_qn+callee_qn");
     return true;
 }
 
@@ -636,12 +704,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         break;
     }
 
-    if (!pxc_append_results(&r->arena, &r->resolved_calls, &out)) {
-        cbm_file_result_set_error(
-            r, "CBM_LSP_RESULT_APPEND_FAILED", "pxc_append_results", "cross_file_lsp",
-            (size_t)out.count, "resolved-call results could not be retained",
-            "free memory or reduce repository size, then retry the complete corpus");
-    }
+    pxc_clone_results(r, &out);
     cbm_arena_destroy(&scratch);
 }
 
@@ -659,12 +722,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_run_ts_lsp_cross(&scratch, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, defs,
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
-    if (!pxc_append_results(&r->arena, &r->resolved_calls, &out)) {
-        cbm_file_result_set_error(
-            r, "CBM_LSP_RESULT_APPEND_FAILED", "pxc_append_results", "cross_file_lsp",
-            (size_t)out.count, "resolved-call results could not be retained",
-            "free memory or reduce repository size, then retry the complete corpus");
-    }
+    pxc_clone_results(r, &out);
     cbm_arena_destroy(&scratch);
 }
 
@@ -698,6 +756,16 @@ int cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *s
                       "remediation", "preserve the complete extraction result through resolution");
         return -1;
     }
+    if (result->resolved_calls.count < 0 ||
+        (result->resolved_calls.count > 0 && !result->resolved_calls.items) ||
+        result->cross_lsp_accounting_present) {
+        pxc_fail_result(
+            result, "CBM_LSP_DEDUP_STATE_INVALID", "dispatch_admission", 0,
+            "cross-LSP dispatch requires one valid, not-yet-accounted resolved-call array",
+            "preserve the generation and repair the single-dispatch ownership boundary");
+        return -1;
+    }
+    int seeded_count = result->resolved_calls.count;
     CBMCargoManifest rust_manifest_view;
     if (lang == CBM_LANG_RUST && rust_manifest) {
         rust_manifest_view = *rust_manifest;
@@ -784,7 +852,10 @@ int cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *s
     }
 
     if (used_prebuilt) {
-        return cbm_arena_failed(&result->arena) ? -1 : 0;
+        if (cbm_arena_failed(&result->arena) || result->has_error) {
+            return -1;
+        }
+        return cbm_pxc_canonicalize_appended_results(result, seeded_count) ? 0 : -1;
     }
     /* Fallback: gopls per-file filter + per-file registry build. RUST is
      * exempt from the module filter: its resolution is Cargo-manifest-aware
@@ -828,7 +899,10 @@ int cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *s
                         imp_keys, imp_vals, imp_count, rust_manifest);
     }
     free(filtered);
-    return cbm_arena_failed(&result->arena) ? -1 : 0;
+    if (cbm_arena_failed(&result->arena) || result->has_error) {
+        return -1;
+    }
+    return cbm_pxc_canonicalize_appended_results(result, seeded_count) ? 0 : -1;
 }
 
 typedef struct {

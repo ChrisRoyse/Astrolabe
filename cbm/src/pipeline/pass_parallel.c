@@ -1952,8 +1952,32 @@ static int resolve_measure_items(const resolve_ctx_t *rc, uint64_t *measured) {
     return 0;
 }
 
+typedef struct {
+    uint64_t items;
+    uint64_t cross_lsp_accounted_units;
+    uint64_t cross_lsp_seeded_rows;
+    uint64_t cross_lsp_source_rows;
+    uint64_t cross_lsp_duplicate_rows;
+    uint64_t cross_lsp_appended_rows;
+} resolve_recount_result_t;
+
+static int resolve_recount_cross_lsp_fail(const resolve_ctx_t *rc, const char *code,
+                                           const char *path, size_t requested,
+                                           const char *message) {
+    cbm_pipeline_record_fatal_error(
+        rc ? rc->pipeline : NULL, code, "recount_cross_lsp_accounting", "parallel_resolve",
+        path ? path : "", requested, message,
+        "preserve the generation, inspect the per-file cross-LSP receipt, and repair the "
+        "canonical merge before retrying the unchanged repository");
+    return CBM_NOT_FOUND;
+}
+
 static int resolve_recount_items(const resolve_ctx_t *rc, uint64_t dynamic_lsp_items,
-                                 uint64_t cross_lsp_units, uint64_t *recounted) {
+                                  uint64_t cross_lsp_units, resolve_recount_result_t *recounted) {
+    if (!recounted) {
+        return CBM_NOT_FOUND;
+    }
+    memset(recounted, 0, sizeof(*recounted));
     uint64_t total = 0;
     for (int file_idx = 0; file_idx < rc->file_count; file_idx++) {
         CBMFileResult *result = rc->result_cache[file_idx];
@@ -1975,6 +1999,37 @@ static int resolve_recount_items(const resolve_ctx_t *rc, uint64_t dynamic_lsp_i
         if (!resolve_count_add(&total, fixed)) {
             return CBM_NOT_FOUND;
         }
+        if (result->cross_lsp_accounting_present) {
+            if (result->cross_lsp_duplicate_rows > result->cross_lsp_source_rows ||
+                result->cross_lsp_appended_rows !=
+                    result->cross_lsp_source_rows - result->cross_lsp_duplicate_rows ||
+                result->cross_lsp_seeded_rows >
+                    UINT64_MAX - result->cross_lsp_appended_rows ||
+                result->cross_lsp_seeded_rows + result->cross_lsp_appended_rows !=
+                    (uint64_t)(unsigned int)result->resolved_calls.count ||
+                !resolve_count_add(&recounted->cross_lsp_accounted_units, 1) ||
+                !resolve_count_add(&recounted->cross_lsp_seeded_rows,
+                                   result->cross_lsp_seeded_rows) ||
+                !resolve_count_add(&recounted->cross_lsp_source_rows,
+                                   result->cross_lsp_source_rows) ||
+                !resolve_count_add(&recounted->cross_lsp_duplicate_rows,
+                                   result->cross_lsp_duplicate_rows) ||
+                !resolve_count_add(&recounted->cross_lsp_appended_rows,
+                                   result->cross_lsp_appended_rows)) {
+                return resolve_recount_cross_lsp_fail(
+                    rc, "CBM_LSP_DEDUP_ACCOUNTING_INVALID", rc->files[file_idx].rel_path,
+                    (size_t)file_idx,
+                    "a retained cross-LSP receipt violates source, duplicate, appended, or "
+                    "final-array cardinality");
+            }
+        } else if (result->cross_lsp_seeded_rows != 0 || result->cross_lsp_source_rows != 0 ||
+                   result->cross_lsp_duplicate_rows != 0 ||
+                   result->cross_lsp_appended_rows != 0) {
+            return resolve_recount_cross_lsp_fail(
+                rc, "CBM_LSP_DEDUP_ACCOUNTING_PARTIAL", rc->files[file_idx].rel_path,
+                (size_t)file_idx,
+                "cross-LSP row counts exist without a committed per-file accounting receipt");
+        }
         for (int def_idx = 0; def_idx < result->defs.count; def_idx++) {
             CBMDefinition *def = &result->defs.items[def_idx];
             if (!def->qualified_name ||
@@ -1994,7 +2049,13 @@ static int resolve_recount_items(const resolve_ctx_t *rc, uint64_t dynamic_lsp_i
     if (!resolve_count_add(&total, cross_lsp_units)) {
         return CBM_NOT_FOUND;
     }
-    *recounted = total;
+    if (recounted->cross_lsp_accounted_units != cross_lsp_units) {
+        return resolve_recount_cross_lsp_fail(
+            rc, "CBM_LSP_DEDUP_UNIT_RECOUNT_MISMATCH", rc ? rc->repo_path : "",
+            (size_t)recounted->cross_lsp_accounted_units,
+            "post-join per-file cross-LSP receipts do not equal the completed dispatch units");
+    }
+    recounted->items = total;
     return 0;
 }
 
@@ -3869,18 +3930,19 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         atomic_load_explicit(&rc.resolve_dynamic_lsp_items, memory_order_relaxed);
     uint64_t cross_lsp_units =
         (uint64_t)atomic_load_explicit(&rc.lsp_cross_processed, memory_order_relaxed);
-    uint64_t recounted_items = 0;
-    if (resolve_recount_items(&rc, dynamic_lsp_items, cross_lsp_units, &recounted_items) != 0 ||
-        recounted_items != rc.resolve_items_total) {
-        char recounted[32];
+    resolve_recount_result_t recounted = {0};
+    if (resolve_recount_items(&rc, dynamic_lsp_items, cross_lsp_units, &recounted) != 0 ||
+        recounted.items != rc.resolve_items_total) {
+        char recounted_buf[32];
         char dynamic[32];
         char cross_units[32];
-        snprintf(recounted, sizeof(recounted), "%llu", (unsigned long long)recounted_items);
+        snprintf(recounted_buf, sizeof(recounted_buf), "%llu",
+                 (unsigned long long)recounted.items);
         snprintf(dynamic, sizeof(dynamic), "%llu", (unsigned long long)dynamic_lsp_items);
         snprintf(cross_units, sizeof(cross_units), "%llu", (unsigned long long)cross_lsp_units);
         cbm_log_error(
             "parallel.resolve.failed", "code", "CBM_RESOLVE_ITEM_RECOUNT_MISMATCH", "component",
-            "parallel.resolve.progress", "operation", "recount", "recounted", recounted,
+            "parallel.resolve.progress", "operation", "recount", "recounted", recounted_buf,
             "expected", resolve_items_total, "dynamic_lsp_items", dynamic, "cross_lsp_units",
             cross_units, "message",
             "the post-join independent recount did not reconstruct the immutable denominator",
@@ -3916,7 +3978,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     if (cbm_pipeline_record_parallel_resolver_accounting(
             ctx ? ctx->pipeline : NULL, resolved_items, rc.resolve_items_total,
-            recounted_items, dynamic_lsp_items, cross_lsp_units) != 0) {
+            recounted.items, dynamic_lsp_items, cross_lsp_units,
+            recounted.cross_lsp_accounted_units, recounted.cross_lsp_seeded_rows,
+            recounted.cross_lsp_source_rows, recounted.cross_lsp_duplicate_rows,
+            recounted.cross_lsp_appended_rows) != 0) {
         for (int i = 0; i < worker_count; i++) {
             if (workers[i].local_edge_buf) {
                 cbm_gbuf_free(workers[i].local_edge_buf);
@@ -3929,17 +3994,30 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     char recounted_items_buf[32];
     char dynamic_lsp_items_buf[32];
     char cross_lsp_units_buf[32];
+    char cross_lsp_seen_rows_buf[32];
+    char cross_lsp_duplicate_rows_buf[32];
+    char cross_lsp_appended_rows_buf[32];
     snprintf(completed_items, sizeof(completed_items), "%llu",
              (unsigned long long)resolved_items);
     snprintf(recounted_items_buf, sizeof(recounted_items_buf), "%llu",
-             (unsigned long long)recounted_items);
+             (unsigned long long)recounted.items);
     snprintf(dynamic_lsp_items_buf, sizeof(dynamic_lsp_items_buf), "%llu",
              (unsigned long long)dynamic_lsp_items);
     snprintf(cross_lsp_units_buf, sizeof(cross_lsp_units_buf), "%llu",
              (unsigned long long)cross_lsp_units);
+    snprintf(cross_lsp_seen_rows_buf, sizeof(cross_lsp_seen_rows_buf), "%llu",
+             (unsigned long long)(recounted.cross_lsp_seeded_rows +
+                                  recounted.cross_lsp_source_rows));
+    snprintf(cross_lsp_duplicate_rows_buf, sizeof(cross_lsp_duplicate_rows_buf), "%llu",
+             (unsigned long long)recounted.cross_lsp_duplicate_rows);
+    snprintf(cross_lsp_appended_rows_buf, sizeof(cross_lsp_appended_rows_buf), "%llu",
+             (unsigned long long)recounted.cross_lsp_appended_rows);
     cbm_log_info("parallel.resolve.progress_done", "completed", completed_items, "denominator",
                  resolve_items_total, "recounted", recounted_items_buf, "dynamic_lsp_items",
-                 dynamic_lsp_items_buf, "cross_lsp_units", cross_lsp_units_buf);
+                 dynamic_lsp_items_buf, "cross_lsp_units", cross_lsp_units_buf,
+                 "cross_lsp_seen_rows", cross_lsp_seen_rows_buf, "cross_lsp_duplicate_rows",
+                 cross_lsp_duplicate_rows_buf, "cross_lsp_appended_rows",
+                 cross_lsp_appended_rows_buf);
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);

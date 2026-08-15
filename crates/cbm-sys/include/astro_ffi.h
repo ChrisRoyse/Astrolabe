@@ -51,6 +51,12 @@ CBM_API bool cbm_profile_is_active(void);
 CBM_API void cbm_index_supervisor_mark_host(void);
 CBM_API void cbm_http_server_set_binary_path(const char *path);
 
+/* One canonical merge boundary for every cross-LSP resolver route. Success
+ * commits the exact per-file accounting receipt while preserving first-row
+ * order and the highest-confidence non-identity payload; every invalid
+ * identity, allocation failure, or count mismatch latches a terminal error. */
+CBM_API bool cbm_pxc_canonicalize_appended_results(CBMFileResult *result, int seeded_count);
+
 CBM_API void *cbm_mimalloc_malloc(size_t size);
 CBM_API void *cbm_mimalloc_malloc_aligned(size_t size, size_t alignment);
 CBM_API void *cbm_mimalloc_zalloc_aligned(size_t size, size_t alignment);

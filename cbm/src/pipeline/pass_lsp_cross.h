@@ -174,6 +174,14 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                         const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
 
+/* Canonicalize one resolver's appended suffix against the retained prefix.
+ * The caller supplies the exact pre-dispatch count. The first row position is
+ * stable; a strictly higher-confidence duplicate updates only its retained
+ * non-identity payload. Success commits the per-file cross-LSP receipt;
+ * malformed identity, allocation failure, duplicate invocation, or count
+ * mismatch latches a terminal result error. */
+bool cbm_pxc_canonicalize_appended_results(CBMFileResult *result, int seeded_count);
+
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
  * sequential driver (one path = one semantics): module-def-index filter →
  * shared prebuilt registry (overlay pattern, no per-file registry build) →

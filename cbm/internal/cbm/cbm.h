@@ -649,6 +649,15 @@ typedef struct {
     uint64_t structured_schema_path_count;
     uint64_t structured_occurrence_count;
 
+    // Exact receipt for the one cross-LSP merge performed for this file. The
+    // receipt is committed only after the final retained array has been
+    // canonicalized and its count read back.
+    bool cross_lsp_accounting_present;
+    uint64_t cross_lsp_seeded_rows;
+    uint64_t cross_lsp_source_rows;
+    uint64_t cross_lsp_duplicate_rows;
+    uint64_t cross_lsp_appended_rows;
+
     bool has_error;
     const char *error_msg;
     CBMExtractionError error;

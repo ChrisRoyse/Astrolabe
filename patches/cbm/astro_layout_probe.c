@@ -86,6 +86,11 @@ CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cached_lang);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, source);
     ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, source_len);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cross_lsp_accounting_present);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cross_lsp_seeded_rows);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cross_lsp_source_rows);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cross_lsp_duplicate_rows);
+    ASTRO_LAYOUT_OFFSET_CASE(CBMFileResult, cross_lsp_appended_rows);
 
     ASTRO_LAYOUT_OFFSET_CASE(cbm_gbuf_row_node_t, id);
     ASTRO_LAYOUT_OFFSET_CASE(cbm_gbuf_row_node_t, project);

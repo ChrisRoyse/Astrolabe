@@ -155,7 +155,12 @@ int cbm_pipeline_record_parallel_resolver_accounting(cbm_pipeline_t *p, uint64_t
                                                      uint64_t denominator,
                                                      uint64_t recounted,
                                                      uint64_t dynamic_lsp_items,
-                                                     uint64_t cross_lsp_units);
+                                                     uint64_t cross_lsp_units,
+                                                     uint64_t cross_lsp_accounted_units,
+                                                     uint64_t cross_lsp_seeded_rows,
+                                                     uint64_t cross_lsp_source_rows,
+                                                     uint64_t cross_lsp_duplicate_rows,
+                                                     uint64_t cross_lsp_appended_rows);
 int cbm_pipeline_set_execution_contract(
     cbm_pipeline_t *p, cbm_pipeline_execution_route_t route,
     cbm_pipeline_parallel_dispatch_expectation_t dispatch_expectation);

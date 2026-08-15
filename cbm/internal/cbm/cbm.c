@@ -2490,6 +2490,11 @@ bool cbm_file_result_compact_facts(CBMFileResult *result, const char *immutable_
     candidate->has_error = result->has_error;
     candidate->structured_schema_path_count = result->structured_schema_path_count;
     candidate->structured_occurrence_count = result->structured_occurrence_count;
+    candidate->cross_lsp_accounting_present = result->cross_lsp_accounting_present;
+    candidate->cross_lsp_seeded_rows = result->cross_lsp_seeded_rows;
+    candidate->cross_lsp_source_rows = result->cross_lsp_source_rows;
+    candidate->cross_lsp_duplicate_rows = result->cross_lsp_duplicate_rows;
+    candidate->cross_lsp_appended_rows = result->cross_lsp_appended_rows;
     candidate->exact_quoted_include_count = result->exact_quoted_include_count;
     candidate->exact_quoted_includes_captured = result->exact_quoted_includes_captured;
     candidate->source = immutable_source;

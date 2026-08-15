@@ -6,6 +6,9 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+manual-fsv = []
+
 [dependencies]
 astrolabe-domain.workspace = true
 cbm-sys.workspace = true
@@ -17,8 +20,16 @@ tracing = "0.1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
 ] }
 
 [lib]
 path = "src/lib.rs"
+
+[[example]]
+name = "issue_1099_cross_lsp_fsv"
+required-features = ["manual-fsv"]

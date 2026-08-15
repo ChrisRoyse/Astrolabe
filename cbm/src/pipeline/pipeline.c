@@ -1382,9 +1382,19 @@ int cbm_pipeline_record_parallel_resolver_accounting(cbm_pipeline_t *p, uint64_t
                                                      uint64_t denominator,
                                                      uint64_t recounted,
                                                      uint64_t dynamic_lsp_items,
-                                                     uint64_t cross_lsp_units) {
+                                                     uint64_t cross_lsp_units,
+                                                     uint64_t cross_lsp_accounted_units,
+                                                     uint64_t cross_lsp_seeded_rows,
+                                                     uint64_t cross_lsp_source_rows,
+                                                     uint64_t cross_lsp_duplicate_rows,
+                                                     uint64_t cross_lsp_appended_rows) {
+    bool cross_rows_valid =
+        cross_lsp_accounted_units == cross_lsp_units &&
+        cross_lsp_duplicate_rows <= cross_lsp_source_rows &&
+        cross_lsp_appended_rows == cross_lsp_source_rows - cross_lsp_duplicate_rows &&
+        cross_lsp_seeded_rows <= UINT64_MAX - cross_lsp_source_rows;
     if (!p || p->parallel_resolver_accounting_present || completed != denominator ||
-        recounted != denominator) {
+        recounted != denominator || !cross_rows_valid) {
         cbm_pipeline_record_fatal_error(
             p, "CBM_PARALLEL_RESOLVER_ACCOUNTING_INVALID",
             "retain_parallel_resolver_accounting", "parallel_resolve",
@@ -1401,6 +1411,12 @@ int cbm_pipeline_record_parallel_resolver_accounting(cbm_pipeline_t *p, uint64_t
         .recounted = recounted,
         .dynamic_lsp_items = dynamic_lsp_items,
         .cross_lsp_units = cross_lsp_units,
+        .cross_lsp_accounted_units = cross_lsp_accounted_units,
+        .cross_lsp_seen_rows = cross_lsp_seeded_rows + cross_lsp_source_rows,
+        .cross_lsp_seeded_rows = cross_lsp_seeded_rows,
+        .cross_lsp_source_rows = cross_lsp_source_rows,
+        .cross_lsp_duplicate_rows = cross_lsp_duplicate_rows,
+        .cross_lsp_appended_rows = cross_lsp_appended_rows,
     };
     p->parallel_resolver_accounting_present = true;
     return 0;

@@ -1178,6 +1178,11 @@ pub struct CBMFileResult {
     pub structured_classification_provenance: *const ::std::os::raw::c_char,
     pub structured_schema_path_count: u64,
     pub structured_occurrence_count: u64,
+    pub cross_lsp_accounting_present: bool,
+    pub cross_lsp_seeded_rows: u64,
+    pub cross_lsp_source_rows: u64,
+    pub cross_lsp_duplicate_rows: u64,
+    pub cross_lsp_appended_rows: u64,
     pub has_error: bool,
     pub error_msg: *const ::std::os::raw::c_char,
     pub error: CBMExtractionError,
@@ -4002,6 +4007,12 @@ pub struct cbm_pipeline_parallel_resolver_accounting_t {
     pub recounted: u64,
     pub dynamic_lsp_items: u64,
     pub cross_lsp_units: u64,
+    pub cross_lsp_accounted_units: u64,
+    pub cross_lsp_seen_rows: u64,
+    pub cross_lsp_seeded_rows: u64,
+    pub cross_lsp_source_rows: u64,
+    pub cross_lsp_duplicate_rows: u64,
+    pub cross_lsp_appended_rows: u64,
 }
 pub const cbm_pipeline_execution_route_t_CBM_PIPELINE_EXECUTION_ROUTE_UNKNOWN:
     cbm_pipeline_execution_route_t = 0;
@@ -4568,6 +4579,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn cbm_http_server_set_binary_path(path: *const ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    pub fn cbm_pxc_canonicalize_appended_results(
+        result: *mut CBMFileResult,
+        seeded_count: ::std::os::raw::c_int,
+    ) -> bool;
 }
 unsafe extern "C" {
     pub fn cbm_mimalloc_malloc(size: usize) -> *mut ::std::os::raw::c_void;
