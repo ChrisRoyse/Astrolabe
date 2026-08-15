@@ -1,4 +1,6 @@
-use astrolabe_bridge::{CbmToolRunner, initialize_cbm_host_process};
+use astrolabe_bridge::{
+    CbmToolRunner, cbm_project_name_from_path, initialize_cbm_host_process, set_cbm_cache_dir,
+};
 use cbm_sys::{
     CBMFileResult, CBMResolvedCall, cbm_arena_destroy, cbm_arena_init, cbm_arena_strdup,
     cbm_pxc_canonicalize_appended_results, cbm_resolvedcall_push,
@@ -51,6 +53,16 @@ fn write_exact(path: &Path, bytes: &[u8]) {
             "preserve the staged session and repair the physical write/read boundary",
         );
     }
+}
+
+fn next_path_arg(args: &mut impl Iterator<Item = std::ffi::OsString>, name: &str) -> PathBuf {
+    args.next().map(PathBuf::from).unwrap_or_else(|| {
+        fail(
+            "ISSUE_1099_FSV_INDEX_CHILD_ARGUMENT_REQUIRED",
+            name,
+            "pass repo, cache, MCP output, payload output, and report output paths",
+        )
+    })
 }
 
 unsafe fn c_text(value: *const c_char) -> String {
@@ -490,9 +502,84 @@ fn write_fixture(repo: &Path) {
         &repo.join("consumer.py"),
         b"from provider import remote\n\ndef consume():\n    return remote(21)\n",
     );
+    write_exact(
+        &repo.join("Helper.java"),
+        b"package demo;\n\nfinal class Helper {\n    static int twice(int value) { return value * 2; }\n}\n",
+    );
+    write_exact(
+        &repo.join("Caller.java"),
+        b"package demo;\n\nfinal class Caller {\n    int local(int value) { return value + 1; }\n    int invoke() { return local(1) + Helper.twice(2); }\n}\n",
+    );
 }
 
-fn run_index(repo: &Path, database: &Path, output: &Path) -> Value {
+fn run_index_child(
+    repo: &Path,
+    cache: &Path,
+    mcp_output: &Path,
+    payload_output: &Path,
+    report_output: &Path,
+) {
+    fs::create_dir(cache).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_CACHE_CREATE_FAILED",
+            format!("path={} error={error}", cache.display()),
+            "use one absent payload-local cache for each real index child",
+        )
+    });
+    let cache_readback = set_cbm_cache_dir(cache).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_CACHE_BIND_FAILED",
+            error,
+            "inspect the native cache resolver diagnostic; do not substitute an environment-only override",
+        )
+    });
+    if cache_readback != cache {
+        fail(
+            "ISSUE_1099_FSV_CACHE_READBACK_MISMATCH",
+            format!(
+                "requested={} observed={}",
+                cache.display(),
+                cache_readback.display()
+            ),
+            "preserve both paths and repair the native cache resolver before indexing",
+        );
+    }
+    let executable = std::env::current_exe().unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_EXE_PATH_FAILED",
+            error,
+            "repair current executable discovery before production host initialization",
+        )
+    });
+    let executable_text = executable.to_str().unwrap_or_else(|| {
+        fail(
+            "ISSUE_1099_FSV_EXE_PATH_INVALID",
+            executable.display(),
+            "run the staged FSV artifact from a UTF-8 workspace path",
+        )
+    });
+    initialize_cbm_host_process(Some(executable_text)).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_HOST_INIT_FAILED",
+            error,
+            "repair the production host initialization boundary before indexing real data",
+        )
+    });
+    let repo_text = repo.to_str().unwrap_or_else(|| {
+        fail(
+            "ISSUE_1099_FSV_REPO_PATH_INVALID",
+            repo.display(),
+            "use one UTF-8 staged repository path",
+        )
+    });
+    let project = cbm_project_name_from_path(repo_text).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_PROJECT_DERIVATION_FAILED",
+            error,
+            "repair canonical repository identity derivation before indexing",
+        )
+    });
+    let database = cache.join(format!("{project}.db"));
     if database.exists() {
         fail(
             "ISSUE_1099_FSV_DATABASE_PREEXISTS",
@@ -505,23 +592,15 @@ fn run_index(repo: &Path, database: &Path, output: &Path) -> Value {
         database.display(),
         database.exists()
     );
-    let runner = CbmToolRunner::new(database.to_str().unwrap_or_else(|| {
-        fail(
-            "ISSUE_1099_FSV_DATABASE_PATH_INVALID",
-            database.display(),
-            "use a UTF-8 staged database path",
-        )
-    }))
-    .unwrap_or_else(|error| {
+    let runner = CbmToolRunner::new_default().unwrap_or_else(|error| {
         fail(
             "ISSUE_1099_FSV_RUNNER_CREATE_FAILED",
             error,
             "inspect native MCP server initialization and retry",
         )
     });
-    let args = json!({"repo_path": repo, "mode": "full"}).to_string();
-    let raw = runner
-        .handle_tool_raw("index_repository", &args)
+    let args = json!({"repo_path": repo, "mode": "full", "calyx": "off"}).to_string();
+    let raw = astrolabe_server::migration::handle_tool_raw(&runner, "index_repository", &args)
         .unwrap_or_else(|error| {
             fail(
                 "ISSUE_1099_FSV_INDEX_CALL_FAILED",
@@ -530,16 +609,56 @@ fn run_index(repo: &Path, database: &Path, output: &Path) -> Value {
             )
         });
     drop(runner);
-    write_exact(output, raw.as_bytes());
-    let value: Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+    write_exact(mcp_output, raw.as_bytes());
+    let envelope: Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
         fail(
             "ISSUE_1099_FSV_INDEX_JSON_INVALID",
             error,
             "inspect the exact native index response bytes",
         )
     });
-    let accounting = &value["parallel_resolver_accounting"];
-    if value.get("code").is_some()
+    let content = envelope
+        .get("content")
+        .and_then(Value::as_array)
+        .filter(|content| content.len() == 1)
+        .and_then(|content| content.first())
+        .filter(|content| content.get("type") == Some(&Value::String("text".to_string())))
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            fail(
+                "ISSUE_1099_FSV_MCP_CONTENT_INVALID",
+                &raw,
+                "repair the MCP result envelope so it contains exactly one text payload",
+            )
+        });
+    let payload: Value = serde_json::from_str(content).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_MCP_CONTENT_JSON_INVALID",
+            error,
+            "preserve the exact MCP envelope and repair its text-payload serializer",
+        )
+    });
+    let structured = envelope.get("structuredContent").unwrap_or_else(|| {
+        fail(
+            "ISSUE_1099_FSV_MCP_STRUCTURED_CONTENT_MISSING",
+            &raw,
+            "repair the MCP result envelope so structuredContent mirrors content[0].text",
+        )
+    });
+    if structured != &payload {
+        fail(
+            "ISSUE_1099_FSV_MCP_MIRROR_MISMATCH",
+            &raw,
+            "preserve both MCP representations and repair the producer before retrying",
+        );
+    }
+    write_exact(payload_output, content.as_bytes());
+    let accounting = &payload["parallel_resolver_accounting"];
+    if envelope.get("isError") != Some(&Value::Bool(false))
+        || payload.get("code").is_some()
+        || payload.get("status") != Some(&Value::String("indexed".to_string()))
+        || payload.get("project") != Some(&Value::String(project.clone()))
         || accounting["state"] != "measured"
         || accounting["cross_lsp_units"] != accounting["cross_lsp_accounted_units"]
         || accounting["cross_lsp_seen_rows"]
@@ -555,13 +674,90 @@ fn run_index(repo: &Path, database: &Path, output: &Path) -> Value {
             "repair the native MCP accounting producer/consumer contract",
         );
     }
+    if !database.is_file() || database.with_extension("db-wal").exists() {
+        fail(
+            "ISSUE_1099_FSV_DATABASE_PUBLICATION_INVALID",
+            format!(
+                "database={} exists={} wal_exists={}",
+                database.display(),
+                database.is_file(),
+                database.with_extension("db-wal").exists()
+            ),
+            "preserve the cache and repair the physical SQLite publication boundary",
+        );
+    }
     println!(
         "FSV_1099 index after database={} exists={} accounting={}",
         database.display(),
         database.exists(),
         accounting
     );
-    value
+    let report = json!({
+        "schema": "astrolabe.issue-1099.index-child.v1",
+        "project": project,
+        "cache_requested": cache,
+        "cache_readback": cache_readback,
+        "database": database,
+        "mcp_output": mcp_output,
+        "payload_output": payload_output,
+        "accounting": accounting,
+    });
+    let report_bytes = serde_json::to_vec(&report).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_INDEX_REPORT_JSON_FAILED",
+            error,
+            "repair index-child receipt serialization",
+        )
+    });
+    write_exact(report_output, &report_bytes);
+}
+
+fn spawn_index_child(repo: &Path, cache: &Path, prefix: &Path) -> Value {
+    let mcp_output = prefix.with_extension("mcp.json");
+    let payload_output = prefix.with_extension("index.json");
+    let report_output = prefix.with_extension("child.json");
+    let status = Command::new(std::env::current_exe().unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_EXE_PATH_FAILED",
+            error,
+            "repair current executable discovery before the index child",
+        )
+    }))
+    .arg("--index-child")
+    .arg(repo)
+    .arg(cache)
+    .arg(&mcp_output)
+    .arg(&payload_output)
+    .arg(&report_output)
+    .status()
+    .unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_INDEX_CHILD_START_FAILED",
+            error,
+            "repair real child-process launch; do not substitute an in-process cache switch",
+        )
+    });
+    if !status.success() {
+        fail(
+            "ISSUE_1099_FSV_INDEX_CHILD_FAILED",
+            status,
+            "inspect the child diagnostic and preserve its isolated cache",
+        );
+    }
+    serde_json::from_slice(&fs::read(&report_output).unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_INDEX_REPORT_READ_FAILED",
+            error,
+            "preserve the index-child report and inspect its physical bytes",
+        )
+    }))
+    .unwrap_or_else(|error| {
+        fail(
+            "ISSUE_1099_FSV_INDEX_REPORT_JSON_INVALID",
+            error,
+            "inspect the physical index-child report bytes",
+        )
+    })
 }
 
 fn main() {
@@ -596,6 +792,22 @@ fn main() {
             );
         }
         unsafe { allocation_child(&output) };
+        return;
+    }
+    if first == "--index-child" {
+        let repo = next_path_arg(&mut args, "repo");
+        let cache = next_path_arg(&mut args, "cache");
+        let mcp_output = next_path_arg(&mut args, "mcp_output");
+        let payload_output = next_path_arg(&mut args, "payload_output");
+        let report_output = next_path_arg(&mut args, "report_output");
+        if args.next().is_some() {
+            fail(
+                "ISSUE_1099_FSV_ARGUMENT_COUNT_INVALID",
+                "unexpected index child argument",
+                "pass only the five required index-child paths",
+            );
+        }
+        run_index_child(&repo, &cache, &mcp_output, &payload_output, &report_output);
         return;
     }
 
@@ -689,22 +901,19 @@ fn main() {
 
     let repo = payload.join("repo");
     write_fixture(&repo);
-    let first_index = run_index(
+    let first_index =
+        spawn_index_child(&repo, &payload.join("first-store"), &payload.join("first"));
+    let second_index = spawn_index_child(
         &repo,
-        &payload.join("first.db"),
-        &payload.join("first-index.json"),
-    );
-    let second_index = run_index(
-        &repo,
-        &payload.join("second.db"),
-        &payload.join("second-index.json"),
+        &payload.join("second-store"),
+        &payload.join("second"),
     );
     let report = json!({
-        "schema": "astrolabe.issue-1099.cross-lsp-fsv.v1",
+        "schema": "astrolabe.issue-1099.cross-lsp-fsv.v2",
         "direct": direct,
         "allocation": allocation,
-        "first_accounting": first_index["parallel_resolver_accounting"],
-        "second_accounting": second_index["parallel_resolver_accounting"],
+        "first_index": first_index,
+        "second_index": second_index,
     });
     let report_bytes = serde_json::to_vec(&report).unwrap_or_else(|error| {
         fail(

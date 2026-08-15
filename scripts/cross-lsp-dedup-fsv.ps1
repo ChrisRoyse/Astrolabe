@@ -140,18 +140,69 @@ Assert-Astro (
 $reportPath = Join-Path $payload 'report.json'
 $directPath = Join-Path $payload 'direct.json'
 $allocationPath = Join-Path $payload 'allocation.json'
-$firstIndexPath = Join-Path $payload 'first-index.json'
-$secondIndexPath = Join-Path $payload 'second-index.json'
-$firstDb = Join-Path $payload 'first.db'
-$secondDb = Join-Path $payload 'second.db'
+$firstMcpPath = Join-Path $payload 'first.mcp.json'
+$secondMcpPath = Join-Path $payload 'second.mcp.json'
+$firstIndexPath = Join-Path $payload 'first.index.json'
+$secondIndexPath = Join-Path $payload 'second.index.json'
+$firstChildPath = Join-Path $payload 'first.child.json'
+$secondChildPath = Join-Path $payload 'second.child.json'
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 $direct = Get-Content -LiteralPath $directPath -Raw | ConvertFrom-Json
 $allocation = Get-Content -LiteralPath $allocationPath -Raw | ConvertFrom-Json
+$firstMcpRaw = Get-Content -LiteralPath $firstMcpPath -Raw
+$secondMcpRaw = Get-Content -LiteralPath $secondMcpPath -Raw
+$firstIndexRaw = Get-Content -LiteralPath $firstIndexPath -Raw
+$secondIndexRaw = Get-Content -LiteralPath $secondIndexPath -Raw
+$firstMcp = $firstMcpRaw | ConvertFrom-Json
+$secondMcp = $secondMcpRaw | ConvertFrom-Json
 $firstIndex = Get-Content -LiteralPath $firstIndexPath -Raw | ConvertFrom-Json
 $secondIndex = Get-Content -LiteralPath $secondIndexPath -Raw | ConvertFrom-Json
+$firstChild = Get-Content -LiteralPath $firstChildPath -Raw | ConvertFrom-Json
+$secondChild = Get-Content -LiteralPath $secondChildPath -Raw | ConvertFrom-Json
 
-Assert-Astro ([string]$report.schema -ceq 'astrolabe.issue-1099.cross-lsp-fsv.v1') `
+Assert-Astro ([string]$report.schema -ceq 'astrolabe.issue-1099.cross-lsp-fsv.v2') `
     'ISSUE_1099_FSV_REPORT_INVALID' 'report schema does not identify the issue-1099 contract'
+Assert-Astro (
+    [string]$firstChild.schema -ceq 'astrolabe.issue-1099.index-child.v1' -and
+    [string]$secondChild.schema -ceq 'astrolabe.issue-1099.index-child.v1' -and
+    [string]$firstChild.cache_requested -ceq [string]$firstChild.cache_readback -and
+    [string]$secondChild.cache_requested -ceq [string]$secondChild.cache_readback
+) 'ISSUE_1099_FSV_INDEX_CHILD_RECEIPT_INVALID' `
+    'an index child did not read back its exact isolated native cache binding'
+$firstStore = [IO.Path]::GetFullPath((Join-Path $payload 'first-store'))
+$secondStore = [IO.Path]::GetFullPath((Join-Path $payload 'second-store'))
+$firstDb = [IO.Path]::GetFullPath([string]$firstChild.database)
+$secondDb = [IO.Path]::GetFullPath([string]$secondChild.database)
+Assert-Astro (
+    [IO.Path]::GetFullPath([string]$firstChild.cache_readback) -ceq $firstStore -and
+    [IO.Path]::GetDirectoryName($firstDb) -ceq $firstStore -and
+    [IO.Path]::GetFullPath([string]$secondChild.cache_readback) -ceq $secondStore -and
+    [IO.Path]::GetDirectoryName($secondDb) -ceq $secondStore -and
+    $firstDb -cne $secondDb -and
+    (Test-Path -LiteralPath $firstDb -PathType Leaf) -and
+    (Test-Path -LiteralPath $secondDb -PathType Leaf)
+) 'ISSUE_1099_FSV_DATABASE_AUTHORITY_INVALID' `
+    'the worker-reported database source of truth is absent or outside its isolated payload cache'
+$mcpPairs = @(
+    [pscustomobject]@{ Mcp = $firstMcp; McpRaw = $firstMcpRaw; IndexRaw = $firstIndexRaw; Index = $firstIndex },
+    [pscustomobject]@{ Mcp = $secondMcp; McpRaw = $secondMcpRaw; IndexRaw = $secondIndexRaw; Index = $secondIndex }
+)
+foreach ($pair in $mcpPairs) {
+    $mcp = $pair.Mcp
+    $mcpRaw = [string]$pair.McpRaw
+    $indexRaw = [string]$pair.IndexRaw
+    $index = $pair.Index
+    Assert-Astro (
+        -not [bool]$mcp.isError -and @($mcp.content).Count -eq 1 -and
+        [string]$mcp.content[0].type -ceq 'text' -and
+        [string]$mcp.content[0].text -ceq $indexRaw -and
+        [string]$index.status -ceq 'indexed' -and
+        [string]$index.project -ceq [string]$mcp.structuredContent.project -and
+        (($mcp.structuredContent | ConvertTo-Json -Depth 100 -Compress) -ceq
+            ($index | ConvertTo-Json -Depth 100 -Compress))
+    ) 'ISSUE_1099_FSV_MCP_ENVELOPE_INVALID' `
+        "outer MCP envelope does not exactly mirror its persisted payload: $mcpRaw"
+}
 Assert-Astro (
     [int]$direct.happy.after.count -eq 2 -and [int]$direct.happy.after.seeded -eq 1 -and
     [int]$direct.happy.after.source -eq 2 -and [int]$direct.happy.after.duplicate -eq 1 -and
@@ -201,9 +252,10 @@ $secondCalls = @($secondCallsRaw | ConvertFrom-Json)
 
 Assert-Astro (
     [int]$firstState.projects -eq 1 -and [int]$firstState.nodes -gt 0 -and
-    [int]$firstState.calls -eq 2 -and [int]$firstState.duplicate_edge_identities -eq 0 -and
+    [int]$firstState.calls -eq 4 -and [int]$firstState.duplicate_edge_identities -eq 0 -and
     [string]$firstState.integrity -ceq 'ok'
-) 'ISSUE_1099_FSV_FIRST_DB_INVALID' 'first physical graph does not contain exactly two canonical CALLS edges'
+) 'ISSUE_1099_FSV_FIRST_DB_INVALID' `
+    'first physical graph does not contain the four known canonical Python/JVM CALLS edges'
 Assert-Astro (
     [int]$secondState.projects -eq 1 -and [int]$secondState.nodes -eq [int]$firstState.nodes -and
     [int]$secondState.edges -eq [int]$firstState.edges -and
@@ -214,11 +266,11 @@ Assert-Astro (
 ) 'ISSUE_1099_FSV_SECOND_DB_INVALID' 'second physical graph/vector state differs in cardinality'
 Assert-Astro ($firstLogical -ceq $secondLogical) 'ISSUE_1099_FSV_DETERMINISM_MISMATCH' `
     'two fresh unchanged full runs did not produce byte-identical logical graph/vector rows'
-Assert-Astro ($firstCallsRaw -ceq $secondCallsRaw -and $firstCalls.Count -eq 2 -and $secondCalls.Count -eq 2) `
+Assert-Astro ($firstCallsRaw -ceq $secondCallsRaw -and $firstCalls.Count -eq 4 -and $secondCalls.Count -eq 4) `
     'ISSUE_1099_FSV_CALL_READBACK_MISMATCH' 'CALLS edge rows are not exact and stable across fresh runs'
 
-$firstAccounting = $firstIndex.parallel_resolver_accounting
-$secondAccounting = $secondIndex.parallel_resolver_accounting
+$firstAccounting = $firstChild.accounting
+$secondAccounting = $secondChild.accounting
 foreach ($accounting in @($firstAccounting, $secondAccounting)) {
     Assert-Astro (
         [string]$accounting.state -ceq 'measured' -and
@@ -239,8 +291,12 @@ $readback = [ordered]@{
     report_sha256 = Get-Sha256 $reportPath
     direct_sha256 = Get-Sha256 $directPath
     allocation_sha256 = Get-Sha256 $allocationPath
+    first_mcp_sha256 = Get-Sha256 $firstMcpPath
+    second_mcp_sha256 = Get-Sha256 $secondMcpPath
     first_index_sha256 = Get-Sha256 $firstIndexPath
     second_index_sha256 = Get-Sha256 $secondIndexPath
+    first_child_sha256 = Get-Sha256 $firstChildPath
+    second_child_sha256 = Get-Sha256 $secondChildPath
     first_db_sha256 = Get-Sha256 $firstDb
     second_db_sha256 = Get-Sha256 $secondDb
     logical_readback_sha256 = [Convert]::ToHexString(
