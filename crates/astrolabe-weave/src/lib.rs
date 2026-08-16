@@ -27,7 +27,8 @@ pub use calyx_loom::reactive::{
     DEFAULT_MAX_TRIGGERS as CALYX_REACTIVE_REGISTRY_CAP,
 };
 pub use calyx_loom::{
-    AuditEntry as ReactiveAuditEntry, CALYX_REACTIVE_ROW_CORRUPT,
+    AuditEntry as ReactiveAuditEntry, CALYX_LOOM_EXPECTED_GAIN_INVALID,
+    CALYX_LOOM_EXPECTED_GAIN_NUMERIC_INVALID, CALYX_REACTIVE_ROW_CORRUPT,
     CALYX_REACTIVE_SUBSCRIPTION_NOT_FOUND, EXPECTED_GAIN_SCHEMA, ExpectedGain, ExpectedGainInput,
     NoveltyVerdict, ReactiveEngine, ReactiveRowKind, ReactiveSignalSet, ReactiveSignals,
     SeriesStore, SubscriptionId, TriggerCondition, TriggerFired, TriggerId,

@@ -112,6 +112,9 @@ pub const ASTRO_ASSAY_CALIBRATION_BELOW_FLOOR: &str = "ASTRO_ASSAY_CALIBRATION_B
 pub const ASTRO_ASSAY_CALIBRATION_DEGENERATE: &str = "ASTRO_ASSAY_CALIBRATION_DEGENERATE";
 /// A causal-effect request was malformed, incomplete, or internally inconsistent.
 pub const ASTRO_ASSAY_CAUSAL_INPUT_INVALID: &str = "ASTRO_ASSAY_CAUSAL_INPUT_INVALID";
+/// Finite causal inputs produced a non-finite derived aggregate, estimator term,
+/// uncertainty value, association, or confidence bound.
+pub const ASTRO_ASSAY_CAUSAL_NUMERIC_INVALID: &str = "ASTRO_ASSAY_CAUSAL_NUMERIC_INVALID";
 /// A requested observational effect was not identifiable under the declared
 /// adjustment set because empirical treatment overlap was absent or inadequate.
 pub const ASTRO_ASSAY_CAUSAL_NOT_IDENTIFIABLE: &str = "ASTRO_ASSAY_CAUSAL_NOT_IDENTIFIABLE";

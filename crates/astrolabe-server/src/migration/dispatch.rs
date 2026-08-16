@@ -203,7 +203,8 @@ fn astrolabe_native_tool_definition(tool_name: &str) -> Option<&'static Value> {
 /// `tools/list` before the handler can open Config, SQLite, or any vault family.
 /// The supported schema vocabulary is deliberately small and exactly matches
 /// the checked-in native definitions: object/array/scalar types, properties,
-/// required fields, closed objects, enums, and numeric bounds.
+/// required fields, closed objects, enums, constants, negated constants, and
+/// inclusive/exclusive numeric bounds.
 fn validate_native_tool_arguments(
     tool_name: &str,
     definition: &Value,
@@ -274,6 +275,50 @@ fn validate_schema_value(
             )
             .with_detail("argument", path)
             .with_detail("allowed_values", variants.clone())
+            .with_detail("observed_value", actual.clone())
+            .into());
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && actual != expected
+    {
+        return Err(ToolFault::new(
+            "ASTRO_MCP_ARGUMENT_CONST_INVALID",
+            format!("{tool_name} argument {path:?} does not equal its advertised constant"),
+            "use the exact const value returned in this tool's tools/list inputSchema",
+        )
+        .with_detail("argument", path)
+        .with_detail("expected_value", expected.clone())
+        .with_detail("observed_value", actual.clone())
+        .into());
+    }
+    if let Some(negated) = schema.get("not") {
+        let negated = negated.as_object().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} not at {path} is not an object; remediation: repair the immutable native definition before dispatch"
+            )
+            .into()
+        })?;
+        let forbidden = negated.get("const").ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} supports not only with one const at {path}; remediation: express the negated input as not={{const:...}}"
+            )
+            .into()
+        })?;
+        if negated.len() != 1 {
+            return Err(format!(
+                "ASTRO_MCP_NATIVE_SCHEMA_INVALID: {tool_name} supports not only with one const at {path}; remediation: remove unsupported keywords from the negated schema"
+            )
+            .into());
+        }
+        if actual == forbidden {
+            return Err(ToolFault::new(
+                "ASTRO_MCP_ARGUMENT_CONST_FORBIDDEN",
+                format!("{tool_name} argument {path:?} equals its advertised forbidden constant"),
+                "use a value other than the exact not.const value returned in this tool's tools/list inputSchema",
+            )
+            .with_detail("argument", path)
+            .with_detail("forbidden_value", forbidden.clone())
             .with_detail("observed_value", actual.clone())
             .into());
         }
@@ -415,7 +460,7 @@ fn validate_schema_number_bounds(
     let Some(number) = actual.as_f64() else {
         return Ok(());
     };
-    for (bound_name, below) in [("minimum", true), ("maximum", false)] {
+    for bound_name in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
         let Some(bound_value) = schema.get(bound_name) else {
             continue;
         };
@@ -425,10 +470,14 @@ fn validate_schema_number_bounds(
             )
             .into()
         })?;
-        let violates = if below {
+        let violates = if bound_name == "minimum" {
             number < bound
-        } else {
+        } else if bound_name == "maximum" {
             number > bound
+        } else if bound_name == "exclusiveMinimum" {
+            number <= bound
+        } else {
+            number >= bound
         };
         if violates {
             return Err(ToolFault::new(

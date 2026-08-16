@@ -49,7 +49,7 @@ pub(crate) fn causal_analysis_tool_definition() -> Value {
     json!({
         "name": "causal_analysis",
         "title": "Identify Causal Effects",
-        "description": "Estimates every declared binary-treatment × numeric-outcome pair with exact discrete-strata AIPW/backdoor standardization, while keeping the unadjusted association separately labeled. prepare requires explicit consistency, conditional-exchangeability, positivity, and no-interference assumptions; both treatment arms and the caller-declared minimum propensity/count must hold in every categorical adjustment stratum. It calculates uncertainty and Loom expected net gain from explicit outcome value, action cost, and unit, ranks only values with the same exact unit, then atomically persists the canonical observation/effect artifact to Assay, the compact intervention kernel to Kernel, and a paired Ledger entry. read independently point-reads and hashes that physical generation. Missing support is non-identifiable and refuses with no partial publication; no regression, imputation, extrapolation, cross-unit comparison, or fallback exists.",
+        "description": "Estimates every declared binary-treatment × numeric-outcome pair with exact discrete-strata AIPW/backdoor standardization, while keeping the unadjusted association separately labeled. prepare requires explicit consistency, conditional-exchangeability, positivity, and no-interference assumptions; both treatment arms and the caller-declared minimum propensity/count must hold in every categorical adjustment stratum. It calculates uncertainty and Loom expected net gain from an explicit finite nonzero signed outcome value, action cost, and unit; a negative value means lower outcome is better. It ranks only values with the same exact unit, then atomically persists the canonical observation/effect artifact to Assay, the compact intervention kernel to Kernel, and a paired Ledger entry. Every derived numeric operation is checked before publication and refuses with its exact pair/stratum/effect and operation if non-finite. read independently point-reads and hashes that physical generation. Missing support is non-identifiable and refuses with no partial publication; no regression, imputation, extrapolation, cross-unit comparison, or fallback exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -102,7 +102,7 @@ pub(crate) fn causal_analysis_tool_definition() -> Value {
                         "properties": {
                             "treatment": {"type": "string"},
                             "outcome": {"type": "string"},
-                            "outcome_value": {"type": "number", "exclusiveMinimum": 0.0},
+                            "outcome_value": {"type": "number", "not": {"const": 0.0}, "description": "Finite nonzero signed marginal value per outcome unit; negative explicitly means lower outcome is better."},
                             "action_cost": {"type": "number", "minimum": 0.0},
                             "unit": {"type": "string"}
                         },
@@ -144,7 +144,7 @@ pub(crate) fn expected_gain_tool_definition() -> Value {
     json!({
         "name": "expected_gain",
         "title": "Rank Expected Intervention Gain",
-        "description": "Reads the persisted Loom intervention kernel produced by causal_analysis and returns every identified effect ranked within its exact unit by expected net gain = effect × explicit outcome value − explicit action cost, with uncertainty bounds and break-even effect. Values carrying different units are never compared. This tool is read-only and independently verifies the Assay artifact, Kernel row, manifest, current pointer, and exact paired Ledger entry before serving. Information-gain bits are never treated as money or utility; absent/corrupt/non-identifiable state refuses fail-closed.",
+        "description": "Reads the persisted Loom intervention kernel produced by causal_analysis and returns every identified effect ranked within its exact unit by expected net gain = effect × explicit finite nonzero signed outcome value − explicit action cost, with normalized uncertainty bounds and break-even effect. A negative value means lower outcome is better; transformed bounds are always ordered lower ≤ point ≤ upper. Values carrying different units are never compared. This tool is read-only and independently verifies the Assay artifact, Kernel row, manifest, current pointer, and exact paired Ledger entry before serving. Information-gain bits are never treated as money or utility; absent/corrupt/non-identifiable/non-finite derived state refuses fail-closed.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -173,12 +173,12 @@ pub(crate) fn expected_gain_tool_definition() -> Value {
                             "treatment": {"type": "string"},
                             "outcome": {"type": "string"},
                             "effect": {"type": "number"},
-                            "outcome_value": {"type": "number"},
+                            "outcome_value": {"type": "number", "description": "Finite nonzero signed marginal value per outcome unit; negative means lower outcome is better."},
                             "action_cost": {"type": "number"},
                             "expected_gross_gain": {"type": "number"},
                             "expected_net_gain": {"type": "number"},
-                            "expected_net_gain_lower": {"type": "number"},
-                            "expected_net_gain_upper": {"type": "number"},
+                            "expected_net_gain_lower": {"type": "number", "description": "Normalized lower net-gain confidence bound."},
+                            "expected_net_gain_upper": {"type": "number", "description": "Normalized upper net-gain confidence bound."},
                             "break_even_effect": {"type": "number"},
                             "unit": {"type": "string"},
                             "rank_within_unit": {"type": "integer", "minimum": 1}

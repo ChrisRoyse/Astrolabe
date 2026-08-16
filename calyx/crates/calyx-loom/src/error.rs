@@ -12,6 +12,10 @@ pub const CALYX_LOOM_SERIES_READ_ERROR: &str = "CALYX_LOOM_SERIES_READ_ERROR";
 pub const CALYX_LOOM_TEMPORAL_XTERM_CORRUPT: &str = "CALYX_LOOM_TEMPORAL_XTERM_CORRUPT";
 /// Expected-gain inputs were non-finite, dimensionally incomplete, or duplicated.
 pub const CALYX_LOOM_EXPECTED_GAIN_INVALID: &str = "CALYX_LOOM_EXPECTED_GAIN_INVALID";
+/// Finite expected-gain inputs produced a non-finite multiplication,
+/// subtraction, division, or transformed confidence bound.
+pub const CALYX_LOOM_EXPECTED_GAIN_NUMERIC_INVALID: &str =
+    "CALYX_LOOM_EXPECTED_GAIN_NUMERIC_INVALID";
 pub const CALYX_RECURRENCE_CONTEXT_TOO_LARGE: &str = "CALYX_RECURRENCE_CONTEXT_TOO_LARGE";
 pub const CALYX_RECURRENCE_INVALID_RETENTION: &str = "CALYX_RECURRENCE_INVALID_RETENTION";
 /// The reactive trigger registry is at `max_triggers`; no new trigger admitted.
@@ -48,6 +52,9 @@ pub fn loom_error(code: &'static str, message: impl Into<String>) -> CalyxError 
         }
         CALYX_LOOM_EXPECTED_GAIN_INVALID => {
             "supply one finite value/cost record with a non-empty unit for every identified effect"
+        }
+        CALYX_LOOM_EXPECTED_GAIN_NUMERIC_INVALID => {
+            "reduce or rescale the finite effect, value, and cost magnitudes, then rerun the complete request"
         }
         CALYX_RECURRENCE_CONTEXT_TOO_LARGE => "store only a bounded recurrence context blob",
         CALYX_RECURRENCE_INVALID_RETENTION => "use a positive recurrence max_occurrences value",

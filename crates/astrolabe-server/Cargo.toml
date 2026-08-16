@@ -63,3 +63,7 @@ required-features = ["manual-fsv"]
 [[example]]
 name = "issue_1099_cross_lsp_fsv"
 required-features = ["manual-fsv"]
+
+[[example]]
+name = "issue_1134_causal_numeric_fsv"
+required-features = ["manual-fsv"]

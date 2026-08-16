@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    ASTRO_ASSAY_CAUSAL_INPUT_INVALID, ASTRO_ASSAY_CAUSAL_NOT_IDENTIFIABLE, AssayError, Result,
+    ASTRO_ASSAY_CAUSAL_INPUT_INVALID, ASTRO_ASSAY_CAUSAL_NOT_IDENTIFIABLE,
+    ASTRO_ASSAY_CAUSAL_NUMERIC_INVALID, AssayError, Result,
 };
 use crate::stats::inverse_standard_normal_cdf;
 
@@ -421,15 +422,55 @@ fn estimate_pair(
             .collect::<Result<Vec<_>>>()?;
         let accumulator = strata.entry(key).or_default();
         if *treatment == 1.0 {
-            accumulator.treated_count += 1;
-            accumulator.treated_sum += outcome;
-            treated_count += 1;
-            treated_sum += outcome;
+            accumulator.treated_count = checked_count(
+                pair,
+                "stratum treated count increment",
+                || row_stratum_location(pair, row),
+                accumulator.treated_count,
+            )?;
+            accumulator.treated_sum = finite_derived(
+                pair,
+                "stratum treated outcome accumulation",
+                || row_stratum_location(pair, row),
+                accumulator.treated_sum + outcome,
+            )?;
+            treated_count = checked_count(
+                pair,
+                "complete-sample treated count increment",
+                || format!("row {:?}", row.row_id),
+                treated_count,
+            )?;
+            treated_sum = finite_derived(
+                pair,
+                "complete-sample treated outcome accumulation",
+                || format!("row {:?}", row.row_id),
+                treated_sum + outcome,
+            )?;
         } else {
-            accumulator.control_count += 1;
-            accumulator.control_sum += outcome;
-            control_count += 1;
-            control_sum += outcome;
+            accumulator.control_count = checked_count(
+                pair,
+                "stratum control count increment",
+                || row_stratum_location(pair, row),
+                accumulator.control_count,
+            )?;
+            accumulator.control_sum = finite_derived(
+                pair,
+                "stratum control outcome accumulation",
+                || row_stratum_location(pair, row),
+                accumulator.control_sum + outcome,
+            )?;
+            control_count = checked_count(
+                pair,
+                "complete-sample control count increment",
+                || format!("row {:?}", row.row_id),
+                control_count,
+            )?;
+            control_sum = finite_derived(
+                pair,
+                "complete-sample control outcome accumulation",
+                || format!("row {:?}", row.row_id),
+                control_sum + outcome,
+            )?;
         }
     }
     if control_count == 0 || treated_count == 0 {
@@ -456,9 +497,32 @@ fn estimate_pair(
                 ),
             ));
         }
-        let count = accumulator.control_count + accumulator.treated_count;
-        let propensity = accumulator.treated_count as f64 / count as f64;
-        let overlap = propensity.min(1.0 - propensity);
+        let count = accumulator
+            .control_count
+            .checked_add(accumulator.treated_count)
+            .ok_or_else(|| {
+                numeric_error(pair, "stratum total count addition", || {
+                    format!("stratum {labels:?}")
+                })
+            })?;
+        let propensity = finite_derived(
+            pair,
+            "empirical propensity division",
+            || format!("stratum {labels:?}"),
+            accumulator.treated_count as f64 / count as f64,
+        )?;
+        let complementary_propensity = finite_derived(
+            pair,
+            "complementary propensity subtraction",
+            || format!("stratum {labels:?}"),
+            1.0 - propensity,
+        )?;
+        let overlap = finite_derived(
+            pair,
+            "minimum overlap selection",
+            || format!("stratum {labels:?}"),
+            propensity.min(complementary_propensity),
+        )?;
         if overlap < config.minimum_propensity {
             return Err(not_identifiable(
                 pair,
@@ -469,14 +533,26 @@ fn estimate_pair(
             ));
         }
         minimum_overlap = minimum_overlap.min(overlap);
+        let control_mean = finite_derived(
+            pair,
+            "control mean division",
+            || format!("stratum {labels:?}"),
+            accumulator.control_sum / accumulator.control_count as f64,
+        )?;
+        let treated_mean = finite_derived(
+            pair,
+            "treated mean division",
+            || format!("stratum {labels:?}"),
+            accumulator.treated_sum / accumulator.treated_count as f64,
+        )?;
         diagnostics.push(CausalStratumDiagnostic {
             labels: labels.clone(),
             observations: count,
             control_count: accumulator.control_count,
             treated_count: accumulator.treated_count,
             propensity,
-            control_mean: accumulator.control_sum / accumulator.control_count as f64,
-            treated_mean: accumulator.treated_sum / accumulator.treated_count as f64,
+            control_mean,
+            treated_mean,
         });
     }
 
@@ -494,22 +570,183 @@ fn estimate_pair(
         let diagnostic = lookup[&labels];
         let treatment = row.values[&pair.treatment];
         let outcome = row.values[&pair.outcome];
-        let value = diagnostic.treated_mean - diagnostic.control_mean
-            + treatment * (outcome - diagnostic.treated_mean) / diagnostic.propensity
-            - (1.0 - treatment) * (outcome - diagnostic.control_mean)
-                / (1.0 - diagnostic.propensity);
+        let location = || format!("row {:?}, stratum {labels:?}", row.row_id);
+        let stratum_contrast = finite_derived(
+            pair,
+            "stratum treated-minus-control contrast",
+            location,
+            diagnostic.treated_mean - diagnostic.control_mean,
+        )?;
+        let treated_residual = finite_derived(
+            pair,
+            "treated outcome residual",
+            location,
+            outcome - diagnostic.treated_mean,
+        )?;
+        let treated_weighted_residual = finite_derived(
+            pair,
+            "treated residual weighting",
+            location,
+            treatment * treated_residual,
+        )?;
+        let treated_correction = finite_derived(
+            pair,
+            "treated inverse-propensity correction",
+            location,
+            treated_weighted_residual / diagnostic.propensity,
+        )?;
+        let control_residual = finite_derived(
+            pair,
+            "control outcome residual",
+            location,
+            outcome - diagnostic.control_mean,
+        )?;
+        let control_weight = finite_derived(
+            pair,
+            "control treatment complement",
+            location,
+            1.0 - treatment,
+        )?;
+        let control_weighted_residual = finite_derived(
+            pair,
+            "control residual weighting",
+            location,
+            control_weight * control_residual,
+        )?;
+        let control_propensity = finite_derived(
+            pair,
+            "control propensity subtraction",
+            location,
+            1.0 - diagnostic.propensity,
+        )?;
+        let control_correction = finite_derived(
+            pair,
+            "control inverse-propensity correction",
+            location,
+            control_weighted_residual / control_propensity,
+        )?;
+        let augmented_treated = finite_derived(
+            pair,
+            "stratum contrast plus treated correction",
+            location,
+            stratum_contrast + treated_correction,
+        )?;
+        let value = finite_derived(
+            pair,
+            "AIPW influence value",
+            location,
+            augmented_treated - control_correction,
+        )?;
         influence.push(value);
     }
-    let ate = influence.iter().sum::<f64>() / influence.len() as f64;
-    let sample_variance = influence
-        .iter()
-        .map(|value| (value - ate).powi(2))
-        .sum::<f64>()
-        / (influence.len() - 1) as f64;
-    let standard_error = (sample_variance / influence.len() as f64).sqrt();
-    let z = inverse_standard_normal_cdf(0.5 + config.confidence_level / 2.0);
-    let margin = z * standard_error;
-    let association = treated_sum / treated_count as f64 - control_sum / control_count as f64;
+    let mut influence_sum = 0.0;
+    for (ordinal, value) in influence.iter().enumerate() {
+        influence_sum = finite_derived(
+            pair,
+            "influence-value accumulation",
+            || format!("influence ordinal {ordinal}"),
+            influence_sum + value,
+        )?;
+    }
+    let ate = finite_derived(
+        pair,
+        "average treatment effect division",
+        || "complete sample".to_string(),
+        influence_sum / influence.len() as f64,
+    )?;
+    let mut squared_deviation_sum = 0.0;
+    for (ordinal, value) in influence.iter().enumerate() {
+        let centered = finite_derived(
+            pair,
+            "influence centering",
+            || format!("influence ordinal {ordinal}"),
+            value - ate,
+        )?;
+        let squared = finite_derived(
+            pair,
+            "squared influence deviation",
+            || format!("influence ordinal {ordinal}"),
+            centered * centered,
+        )?;
+        squared_deviation_sum = finite_derived(
+            pair,
+            "squared-deviation accumulation",
+            || format!("influence ordinal {ordinal}"),
+            squared_deviation_sum + squared,
+        )?;
+    }
+    let sample_variance = finite_derived(
+        pair,
+        "sample variance division",
+        || "complete sample".to_string(),
+        squared_deviation_sum / (influence.len() - 1) as f64,
+    )?;
+    let mean_variance = finite_derived(
+        pair,
+        "mean variance division",
+        || "complete sample".to_string(),
+        sample_variance / influence.len() as f64,
+    )?;
+    let standard_error = finite_derived(
+        pair,
+        "standard error square root",
+        || "complete sample".to_string(),
+        mean_variance.sqrt(),
+    )?;
+    let confidence_probability = finite_derived(
+        pair,
+        "confidence probability calculation",
+        || "complete sample".to_string(),
+        0.5 + config.confidence_level / 2.0,
+    )?;
+    let z = finite_derived(
+        pair,
+        "normal critical value",
+        || "complete sample".to_string(),
+        inverse_standard_normal_cdf(confidence_probability),
+    )?;
+    let margin = finite_derived(
+        pair,
+        "confidence margin multiplication",
+        || "complete sample".to_string(),
+        z * standard_error,
+    )?;
+    let confidence_lower = finite_derived(
+        pair,
+        "lower confidence-bound subtraction",
+        || "complete sample".to_string(),
+        ate - margin,
+    )?;
+    let confidence_upper = finite_derived(
+        pair,
+        "upper confidence-bound addition",
+        || "complete sample".to_string(),
+        ate + margin,
+    )?;
+    let treated_mean = finite_derived(
+        pair,
+        "complete-sample treated mean division",
+        || "complete sample".to_string(),
+        treated_sum / treated_count as f64,
+    )?;
+    let control_mean = finite_derived(
+        pair,
+        "complete-sample control mean division",
+        || "complete sample".to_string(),
+        control_sum / control_count as f64,
+    )?;
+    let association = finite_derived(
+        pair,
+        "unadjusted association subtraction",
+        || "complete sample".to_string(),
+        treated_mean - control_mean,
+    )?;
+    let confounding_adjustment = finite_derived(
+        pair,
+        "confounding adjustment subtraction",
+        || "complete sample".to_string(),
+        ate - association,
+    )?;
     Ok(CausalEffectEstimate {
         effect_id: format!("{}=>{}", pair.treatment, pair.outcome),
         treatment: pair.treatment.clone(),
@@ -517,16 +754,66 @@ fn estimate_pair(
         adjustment_set: pair.adjustment_set.clone(),
         unadjusted_association: association,
         average_treatment_effect: ate,
-        confounding_adjustment: ate - association,
+        confounding_adjustment,
         standard_error,
-        confidence_lower: ate - margin,
-        confidence_upper: ate + margin,
+        confidence_lower,
+        confidence_upper,
         confidence_level: config.confidence_level,
         minimum_observed_overlap: minimum_overlap,
         strata: diagnostics,
         identifiability: "identified_backdoor".to_string(),
         evidence_kind: "identified_observational_effect".to_string(),
     })
+}
+
+fn checked_count<F>(
+    pair: &CausalPairSpec,
+    operation: &str,
+    location: F,
+    value: usize,
+) -> Result<usize>
+where
+    F: FnOnce() -> String,
+{
+    value
+        .checked_add(1)
+        .ok_or_else(|| numeric_error(pair, operation, location))
+}
+
+fn row_stratum_location(pair: &CausalPairSpec, row: &CausalObservation) -> String {
+    let labels = pair
+        .adjustment_set
+        .iter()
+        .map(|name| format!("{name}={}", row.strata[name]))
+        .collect::<Vec<_>>();
+    format!("row {:?}, stratum {labels:?}", row.row_id)
+}
+
+fn finite_derived<F>(pair: &CausalPairSpec, operation: &str, location: F, value: f64) -> Result<f64>
+where
+    F: FnOnce() -> String,
+{
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(numeric_error(pair, operation, location))
+    }
+}
+
+fn numeric_error<F>(pair: &CausalPairSpec, operation: &str, location: F) -> AssayError
+where
+    F: FnOnce() -> String,
+{
+    AssayError::new(
+        ASTRO_ASSAY_CAUSAL_NUMERIC_INVALID,
+        format!(
+            "causal effect {}=>{} derived a non-finite or overflowing value during {operation} at {}",
+            pair.treatment,
+            pair.outcome,
+            location()
+        ),
+        "reduce or rescale the finite outcome magnitudes, then rerun the complete causal request; no partial artifact was published",
+    )
 }
 
 fn invalid(message: impl Into<String>) -> AssayError {
