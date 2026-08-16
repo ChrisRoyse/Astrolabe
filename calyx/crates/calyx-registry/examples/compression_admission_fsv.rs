@@ -1858,7 +1858,12 @@ fn production(root: &Path) -> AnyResult<()> {
         .latest_evaluation
         .as_ref()
         .ok_or("production receipt missing after restart")?;
-    require_unpublished_candidate(latest)?;
+    require(
+        status.current_admission.is_none()
+            && latest.receipt_sha256 == candidate.evaluation.receipt_sha256,
+        "production restart status did not bind the exact unpublished candidate receipt without a current admission",
+    )?;
+    require_latest_candidate_status(latest)?;
     let immutable_components = verify_immutable_receipt_components(&vault_dir, &latest.receipt)?;
     println!(
         "{}",
@@ -3492,6 +3497,22 @@ fn require_unpublished_candidate(readback: &CompressionAdmissionReadback) -> Any
             && readback.pointer_ledger.is_none()
             && readback.receipt.candidate_selection.is_none(),
         "passing candidate evaluation was published before selection",
+    )
+}
+
+fn require_latest_candidate_status(readback: &CompressionAdmissionReadback) -> AnyResult<()> {
+    require(
+        readback.receipt.schema == COMPRESSION_ADMISSION_SCHEMA
+            && readback.receipt.verdict == CompressionAdmissionVerdict::Admitted
+            && !readback.current
+            && readback.active_generation_current
+            && readback.receipt_commit_seq.is_none()
+            && readback.receipt_ledger.is_none()
+            && readback.pointer_commit_seq.is_none()
+            && readback.pointer_ledger.is_none()
+            && readback.receipt.candidate_selection.is_none()
+            && readback.trust == "verified_latest_evaluation_and_active_generation",
+        "latest persisted candidate status did not prove an unpublished active-generation evaluation without mutation-only references",
     )
 }
 
