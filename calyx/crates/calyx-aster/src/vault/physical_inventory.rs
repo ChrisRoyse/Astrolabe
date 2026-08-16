@@ -184,15 +184,20 @@ where
     /// but are not substituted for or charged to the generation.
     ///
     /// Structural cost (issue #557; PC-02/03/04/13/29/41) is
-    /// `O(W + H_seq + F + exact WAL/SST/control bytes)`: canonical WAL segment
-    /// names `W` and framing headers through `seq` (`H_seq`) are walked once;
-    /// `F` is the total retained immutable-manifest roster bytes read and
-    /// decoded to locate `durable_seq == seq`. Only the requested WAL payload,
-    /// exact per-CF SSTs, and selected immutable manifest are SHA-256
-    /// inventoried. Tip controls are read once, and the immutable bytes are
-    /// BLAKE3-bound to ROUTER_HANDOFF, solely to validate the active vault head.
-    /// Real production `W`, `H_seq`, and `F` are unknown until #557's
-    /// production-size measurement; a fixture must not be cited as their bound.
+    /// `O(W + H_seq + F + R_commit log R_commit + sum(D_cf) + exact
+    /// WAL/SST/control bytes)`: canonical WAL segment names `W` and framing
+    /// headers through `seq` (`H_seq`) are walked once; `F` is the total retained
+    /// immutable-manifest roster bytes read and decoded to locate
+    /// `durable_seq == seq`; `R_commit` decoded WAL rows are partitioned once;
+    /// and `D_cf` directory entries are enumerated for each exact requested CF
+    /// and tier placement. Only the requested WAL payload, exact per-CF SSTs,
+    /// and selected immutable manifest are SHA-256 inventoried. Tip controls are
+    /// read once, and the immutable bytes are BLAKE3-bound to ROUTER_HANDOFF,
+    /// solely to validate the active vault head. The decoded WAL and its
+    /// per-CF expected-row maps are invariant across SST inspection. Real
+    /// production `W`, `H_seq`, `F`, `R_commit`, and `D_cf` are unknown until
+    /// #557's production-size measurement; a fixture must not be cited as their
+    /// bound.
     pub fn physical_commit_inventory(
         &self,
         seq: Seq,
@@ -261,6 +266,7 @@ where
                 cf_names(&actual_cfs)
             )));
         }
+        let expected_rows_by_cf = expected_sst_rows_by_cf(&write_rows);
 
         let wal_name = utf8_file_name(&record.segment_path, "WAL segment")?;
         let mut built = vec![BuiltComponent {
@@ -276,7 +282,22 @@ where
         }];
 
         for cf in &expected_cfs {
-            built.push(self.read_commit_sst(seq, *cf, &write_rows)?);
+            let expected_rows = expected_rows_by_cf.get(cf).ok_or_else(|| {
+                inventory_error(format!(
+                    "decoded WAL CF set named {} but no rows were present",
+                    cf.name()
+                ))
+            })?;
+            let expected_index = expected_rows
+                .first_key_value()
+                .map(|(_, (ordinal, _))| *ordinal)
+                .ok_or_else(|| {
+                    inventory_error(format!(
+                        "decoded WAL CF set named {} but no rows were present",
+                        cf.name()
+                    ))
+                })?;
+            built.push(self.read_commit_sst(seq, *cf, expected_index, expected_rows)?);
         }
 
         if at_common_tip {
@@ -325,7 +346,8 @@ where
         &self,
         seq: Seq,
         cf: ColumnFamily,
-        write_rows: &[encode::WriteRow],
+        expected_index: usize,
+        expected_rows: &BTreeMap<&[u8], (usize, &[u8])>,
     ) -> Result<BuiltComponent> {
         let locations = match &self.durable_tiering_policy {
             Some(policy) => {
@@ -364,7 +386,6 @@ where
                 )]
             }
         };
-        let (expected_index, expected_rows) = expected_sst_rows(write_rows, cf)?;
         let mut candidates = Vec::new();
         for (container, cf_dir, is_current_placement) in locations {
             let entries = match fs::read_dir(&cf_dir) {
@@ -491,26 +512,17 @@ fn canonical_cf_set(expected_cfs: &[ColumnFamily]) -> Result<Vec<ColumnFamily>> 
     Ok(canonical)
 }
 
-fn expected_sst_rows<'a>(
-    write_rows: &'a [encode::WriteRow],
-    cf: ColumnFamily,
-) -> Result<(usize, BTreeMap<&'a [u8], (usize, &'a [u8])>)> {
-    let mut latest = BTreeMap::<&[u8], (usize, &[u8])>::new();
+fn expected_sst_rows_by_cf(
+    write_rows: &[encode::WriteRow],
+) -> BTreeMap<ColumnFamily, BTreeMap<&[u8], (usize, &[u8])>> {
+    let mut by_cf = BTreeMap::<ColumnFamily, BTreeMap<&[u8], (usize, &[u8])>>::new();
     for (ordinal, row) in write_rows.iter().enumerate() {
-        if row.cf == cf {
-            latest.insert(row.key.as_slice(), (ordinal, row.value.as_slice()));
-        }
+        by_cf
+            .entry(row.cf)
+            .or_default()
+            .insert(row.key.as_slice(), (ordinal, row.value.as_slice()));
     }
-    let expected_index = latest
-        .first_key_value()
-        .map(|(_, (ordinal, _))| *ordinal)
-        .ok_or_else(|| {
-            inventory_error(format!(
-                "decoded WAL CF set named {} but no rows were present",
-                cf.name()
-            ))
-        })?;
-    Ok((expected_index, latest))
+    by_cf
 }
 
 fn validate_current_control_generation(root: &Path, seq: Seq) -> Result<()> {

@@ -527,6 +527,7 @@ fn evaluate_candidate<C: Clock>(
             ColumnFamily::slot_raw(slot.slot_id),
             ColumnFamily::Compression,
             ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
         ],
     )?;
     validate_generation_inventory(slot, &inventory)?;
@@ -1520,7 +1521,11 @@ fn publish_selected_receipt<C: Clock>(
     vault.flush_with_report()?;
     let inventory = vault.physical_commit_inventory(
         pointer_seq,
-        &[ColumnFamily::Compression, ColumnFamily::Ledger],
+        &[
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
     )?;
     let pointer = vault
         .read_cf_at(pointer_seq, ColumnFamily::Compression, &pointer_key)?
@@ -1651,7 +1656,11 @@ fn persist_evaluation_receipt<C: Clock>(
     vault.flush_with_report()?;
     let receipt_inventory = vault.physical_commit_inventory(
         receipt_seq,
-        &[ColumnFamily::Compression, ColumnFamily::Ledger],
+        &[
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
     )?;
     let observed = vault
         .read_cf_at(receipt_seq, ColumnFamily::Compression, &receipt_key)?
@@ -2140,6 +2149,7 @@ fn validate_generation_inventory(slot: &Slot, inventory: &PhysicalCommitInventor
     let mut manifests = 0_usize;
     let mut lifecycles = 0_usize;
     let mut ledgers = 0_usize;
+    let mut time_indexes = 0_usize;
     let mut invalidated_evaluation_pointers = 0_usize;
     let mut invalidated_admission_pointers = 0_usize;
     for row in &inventory.rows {
@@ -2208,6 +2218,7 @@ fn validate_generation_inventory(slot: &Slot, inventory: &PhysicalCommitInventor
                 }
             }
             ColumnFamily::Ledger => ledgers += 1,
+            ColumnFamily::TimeIndex => time_indexes += 1,
             _ => {
                 return Err(admission_error(format!(
                     "generation inventory contains unexpected CF {}",
@@ -2222,11 +2233,12 @@ fn validate_generation_inventory(slot: &Slot, inventory: &PhysicalCommitInventor
         || manifests != 1
         || lifecycles != 1
         || ledgers == 0
+        || time_indexes != 1
         || invalidated_evaluation_pointers > 1
         || invalidated_admission_pointers > 1
     {
         return Err(admission_error(format!(
-            "generation inventory is incomplete: primary={} raw={} proofs={} manifests={manifests} lifecycles={lifecycles} ledgers={ledgers}",
+            "generation inventory is incomplete: primary={} raw={} proofs={} manifests={manifests} lifecycles={lifecycles} ledgers={ledgers} time_indexes={time_indexes}",
             primary.len(),
             raw.len(),
             proofs.len()

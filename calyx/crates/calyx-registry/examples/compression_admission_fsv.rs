@@ -2956,6 +2956,7 @@ fn live_generation_inventory(
         ColumnFamily::slot_raw(slot_id),
         ColumnFamily::Compression,
         ColumnFamily::Ledger,
+        ColumnFamily::TimeIndex,
     ];
     let inventory = vault.physical_commit_inventory(seq, &expected_cfs)?;
     let mut components = Vec::with_capacity(inventory.components.len());
