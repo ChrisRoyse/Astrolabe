@@ -258,23 +258,14 @@ fn exercise(root: &Path) -> AnyResult<()> {
     )?;
     fs::create_dir_all(root)?;
     let vault_dir = root.join("vault");
-    let vault = open_write_vault(&vault_dir)?;
-
     let (registry, slots) = registry_and_slots()?;
-    let panel = Panel {
-        version: PANEL_VERSION,
-        slots: slots
-            .iter()
-            .map(|registered| registered.slot.clone())
-            .collect(),
-        created_at: 1_725_000_000_000,
-        kernel_ref: None,
-        guard_ref: None,
-    };
-    let panel_before = match load_vault_panel_state(&vault_dir) {
-        Err(error) => error.to_string(),
-        Ok(_) => return Err("fresh vault unexpectedly had persisted Panel/Registry state".into()),
-    };
+    let panel = panel_for_slots(slots.iter().map(|registered| registered.slot.clone()));
+    let vault = open_write_vault(&vault_dir, &panel)?;
+    let panel_before = load_vault_panel_state(&vault_dir)?;
+    require(
+        panel_before.panel == panel && panel_before.registry_snapshot.is_none(),
+        "fresh vault did not persist its exact Panel before Registry publication",
+    )?;
     let persisted = persist_vault_panel_state(&vault_dir, &panel, &registry)?;
     let loaded = load_vault_panel_state(&vault_dir)?;
     require(loaded.panel == panel, "persisted Panel readback differs")?;
@@ -286,7 +277,11 @@ fn exercise(root: &Path) -> AnyResult<()> {
         "{}",
         json!({
             "event": "panel_registry_persisted",
-            "before": { "load_error": panel_before },
+            "before": {
+                "panel_version": panel_before.panel.version,
+                "slot_ids": panel_before.panel.slots.iter().map(|slot| slot.slot_id.get()).collect::<Vec<_>>(),
+                "registry_snapshot_present": false,
+            },
             "after": {
                 "panel_version": loaded.panel.version,
                 "slot_ids": loaded.panel.slots.iter().map(|slot| slot.slot_id.get()).collect::<Vec<_>>(),
@@ -1048,7 +1043,6 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
     let directory = root.join("maximum-dimension");
     let vault_dir = directory.join("vault");
     fs::create_dir_all(&directory)?;
-    let vault = open_write_vault(&vault_dir)?;
     let mut registry = Registry::new();
     let registered = register_dim(
         &mut registry,
@@ -1059,7 +1053,9 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
         },
         MAX_SUPPORTED_DIM,
     )?;
-    persist_single_slot_panel(&vault_dir, &registry, &registered.slot)?;
+    let panel = panel_for_slots([registered.slot.clone()]);
+    let vault = open_write_vault(&vault_dir, &panel)?;
+    persist_single_slot_panel(&vault_dir, &registry, &panel)?;
 
     let inputs = (0..2)
         .map(|row| dimension_input("max-d4096", row, registered.slot.slot_id, MAX_SUPPORTED_DIM))
@@ -1196,7 +1192,6 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
     let directory = root.join("over-limit-dimension");
     let vault_dir = directory.join("vault");
     fs::create_dir_all(&directory)?;
-    let vault = open_write_vault(&vault_dir)?;
     let mut registry = Registry::new();
     let registered = register_dim(
         &mut registry,
@@ -1207,7 +1202,9 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
         },
         OVER_LIMIT_DIM,
     )?;
-    persist_single_slot_panel(&vault_dir, &registry, &registered.slot)?;
+    let panel = panel_for_slots([registered.slot.clone()]);
+    let vault = open_write_vault(&vault_dir, &panel)?;
+    persist_single_slot_panel(&vault_dir, &registry, &panel)?;
     let inputs = (0..2)
         .map(|row| {
             dimension_input(
@@ -1270,18 +1267,29 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
     Ok(())
 }
 
-fn persist_single_slot_panel(vault_dir: &Path, registry: &Registry, slot: &Slot) -> AnyResult<()> {
-    let panel = Panel {
+fn panel_for_slots(slots: impl IntoIterator<Item = Slot>) -> Panel {
+    Panel {
         version: PANEL_VERSION,
-        slots: vec![slot.clone()],
+        slots: slots.into_iter().collect(),
         created_at: 1_725_000_000_000,
         kernel_ref: None,
         guard_ref: None,
-    };
-    persist_vault_panel_state(vault_dir, &panel, registry)?;
+    }
+}
+
+fn persist_single_slot_panel(
+    vault_dir: &Path,
+    registry: &Registry,
+    panel: &Panel,
+) -> AnyResult<()> {
+    require(
+        panel.slots.len() == 1,
+        "single-slot Panel persistence received a multi-slot Panel",
+    )?;
+    persist_vault_panel_state(vault_dir, panel, registry)?;
     let loaded = load_vault_panel_state(vault_dir)?;
     require(
-        loaded.panel == panel && loaded.registry_snapshot.is_some(),
+        loaded.panel == *panel && loaded.registry_snapshot.is_some(),
         "single-slot Panel/Registry persisted readback differs",
     )
 }
@@ -1367,7 +1375,6 @@ fn production(root: &Path) -> AnyResult<()> {
 
     fs::create_dir_all(root)?;
     let vault_dir = root.join("vault");
-    let vault = open_write_vault(&vault_dir)?;
     let mut registry = Registry::new();
     let registered = register_dim(
         &mut registry,
@@ -1376,7 +1383,9 @@ fn production(root: &Path) -> AnyResult<()> {
         QuantPolicy::ScalarInt8,
         PRODUCTION_DIM,
     )?;
-    persist_single_slot_panel(&vault_dir, &registry, &registered.slot)?;
+    let panel = panel_for_slots([registered.slot.clone()]);
+    let vault = open_write_vault(&vault_dir, &panel)?;
+    persist_single_slot_panel(&vault_dir, &registry, &panel)?;
     let before_ingest = slot_state(&vault, registered.slot.slot_id)?;
     let held_out_raw = format!("C-code-poly/node_vectors/{}", source.first_node_id).into_bytes();
     let held_out_cx_id = vault.cx_id_for_input(&held_out_raw, PANEL_VERSION);
@@ -1859,18 +1868,9 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
     let cache_dir = root.join("cache");
     let vault_dir = root.join("vault");
     fs::create_dir_all(&cache_dir)?;
-    let vault = open_write_vault(&vault_dir)?;
     let (registry, slots) = registry_and_slots()?;
-    let panel = Panel {
-        version: PANEL_VERSION,
-        slots: slots
-            .iter()
-            .map(|registered| registered.slot.clone())
-            .collect(),
-        created_at: 1_725_000_000_000,
-        kernel_ref: None,
-        guard_ref: None,
-    };
+    let panel = panel_for_slots(slots.iter().map(|registered| registered.slot.clone()));
+    let vault = open_write_vault(&vault_dir, &panel)?;
     persist_vault_panel_state(&vault_dir, &panel, &registry)?;
     let loaded = load_vault_panel_state(&vault_dir)?;
     require(
@@ -3141,7 +3141,7 @@ fn required_row(
         .ok_or_else(|| format!("{name} is absent from {}", cf.name()).into())
 }
 
-fn open_write_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
+fn open_write_vault(dir: &Path, panel: &Panel) -> AnyResult<Arc<AsterVault<SystemClock>>> {
     fs::create_dir_all(dir)?;
     let vault_id: VaultId = VAULT_ID.parse()?;
     Ok(Arc::new(AsterVault::open(
@@ -3150,6 +3150,7 @@ fn open_write_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
         VAULT_SALT.to_vec(),
         VaultOptions {
             dedup_policy: Some(DedupPolicy::Off),
+            panel: Some(panel.clone()),
             ..VaultOptions::default()
         },
     )?))
