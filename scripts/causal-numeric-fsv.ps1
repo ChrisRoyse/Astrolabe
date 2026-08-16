@@ -7,6 +7,7 @@
     lease, then independently reads its persisted report and exact artifact-run
     records. This is a manual reality probe, not a test or gate.
 #>
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$SourcePath,
