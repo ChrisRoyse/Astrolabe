@@ -802,7 +802,7 @@ fn snapshot_corruption_copies(
     ] {
         let destination = root.join(format!("corrupt-{}-vault", kind.name()));
         vault.copy_durable_snapshot_to(&destination)?;
-        let copied = open_read_vault(&destination)?;
+        let copied = open_read_vault_for_slots(&destination, &[SlotId::new(TQ35_SLOT)])?;
         let copied_state = slot_state(&copied, SlotId::new(TQ35_SLOT))?;
         require(
             copied_state == source_state,
@@ -835,7 +835,7 @@ fn persisted_corruption_edges(copies: &[(PersistedCorruption, PathBuf)]) -> AnyR
 fn persisted_corruption_edge(kind: PersistedCorruption, directory: &Path) -> AnyResult<()> {
     let state = load_vault_panel_state(directory)?;
     let slot = panel_slot(&state, TQ35_SLOT)?.clone();
-    let before_vault = open_read_vault(directory)?;
+    let before_vault = open_read_vault_for_slots(directory, &[slot.slot_id])?;
     let before = slot_state(&before_vault, slot.slot_id)?;
     let cx_ids = corpus_ids(&before_vault);
     let first = cx_ids[0];
@@ -947,7 +947,7 @@ fn persisted_corruption_edge(kind: PersistedCorruption, directory: &Path) -> Any
     let segment_after_append = sha256_file(&append.segment_path)?;
     drop(wal);
 
-    let reopened = open_read_vault(directory)?;
+    let reopened = open_read_vault_for_slots(directory, &[slot.slot_id])?;
     let after = slot_state(&reopened, slot.slot_id)?;
     require(
         after.seq == append.seq,
