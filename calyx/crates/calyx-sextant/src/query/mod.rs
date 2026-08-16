@@ -12,8 +12,8 @@ use calyx_core::{CxId, LensId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use ask::{AskResult, ask};
-pub use executor::execute;
+pub use ask::{AskResult, ask, ask_resolved};
+pub use executor::{execute, execute_resolved};
 pub use planner::{DEFAULT_COST_CAP_MS, plan};
 pub use search::*;
 

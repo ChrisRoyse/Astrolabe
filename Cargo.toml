@@ -43,6 +43,7 @@ calyx-ledger = { path = "calyx/crates/calyx-ledger" }
 calyx-lodestar = { path = "calyx/crates/calyx-lodestar" }
 calyx-loom = { path = "calyx/crates/calyx-loom" }
 calyx-paths = { path = "calyx/crates/calyx-paths" }
+calyx-registry = { path = "calyx/crates/calyx-registry" }
 calyx-sextant = { path = "calyx/crates/calyx-sextant" }
 
 [profile.release]

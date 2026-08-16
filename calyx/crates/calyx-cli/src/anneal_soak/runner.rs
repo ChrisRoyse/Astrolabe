@@ -19,7 +19,11 @@ pub(super) fn run_seeded_soak(
     stats: &CorpusStats,
 ) -> crate::error::CliResult<calyx_anneal::SoakReport> {
     let cache_path = request.metrics_dir.join("anneal_autotune_cache.json");
-    let cache = AutotuneCache::load(&cache_path)?;
+    let cache = if cache_path.try_exists()? {
+        AutotuneCache::open_existing(&cache_path)?
+    } else {
+        AutotuneCache::create_empty(&cache_path)?
+    };
     let store = AsterAnnealLedgerStore::new(vault);
     let appender = LedgerAppender::open(store, SystemClock)?;
     let ledger = AnnealLedger::new(

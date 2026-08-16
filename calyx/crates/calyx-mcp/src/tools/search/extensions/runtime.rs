@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
@@ -18,11 +19,25 @@ pub(super) struct NavRuntime {
     pub(super) engine: SearchEngine,
 }
 
-pub(super) fn load_runtime(vault: &str) -> ToolResult<NavRuntime> {
+pub(super) fn load_runtime_read(
+    vault: &str,
+    additional_cfs: impl IntoIterator<Item = ColumnFamily>,
+) -> ToolResult<NavRuntime> {
     let resolved = engine::resolve_requested_vault(vault)?;
-    let vault = engine::open_vault(&resolved)?;
     let state = load_vault_panel_state(&resolved.path)?;
-    let loaded = engine::load_docs(&vault)?;
+    let vault = engine::open_vault_resolved(&resolved, &state, additional_cfs)?;
+    assemble_runtime(vault, state)
+}
+
+pub(super) fn load_runtime_write(vault: &str) -> ToolResult<NavRuntime> {
+    let resolved = engine::resolve_requested_vault(vault)?;
+    let state = load_vault_panel_state(&resolved.path)?;
+    let vault = engine::open_vault_write(&resolved)?;
+    assemble_runtime(vault, state)
+}
+
+fn assemble_runtime(vault: AsterVault, state: VaultPanelState) -> ToolResult<NavRuntime> {
+    let loaded = engine::load_docs_resolved(&vault, &state)?;
     let engine = build_search_engine(&loaded.docs, loaded.snapshot_seq)?;
     Ok(NavRuntime {
         vault,

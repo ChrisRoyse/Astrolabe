@@ -143,7 +143,7 @@ where
         let latest = self.snapshot();
         let snapshot = self.snapshot_handle(latest);
         let mut accepted_indexes = BTreeMap::<Vec<u8>, usize>::new();
-        let mut existing_merges = BTreeMap::<Vec<u8>, Constellation>::new();
+        let mut existing_merges = BTreeMap::<Vec<u8>, encode::BaseRecord>::new();
         let mut anchor_merge_rows = Vec::new();
         let mut accepted = Vec::<Constellation>::new();
         let mut ids = Vec::with_capacity(input.len());
@@ -173,15 +173,19 @@ where
                 let merged = if let Some(merged) = existing_merges.get_mut(&key) {
                     merged
                 } else {
-                    existing_merges.insert(key.clone(), self.get_at_snapshot(id, pinned)?);
+                    existing_merges.insert(
+                        key.clone(),
+                        encode::BaseRecord::decode_for_key(id, &existing)?,
+                    );
                     existing_merges
                         .get_mut(&key)
                         .expect("inserted existing merge")
                 };
-                let added = anchor_merge::merge_duplicate_anchors(merged, &constellation)?;
+                let added = anchor_merge::merge_duplicate_anchors_base(merged, &constellation)?;
                 if !added.is_empty() {
-                    anchor_merge_rows
-                        .extend(anchor_merge::stage_anchor_merge_rows(id, merged, &added)?);
+                    anchor_merge_rows.extend(anchor_merge::stage_anchor_merge_base_rows(
+                        id, merged, &added,
+                    )?);
                 }
                 ids.push(id);
                 continue;

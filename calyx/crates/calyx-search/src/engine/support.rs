@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Constellation, CxId, SlotVector};
@@ -7,7 +8,7 @@ use calyx_sextant::{FreshnessTag, Hit};
 
 use super::{SEARCH_READER_LEASE_MS, SearchFreshness};
 use crate::error::CliResult;
-use crate::persisted::{PersistedSearchIndexes, load_docs_at};
+use crate::persisted::PersistedSearchIndexes;
 
 pub(super) fn index_freshness_tag(
     indexes: &PersistedSearchIndexes,
@@ -87,7 +88,7 @@ pub(super) fn is_stale_derived(error: &crate::error::SearchError) -> bool {
 }
 
 pub(super) fn vault_base_count_at(vault: &AsterVault, snapshot: Snapshot) -> CliResult<usize> {
-    Ok(load_docs_at(vault, snapshot)?.len())
+    Ok(vault.scan_cf_snapshot(snapshot, ColumnFamily::Base)?.len())
 }
 
 pub(super) fn renumber_and_truncate(hits: &mut Vec<Hit>, k: usize) {

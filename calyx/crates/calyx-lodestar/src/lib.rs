@@ -194,6 +194,10 @@ pub use temporal_kernel::{
 };
 
 pub use vault_kernel::{
-    MeasuredVaultKernel, measured_kernel_from_vault, measured_kernel_with_contributions_from_vault,
+    MeasuredVaultKernel, MeasuredVaultKernelSelection, measured_kernel_from_vault,
+    measured_kernel_from_vault_resolved, measured_kernel_with_contributions_from_vault,
     measured_kernel_with_contributions_from_vault_allow_partial,
+    measured_kernel_with_contributions_from_vault_allow_partial_resolved,
+    measured_kernel_with_contributions_from_vault_candidates_allow_partial_resolved,
+    measured_kernel_with_contributions_from_vault_resolved,
 };

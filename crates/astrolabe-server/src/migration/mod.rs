@@ -63,16 +63,18 @@ use astrolabe_weave::{
     BlindSpotConfig, CrossTermValue, DEFAULT_BLIND_SPOT_PAIRS, DETECT_ANOMALIES_SCHEMA,
     EagerAgreementKind, EagerCrossTermDeltaPlanRequest, EagerCrossTermPlanRequest,
     LiveAnomalyInputs, SimilarityFamily, SimilarityNode, SimilarityPlannerConfig, SubscriptionId,
-    acknowledge_reactive_subscription, anomaly_report_artifact_bytes, blind_spot_anomaly_inputs,
-    blind_spot_slots, detect_anomalies, expand_persisted_similarity_region_from_vault,
-    extend_similarity_candidate_region_for_family, live_anomaly_inputs_from_vault,
-    persist_eager_cross_term_kind_run, persist_eager_cross_term_kind_run_delta,
-    persist_similarity_family_run, persist_similarity_family_run_delta,
-    plan_eager_cross_term_kind_run, plan_eager_cross_term_kind_run_delta,
-    plan_similarity_family_run, reconcile_complete_associations, recover_reactive_state,
-    run_index_time_drift, scan_similarity_physical_state, stream_eager_cross_term_rows,
+    WeaveSlotSource, acknowledge_reactive_subscription, anomaly_report_artifact_bytes,
+    blind_spot_anomaly_inputs, blind_spot_slots, detect_anomalies,
+    expand_persisted_similarity_region_from_vault, extend_similarity_candidate_region_for_family,
+    live_anomaly_inputs_from_vault, persist_eager_cross_term_kind_run,
+    persist_eager_cross_term_kind_run_delta, persist_similarity_family_run,
+    persist_similarity_family_run_delta, plan_eager_cross_term_kind_run,
+    plan_eager_cross_term_kind_run_delta, plan_similarity_family_run,
+    reconcile_complete_associations_with_panel_root, recover_reactive_state,
+    run_index_time_drift_with_panel_root, scan_similarity_physical_state,
+    stream_eager_cross_term_rows,
 };
-use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range, slot_key};
+use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range};
 use calyx_aster::ledger_view::{LedgerPointReadTrace, parse_aster_ledger_seq};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Clock, FixedClock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};

@@ -75,7 +75,11 @@ where
 /// internally (it reads its own bytes back and refuses on divergence); this
 /// wrapper only decides that a build refusal degrades the surface, never the
 /// index. The persisted bytes are independently read back by the serve path.
-pub(crate) fn persist_index_time_kernel_artifact<C>(vault: &AsterVault<C>, project: &str) -> Value
+pub(crate) fn persist_index_time_kernel_artifact<C>(
+    vault: &AsterVault<C>,
+    vault_dir: &Path,
+    project: &str,
+) -> Value
 where
     C: Clock,
 {
@@ -129,6 +133,7 @@ where
                 .collect::<Vec<_>>();
             let member_index = match astrolabe_weave::build_kernel_member_index(
                 vault,
+                vault_dir,
                 project,
                 &member_ids,
                 &artifact.members_hash,

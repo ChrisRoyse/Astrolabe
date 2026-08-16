@@ -9,7 +9,8 @@
 //! * [`erase_compressed_slot_rows`] — remove a strict subset of rows, resealing
 //!   the survivors.
 //! * [`delete_compressed_generation`] — remove an entire generation (manifest,
-//!   primary rows, and raw sidecars) in one coordinated, ledgered batch.
+//!   primary rows, raw sidecars, and membership proofs) in one coordinated,
+//!   ledgered batch.
 //!
 //! Every transition commits in a single seq-guarded conditional batch that
 //! carries its manifest mutation, resealed rows, one append-only
@@ -19,8 +20,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{
-    ColumnFamily, compression_lifecycle_key, compression_lifecycle_prefix_range,
-    compression_manifest_key, slot_key,
+    ColumnFamily, compression_admission_evaluation_pointer_key, compression_admission_pointer_key,
+    compression_lifecycle_key, compression_lifecycle_prefix_range, compression_manifest_key,
+    compression_membership_proof_key, compression_membership_proof_prefix_range,
+    parse_compression_membership_proof_key, slot_key,
 };
 use calyx_aster::compression_lifecycle::{
     GenerationLifecycleRecord, GenerationTransition, compression_generation_subject,
@@ -46,6 +49,8 @@ pub struct GenerationDeleteReport {
     pub slot_id: u16,
     /// Distinct `CxId`s whose primary and raw-sidecar rows were tombstoned.
     pub deleted_rows: usize,
+    /// Exact number of membership-proof values tombstoned with the generation.
+    pub deleted_membership_proofs: usize,
     /// Sequence at which the coordinated delete committed.
     pub snapshot: Seq,
     /// Hash-chained ledger transition committed atomically with the delete.
@@ -165,11 +170,21 @@ pub fn erase_compressed_slot_rows<C: Clock>(
         .filter(|(cx_id, _)| !erase_set.contains(cx_id))
         .map(|(cx_id, values)| (*cx_id, values.clone()))
         .collect();
-    let mut extra_tombstones = Vec::with_capacity(erase_set.len() * 2);
+    let tombstone_capacity = erase_set.len().checked_mul(3).ok_or_else(|| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "erase-reseal tombstone count overflow",
+        )
+    })?;
+    let mut extra_tombstones = Vec::with_capacity(tombstone_capacity);
     for cx_id in &erase_set {
         let key = slot_key(*cx_id);
         extra_tombstones.push((ColumnFamily::slot(slot.slot_id), key.clone()));
         extra_tombstones.push((ColumnFamily::slot_raw(slot.slot_id), key));
+        extra_tombstones.push((
+            ColumnFamily::Compression,
+            compression_membership_proof_key(slot.slot_id, *cx_id),
+        ));
     }
     let affected: Vec<CxId> = erase_set.iter().copied().collect();
     commit_reseal(
@@ -188,7 +203,8 @@ pub fn erase_compressed_slot_rows<C: Clock>(
 }
 
 /// Removes an entire compressed generation — its manifest, every compressed
-/// primary row, and every raw sidecar — in one coordinated, ledgered batch
+/// primary row, every raw sidecar, and every membership proof — in one
+/// coordinated, ledgered batch
 /// (`DeleteGeneration`). No orphaned rows or manifest can remain.
 ///
 /// Fails closed if the slot has no live generation manifest.
@@ -223,8 +239,46 @@ pub fn delete_compressed_generation<C: Clock>(
         .into_iter()
         .map(|(key, _)| key)
         .collect();
-    let mut writes: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> =
-        Vec::with_capacity(primary_keys.len() + raw_keys.len() + 2);
+    let proof_range = compression_membership_proof_prefix_range(slot.slot_id);
+    let proof_keys: Vec<Vec<u8>> = vault
+        .scan_cf_range_at(snapshot, ColumnFamily::Compression, &proof_range)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    for key in &proof_keys {
+        let (proof_slot, _) = parse_compression_membership_proof_key(key).ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!(
+                    "malformed compression membership key in slot {} delete range: {} bytes",
+                    slot.slot_id.get(),
+                    key.len()
+                ),
+            )
+        })?;
+        if proof_slot != slot.slot_id {
+            return Err(compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!(
+                    "compression membership key for slot {} appeared in slot {} delete range",
+                    proof_slot.get(),
+                    slot.slot_id.get()
+                ),
+            ));
+        }
+    }
+    let write_capacity = primary_keys
+        .len()
+        .checked_add(raw_keys.len())
+        .and_then(|count| count.checked_add(proof_keys.len()))
+        .and_then(|count| count.checked_add(4))
+        .ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                "delete-generation write count overflow",
+            )
+        })?;
+    let mut writes: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> = Vec::with_capacity(write_capacity);
     let mut deleted: Vec<CxId> = Vec::new();
     let mut deleted_set: BTreeSet<CxId> = BTreeSet::new();
     for key in &primary_keys {
@@ -249,11 +303,15 @@ pub fn delete_compressed_generation<C: Clock>(
             tombstone_value(),
         ));
     }
+    for key in &proof_keys {
+        writes.push((ColumnFamily::Compression, key.clone(), tombstone_value()));
+    }
     writes.push((
         ColumnFamily::Compression,
         compression_manifest_key(slot.slot_id),
         tombstone_value(),
     ));
+    append_admission_pointer_tombstones(vault, slot, snapshot, &mut writes)?;
     let record = GenerationLifecycleRecord::new(
         GenerationTransition::DeleteGeneration,
         slot.slot_id.get(),
@@ -271,7 +329,7 @@ pub fn delete_compressed_generation<C: Clock>(
         compression_lifecycle_key(slot.slot_id, snapshot),
         record.encode()?,
     ));
-    let ledger_payload = delete_ledger_payload(slot, &deleted)?;
+    let ledger_payload = delete_ledger_payload(slot, &deleted, proof_keys.len())?;
     let (committed, ledger_ref) = vault.write_cf_batch_with_ledger_entry_if_seq(
         snapshot,
         writes,
@@ -283,6 +341,7 @@ pub fn delete_compressed_generation<C: Clock>(
     Ok(GenerationDeleteReport {
         slot_id: slot.slot_id.get(),
         deleted_rows: deleted.len(),
+        deleted_membership_proofs: proof_keys.len(),
         snapshot: committed,
         ledger: ledger_ref,
     })
@@ -348,7 +407,8 @@ fn commit_reseal<C: Clock>(
     ledger_kind: EntryKind,
 ) -> Result<SlotCompressionReport> {
     let mut report = compress_slot_batch_with_assay_evidence(slot, lens, rows, queries, k, None)?;
-    let mut writes = generation_column_writes(slot, &report);
+    let mut writes = generation_column_writes(slot, &report)?;
+    append_admission_pointer_tombstones(vault, slot, expected_seq, &mut writes)?;
     for (cf, key) in extra_tombstones {
         writes.push((cf, key, tombstone_value()));
     }
@@ -376,8 +436,19 @@ fn commit_reseal<C: Clock>(
 fn generation_column_writes(
     slot: &Slot,
     report: &SlotCompressionReport,
-) -> Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> {
-    let mut writes = Vec::with_capacity(report.rows.len() * 2 + 1);
+) -> Result<Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>> {
+    let capacity = report
+        .rows
+        .len()
+        .checked_mul(3)
+        .and_then(|count| count.checked_add(3))
+        .ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                "compressed generation write count overflow",
+            )
+        })?;
+    let mut writes = Vec::with_capacity(capacity);
     for row in &report.rows {
         let key = slot_key(row.cx_id);
         writes.push((
@@ -390,13 +461,41 @@ fn generation_column_writes(
             key,
             row.compressed_bytes.clone(),
         ));
+        writes.push((
+            ColumnFamily::Compression,
+            compression_membership_proof_key(slot.slot_id, row.cx_id),
+            row.membership_proof_bytes.clone(),
+        ));
     }
     writes.push((
         ColumnFamily::Compression,
         compression_manifest_key(slot.slot_id),
         report.generation_manifest_bytes.clone(),
     ));
-    writes
+    Ok(writes)
+}
+
+/// A compression admission is bound to one immutable manifested generation.
+/// Every generation mutation removes both mutable pointers in the same durable
+/// transaction; immutable receipts remain as historical evidence.
+pub(super) fn append_admission_pointer_tombstones<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    snapshot: Seq,
+    writes: &mut Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    for key in [
+        compression_admission_evaluation_pointer_key(slot.slot_id),
+        compression_admission_pointer_key(slot.slot_id),
+    ] {
+        if vault
+            .read_cf_at(snapshot, ColumnFamily::Compression, &key)?
+            .is_some()
+        {
+            writes.push((ColumnFamily::Compression, key, tombstone_value()));
+        }
+    }
+    Ok(())
 }
 
 fn require_live_generation<C: Clock>(
@@ -472,12 +571,17 @@ fn cx_id_from_slot_key(key: &[u8]) -> Result<CxId> {
     Ok(CxId::from_bytes(bytes))
 }
 
-fn delete_ledger_payload(slot: &Slot, deleted: &[CxId]) -> Result<Vec<u8>> {
+fn delete_ledger_payload(
+    slot: &Slot,
+    deleted: &[CxId],
+    deleted_membership_proofs: usize,
+) -> Result<Vec<u8>> {
     serde_json::to_vec(&json!({
         "marker": COMPRESSION_GENERATION_MARKER,
         "transition": GenerationTransition::DeleteGeneration.as_str(),
         "slot_id": slot.slot_id.get(),
         "rows": 0,
+        "deleted_membership_proofs": deleted_membership_proofs,
         "affected_cx_ids": deleted.iter().map(|cx_id| hex_bytes(cx_id.as_bytes())).collect::<Vec<_>>(),
     }))
     .map_err(|error| {

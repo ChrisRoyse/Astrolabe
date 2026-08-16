@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::vault::{AsterVault, SlotVectorResolver, StrictRawSlotResolver};
 use calyx_core::{CalyxError, Clock, CxId, SlotId, SlotVector, SparseEntry, VaultStore};
 use calyx_loom::agreement_graph::XtermRow;
 use calyx_loom::{
@@ -66,14 +66,40 @@ pub fn run_shape_aware_loom_weave_for_cx_ids<C: Clock>(
     output_dir: &Path,
     cache_capacity: usize,
 ) -> Result<ShapeAwareLoomWeaveRun> {
+    run_shape_aware_loom_weave_for_cx_ids_resolved(
+        vault,
+        domain,
+        panel_version,
+        cx_ids,
+        output_dir,
+        cache_capacity,
+        &StrictRawSlotResolver,
+    )
+}
+
+pub fn run_shape_aware_loom_weave_for_cx_ids_resolved<C, R>(
+    vault: &AsterVault<C>,
+    domain: &str,
+    panel_version: u32,
+    cx_ids: &[CxId],
+    output_dir: &Path,
+    cache_capacity: usize,
+    resolver: &R,
+) -> Result<ShapeAwareLoomWeaveRun>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
     validate_request(cx_ids)?;
     let snapshot = vault.snapshot();
     let mut xterms = BTreeMap::<CrossTermKey, XtermRow>::new();
     let mut unsupported_pairs = Vec::new();
     let mut constellations = Vec::with_capacity(cx_ids.len());
 
-    for cx_id in cx_ids {
-        let constellation = vault.get(*cx_id, snapshot)?;
+    for (cx_id, constellation) in cx_ids
+        .iter()
+        .zip(vault.get_many_resolved_at(snapshot, cx_ids, resolver)?)
+    {
         if constellation.panel_version != panel_version {
             return Err(PolyError::diagnostics(
                 ERR_LOOM_WEAVE_PANEL_VERSION_MISMATCH,

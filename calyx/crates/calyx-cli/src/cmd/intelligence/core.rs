@@ -1,13 +1,11 @@
-use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    AnchorKind, AnchorValue, CalyxError, Constellation, CxId, Panel, Slot, SlotId, SlotState,
-    SlotVector, VaultStore,
+    AnchorKind, AnchorValue, Constellation, CxId, Panel, Slot, SlotId, SlotState, SlotVector,
 };
-use calyx_registry::{VaultPanelState, load_vault_panel_state};
+use calyx_registry::{VaultPanelState, load_vault_panel_state, resolved_constellation_read_cfs};
 use serde::Serialize;
 
 use super::super::ingest::parse_anchor_kind;
@@ -21,8 +19,33 @@ pub(super) struct VaultContext {
 
 pub(super) fn load_context(vault_name: &str) -> CliResult<VaultContext> {
     let resolved = resolve_vault_info(&home_dir()?, vault_name)?;
-    let vault = open_vault(&resolved)?;
     let state = load_vault_panel_state(&resolved.path)?;
+    let vault = open_vault(&resolved)?;
+    Ok(VaultContext { vault, state })
+}
+
+pub(super) fn load_read_context(
+    vault_name: &str,
+    additional_cfs: impl IntoIterator<Item = ColumnFamily>,
+) -> CliResult<VaultContext> {
+    let resolved = resolve_vault_info(&home_dir()?, vault_name)?;
+    let state = load_vault_panel_state(&resolved.path)?;
+    let mut selected_cfs = resolved_constellation_read_cfs(&state.panel);
+    selected_cfs.extend(additional_cfs);
+    selected_cfs.sort();
+    selected_cfs.dedup();
+    let vault = AsterVault::open(
+        &resolved.path,
+        resolved.vault_id,
+        vault_salt(resolved.vault_id, &resolved.name),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(selected_cfs),
+            ..VaultOptions::default()
+        },
+    )?;
     Ok(VaultContext { vault, state })
 }
 
@@ -35,17 +58,13 @@ pub(super) fn open_vault(resolved: &ResolvedVault) -> CliResult<AsterVault> {
     )?)
 }
 
-pub(super) fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
-    let snapshot = vault.snapshot();
-    let mut docs = BTreeMap::new();
-    for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let bytes: [u8; 16] = key.as_slice().try_into().map_err(|_| {
-            CalyxError::vault_access_denied(format!("base CF key has {} bytes", key.len()))
-        })?;
-        let cx_id = CxId::from_bytes(bytes);
-        docs.insert(cx_id, vault.get(cx_id, snapshot)?);
-    }
-    Ok(docs)
+pub(super) fn load_docs(
+    context: &VaultContext,
+) -> CliResult<std::collections::BTreeMap<CxId, Constellation>> {
+    Ok(calyx_search::load_docs_resolved(
+        &context.vault,
+        &context.state,
+    )?)
 }
 
 pub(super) fn parse_anchor(raw: &str) -> CliResult<AnchorKind> {
@@ -154,7 +173,7 @@ pub(super) fn read_json_row<T: serde::de::DeserializeOwned>(
     cf: ColumnFamily,
     key: &[u8],
 ) -> CliResult<Option<T>> {
-    let Some(bytes) = vault.read_cf_at(vault.snapshot(), cf, key)? else {
+    let Some(bytes) = vault.read_cf_at(vault.latest_seq(), cf, key)? else {
         return Ok(None);
     };
     serde_json::from_slice(&bytes)

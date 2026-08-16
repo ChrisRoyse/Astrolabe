@@ -61,8 +61,8 @@ pub(crate) fn run_real_panel(
     persist_vault_panel_state(&request.vault, &panel.panel, &panel.registry)?;
     let state = load_vault_panel_state(&request.vault)?;
     ingest_corpus(&vault, &state, data)?;
-    rebuild_persistent_indexes(&request.vault, &vault)?;
-    let docs = load_search_docs(&vault)?;
+    rebuild_persistent_indexes(&request.vault, &vault, &state)?;
+    let docs = calyx_search::load_docs_resolved(&vault, &state)?;
     validate_stored_docs(&docs, data, state.panel.slots.len())?;
     let report = evaluate_panel(&vault, &state, request, data, &docs, panel.slots)?;
     write_outputs(&vault, request, report)

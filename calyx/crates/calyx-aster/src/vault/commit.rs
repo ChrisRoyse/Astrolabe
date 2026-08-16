@@ -1,7 +1,7 @@
 mod generation_injection;
 
 use super::{AsterVault, durable, encode, ledger_hook};
-use crate::cf::{CfRouter, ColumnFamily};
+use crate::cf::{CfRouter, ColumnFamily, compression_membership_proof_prefix_range};
 use calyx_core::{CalyxError, Clock, Result, Seq};
 use generation_injection::validate_generation_injection_shape;
 
@@ -172,8 +172,9 @@ where
     ///
     /// * every row targets exactly one slot;
     /// * the `Compression` CF carries tombstones ONLY (an existing manifest and/or
-    ///   its append-only lifecycle records may be torn down; a manifest put or a
-    ///   lifecycle-record put is refused);
+    ///   its append-only lifecycle records may be torn down only when no
+    ///   membership proofs exist; a manifest put, lifecycle-record put, or proof
+    ///   mutation is refused);
     /// * every quantized primary row is a compressed-tagged put, every raw row is a
     ///   put, and the primary and raw key sets are identical and non-empty;
     /// * no other column family and no primary/raw tombstone appears.
@@ -212,6 +213,28 @@ where
                     remediation:
                         "re-read the current snapshot, rebuild the injection batch, and retry with that exact sequence",
                 });
+            }
+            let torn_down_slot = rows.iter().find_map(|row| {
+                (row.cf == ColumnFamily::Compression && row.key.len() == 2)
+                    .then(|| calyx_core::SlotId::new(u16::from_be_bytes([row.key[0], row.key[1]])))
+            });
+            if let Some(slot) = torn_down_slot {
+                let live_proofs = self.scan_cf_range_at(
+                    current_seq,
+                    ColumnFamily::Compression,
+                    &compression_membership_proof_prefix_range(slot),
+                )?;
+                if !live_proofs.is_empty() {
+                    return Err(CalyxError {
+                        code: generation_injection::CALYX_ASTER_GENERATION_INJECTION_INVALID,
+                        message: format!(
+                            "generation injection cannot tombstone slot {} manifest while {} membership-proof row(s) are live",
+                            slot.get(),
+                            live_proofs.len()
+                        ),
+                        remediation: "delete or reseal a proof-bearing generation through the registry lifecycle API; historical reconstruction cannot orphan membership proofs",
+                    });
+                }
             }
             self.commit_rows_locked_owned(rows, true)
         })

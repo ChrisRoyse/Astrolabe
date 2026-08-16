@@ -8,11 +8,11 @@
 //! MEASURED by [`kernel_recall_test`] against the full corpus index. Fails loud
 //! on a too-small / unanchored / unembedded vault.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::ColumnFamily;
-use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId, SlotId, VaultStore, dense_cosine};
+use calyx_aster::vault::{AsterVault, SlotVectorResolver, StrictRawSlotResolver, encode};
+use calyx_core::{AnchorKind, Clock, CxId, Seq, SlotId, SlotVector, VaultStore, dense_cosine};
 use calyx_paths::AssocGraph;
 
 use crate::error::{LodestarError, Result};
@@ -32,6 +32,16 @@ pub struct MeasuredVaultKernel {
     pub vault_corpus_size: usize,
     /// Number of visible concepts skipped because `content_slot` had no dense vector.
     pub skipped_unembedded: usize,
+    /// Persisted label anchors captured during the same Base scan.
+    pub labels: BTreeMap<CxId, String>,
+}
+
+/// Result of selecting and measuring the best dense content column from a
+/// caller-ordered candidate list. Equal coverage preserves caller order.
+pub struct MeasuredVaultKernelSelection {
+    pub content_slot: SlotId,
+    pub measured: MeasuredVaultKernel,
+    pub contributions: Vec<(CxId, f32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +65,33 @@ pub fn measured_kernel_from_vault<C: Clock>(
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<MeasuredVaultKernel> {
+    measured_kernel_from_vault_resolved(
+        vault,
+        content_slot,
+        kernel_params,
+        recall_params,
+        knn,
+        edge_cos_threshold,
+        &StrictRawSlotResolver,
+    )
+}
+
+/// Compression-aware form of [`measured_kernel_from_vault`]. The resolver is
+/// the sole owner of slot interpretation; Base is still read directly from the
+/// same Aster snapshot.
+pub fn measured_kernel_from_vault_resolved<C, R>(
+    vault: &AsterVault<C>,
+    content_slot: SlotId,
+    kernel_params: &KernelParams,
+    recall_params: &RecallTestParams,
+    knn: usize,
+    edge_cos_threshold: f32,
+    resolver: &R,
+) -> Result<MeasuredVaultKernel>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
     let inputs = build_vault_kernel_inputs(
         vault,
         content_slot,
@@ -62,6 +99,7 @@ pub fn measured_kernel_from_vault<C: Clock>(
         knn,
         edge_cos_threshold,
         VaultKernelMode::Strict,
+        resolver,
     )?;
     let kernel_index = build_kernel_index(&inputs.kernel, &inputs.embeddings)?;
     let recall = kernel_recall_test(&kernel_index, &inputs.full, &inputs.corpus, recall_params)?;
@@ -71,6 +109,7 @@ pub fn measured_kernel_from_vault<C: Clock>(
         corpus_size: inputs.corpus_size,
         vault_corpus_size: inputs.vault_corpus_size,
         skipped_unembedded: inputs.skipped_unembedded,
+        labels: inputs.labels,
     })
 }
 
@@ -94,6 +133,32 @@ pub fn measured_kernel_with_contributions_from_vault<C: Clock>(
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
+    measured_kernel_with_contributions_from_vault_resolved(
+        vault,
+        content_slot,
+        kernel_params,
+        recall_params,
+        knn,
+        edge_cos_threshold,
+        &StrictRawSlotResolver,
+    )
+}
+
+/// Compression-aware form of
+/// [`measured_kernel_with_contributions_from_vault`].
+pub fn measured_kernel_with_contributions_from_vault_resolved<C, R>(
+    vault: &AsterVault<C>,
+    content_slot: SlotId,
+    kernel_params: &KernelParams,
+    recall_params: &RecallTestParams,
+    knn: usize,
+    edge_cos_threshold: f32,
+    resolver: &R,
+) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
     let inputs = build_vault_kernel_inputs(
         vault,
         content_slot,
@@ -101,6 +166,7 @@ pub fn measured_kernel_with_contributions_from_vault<C: Clock>(
         knn,
         edge_cos_threshold,
         VaultKernelMode::Strict,
+        resolver,
     )?;
     measured_kernel_with_contributions_from_inputs(inputs, recall_params)
 }
@@ -121,6 +187,32 @@ pub fn measured_kernel_with_contributions_from_vault_allow_partial<C: Clock>(
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
+    measured_kernel_with_contributions_from_vault_allow_partial_resolved(
+        vault,
+        content_slot,
+        kernel_params,
+        recall_params,
+        knn,
+        edge_cos_threshold,
+        &StrictRawSlotResolver,
+    )
+}
+
+/// Compression-aware form of
+/// [`measured_kernel_with_contributions_from_vault_allow_partial`].
+pub fn measured_kernel_with_contributions_from_vault_allow_partial_resolved<C, R>(
+    vault: &AsterVault<C>,
+    content_slot: SlotId,
+    kernel_params: &KernelParams,
+    recall_params: &RecallTestParams,
+    knn: usize,
+    edge_cos_threshold: f32,
+    resolver: &R,
+) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
     let inputs = build_vault_kernel_inputs(
         vault,
         content_slot,
@@ -128,8 +220,79 @@ pub fn measured_kernel_with_contributions_from_vault_allow_partial<C: Clock>(
         knn,
         edge_cos_threshold,
         VaultKernelMode::WebPartial,
+        resolver,
     )?;
     measured_kernel_with_contributions_from_inputs(inputs, recall_params)
+}
+
+/// Selects the highest-coverage dense content slot and measures the website
+/// kernel without rereading Base or the selected slot column.
+///
+/// Base is decoded once at one sequence. Each distinct candidate column is
+/// resolved once through `resolver`; ties preserve `content_slots` order so the
+/// caller can encode panel-state preference deterministically.
+pub fn measured_kernel_with_contributions_from_vault_candidates_allow_partial_resolved<C, R>(
+    vault: &AsterVault<C>,
+    content_slots: &[SlotId],
+    kernel_params: &KernelParams,
+    recall_params: &RecallTestParams,
+    knn: usize,
+    edge_cos_threshold: f32,
+    resolver: &R,
+) -> Result<MeasuredVaultKernelSelection>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
+    if content_slots.is_empty() {
+        return Err(LodestarError::KernelInvalidParams {
+            detail: "kernel content-slot candidate list is empty".to_string(),
+        });
+    }
+    if content_slots.iter().copied().collect::<BTreeSet<_>>().len() != content_slots.len() {
+        return Err(LodestarError::KernelInvalidParams {
+            detail: "kernel content-slot candidate list contains duplicates".to_string(),
+        });
+    }
+
+    let snapshot = vault.snapshot();
+    let base_by_id = read_vault_kernel_base(vault, snapshot)?;
+    let mut selected: Option<(SlotId, BTreeMap<CxId, SlotVector>, usize)> = None;
+    for content_slot in content_slots {
+        let vectors =
+            resolve_content_vectors(vault, snapshot, *content_slot, resolver, &base_by_id)?;
+        let dense_count = vectors
+            .values()
+            .filter(|vector| vector.as_dense().is_some())
+            .count();
+        let improves_coverage = match selected.as_ref() {
+            Some((_, _, best_count)) => dense_count > *best_count,
+            None => true,
+        };
+        if improves_coverage {
+            selected = Some((*content_slot, vectors, dense_count));
+        }
+    }
+    let (content_slot, vectors, _) =
+        selected.ok_or_else(|| LodestarError::KernelInvalidParams {
+            detail: "kernel content-slot candidate selection produced no column".to_string(),
+        })?;
+    let inputs = build_vault_kernel_inputs_from_rows(
+        &base_by_id,
+        vectors,
+        content_slot,
+        kernel_params,
+        knn,
+        edge_cos_threshold,
+        VaultKernelMode::WebPartial,
+    )?;
+    let (measured, contributions) =
+        measured_kernel_with_contributions_from_inputs(inputs, recall_params)?;
+    Ok(MeasuredVaultKernelSelection {
+        content_slot,
+        measured,
+        contributions,
+    })
 }
 
 fn measured_kernel_with_contributions_from_inputs(
@@ -164,6 +327,7 @@ fn measured_kernel_with_contributions_from_inputs(
             corpus_size: inputs.corpus_size,
             vault_corpus_size: inputs.vault_corpus_size,
             skipped_unembedded: inputs.skipped_unembedded,
+            labels: inputs.labels,
         },
         contributions,
     ))
@@ -181,27 +345,46 @@ struct VaultKernelInputs {
     corpus_size: usize,
     vault_corpus_size: usize,
     skipped_unembedded: usize,
+    labels: BTreeMap<CxId, String>,
 }
 
 /// Scan the vault's content-slot embeddings, build the embedding k-NN
 /// association graph, select the kernel, and build the full-corpus index — the
 /// setup common to every measured-kernel call. Fails loud (never silent) on a
 /// too-small / unanchored / unembedded vault.
-fn build_vault_kernel_inputs<C: Clock>(
+fn build_vault_kernel_inputs<C, R>(
     vault: &AsterVault<C>,
     content_slot: SlotId,
     kernel_params: &KernelParams,
     knn: usize,
     edge_cos_threshold: f32,
     mode: VaultKernelMode,
-) -> Result<VaultKernelInputs> {
+    resolver: &R,
+) -> Result<VaultKernelInputs>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
     let snapshot = vault.snapshot();
-    let mut rows: Vec<RecallQuery> = Vec::new();
-    let mut anchors: Vec<CxId> = Vec::new();
-    let mut vault_corpus_size = 0usize;
-    let mut skipped_unembedded = 0usize;
-    for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        vault_corpus_size += 1;
+    let base_by_id = read_vault_kernel_base(vault, snapshot)?;
+    let vectors = resolve_content_vectors(vault, snapshot, content_slot, resolver, &base_by_id)?;
+    build_vault_kernel_inputs_from_rows(
+        &base_by_id,
+        vectors,
+        content_slot,
+        kernel_params,
+        knn,
+        edge_cos_threshold,
+        mode,
+    )
+}
+
+fn read_vault_kernel_base<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> Result<BTreeMap<CxId, calyx_core::Constellation>> {
+    let mut base_by_id = BTreeMap::new();
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
         let bytes: [u8; 16] =
             key.as_slice()
                 .try_into()
@@ -209,12 +392,94 @@ fn build_vault_kernel_inputs<C: Clock>(
                     detail: format!("base CF key has {} bytes, expected 16", key.len()),
                 })?;
         let cx_id = CxId::from_bytes(bytes);
-        let cx = vault.get(cx_id, snapshot)?;
-        let Some(dense) = cx
-            .slots
-            .get(&content_slot)
-            .and_then(|vector| vector.as_dense())
-        else {
+        let cx = encode::decode_constellation_base(&value)?;
+        if cx.cx_id != cx_id {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!(
+                    "base CF key {cx_id} differs from embedded constellation {}",
+                    cx.cx_id
+                ),
+            });
+        }
+        if base_by_id.insert(cx_id, cx).is_some() {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!("base CF contains duplicate constellation {cx_id}"),
+            });
+        }
+    }
+    Ok(base_by_id)
+}
+
+fn resolve_content_vectors<C, R>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    content_slot: SlotId,
+    resolver: &R,
+    base_by_id: &BTreeMap<CxId, calyx_core::Constellation>,
+) -> Result<BTreeMap<CxId, SlotVector>>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
+    let mut vectors_by_id = BTreeMap::new();
+    let mut previous_cx_id = None;
+    for (cx_id, vector) in resolver.resolve_slot_column_at(vault, snapshot, content_slot)? {
+        if previous_cx_id.is_some_and(|previous| previous >= cx_id) {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!(
+                    "content slot {content_slot} resolver column is not strictly ordered at {cx_id}"
+                ),
+            });
+        }
+        previous_cx_id = Some(cx_id);
+        if !base_by_id
+            .get(&cx_id)
+            .is_some_and(|cx| cx.slots.contains_key(&content_slot))
+        {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!(
+                    "content slot {content_slot} resolved orphan or undeclared row {cx_id}"
+                ),
+            });
+        }
+        if vectors_by_id.insert(cx_id, vector).is_some() {
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!(
+                    "content slot {content_slot} resolver returned duplicate row {cx_id}"
+                ),
+            });
+        }
+    }
+    Ok(vectors_by_id)
+}
+
+fn build_vault_kernel_inputs_from_rows(
+    base_by_id: &BTreeMap<CxId, calyx_core::Constellation>,
+    mut vectors_by_id: BTreeMap<CxId, SlotVector>,
+    content_slot: SlotId,
+    kernel_params: &KernelParams,
+    knn: usize,
+    edge_cos_threshold: f32,
+    mode: VaultKernelMode,
+) -> Result<VaultKernelInputs> {
+    let vault_corpus_size = base_by_id.len();
+    let mut rows: Vec<RecallQuery> = Vec::new();
+    let mut anchors: Vec<CxId> = Vec::new();
+    let mut skipped_unembedded = 0usize;
+    let labels = base_by_id
+        .iter()
+        .filter_map(|(cx_id, cx)| {
+            cx.anchors.iter().find_map(|anchor| match &anchor.kind {
+                AnchorKind::Label(value) => Some((*cx_id, value.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+    for (cx_id, cx) in base_by_id {
+        let dense = vectors_by_id
+            .remove(cx_id)
+            .and_then(|vector| vector.as_dense().map(ToOwned::to_owned));
+        let Some(dense) = dense else {
             match mode {
                 VaultKernelMode::Strict => {
                     return Err(LodestarError::KernelInvalidParams {
@@ -231,12 +496,19 @@ fn build_vault_kernel_inputs<C: Clock>(
             }
         };
         rows.push(RecallQuery {
-            cx_id,
-            vector: dense.to_vec(),
+            cx_id: *cx_id,
+            vector: dense,
         });
         if !cx.anchors.is_empty() {
-            anchors.push(cx_id);
+            anchors.push(*cx_id);
         }
+    }
+    if !vectors_by_id.is_empty() {
+        return Err(LodestarError::KernelInvalidParams {
+            detail: format!(
+                "content slot {content_slot} resolver returned rows not consumed by Base"
+            ),
+        });
     }
     if rows.len() < 2 {
         return Err(LodestarError::KernelInvalidParams {
@@ -332,5 +604,6 @@ fn build_vault_kernel_inputs<C: Clock>(
         corpus_size,
         vault_corpus_size,
         skipped_unembedded,
+        labels,
     })
 }

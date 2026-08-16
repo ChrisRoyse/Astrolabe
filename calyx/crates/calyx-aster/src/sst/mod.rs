@@ -380,6 +380,21 @@ impl SstReader {
             .collect()
     }
 
+    /// Visits every row through the retained immutable mmap without cloning
+    /// key/value bodies. Physical generation readback uses this to compare an
+    /// SST to its decoded WAL batch with memory bounded by that WAL batch,
+    /// rather than allocating a second copy of the checkpoint.
+    pub(crate) fn visit_entries(
+        &self,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        for entry in self.lookup.index.iter() {
+            let record = read_record_ref(self.column.as_bytes(), entry.offset)?;
+            visit(record.key, record.value)?;
+        }
+        Ok(self.lookup.index.len())
+    }
+
     pub fn bloom_may_contain(&self, key: &[u8]) -> bool {
         self.lookup.bloom.may_contain(key)
     }

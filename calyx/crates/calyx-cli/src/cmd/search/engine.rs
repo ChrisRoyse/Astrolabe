@@ -15,8 +15,8 @@ use calyx_core::{
 };
 use calyx_registry::{VaultPanelState, load_vault_panel_state, require_vault_registry_contracts};
 use calyx_search::{
-    FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchTraceEvent, load_docs,
-    search_outcome_with_freshness, search_outcome_with_query_vectors_freshness,
+    FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchTraceEvent, load_docs_resolved,
+    search_outcome_with_freshness, search_outcome_with_query_vectors_freshness_resolved,
 };
 use calyx_sextant::Hit;
 
@@ -54,8 +54,9 @@ fn search_command(args: SearchArgs) -> CliResult {
                 measure_search_query_vectors_via_resident(&state, &resolved, &args.query, addr)?;
             let vault = open_vault(&resolved, search_read_cfs(&state, guard))?;
             let mut trace_sink = emit_search_trace;
-            search_outcome_with_query_vectors_freshness(
+            search_outcome_with_query_vectors_freshness_resolved(
                 &vault,
+                &state,
                 &resolved.path,
                 &query_vectors,
                 args.k,
@@ -307,7 +308,7 @@ fn kernel_answer_command(args: KernelAnswerArgs) -> CliResult {
     require_vault_registry_contracts(&resolved.path)?;
     let state = load_vault_panel_state(&resolved.path)?;
     let vault = open_vault(&resolved, panel_read_cfs(&state.panel))?;
-    let docs = load_docs(&vault)?;
+    let docs = load_docs_resolved(&vault, &state)?;
     let outcome = search_outcome_with_freshness(
         &vault,
         &state,

@@ -18,8 +18,10 @@ use astrolabe_domain::fsv::FsvAck;
 use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, KeyRange, prefix_range};
 use calyx_aster::mvcc::{LatestOnlyReadbackStatus, tombstone_value};
-use calyx_aster::vault::encode::{BaseRecord, decode_slot_vector};
-use calyx_aster::vault::{AsterVault, OrderedCfRead, SstReadSession, VaultOptions};
+use calyx_aster::vault::encode::BaseRecord;
+use calyx_aster::vault::{
+    AsterVault, OrderedCfRead, SstReadSession, VaultOptions, decode_strict_raw_slot_value,
+};
 use calyx_core::{
     AbsentReason, CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultId,
     VaultStore,
@@ -30,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hex_lower_bytes;
 use crate::sim_rows::ledger_ref_at_commit;
+use crate::slot_source::WeaveSlotSource;
 use crate::xterm_cotenant::{
     XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_BLOCK_MAGIC,
     XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
@@ -395,8 +398,16 @@ pub struct CompleteAssociationSourceReceipt {
     pub base_page_rows_high_water: usize,
     pub source_records_loaded: usize,
     pub source_record_batches: usize,
+    /// Raw Slot-CF rows covered by Aster ordered physical telemetry.
     pub slot_rows_read: usize,
+    /// Raw persisted Slot-CF value bytes covered by that telemetry.
     pub slot_bytes_read: u64,
+    /// Registry-authenticated compressed rows reconstructed as logical vectors.
+    pub compressed_rows_read: usize,
+    /// Bounded Registry batch calls, each over one exact manifested slot.
+    pub compressed_slot_batches: usize,
+    /// Immutable generation identities bound into every source fingerprint.
+    pub compressed_generation_identities: BTreeMap<String, String>,
     pub slot_batch_bytes_high_water: u64,
     pub readback_plan_bytes_high_water: u64,
     pub exact_source_reassemblies: usize,
@@ -483,11 +494,27 @@ pub fn reconcile_complete_associations<C>(
 where
     C: Clock,
 {
+    reconcile_complete_associations_with_panel_root(vault, actor, None)
+}
+
+/// Compression-aware reconciliation using one persisted panel/Registry
+/// interpretation for the complete operation. The legacy surface above remains
+/// valid for raw generations and fails closed on a compressed envelope.
+pub fn reconcile_complete_associations_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    actor: impl Into<String>,
+    vault_panel_root: Option<&Path>,
+) -> calyx_core::Result<CompleteAssociationPersistReport>
+where
+    C: Clock,
+{
     let actor = actor.into();
     let storage_before = vault.latest_only_readback_status();
     ensure_bounded_source_storage(&storage_before, "complete-association pre-read")?;
     let base_generation_before = vault.cf_content_generation(ColumnFamily::Base)?;
-    let snapshot = vault.snapshot();
+    let snapshot_lease = vault.retain_latest_snapshot();
+    let snapshot = snapshot_lease.seq();
+    let source = WeaveSlotSource::open(snapshot, vault_panel_root, None)?;
     let persisted = read_persisted_state_at(vault, snapshot)?;
     let legacy = read_legacy_v1_state_at(vault, snapshot)?;
     if persisted
@@ -500,8 +527,15 @@ where
         ));
     }
     let mut roster_cache = BTreeMap::<u32, BTreeSet<SlotId>>::new();
-    let inventory =
-        inventory_association_sources_at(vault, snapshot, &persisted, &mut roster_cache)?;
+    let mut slot_representation_ids = BTreeMap::<SlotId, String>::new();
+    let inventory = inventory_association_sources_at(
+        vault,
+        snapshot,
+        &persisted,
+        &mut roster_cache,
+        &source,
+        &mut slot_representation_ids,
+    )?;
     let current_id_set = inventory
         .current_ids
         .iter()
@@ -528,6 +562,12 @@ where
             .flat_map(|slots| slots.iter().copied())
             .map(ColumnFamily::slot),
     );
+    if slot_representation_ids
+        .values()
+        .any(|identity| identity.starts_with("registry-compressed:"))
+    {
+        source_cfs.insert(ColumnFamily::Compression);
+    }
     let source_cf_generations = source_cfs
         .iter()
         .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
@@ -564,6 +604,7 @@ where
     let tombstone = tombstone_value();
 
     for source_ids in changed_ids.chunks(SOURCE_RECORD_BATCH) {
+        snapshot_lease.record_progress();
         ensure_complete_source_generations(vault, &source_cf_generations, "pre-hydration")?;
         let hydration_snapshot = vault.snapshot();
         source_receipt
@@ -572,10 +613,13 @@ where
         source_receipt.hydration_snapshot_last = Some(hydration_snapshot);
         let source_session = vault.sst_read_session_at(hydration_snapshot)?;
         let records = load_constellation_batch(
+            vault,
             &source_session,
+            &source,
             source_ids,
             &current_sources,
             &mut roster_cache,
+            &slot_representation_ids,
             &mut source_receipt,
         )?;
         drop(source_session);
@@ -685,7 +729,9 @@ where
                 }
             }
         }
+        snapshot_lease.record_progress();
     }
+    drop(snapshot_lease);
 
     for cx_id in &removed {
         let mut record_mutations = Vec::new();
@@ -929,9 +975,19 @@ fn decode_association_source_base(
     key: &[u8],
     bytes: &[u8],
     roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+    slot_representation_ids: &BTreeMap<SlotId, String>,
 ) -> calyx_core::Result<AssociationSourceBase> {
     let cx_id = cx_from_exact_key(key, "Base")?;
     let base = BaseRecord::decode_for_key(cx_id, bytes)?;
+    association_source_base_from_record(cx_id, base, roster_cache, slot_representation_ids)
+}
+
+fn association_source_base_from_record(
+    cx_id: CxId,
+    base: BaseRecord,
+    roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+    slot_representation_ids: &BTreeMap<SlotId, String>,
+) -> calyx_core::Result<AssociationSourceBase> {
     let panel_version = base.constellation().panel_version;
     if let Entry::Vacant(entry) = roster_cache.entry(panel_version) {
         let roster = astrolabe_panel::slots_for_version(panel_version).map_err(|error| {
@@ -959,12 +1015,20 @@ fn decode_association_source_base(
     }
     let slot_hashes = base.slot_hashes().clone();
     let mut source_bytes = Vec::new();
-    append_part(&mut source_bytes, b"astrolabe.association_source.v1");
+    append_part(&mut source_bytes, b"astrolabe.association_source.v2");
     append_part(&mut source_bytes, &panel_version.to_be_bytes());
     append_part(&mut source_bytes, &(slot_hashes.len() as u64).to_be_bytes());
     for (slot, slot_hash) in &slot_hashes {
         append_part(&mut source_bytes, &slot.get().to_be_bytes());
         append_part(&mut source_bytes, slot_hash);
+        let representation = slot_representation_ids.get(slot).ok_or_else(|| {
+            source_corrupt(format!(
+                "source representation for Base {} S{} was not resolved before fingerprinting",
+                cx_hex(cx_id),
+                slot.get()
+            ))
+        })?;
+        append_part(&mut source_bytes, representation.as_bytes());
     }
     Ok(AssociationSourceBase {
         cx_id,
@@ -979,6 +1043,8 @@ fn inventory_association_sources_at<C>(
     snapshot: u64,
     persisted: &PersistedState,
     roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+    source: &WeaveSlotSource,
+    slot_representation_ids: &mut BTreeMap<SlotId, String>,
 ) -> calyx_core::Result<AssociationSourceInventory>
 where
     C: Clock,
@@ -1006,7 +1072,39 @@ where
             receipt.base_scan_pages = checked_add(receipt.base_scan_pages, 1, "Base scan pages")?;
             receipt.base_page_rows_high_water = receipt.base_page_rows_high_water.max(page.len());
             for (key, bytes) in page {
-                let base = decode_association_source_base(&key, &bytes, roster_cache)?;
+                let cx_id = cx_from_exact_key(&key, "Base")?;
+                let record = BaseRecord::decode_for_key(cx_id, &bytes)?;
+                source.ensure_panel_version(record.constellation().panel_version)?;
+                for slot in record.slot_hashes().keys() {
+                    if !slot_representation_ids.contains_key(slot) {
+                        let identity = source.compressed_generation_identity(vault, *slot)?;
+                        let binding = match identity {
+                            Some(identity) => {
+                                let bytes = serde_json::to_vec(&identity).map_err(|error| {
+                                    source_corrupt(format!(
+                                        "encode compressed S{} generation identity: {error}",
+                                        slot.get()
+                                    ))
+                                })?;
+                                let identity_hash =
+                                    hex_lower_bytes(blake3::hash(&bytes).as_bytes());
+                                receipt
+                                    .compressed_generation_identities
+                                    .insert(format!("S{}", slot.get()), identity_hash.clone());
+                                format!("registry-compressed:{identity_hash}")
+                            }
+                            None => "aster-raw-slot-vector-v1".to_string(),
+                        };
+                        slot_representation_ids.insert(*slot, binding);
+                    }
+                }
+                source.ensure_panel_version(record.constellation().panel_version)?;
+                let base = association_source_base_from_record(
+                    cx_id,
+                    record,
+                    roster_cache,
+                    slot_representation_ids,
+                )?;
                 if current_sources
                     .insert(base.cx_id, base.source_hash.clone())
                     .is_some()
@@ -1053,10 +1151,13 @@ where
 }
 
 fn load_constellation_batch<C>(
+    vault: &AsterVault<C>,
     source: &SstReadSession<'_, C>,
+    slot_source: &WeaveSlotSource,
     cx_ids: &[CxId],
     current_sources: &BTreeMap<CxId, String>,
     roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
+    slot_representation_ids: &BTreeMap<SlotId, String>,
     receipt: &mut CompleteAssociationSourceReceipt,
 ) -> calyx_core::Result<Vec<AssociationConstellation>>
 where
@@ -1083,7 +1184,8 @@ where
                     source.snapshot_seq()
                 ))
             })?;
-            let base = decode_association_source_base(key, bytes, roster_cache)?;
+            let base =
+                decode_association_source_base(key, bytes, roster_cache, slot_representation_ids)?;
             if current_sources.get(&base.cx_id) != Some(&base.source_hash) {
                 return Err(source_corrupt(format!(
                     "Base {} source identity changed between inventory and hydration",
@@ -1109,13 +1211,28 @@ where
         })
         .collect::<calyx_core::Result<Vec<_>>>()?;
 
-    let mut routes = Vec::<(usize, SlotId)>::new();
+    let mut raw_routes = Vec::<(usize, SlotId)>::new();
+    let mut compressed_routes = BTreeMap::<SlotId, Vec<usize>>::new();
     for (base_ordinal, base) in bases.iter().enumerate() {
         for slot in base.slot_hashes.keys() {
-            routes.push((base_ordinal, *slot));
+            let representation = slot_representation_ids.get(slot).ok_or_else(|| {
+                source_corrupt(format!(
+                    "source representation disappeared for Base {} S{}",
+                    cx_hex(base.cx_id),
+                    slot.get()
+                ))
+            })?;
+            if representation.starts_with("registry-compressed:") {
+                compressed_routes
+                    .entry(*slot)
+                    .or_default()
+                    .push(base_ordinal);
+            } else {
+                raw_routes.push((base_ordinal, *slot));
+            }
         }
     }
-    let slot_reads = routes
+    let slot_reads = raw_routes
         .iter()
         .enumerate()
         .map(|(ordinal, (base_ordinal, slot))| {
@@ -1137,69 +1254,97 @@ where
             slots: BTreeMap::new(),
         })
         .collect::<Vec<_>>();
-    let slot_metrics = source.visit_ordered_cf_plan(
-        &slot_reads,
-        |ordinal, cf, key, value| -> calyx_core::Result<()> {
-            let (base_ordinal, slot) = routes[ordinal];
-            let base = &bases[base_ordinal];
-            if cf != ColumnFamily::slot(slot) || key != base.cx_id.as_bytes() {
-                return Err(source_corrupt(format!(
-                    "ordered Slot readback ordinal {ordinal} changed identity for Base {} S{}",
-                    cx_hex(base.cx_id),
-                    slot.get()
-                )));
-            }
-            let bytes = value.ok_or_else(|| {
-                source_corrupt(format!(
-                    "Base {} hashes S{} but its Slot-CF row is absent at snapshot {}",
-                    cx_hex(base.cx_id),
-                    slot.get(),
-                    source.snapshot_seq()
-                ))
-            })?;
-            let expected_hash = base.slot_hashes.get(&slot).ok_or_else(|| {
-                source_corrupt(format!(
-                    "ordered Slot readback produced unrequested S{} for Base {}",
-                    slot.get(),
-                    cx_hex(base.cx_id)
-                ))
-            })?;
-            let observed_hash = blake3::hash(bytes);
-            if observed_hash.as_bytes() != expected_hash {
-                return Err(source_corrupt(format!(
-                    "Base {} S{} hash mismatch: expected={} observed={}",
-                    cx_hex(base.cx_id),
-                    slot.get(),
-                    hex_lower_bytes(expected_hash),
-                    hex_lower_bytes(observed_hash.as_bytes())
-                )));
-            }
-            let vector = decode_slot_vector(bytes)?;
-            if matches!(
-                vector,
-                SlotVector::Absent {
-                    reason: AbsentReason::NotApplicable
+    let slot_metrics = if slot_reads.is_empty() {
+        calyx_aster::mvcc::OrderedReadbackMetrics {
+            session_snapshot_seq: source.snapshot_seq(),
+            ..calyx_aster::mvcc::OrderedReadbackMetrics::default()
+        }
+    } else {
+        source.visit_ordered_cf_plan(
+            &slot_reads,
+            |ordinal, cf, key, value| -> calyx_core::Result<()> {
+                let (base_ordinal, slot) = raw_routes[ordinal];
+                let base = &bases[base_ordinal];
+                if cf != ColumnFamily::slot(slot) || key != base.cx_id.as_bytes() {
+                    return Err(source_corrupt(format!(
+                        "ordered raw Slot readback ordinal {ordinal} changed identity for Base {} S{}",
+                        cx_hex(base.cx_id),
+                        slot.get()
+                    )));
                 }
-            ) {
-                records[base_ordinal].not_applicable_slot_count = checked_add(
-                    records[base_ordinal].not_applicable_slot_count,
-                    1,
-                    "NotApplicable slot count",
-                )?;
-            } else if records[base_ordinal]
-                .slots
-                .insert(slot, prepare_slot(slot, vector)?)
-                .is_some()
-            {
+                let bytes = value.ok_or_else(|| {
+                    source_corrupt(format!(
+                        "Base {} hashes raw S{} but its Slot-CF row is absent at snapshot {}",
+                        cx_hex(base.cx_id),
+                        slot.get(),
+                        source.snapshot_seq()
+                    ))
+                })?;
+                let expected_hash = base.slot_hashes.get(&slot).ok_or_else(|| {
+                    source_corrupt(format!(
+                        "ordered raw Slot readback produced unrequested S{} for Base {}",
+                        slot.get(),
+                        cx_hex(base.cx_id)
+                    ))
+                })?;
+                let observed_hash = blake3::hash(bytes);
+                if observed_hash.as_bytes() != expected_hash {
+                    return Err(source_corrupt(format!(
+                        "Base {} raw S{} hash mismatch: expected={} observed={}",
+                        cx_hex(base.cx_id),
+                        slot.get(),
+                        hex_lower_bytes(expected_hash),
+                        hex_lower_bytes(observed_hash.as_bytes())
+                    )));
+                }
+                let vector = decode_strict_raw_slot_value(slot, base.cx_id, bytes)?;
+                insert_resolved_slot(&mut records, base_ordinal, slot, vector)
+            },
+        )?
+    };
+    for (slot, base_ordinals) in compressed_routes {
+        let requested = base_ordinals
+            .iter()
+            .map(|ordinal| bases[*ordinal].cx_id)
+            .collect::<Vec<_>>();
+        let resolved = slot_source.resolve_many(vault, slot, &requested)?;
+        if resolved.len() != requested.len() {
+            return Err(source_corrupt(format!(
+                "Registry compressed S{} batch returned {} rows for {} requested Base identities",
+                slot.get(),
+                resolved.len(),
+                requested.len()
+            )));
+        }
+        for (ordinal, (observed_cx_id, vector)) in resolved.into_iter().enumerate() {
+            let base_ordinal = base_ordinals[ordinal];
+            let expected_cx_id = bases[base_ordinal].cx_id;
+            if observed_cx_id != expected_cx_id {
                 return Err(source_corrupt(format!(
-                    "ordered Slot readback duplicated Base {} S{}",
-                    cx_hex(base.cx_id),
+                    "Registry compressed S{} batch changed ordinal {ordinal} identity from {expected_cx_id} to {observed_cx_id}",
                     slot.get()
                 )));
             }
-            Ok(())
-        },
-    )?;
+            let vector = vector.ok_or_else(|| {
+                source_corrupt(format!(
+                    "Base {} names compressed S{} but Registry returned no authenticated member",
+                    cx_hex(expected_cx_id),
+                    slot.get()
+                ))
+            })?;
+            insert_resolved_slot(&mut records, base_ordinal, slot, vector)?;
+        }
+        receipt.compressed_rows_read = checked_add(
+            receipt.compressed_rows_read,
+            requested.len(),
+            "compressed Slot rows read",
+        )?;
+        receipt.compressed_slot_batches = checked_add(
+            receipt.compressed_slot_batches,
+            1,
+            "compressed Slot batches",
+        )?;
+    }
     receipt.source_records_loaded = checked_add(
         receipt.source_records_loaded,
         records.len(),
@@ -1224,6 +1369,37 @@ where
         .readback_plan_bytes_high_water
         .max(slot_metrics.plan_index_bytes);
     Ok(records)
+}
+
+fn insert_resolved_slot(
+    records: &mut [AssociationConstellation],
+    base_ordinal: usize,
+    slot: SlotId,
+    vector: SlotVector,
+) -> calyx_core::Result<()> {
+    if matches!(
+        vector,
+        SlotVector::Absent {
+            reason: AbsentReason::NotApplicable
+        }
+    ) {
+        records[base_ordinal].not_applicable_slot_count = checked_add(
+            records[base_ordinal].not_applicable_slot_count,
+            1,
+            "NotApplicable slot count",
+        )?;
+    } else if records[base_ordinal]
+        .slots
+        .insert(slot, prepare_slot(slot, vector)?)
+        .is_some()
+    {
+        return Err(source_corrupt(format!(
+            "resolved Slot readback duplicated Base {} S{}",
+            cx_hex(records[base_ordinal].cx_id),
+            slot.get()
+        )));
+    }
+    Ok(())
 }
 
 fn prepare_slot(slot: SlotId, vector: SlotVector) -> calyx_core::Result<PreparedSlot> {

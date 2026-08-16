@@ -97,6 +97,23 @@ pub fn compression_manifest_key(slot_id: SlotId) -> Vec<u8> {
 /// (issue #562).
 pub const COMPRESSION_LIFECYCLE_KEY_TAG: u8 = 0x4C;
 
+/// Leading byte marking a point-readable compression membership proof inside
+/// the `compression` CF.
+///
+/// Proof keys are nineteen bytes (`tag ‖ slot_id ‖ CxId`). Their marker and
+/// length keep them disjoint from two-byte manifests and eleven-byte lifecycle
+/// records while preserving one contiguous prefix per slot (issue #564).
+pub const COMPRESSION_MEMBERSHIP_PROOF_KEY_TAG: u8 = 0x50;
+
+/// Immutable physical compression admission receipt key marker.
+pub const COMPRESSION_ADMISSION_RECEIPT_KEY_TAG: u8 = 0x41;
+
+/// Mutable latest compression-evaluation pointer key marker.
+pub const COMPRESSION_ADMISSION_EVALUATION_POINTER_KEY_TAG: u8 = 0x42;
+
+/// Mutable current-admission pointer key marker.
+pub const COMPRESSION_ADMISSION_POINTER_KEY_TAG: u8 = 0x43;
+
 /// `compression` CF lifecycle-record key: `0x4C ‖ slot_id_be(2) ‖ prior_seq_be(8)`.
 ///
 /// One lifecycle record is written per generation transition, keyed by the
@@ -133,6 +150,102 @@ pub fn parse_compression_lifecycle_key(key: &[u8]) -> Option<(SlotId, u64)> {
         key[3], key[4], key[5], key[6], key[7], key[8], key[9], key[10],
     ]);
     Some((slot, prior_seq))
+}
+
+/// `compression` CF membership-proof key:
+/// `0x50 ‖ slot_id_be(2) ‖ CxId(16)`.
+pub fn compression_membership_proof_key(slot_id: SlotId, cx_id: CxId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 2 + CX_ID_BYTES);
+    key.push(COMPRESSION_MEMBERSHIP_PROOF_KEY_TAG);
+    key.extend_from_slice(&slot_id.get().to_be_bytes());
+    key.extend_from_slice(cx_id.as_bytes());
+    key
+}
+
+/// Prefix range over every membership proof for one compressed slot.
+pub fn compression_membership_proof_prefix_range(slot_id: SlotId) -> KeyRange {
+    let mut prefix = Vec::with_capacity(1 + 2);
+    prefix.push(COMPRESSION_MEMBERSHIP_PROOF_KEY_TAG);
+    prefix.extend_from_slice(&slot_id.get().to_be_bytes());
+    prefix_range(&prefix)
+}
+
+/// Parses the `(slot_id, CxId)` addressed by a membership-proof key.
+///
+/// Returns `None` unless the marker and all nineteen bytes are canonical.
+pub fn parse_compression_membership_proof_key(key: &[u8]) -> Option<(SlotId, CxId)> {
+    if key.len() != 1 + 2 + CX_ID_BYTES || key[0] != COMPRESSION_MEMBERSHIP_PROOF_KEY_TAG {
+        return None;
+    }
+    let slot = SlotId::new(u16::from_be_bytes([key[1], key[2]]));
+    let mut cx_id = [0_u8; CX_ID_BYTES];
+    cx_id.copy_from_slice(&key[3..]);
+    Some((slot, CxId::from_bytes(cx_id)))
+}
+
+/// `compression` CF immutable admission receipt key:
+/// `0x41 ‖ slot_id_be(2) ‖ receipt_sha256(32)`.
+pub fn compression_admission_receipt_key(slot_id: SlotId, receipt_sha256: [u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 2 + FULL_HASH_BYTES);
+    key.push(COMPRESSION_ADMISSION_RECEIPT_KEY_TAG);
+    key.extend_from_slice(&slot_id.get().to_be_bytes());
+    key.extend_from_slice(&receipt_sha256);
+    key
+}
+
+/// Prefix range over every immutable admission receipt for one slot.
+pub fn compression_admission_receipt_prefix_range(slot_id: SlotId) -> KeyRange {
+    let mut prefix = Vec::with_capacity(3);
+    prefix.push(COMPRESSION_ADMISSION_RECEIPT_KEY_TAG);
+    prefix.extend_from_slice(&slot_id.get().to_be_bytes());
+    prefix_range(&prefix)
+}
+
+/// Parses a canonical immutable compression admission receipt key.
+pub fn parse_compression_admission_receipt_key(key: &[u8]) -> Option<(SlotId, [u8; 32])> {
+    if key.len() != 1 + 2 + FULL_HASH_BYTES || key[0] != COMPRESSION_ADMISSION_RECEIPT_KEY_TAG {
+        return None;
+    }
+    let slot = SlotId::new(u16::from_be_bytes([key[1], key[2]]));
+    let mut digest = [0_u8; FULL_HASH_BYTES];
+    digest.copy_from_slice(&key[3..]);
+    Some((slot, digest))
+}
+
+/// `compression` CF latest-evaluation pointer key: `0x42 ‖ slot_id_be(2)`.
+///
+/// This pointer moves for both admitted and refused evaluations. It therefore
+/// makes the latest refusal discoverable with one bounded point read while the
+/// separate current-admission pointer remains unchanged.
+pub fn compression_admission_evaluation_pointer_key(slot_id: SlotId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3);
+    key.push(COMPRESSION_ADMISSION_EVALUATION_POINTER_KEY_TAG);
+    key.extend_from_slice(&slot_id.get().to_be_bytes());
+    key
+}
+
+/// Parses a canonical latest compression-evaluation pointer key.
+pub fn parse_compression_admission_evaluation_pointer_key(key: &[u8]) -> Option<SlotId> {
+    if key.len() != 3 || key[0] != COMPRESSION_ADMISSION_EVALUATION_POINTER_KEY_TAG {
+        return None;
+    }
+    Some(SlotId::new(u16::from_be_bytes([key[1], key[2]])))
+}
+
+/// `compression` CF current-admission pointer key: `0x43 ‖ slot_id_be(2)`.
+pub fn compression_admission_pointer_key(slot_id: SlotId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3);
+    key.push(COMPRESSION_ADMISSION_POINTER_KEY_TAG);
+    key.extend_from_slice(&slot_id.get().to_be_bytes());
+    key
+}
+
+/// Parses a canonical current compression admission pointer key.
+pub fn parse_compression_admission_pointer_key(key: &[u8]) -> Option<SlotId> {
+    if key.len() != 3 || key[0] != COMPRESSION_ADMISSION_POINTER_KEY_TAG {
+        return None;
+    }
+    Some(SlotId::new(u16::from_be_bytes([key[1], key[2]])))
 }
 
 /// `xterm` CF key: `(CxId, SlotId_a, SlotId_b, XTermKind)`.

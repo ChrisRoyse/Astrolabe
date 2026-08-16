@@ -1,12 +1,15 @@
 mod codec;
 mod index;
 mod lifecycle;
+mod measurement;
+mod membership;
 mod multivector;
 mod recall;
 
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, MiEstimate, TrustTag};
 use calyx_aster::cf::{
-    COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key, slot_key,
+    COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key,
+    compression_membership_proof_key, slot_key,
 };
 pub use calyx_aster::compression_lifecycle::COMPRESSION_GENERATION_MARKER;
 use calyx_aster::compression_lifecycle::{GenerationTransition, compression_generation_subject};
@@ -21,10 +24,31 @@ use std::collections::BTreeSet;
 use crate::spec::LensSpec;
 pub use codec::inspect_unbound_stored_slot_envelope;
 use codec::{EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows, parse_compression_manifest};
-pub use index::{CompressedSlotHit, CompressedSlotIndex};
+pub use index::{
+    CompressedGenerationIdentity, CompressedSlotHit, CompressedSlotIndex,
+    CompressionReconstructionObservation,
+};
 pub use lifecycle::{
     GenerationDeleteReport, append_reseal_compressed_rows, delete_compressed_generation,
     erase_compressed_slot_rows, generation_lifecycle,
+};
+pub use measurement::{
+    CALYX_COMPRESSION_ADMISSION_REFUSED, COMPRESSION_ADMISSION_SCHEMA,
+    COMPRESSION_CANDIDATE_SELECTION_SCHEMA, CompressionAdmissionGates,
+    CompressionAdmissionReadback, CompressionAdmissionReceipt, CompressionAdmissionRequest,
+    CompressionAdmissionStatus, CompressionAdmissionVerdict, CompressionAdmissionWorkLimits,
+    CompressionAllocationObservation, CompressionBuildObservation,
+    CompressionCandidateCommissionReadback, CompressionCandidateEvaluationReadback,
+    CompressionCandidateEvaluationRequest, CompressionCandidateReference,
+    CompressionCandidateSelectionEntry, CompressionCandidateSelectionReceipt,
+    CompressionGateComparison, CompressionGateObservation, CompressionPhysicalComponent,
+    CompressionPlacementObservation, CompressionQueryObservation,
+    CompressionReconstructionEvidence, CompressionResourceObservation, CompressionScoredHit,
+    CompressionVramObservation, CompressionWorkObservation,
+};
+pub(crate) use measurement::{
+    admission_status, build_and_evaluate_candidate, commission_and_select_candidates,
+    read_admission, select_compression_candidate,
 };
 pub use multivector::{
     CALYX_MULTIVECTOR_ADMISSION_FAILED, CALYX_MULTIVECTOR_CONTEXT_MISMATCH,
@@ -69,6 +93,9 @@ pub struct SlotCompressionRow {
     pub cx_id: CxId,
     pub raw_bytes: Vec<u8>,
     pub compressed_bytes: Vec<u8>,
+    /// Versioned membership proof committed in the `compression` CF under this
+    /// row's `(SlotId, CxId)` key.
+    pub membership_proof_bytes: Vec<u8>,
     pub stored_dim: u32,
     pub codec: StoredSlotCodec,
 }
@@ -97,11 +124,16 @@ pub struct SlotCompressionReport {
     pub registry_envelope_bytes_total: usize,
     /// Atomic whole-column generation manifest bytes.
     pub generation_manifest_bytes_total: usize,
+    /// Exact membership-proof value bytes submitted to the vault.
+    pub membership_proof_bytes_total: usize,
+    /// Exact membership-proof key bytes submitted to the vault.
+    pub membership_proof_key_bytes_total: usize,
     /// Codec-format headers inside the payload (for TurboQuant, TQPR headers).
     pub codec_header_bytes_total: usize,
     /// Scalar-index plus QJL data bits, excluding every fixed header and norm.
     pub logical_data_bits_total: u64,
-    /// Raw-sidecar and compressed-envelope value bytes submitted to the vault.
+    /// Raw-sidecar, compressed-envelope, manifest, and membership-proof value
+    /// bytes submitted to the vault.
     /// This excludes keys and storage-engine/WAL framing, which must be measured
     /// from the durable vault when physical storage is reported.
     pub written_value_bytes_total: usize,
@@ -117,15 +149,16 @@ pub struct SlotCompressionReport {
     pub recall_drop: f32,
     pub truncate_dim: Option<u32>,
     pub rows: Vec<SlotCompressionRow>,
-    /// Exact manifest value committed with the compressed and raw columns.
+    /// Exact manifest value committed with compressed rows, raw sidecars, and
+    /// membership proofs.
     pub generation_manifest_bytes: Vec<u8>,
     pub snapshot: Option<Seq>,
     /// Ledger transition committed atomically with the generation write.
     ///
     /// `Some` exactly when `snapshot` is `Some`: the durable write path commits
-    /// the envelopes, raw sidecars, generation manifest, and this hash-chained
-    /// ledger entry in one group commit. Pure (non-writing) compression reports
-    /// carry `None`.
+    /// the envelopes, raw sidecars, generation manifest, membership proofs, and
+    /// this hash-chained ledger entry in one group commit. Pure (non-writing)
+    /// compression reports carry `None`.
     pub ledger: Option<LedgerRef>,
 }
 
@@ -524,8 +557,8 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
     let write_capacity = report
         .rows
         .len()
-        .checked_mul(2)
-        .and_then(|count| count.checked_add(1))
+        .checked_mul(3)
+        .and_then(|count| count.checked_add(4))
         .ok_or_else(|| {
             compression_error(
                 CALYX_VECTOR_COMPRESSION_INVALID,
@@ -545,12 +578,18 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
             key,
             row.compressed_bytes.clone(),
         ));
+        writes.push((
+            ColumnFamily::Compression,
+            compression_membership_proof_key(slot.slot_id, row.cx_id),
+            row.membership_proof_bytes.clone(),
+        ));
     }
     writes.push((
         ColumnFamily::Compression,
         compression_manifest_key(slot.slot_id),
         report.generation_manifest_bytes.clone(),
     ));
+    lifecycle::append_admission_pointer_tombstones(vault, slot, expected_seq, &mut writes)?;
     // Issue #562: every manifest put carries its append-only lifecycle record in
     // the same seq-guarded batch. The full-column create/migrate/reseal rewrite
     // touches every row, so the affected set is the complete generation.
@@ -591,6 +630,12 @@ fn generation_ledger_payload(
         "codec_context_id_sha256": hex_bytes(&manifest.codec_context_id),
         "generation_root_sha256": hex_bytes(&manifest.generation_root),
         "raw_generation_root_sha256": hex_bytes(&manifest.raw_generation_root),
+        "membership_version": manifest.membership_version,
+        "membership_root_sha256": hex_bytes(&manifest.membership_root),
+        "assay_attestation_sha256": (manifest.codec == StoredSlotCodec::MxFp4)
+            .then(|| hex_bytes(&manifest.assay_attestation_id)),
+        "membership_proof_bytes": report.membership_proof_bytes_total,
+        "membership_proof_key_bytes": report.membership_proof_key_bytes_total,
         "affected_cx_ids": affected.iter().map(|cx| hex_bytes(cx.as_bytes())).collect::<Vec<_>>(),
     }))
     .map_err(|error| {
@@ -996,6 +1041,24 @@ fn build_report(
             )
         })?;
     let generation_manifest_bytes_total = encoded.manifest_bytes.len();
+    let membership_proof_bytes_total = encoded.rows.iter().try_fold(0_usize, |sum, row| {
+        sum.checked_add(row.membership_proof_bytes.len())
+            .ok_or_else(|| {
+                compression_error(
+                    CALYX_VECTOR_COMPRESSION_INVALID,
+                    "membership-proof value-byte accounting overflow",
+                )
+            })
+    })?;
+    let membership_proof_key_bytes_total = encoded.rows.iter().try_fold(0_usize, |sum, row| {
+        sum.checked_add(compression_membership_proof_key(slot.slot_id, row.cx_id).len())
+            .ok_or_else(|| {
+                compression_error(
+                    CALYX_VECTOR_COMPRESSION_INVALID,
+                    "membership-proof key-byte accounting overflow",
+                )
+            })
+    })?;
     let codec_header_bytes_total = encoded.rows.iter().try_fold(0_usize, |sum, row| {
         sum.checked_add(row.codec_header_bytes).ok_or_else(|| {
             compression_error(
@@ -1015,6 +1078,7 @@ fn build_report(
     let written_value_bytes_total = raw_bytes_total
         .checked_add(stored_bytes_total)
         .and_then(|total| total.checked_add(generation_manifest_bytes_total))
+        .and_then(|total| total.checked_add(membership_proof_bytes_total))
         .ok_or_else(|| {
             compression_error(
                 CALYX_VECTOR_COMPRESSION_INVALID,
@@ -1068,6 +1132,8 @@ fn build_report(
         codec_payload_bytes_total,
         registry_envelope_bytes_total,
         generation_manifest_bytes_total,
+        membership_proof_bytes_total,
+        membership_proof_key_bytes_total,
         codec_header_bytes_total,
         logical_data_bits_total,
         written_value_bytes_total,
@@ -1085,6 +1151,7 @@ fn build_report(
                 cx_id: row.cx_id,
                 raw_bytes: row.raw_bytes,
                 compressed_bytes: row.stored_bytes,
+                membership_proof_bytes: row.membership_proof_bytes,
                 stored_dim: row.prepared.len() as u32,
                 codec: row.codec,
             })

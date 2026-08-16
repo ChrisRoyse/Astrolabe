@@ -1,5 +1,4 @@
-use super::{AsterVault, encode};
-use crate::cf::ColumnFamily;
+use super::{AsterVault, SlotVectorResolver, StrictRawSlotResolver};
 use crate::mmap_col::MmapColumn;
 use crate::sst::arrow::{decode_column_chunk, encode_column_chunk};
 use calyx_core::{CalyxError, Clock, CxId, Result, Seq, SlotId, SlotVector};
@@ -64,7 +63,24 @@ where
         slot: SlotId,
         output_dir: impl AsRef<Path>,
     ) -> Result<SlotColumnMaterialization> {
-        let rows = self.dense_slot_rows_at(snapshot, slot)?;
+        self.materialize_slot_column_resolved_at(snapshot, slot, output_dir, &StrictRawSlotResolver)
+    }
+
+    /// Materializes one complete slot column through an explicit interpretation
+    /// owner. The resolver owns whether the persisted generation is ordinary or
+    /// registry-compressed; Aster owns deterministic Arrow publication.
+    pub fn materialize_slot_column_resolved_at<R>(
+        &self,
+        snapshot: Seq,
+        slot: SlotId,
+        output_dir: impl AsRef<Path>,
+        resolver: &R,
+    ) -> Result<SlotColumnMaterialization>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let resolved = resolver.resolve_slot_column_at(self, snapshot, slot)?;
+        let rows = dense_slot_rows(resolved)?;
         let output_dir = output_dir.as_ref();
         fs::create_dir_all(output_dir)
             .map_err(|error| storage_error("create slot-column output dir", error))?;
@@ -111,44 +127,44 @@ where
             cx_ids: manifest.cx_ids,
         })
     }
+}
 
-    fn dense_slot_rows_at(&self, snapshot: Seq, slot: SlotId) -> Result<Vec<SlotColumnRow>> {
-        let snapshot = self.snapshot_handle(snapshot);
-        let rows =
-            self.rows
-                .scan_cf_at(snapshot.snapshot(), ColumnFamily::slot(slot), &self.clock)?;
-        if rows.is_empty() {
-            return Err(CalyxError::stale_derived(format!(
-                "slot {slot} has no rows to materialize"
-            )));
-        }
-
-        let mut out = Vec::with_capacity(rows.len());
-        let mut dim = None;
-        for (key, value) in rows {
-            let cx_id = cx_id_from_key(&key)?;
-            let vector = encode::decode_slot_vector(&value)?;
-            let SlotVector::Dense { dim: row_dim, data } = vector else {
-                return Err(CalyxError::stale_derived(
-                    "slot column materialization requires dense slot vectors",
-                ));
-            };
-            if let Some(expected) = dim {
-                if expected != row_dim {
-                    return Err(CalyxError::aster_corrupt_shard(
-                        "slot column dense dimensions differ",
-                    ));
-                }
-            } else {
-                dim = Some(row_dim);
-            }
-            out.push(SlotColumnRow {
-                cx_id,
-                values: data,
-            });
-        }
-        Ok(out)
+fn dense_slot_rows(resolved: Vec<(CxId, SlotVector)>) -> Result<Vec<SlotColumnRow>> {
+    if resolved.is_empty() {
+        return Err(CalyxError::stale_derived(
+            "slot column has no rows to materialize",
+        ));
     }
+    let mut out = Vec::with_capacity(resolved.len());
+    let mut dim = None;
+    let mut prior_cx_id = None;
+    for (cx_id, vector) in resolved {
+        if prior_cx_id.is_some_and(|prior| prior >= cx_id) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "resolved slot column is not in unique ascending CxId order",
+            ));
+        }
+        prior_cx_id = Some(cx_id);
+        let SlotVector::Dense { dim: row_dim, data } = vector else {
+            return Err(CalyxError::stale_derived(
+                "slot column materialization requires dense slot vectors",
+            ));
+        };
+        if let Some(expected) = dim {
+            if expected != row_dim {
+                return Err(CalyxError::aster_corrupt_shard(
+                    "slot column dense dimensions differ",
+                ));
+            }
+        } else {
+            dim = Some(row_dim);
+        }
+        out.push(SlotColumnRow {
+            cx_id,
+            values: data,
+        });
+    }
+    Ok(out)
 }
 
 pub fn read_materialized_slot_column(
@@ -201,17 +217,6 @@ pub fn read_materialized_slot_column(
         chunk_path,
         rows,
     })
-}
-
-fn cx_id_from_key(key: &[u8]) -> Result<CxId> {
-    if key.len() != 16 {
-        return Err(CalyxError::aster_corrupt_shard(
-            "slot column row key is not a CxId",
-        ));
-    }
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(key);
-    Ok(CxId::from_bytes(bytes))
 }
 
 fn encode_manifest(manifest: &SlotColumnManifest) -> Result<Vec<u8>> {

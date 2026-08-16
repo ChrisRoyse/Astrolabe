@@ -401,6 +401,7 @@ fn anneal_low_recall_refusal_fsv(
         b"calyx-553-tq-rejection-fsv".to_vec(),
         VaultOptions::default(),
     )?;
+    let cache = AutotuneCache::create_empty(&cache_path)?;
     println!(
         "{{\"event\":\"anneal_low_recall_before\",\"incumbent_recall\":{:.3},\"candidate_recall\":{:.3},\"incumbent_latency_ns\":{},\"candidate_latency_ns\":{},\"cache_exists\":{},\"ledger_rows\":0}}",
         incumbent.recall,
@@ -409,7 +410,6 @@ fn anneal_low_recall_refusal_fsv(
         candidate.latency_ns,
         cache_path.exists()
     );
-    let cache = AutotuneCache::load(&cache_path)?;
     let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
     let ledger = AnnealLedger::new(
         appender,
@@ -447,11 +447,17 @@ fn anneal_low_recall_refusal_fsv(
     vault.flush()?;
     let bandit = persisted_bandit(&vault)?;
     let ledger_rows = read_anneal_entries(&vault)?.len();
-    if won || promoted || bandit.incumbent_idx != 0 || cache_path.exists() || ledger_rows != 0 {
+    if won
+        || promoted
+        || bandit.incumbent_idx != 0
+        || !cache_path.exists()
+        || !AutotuneCache::open_existing(&cache_path)?.is_empty()?
+        || ledger_rows != 0
+    {
         return Err("measured low-recall TurboQuant candidate was not refused cleanly".into());
     }
     println!(
-        "{{\"event\":\"anneal_low_recall_after\",\"won\":false,\"promoted\":false,\"persisted_bandit_incumbent\":{},\"cache_exists\":false,\"ledger_rows\":{},\"reason\":\"measured raw recall regression\"}}",
+        "{{\"event\":\"anneal_low_recall_after\",\"won\":false,\"promoted\":false,\"persisted_bandit_incumbent\":{},\"cache_exists\":true,\"cache_entries\":0,\"ledger_rows\":{},\"reason\":\"measured raw recall regression\"}}",
         bandit.incumbent_idx, ledger_rows
     );
     Ok(())
@@ -710,6 +716,7 @@ fn anneal_activation_fsv(
         ANNEAL_VAULT_SALT.to_vec(),
         VaultOptions::default(),
     )?;
+    let unconfigured_cache = AutotuneCache::create_empty(&unconfigured_cache_path)?;
 
     // Edge 1: the default tuner is deliberately incapable of turning a
     // quant_bits metadata win into an administrative-only promotion.
@@ -725,7 +732,6 @@ fn anneal_activation_fsv(
             .len()
     );
     let unconfigured_error = {
-        let cache = AutotuneCache::load(&unconfigured_cache_path)?;
         let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
         let ledger = AnnealLedger::new(
             appender,
@@ -733,7 +739,7 @@ fn anneal_activation_fsv(
         )?;
         let bandits = ConfigBanditStore::new(AsterBanditStorage::new(&vault));
         let health = DegradeRegistry::open(Arc::new(SystemClock), AsterHealthStore::new(&vault))?;
-        let mut tuner = IndexScopeTuner::with_parts(cache, ledger, bandits, health);
+        let mut tuner = IndexScopeTuner::with_parts(unconfigured_cache, ledger, bandits, health);
         tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
         tuner.on_search_for_arm(
             SLOT,
@@ -768,14 +774,15 @@ fn anneal_activation_fsv(
     let unconfigured_bandit = persisted_bandit(&vault)?;
     if unconfigured_error.code != CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED
         || after_unconfigured != incumbent_pointer_bytes
-        || unconfigured_cache_path.exists()
+        || !unconfigured_cache_path.exists()
+        || !AutotuneCache::open_existing(&unconfigured_cache_path)?.is_empty()?
         || unconfigured_bandit.incumbent_idx != 0
         || !read_anneal_entries(&vault)?.is_empty()
     {
         return Err("unconfigured Anneal promotion mutated physical state".into());
     }
     println!(
-        "{{\"event\":\"anneal_unconfigured_after\",\"error\":\"{}\",\"pointer_unchanged\":true,\"cache_exists\":false,\"ledger_rows\":0,\"persisted_bandit_incumbent\":{}}}",
+        "{{\"event\":\"anneal_unconfigured_after\",\"error\":\"{}\",\"pointer_unchanged\":true,\"cache_exists\":true,\"cache_entries\":0,\"ledger_rows\":0,\"persisted_bandit_incumbent\":{}}}",
         unconfigured_error.code, unconfigured_bandit.incumbent_idx
     );
 
@@ -790,7 +797,13 @@ fn anneal_activation_fsv(
         read_anneal_entries(&vault)?.len()
     );
     let cache_failure = {
-        let cache = AutotuneCache::load(&missing_cache_path)?;
+        let missing_parent = missing_cache_path
+            .parent()
+            .ok_or("missing cache failure path has no parent")?;
+        std::fs::create_dir_all(missing_parent)?;
+        let cache = AutotuneCache::create_empty(&missing_cache_path)?;
+        std::fs::remove_file(&missing_cache_path)?;
+        std::fs::remove_dir(missing_parent)?;
         let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
         let ledger = AnnealLedger::new(
             appender,
@@ -861,7 +874,7 @@ fn anneal_activation_fsv(
         persisted_bandit(&vault)?.incumbent_idx
     );
     let promotion = {
-        let cache = AutotuneCache::load(&cache_path)?;
+        let cache = AutotuneCache::create_empty(&cache_path)?;
         let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
         let ledger = AnnealLedger::new(
             appender,
@@ -1027,9 +1040,9 @@ fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
     let (index, active) = HnswArtifactActivator::new(&pointer_path, SLOT).open_active()?;
     let (_, candidate) = anneal_configs();
     let candidate_hash = config_hash(&candidate)?;
-    let cache = AutotuneCache::load(&cache_path)?;
+    let cache = AutotuneCache::open_existing(&cache_path)?;
     let cached = cache
-        .get(&slot_autotune_key(SLOT, 0.99))
+        .get(&slot_autotune_key(SLOT, 0.99))?
         .ok_or("restarted autotune cache has no slot-7 entry")?;
     let cached_config = IndexConfig::from_best_config(cached)?;
     let vault = AsterVault::open(

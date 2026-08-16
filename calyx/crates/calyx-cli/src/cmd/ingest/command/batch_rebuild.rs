@@ -14,6 +14,7 @@ use super::*;
 pub(super) fn run_post_commit_index_rebuild(
     resolved: &ResolvedVault,
     vault: &AsterVault,
+    state: &VaultPanelState,
     summary: &BatchIngestSummary,
     session: &mut Option<&mut BatchIngestSession>,
 ) -> CliResult<()> {
@@ -29,6 +30,7 @@ pub(super) fn run_post_commit_index_rebuild(
         if let Err(error) = rebuild_persistent_indexes_with_progress(
             &resolved.path,
             vault,
+            state,
             log_batch_index_rebuild_progress,
         ) {
             log_batch_index_rebuild_error(summary, &error);

@@ -1039,7 +1039,7 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
     json!({
         "name": "optimizer_status",
         "title": "Optimizer Status",
-        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project, including Calyx Loom's physical Ledger+Reactive subscription/event state; durably acknowledge pending Loom trigger events for a subscription; or generate pending proposals from measured deficits.",
+        "description": "Return labeled optimizer readiness, acknowledge Loom trigger events, generate measured proposals, commission real registered compression candidates through all-slot preflight/build/evaluate/select, or replay selection from exact immutable candidate receipts after an interrupted publication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1049,12 +1049,82 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["status", "ack_triggers", "propose"],
-                    "description": "Use status for readback, ack_triggers to append a durable acknowledgement for one subscription, or propose to turn measured deficits into a persisted proposal queue."
+                    "enum": ["status", "ack_triggers", "propose", "commission_compression_candidates", "select_compression_candidates"],
+                    "description": "Use status for readback, ack_triggers to append a durable acknowledgement, propose to persist measured proposals, commission_compression_candidates to preflight/build/evaluate/select raw slots, or select_compression_candidates to independently replay selection from immutable source receipts."
                 },
                 "subscription_id": {
                     "type": "string",
                     "description": "Required when mode is ack_triggers; use a subscription_id returned by optimizer_status.reactive_triggers.subscriptions."
+                },
+                "candidate_slot_ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "uniqueItems": true,
+                    "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
+                    "description": "Required for commission_compression_candidates: unique registered dense raw candidate slots sharing identical source rows."
+                },
+                "candidate_request": {
+                    "type": "object",
+                    "description": "Required for commission_compression_candidates. Registry derives all measurements and generation ids; callers provide only real held-out inputs, bounded work, and strict gates.",
+                    "properties": {
+                        "requested_backend": { "type": "string", "enum": ["cpu", "cuda"] },
+                        "queries": {
+                            "type": "array", "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "cx_id": { "type": "string" },
+                                    "values": { "type": "array", "minItems": 1, "items": { "type": "number" } }
+                                },
+                                "required": ["cx_id", "values"], "additionalProperties": false
+                            }
+                        },
+                        "k": { "type": "integer", "minimum": 1 },
+                        "warmup_runs": { "type": "integer", "minimum": 1 },
+                        "measured_runs": { "type": "integer", "minimum": 3 },
+                        "work_limits": {
+                            "type": "object",
+                            "properties": {
+                                "maximum_corpus_rows": { "type": "integer", "minimum": 1 },
+                                "maximum_held_out_queries": { "type": "integer", "minimum": 1 },
+                                "maximum_total_packed_searches": { "type": "integer", "minimum": 1 },
+                                "maximum_pairwise_score_evaluations": { "type": "integer", "minimum": 1 },
+                                "maximum_coefficient_evaluations": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["maximum_corpus_rows", "maximum_held_out_queries", "maximum_total_packed_searches", "maximum_pairwise_score_evaluations", "maximum_coefficient_evaluations"],
+                            "additionalProperties": false
+                        },
+                        "gates": {
+                            "type": "object",
+                            "properties": {
+                                "minimum_recall_at_k": { "type": "number", "minimum": 0, "maximum": 1 },
+                                "maximum_mean_cosine_error": { "type": "number", "minimum": 0 },
+                                "maximum_cosine_error": { "type": "number", "minimum": 0 },
+                                "maximum_p99_latency_ns": { "type": "integer", "minimum": 1 },
+                                "maximum_total_physical_bytes": { "type": "integer", "minimum": 1 },
+                                "maximum_working_set_bytes": { "type": "integer", "minimum": 1 },
+                                "maximum_materialized_primary_bytes_per_query": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["minimum_recall_at_k", "maximum_mean_cosine_error", "maximum_cosine_error", "maximum_p99_latency_ns", "maximum_total_physical_bytes", "maximum_working_set_bytes", "maximum_materialized_primary_bytes_per_query"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["requested_backend", "queries", "k", "warmup_runs", "measured_runs", "work_limits", "gates"],
+                    "additionalProperties": false
+                },
+                "candidate_receipts": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "slot_id": { "type": "integer", "minimum": 0, "maximum": 65535 },
+                            "receipt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                        },
+                        "required": ["slot_id", "receipt_sha256"],
+                        "additionalProperties": false
+                    },
+                    "description": "Required for select_compression_candidates: exact original candidate receipt identities from a pending selection receipt; Registry re-reads and recomputes the full set before publication."
                 }
             },
             "required": ["project"],

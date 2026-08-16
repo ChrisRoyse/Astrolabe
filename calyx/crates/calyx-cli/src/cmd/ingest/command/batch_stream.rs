@@ -186,7 +186,7 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
         session.record_summary_progress(&summary, "batch_physical_base_readback_after")?;
     }
     let summary_emit_error = emit_batch_summary_if_requested(&mut summary_emitter, &summary)?;
-    batch_rebuild::run_post_commit_index_rebuild(resolved, &vault, &summary, &mut session)?;
+    batch_rebuild::run_post_commit_index_rebuild(resolved, &vault, &state, &summary, &mut session)?;
     if let Some(session) = session {
         session.complete(&summary, vault.snapshot())?;
     }

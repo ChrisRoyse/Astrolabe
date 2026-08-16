@@ -185,41 +185,14 @@ fn directory_of(file_path: &str) -> String {
     components.join("/")
 }
 
-/// Reads a symbol's persisted S23 posterior and re-encodes it into the exact
-/// guard-raw envelope the kernel frame decodes ([`astrolabe_panel::decode_slot_raw`]).
-///
-/// The persisted bytes live in the guard-raw sidecar CF `slot_23.raw`; the
-/// quantized `slot_23` CF is a fallback for pipelines that do not carry the
-/// guard sidecar. `Ok(None)` is a *labeled absence* (no S23 posterior persisted
-/// for this symbol), never a fabricated vector.
-fn read_member_s23_bytes<C>(
-    vault: &AsterVault<C>,
-    at_seq: u64,
-    cx_id: CxId,
-) -> Result<Option<Vec<u8>>, DynError>
-where
-    C: Clock,
-{
-    let slot = SlotId::new(LAYER_ROLE_SLOT);
-    let key = slot_key(cx_id);
-    let raw = vault.read_cf_at(at_seq, ColumnFamily::slot_raw(slot), &key)?;
-    let bytes = match raw {
-        Some(bytes) => bytes,
-        None => match vault.read_cf_at(at_seq, ColumnFamily::slot(slot), &key)? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        },
-    };
-    // Decode via the vault codec, re-encode via the panel guard-raw codec so the
-    // kernel's `decode_slot_raw` accepts the bytes regardless of which CF codec
-    // wrote them. Both consume `calyx_core::SlotVector`.
-    let vector = calyx_aster::vault::encode::decode_slot_vector(&bytes)?;
+/// Re-encodes one registry-resolved S23 vector into the exact guard envelope
+/// consumed by the layout kernel. `Absent` remains a labeled absence; raw
+/// sidecars are recovery artifacts and are never a serving input.
+fn member_s23_bytes(vector: &SlotVector) -> Result<Option<Vec<u8>>, DynError> {
     if matches!(vector, SlotVector::Absent { .. }) {
-        // A guard-raw sidecar records a concrete measured vector; an Absent
-        // envelope carries no role mass — treat as a labeled absence.
         return Ok(None);
     }
-    let raw_bytes = astrolabe_panel::slot_raw_bytes(&vector).map_err(|error| {
+    let raw_bytes = astrolabe_panel::slot_raw_bytes(vector).map_err(|error| {
         format!(
             "re-encode S23 guard-raw sidecar failed: {}",
             error.message()
@@ -238,13 +211,20 @@ where
 /// silently defaulted.
 fn gather_directory_layout<C>(
     vault: &AsterVault<C>,
+    vault_panel_root: &Path,
     project: &str,
     at_seq: u64,
 ) -> Result<GatheredLayout, DynError>
 where
     C: Clock,
 {
-    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot_at(vault, project, at_seq)?;
+    let s23_slot = SlotId::new(LAYER_ROLE_SLOT);
+    let source = WeaveSlotSource::open(at_seq, Some(vault_panel_root), snapshot.panel_version)?;
+    let s23_rows = source
+        .resolve_column(vault, s23_slot)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
     // directory_path -> Vec<LayoutMember>, deterministic order.
     let mut by_directory: BTreeMap<String, Vec<LayoutMember>> = BTreeMap::new();
     // Deterministic set of every directory seen, so a declared directory with no
@@ -259,8 +239,8 @@ where
         let Some(cx_id) = node.cx_id else {
             continue;
         };
-        match read_member_s23_bytes(vault, at_seq, cx_id)? {
-            Some(bytes) => {
+        match s23_rows.get(&cx_id).map(member_s23_bytes).transpose()? {
+            Some(Some(bytes)) => {
                 s23_symbols_seen += 1;
                 by_directory
                     .entry(directory_path)
@@ -274,7 +254,7 @@ where
                         ),
                     });
             }
-            None => missing_s23 += 1,
+            Some(None) | None => missing_s23 += 1,
         }
     }
 
@@ -320,6 +300,7 @@ where
 /// not persisted S23 posteriors yet. Fails closed only on a genuine vault fault.
 pub(crate) fn persist_layout_frames<C>(
     vault: &AsterVault<C>,
+    vault_dir: &Path,
     project: &str,
     import_changed: bool,
 ) -> Result<Value, DynError>
@@ -335,8 +316,10 @@ where
         }));
     }
 
-    let at_seq = vault.snapshot();
-    let gathered = gather_directory_layout(vault, project, at_seq)?;
+    let snapshot_lease = vault.retain_latest_snapshot();
+    let at_seq = snapshot_lease.seq();
+    let gathered = gather_directory_layout(vault, vault_dir, project, at_seq)?;
+    snapshot_lease.record_progress();
     if gathered.bundles.is_empty() {
         return Ok(json!({
             "schema": LAYOUT_FRAME_SCHEMA,
@@ -583,7 +566,7 @@ pub(crate) fn read_layout_map_aspect(cache_dir: &Path, project: &str) -> Result<
             "shadow vault absent; rerun index_repository with calyx=\"shadow\" before requesting the layout_map aspect",
         ));
     }
-    let vault = match open_shadow_vault_read_only(
+    let vault = open_shadow_vault_read_only(
         &vault_dir,
         &vault_id,
         &vault_salt,
@@ -594,26 +577,14 @@ pub(crate) fn read_layout_map_aspect(cache_dir: &Path, project: &str) -> Result<
             ColumnFamily::Base,
             ColumnFamily::Kv,
             ColumnFamily::Recurrence,
-            ColumnFamily::slot_raw(SlotId::new(LAYER_ROLE_SLOT)),
+            ColumnFamily::Compression,
+            ColumnFamily::Assay,
             ColumnFamily::slot(SlotId::new(LAYER_ROLE_SLOT)),
         ],
-    ) {
-        Ok(vault) => vault,
-        Err(error) => {
-            return Ok(layout_map_unavailable_json(&format!(
-                "shadow vault open failed: {error}"
-            )));
-        }
-    };
+    )?;
 
-    let gathered = match gather_directory_layout(&vault, project, vault.snapshot()) {
-        Ok(gathered) => gathered,
-        Err(error) => {
-            return Ok(layout_map_unavailable_json(&format!(
-                "layout frame recompute failed: {error}"
-            )));
-        }
-    };
+    let snapshot_lease = vault.retain_latest_snapshot();
+    let gathered = gather_directory_layout(&vault, &vault_dir, project, snapshot_lease.seq())?;
     if gathered.bundles.is_empty() {
         return Ok(layout_map_unavailable_json(
             "no persisted S23 layer_role posterior and no declared directory role; the layout_map aspect requires panel v2 S23 posteriors persisted during shadow import or an astro.layout.declared_map.v1 declaration",

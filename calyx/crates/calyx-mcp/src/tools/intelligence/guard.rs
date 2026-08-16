@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::core::{
-    dense, dense_dim, load_context, load_docs, parse_cx_id, read_json_row, text_vector,
-    write_json_row,
+    dense, dense_dim, load_context, load_docs_resolved, load_read_context, parse_cx_id,
+    read_json_row, text_vector, write_json_row,
 };
 use super::model::{
     GuardCheckOut, GuardProfileOut, SlotTauOut, default_guard_key, guard_profile_key,
@@ -110,9 +110,9 @@ pub(super) fn check(
         }
         _ => {}
     }
-    let ctx = load_context(vault_name)?;
+    let ctx = load_read_context(vault_name, [ColumnFamily::Guard])?;
     let profile = load_profile(&ctx.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs_resolved(&ctx)?;
     let identity = cx_id
         .map(|raw| parse_cx_id(raw, "cx_id"))
         .transpose()?

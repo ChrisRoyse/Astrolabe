@@ -3,21 +3,21 @@
 mod graph_hop;
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::collection::{Collection, CollectionMode, SecondaryIndexSpec};
 use calyx_aster::index::btree::btree_range_at;
 use calyx_aster::layers::document::DocId;
 use calyx_aster::layers::kv::kv_key;
 use calyx_aster::layers::relational::{RecordKey, RecordValue, RelationalLayer, Row};
 use calyx_aster::layers::{DocumentLayer, KvLayer, TimeSeriesLayer};
-use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId, Result, Seq};
+use calyx_aster::vault::{AsterVault, SlotVectorResolver, StrictRawSlotResolver, encode};
+use calyx_core::{CalyxError, Clock, CxId, Result, Seq};
 use serde_json::Value;
 
-use super::ask::ask as ask_query;
+use super::ask::ask_resolved as ask_query_resolved;
 use super::{
     AggOp, AggSpec, AskSpec, CrossModelPlan, DocPathFilter, FieldPredicate, PlanStep,
     ProvenancedRow, QueryResult,
@@ -26,8 +26,8 @@ use crate::error::{CALYX_SEXTANT_VECTOR_FUSION_UNWIRED, sextant_error};
 use graph_hop::execute_graph_hop;
 use support::{
     cx_from_key, default_collection, doc_value_matches, fold_numeric, index_bounds, json_row,
-    ledger_ref, numeric_values, parse_record_pk, plain_row, relational_prefix, require_mode,
-    row_matches, runtime_index, scan_doc_ids, scoped_u64, shape,
+    numeric_values, parse_record_pk, plain_row, relational_prefix, require_mode, row_matches,
+    runtime_index, scan_doc_ids, scoped_u64, shape,
 };
 
 const DEFAULT_KV_COLLECTION: &str = "kv";
@@ -43,18 +43,35 @@ pub fn execute<C>(vault: &AsterVault<C>, plan: CrossModelPlan) -> Result<QueryRe
 where
     C: Clock,
 {
-    let snapshot = vault.latest_seq();
-    execute_at_snapshot(vault, plan, snapshot)
+    execute_resolved(vault, plan, &StrictRawSlotResolver)
 }
 
-fn execute_at_snapshot<C>(
+/// Executes a cross-model plan through one explicit slot-interpretation owner.
+/// The resolver is used only by ASK today; all plan steps share one sequence.
+pub fn execute_resolved<C, R>(
     vault: &AsterVault<C>,
     plan: CrossModelPlan,
-    snapshot: Seq,
+    resolver: &R,
 ) -> Result<QueryResult>
 where
     C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
 {
+    let snapshot = vault.latest_seq();
+    execute_at_snapshot(vault, plan, snapshot, resolver)
+}
+
+fn execute_at_snapshot<C, R>(
+    vault: &AsterVault<C>,
+    plan: CrossModelPlan,
+    snapshot: Seq,
+    resolver: &R,
+) -> Result<QueryResult>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
+    let snapshot_lease = vault.retain_snapshot_at(snapshot);
     let started = Instant::now();
     let explain = plan.explain.clone();
     let mut state = ExecState {
@@ -63,9 +80,10 @@ where
         total_scanned: 0,
     };
     for step in plan.steps {
-        apply_step(vault, snapshot, &mut state, step)?;
+        apply_step(vault, snapshot, &mut state, step, resolver)?;
+        snapshot_lease.record_progress();
     }
-    annotate_provenance(vault, snapshot, &mut state.rows);
+    annotate_provenance(vault, snapshot, &mut state.rows)?;
     Ok(QueryResult {
         rows: state.rows,
         total_scanned: state.total_scanned,
@@ -74,14 +92,16 @@ where
     })
 }
 
-fn apply_step<C>(
+fn apply_step<C, R>(
     vault: &AsterVault<C>,
     snapshot: Seq,
     state: &mut ExecState,
     step: PlanStep,
+    resolver: &R,
 ) -> Result<()>
 where
     C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
 {
     match step {
         PlanStep::RelationalScan {
@@ -121,6 +141,7 @@ where
             context_cx_ids,
             top_k,
             oracle,
+            resolver,
         ),
     }
 }
@@ -324,7 +345,7 @@ where
     ))
 }
 
-fn execute_ask<C>(
+fn execute_ask<C, R>(
     vault: &AsterVault<C>,
     snapshot: Seq,
     state: &mut ExecState,
@@ -332,9 +353,11 @@ fn execute_ask<C>(
     mut context_cx_ids: Vec<CxId>,
     top_k: usize,
     oracle: bool,
+    resolver: &R,
 ) -> Result<()>
 where
     C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
 {
     if context_cx_ids.is_empty() {
         context_cx_ids.extend(state.candidates.iter().copied());
@@ -342,7 +365,7 @@ where
     if context_cx_ids.is_empty() {
         context_cx_ids.extend(state.rows.iter().filter_map(|row| cx_from_key(&row.key)));
     }
-    let result = ask_query(
+    let result = ask_query_resolved(
         vault,
         &AskSpec {
             question,
@@ -351,6 +374,7 @@ where
             oracle,
         },
         snapshot,
+        resolver,
     )?;
     state.candidates.extend(
         result
@@ -363,16 +387,45 @@ where
     Ok(())
 }
 
-fn annotate_provenance<C>(vault: &AsterVault<C>, snapshot: Seq, rows: &mut [ProvenancedRow])
+fn annotate_provenance<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    rows: &mut [ProvenancedRow],
+) -> Result<()>
 where
     C: Clock,
 {
-    for row in rows.iter_mut().filter(|row| row.ledger_ref.is_none()) {
+    let mut positions = BTreeMap::<CxId, Vec<usize>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        if row.ledger_ref.is_some() {
+            continue;
+        }
         let Some(cx_id) = cx_from_key(&row.key) else {
             continue;
         };
-        row.ledger_ref = ledger_ref(vault, snapshot, cx_id);
+        positions.entry(cx_id).or_default().push(index);
     }
+    let reads = positions
+        .keys()
+        .map(|cx_id| (ColumnFamily::Base, base_key(*cx_id)))
+        .collect::<Vec<_>>();
+    let values = vault.read_cf_batch_at(snapshot, reads)?;
+    for ((cx_id, indexes), bytes) in positions.into_iter().zip(values) {
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let constellation = encode::decode_constellation_base(&bytes)?;
+        if constellation.cx_id != cx_id {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "query provenance Base key {cx_id} differs from embedded CxId {}",
+                constellation.cx_id
+            )));
+        }
+        for index in indexes {
+            rows[index].ledger_ref = Some(constellation.provenance.clone());
+        }
+    }
+    Ok(())
 }
 
 fn execute_aggregate(state: &mut ExecState, spec: &AggSpec) -> Result<()> {

@@ -2,22 +2,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use calyx_aster::vault::AsterVault;
-use calyx_core::{Constellation, CxId};
+use calyx_aster::vault::{AsterVault, SlotVectorResolver};
+use calyx_core::{Constellation, CxId, SlotId, SystemClock};
 use calyx_sextant::{FreshnessTag, Hit};
 
 use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
 use crate::persisted::PersistedSearchIndexes;
-use crate::provenance::hit_docs_at;
+use crate::provenance::{hit_base_docs_with_slot_declarations_at, hit_docs_at};
 
 use super::hydration_cache;
 use super::support::{SearchReadSnapshot, index_freshness_tag};
 use super::{SearchBudget, SearchFreshness};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
+pub(super) fn hydrate_hit_docs_with_bounded_readbacks<R>(
     vault: &AsterVault,
+    resolver: &R,
     vault_dir: &Path,
     indexes: &PersistedSearchIndexes,
     hits: &[Hit],
@@ -25,7 +26,10 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
     hydrate_hit_slots: bool,
     trace: &mut SearchTracer<'_>,
     budget: &mut SearchBudget<'_>,
-) -> CliResult<(BTreeMap<CxId, Constellation>, FreshnessTag)> {
+) -> CliResult<(BTreeMap<CxId, Constellation>, FreshnessTag)>
+where
+    R: SlotVectorResolver<SystemClock> + ?Sized,
+{
     if hits.is_empty() {
         budget.check("empty_hit_set", 0)?;
         let read = pin_search_readback(vault, trace, "empty_hit_set", None, 0);
@@ -33,9 +37,14 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
         return Ok((BTreeMap::new(), freshness_tag));
     }
 
+    // One continuity lease keeps the exact MVCC sequence, freshness decision,
+    // hit identities/slot declarations, and resolver context invariant from
+    // the first Base read through the final slot-batched resolver read.
+    let continuity = vault.retain_latest_snapshot();
+    let expected_seq = continuity.seq();
     let mut docs = BTreeMap::new();
-    let mut expected_seq = None;
     let mut freshness_tag = None;
+    let mut pending = Vec::<PendingResolvedDoc>::new();
     for (hit_index, hit) in hits.iter().enumerate() {
         budget.check("before_hit_doc_hydration", hit_index)?;
         let read = pin_search_readback(
@@ -45,20 +54,16 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
             Some(hit.cx_id),
             hit_index + 1,
         );
-        if let Some(seq) = expected_seq {
-            if read.seq() != seq {
-                return Err(calyx_core::CalyxError::stale_derived(format!(
-                    "vault advanced during search hit hydration: initial pinned seq {seq}, \
-                     hit_index={hit_index}, cx_id={}, new pinned seq {}, search index base seq {}; \
-                     refusing to mix index hits with a newer Base snapshot",
-                    hit.cx_id,
-                    read.seq(),
-                    indexes.base_seq()
-                ))
-                .into());
-            }
-        } else {
-            expected_seq = Some(read.seq());
+        if read.seq() != expected_seq {
+            return Err(calyx_core::CalyxError::stale_derived(format!(
+                "vault advanced during search hit hydration: retained seq {expected_seq}, \
+                 hit_index={hit_index}, cx_id={}, new pinned seq {}, search index base seq {}; \
+                 refusing to mix index hits with a newer Base snapshot",
+                hit.cx_id,
+                read.seq(),
+                indexes.base_seq()
+            ))
+            .into());
         }
         let tag = verify_index_freshness(indexes, &read, freshness, trace)?;
         if freshness_tag.is_none() {
@@ -86,14 +91,23 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
         if let Some(doc) = cached {
             docs.insert(hit.cx_id, (*doc).clone());
         } else {
-            let one = hit_docs_at(
-                vault,
-                std::slice::from_ref(hit),
-                read.snapshot(),
-                hydrate_hit_slots,
-            )
+            let one = if hydrate_hit_slots {
+                hit_base_docs_with_slot_declarations_at(
+                    vault,
+                    std::slice::from_ref(hit),
+                    read.snapshot(),
+                )
+            } else {
+                hit_docs_at(vault, std::slice::from_ref(hit), read.snapshot())
+            }
             .map_err(|error| contextualize_hit_hydration_error(error, hit, hit_index, &read))?;
-            if let Some(doc) = one.get(&hit.cx_id) {
+            if hydrate_hit_slots {
+                pending.push(PendingResolvedDoc {
+                    cx_id: hit.cx_id,
+                    slots: hit.per_lens.iter().map(|lens_hit| lens_hit.slot).collect(),
+                    slots_key: slots_key.clone(),
+                });
+            } else if let Some(doc) = one.get(&hit.cx_id) {
                 hydration_cache::store_doc(
                     vault_dir,
                     hit.cx_id,
@@ -116,6 +130,34 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
                 read.seq()
             )),
         );
+        continuity.record_progress();
+    }
+
+    if hydrate_hit_slots && !pending.is_empty() {
+        continuity.record_progress();
+        hydrate_pending_slots(vault, resolver, expected_seq, &pending, &mut docs)?;
+        continuity.record_progress();
+        for item in pending {
+            let doc = docs.get_mut(&item.cx_id).ok_or_else(|| {
+                calyx_core::CalyxError::stale_derived(format!(
+                    "resolved hit document {} disappeared before cache publication",
+                    item.cx_id
+                ))
+            })?;
+            // Base carries every declared slot as an `Absent` placeholder. A
+            // hit hydration has always published only the slots named by the
+            // persisted hit, so do not leak unrequested declarations into the
+            // result or its cache entry after the batched resolver fills them.
+            doc.slots.retain(|slot, _| item.slots.contains(slot));
+            hydration_cache::store_doc(
+                vault_dir,
+                item.cx_id,
+                expected_seq,
+                true,
+                &item.slots_key,
+                Arc::new(doc.clone()),
+            )?;
+        }
     }
 
     let tag = freshness_tag.ok_or_else(|| {
@@ -124,6 +166,68 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
         )
     })?;
     Ok((docs, tag))
+}
+
+struct PendingResolvedDoc {
+    cx_id: CxId,
+    slots: BTreeSet<SlotId>,
+    slots_key: String,
+}
+
+fn hydrate_pending_slots<R>(
+    vault: &AsterVault,
+    resolver: &R,
+    snapshot_seq: u64,
+    pending: &[PendingResolvedDoc],
+    docs: &mut BTreeMap<CxId, Constellation>,
+) -> CliResult
+where
+    R: SlotVectorResolver<SystemClock> + ?Sized,
+{
+    let mut ids_by_slot = BTreeMap::<SlotId, BTreeSet<CxId>>::new();
+    for item in pending {
+        for slot in &item.slots {
+            ids_by_slot.entry(*slot).or_default().insert(item.cx_id);
+        }
+    }
+    for (slot, ids) in ids_by_slot {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        let resolved = resolver.resolve_slot_vectors_at(vault, snapshot_seq, slot, &ids)?;
+        if resolved.len() != ids.len() {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "resolved search slot {slot} returned {} rows for {} requested hits",
+                resolved.len(),
+                ids.len()
+            ))
+            .into());
+        }
+        for (expected, (cx_id, vector)) in ids.into_iter().zip(resolved) {
+            if cx_id != expected {
+                return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "resolved search slot {slot} returned CxId {cx_id} where {expected} was requested"
+                ))
+                .into());
+            }
+            let vector = vector.ok_or_else(|| {
+                calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "resolved search slot {slot} is missing hit row {cx_id}"
+                ))
+            })?;
+            let doc = docs.get_mut(&cx_id).ok_or_else(|| {
+                calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "resolved search slot {slot} returned orphan hit row {cx_id}"
+                ))
+            })?;
+            if !doc.slots.contains_key(&slot) {
+                return Err(calyx_core::CalyxError::stale_derived(format!(
+                    "search index requested slot {slot} absent from Base declaration for hit {cx_id}"
+                ))
+                .into());
+            }
+            doc.slots.insert(slot, vector);
+        }
+    }
+    Ok(())
 }
 
 fn hit_slots_key(hit: &Hit) -> String {

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, SlotId, SlotVector};
+use calyx_aster::vault::{AsterVault, SlotVectorResolver};
+use calyx_core::{CalyxError, SlotId, SlotVector, SystemClock};
 use calyx_sextant::FusionContext;
 use calyx_sextant::{apply_in_region_guard_to_hits, fusion};
 
@@ -25,8 +25,9 @@ use super::support::{
 use super::{FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchOutcome};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn search_outcome_with_measured_slots(
+pub(super) fn search_outcome_with_measured_slots<R>(
     vault: &AsterVault,
+    resolver: &R,
     vault_dir: &Path,
     query_vectors: &[(SlotId, SlotVector)],
     k: usize,
@@ -41,7 +42,10 @@ pub(super) fn search_outcome_with_measured_slots(
     mut budget: SearchBudget<'_>,
     slot_cache: Option<&mut SearchSlotCache>,
     trace: Option<&mut SearchTracer<'_>>,
-) -> CliResult<SearchOutcome> {
+) -> CliResult<SearchOutcome>
+where
+    R: SlotVectorResolver<SystemClock> + ?Sized,
+{
     // Resolve (and for profile mode, load + validate) the guard BEFORE any
     // expensive slot search: an uncalibrated vault must fail closed with
     // CALYX_GUARD_PROVISIONAL in milliseconds, not after seconds of recall
@@ -181,6 +185,7 @@ pub(super) fn search_outcome_with_measured_slots(
     budget.check("before_hit_hydration", hits.len())?;
     let (hit_docs, freshness_tag) = hydrate_hit_docs_with_bounded_readbacks(
         vault,
+        resolver,
         vault_dir,
         &indexes,
         &hits,

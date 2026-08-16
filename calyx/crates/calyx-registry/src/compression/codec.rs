@@ -10,6 +10,7 @@ use calyx_forge::{
 };
 use sha2::{Digest, Sha256};
 
+use super::membership::{COMPRESSION_MEMBERSHIP_VERSION, build_membership};
 use super::recall::prepare_dense;
 use super::{
     CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG, COMPRESSED_SLOT_VERSION,
@@ -23,13 +24,13 @@ const LEGACY_ENVELOPE_HASH_DOMAIN: &[u8] = b"calyx-registry-slot-envelope-v2";
 const CODEC_CONTEXT_DOMAIN: &[u8] = b"calyx-registry-codec-context-v3";
 const GENERATION_ROOT_DOMAIN: &[u8] = b"calyx-registry-compression-generation-v1";
 const RAW_GENERATION_ROOT_DOMAIN: &[u8] = b"calyx-registry-compression-raw-generation-v1";
-const MANIFEST_HASH_DOMAIN: &[u8] = b"calyx-registry-compression-manifest-v1";
+const MANIFEST_HASH_DOMAIN: &[u8] = b"calyx-registry-compression-manifest-v3";
 const ZERO_SEED: [u8; 32] = [0; 32];
 const ENVELOPE_PREFIX_BYTES: usize = 137;
 const ENVELOPE_DIGEST_OFFSET: usize = ENVELOPE_PREFIX_BYTES;
 const MANIFEST_MAGIC: &[u8; 4] = b"CSMF";
-const MANIFEST_VERSION: u8 = 1;
-const MANIFEST_PREFIX_BYTES: usize = 116;
+const MANIFEST_VERSION: u8 = 3;
+const MANIFEST_PREFIX_BYTES: usize = 184;
 const MANIFEST_BYTES: usize = MANIFEST_PREFIX_BYTES + 32;
 const LEGACY_TQPR_MAGIC: &[u8; 4] = b"TQPR";
 const LEGACY_TQPR_VERSION: u8 = 1;
@@ -53,6 +54,7 @@ pub(super) struct EncodedRow {
     pub(super) payload_bytes: usize,
     pub(super) codec_header_bytes: usize,
     pub(super) logical_data_bits: u64,
+    pub(super) membership_proof_bytes: Vec<u8>,
 }
 
 struct PendingEncodedRow {
@@ -82,6 +84,11 @@ pub(super) struct CompressionManifest {
     pub(super) generation_root: [u8; 32],
     pub(super) raw_generation_root: [u8; 32],
     pub(super) generation_rows: u32,
+    pub(super) membership_version: u8,
+    pub(super) membership_root: [u8; 32],
+    /// Exact Assay record identity required by this immutable generation.
+    /// Non-MXFP4 manifests carry the canonical all-zero value.
+    pub(super) assay_attestation_id: [u8; 32],
 }
 
 pub(super) struct LegacyV2EnvelopeVerifier {
@@ -190,18 +197,6 @@ pub(super) fn encode_rows(
         SlotShape::Dense(dim) => dim,
         _ => return Err(invalid("slot compression requires a dense slot")),
     };
-    let manifest = CompressionManifest {
-        codec: codec.stored_codec(),
-        level: codec.level(),
-        raw_dim,
-        stored_dim: u32::try_from(codec.dim())
-            .map_err(|_| invalid("stored dimension exceeds u32"))?,
-        codec_context_id,
-        generation_root,
-        raw_generation_root,
-        generation_rows,
-    };
-    let manifest_bytes = encode_manifest(&manifest)?;
     let mut encoded_rows = Vec::with_capacity(pending.len());
     for row in pending {
         let payload_bytes = row.qv.bytes.len();
@@ -223,8 +218,57 @@ pub(super) fn encode_rows(
             payload_bytes,
             codec_header_bytes: row.codec_header_bytes,
             logical_data_bits: row.logical_data_bits,
+            membership_proof_bytes: Vec::new(),
         });
     }
+    let mut membership = build_membership(
+        encoded_rows
+            .iter()
+            .map(|row| (row.cx_id, row.stored_bytes.as_slice())),
+    )?;
+    for row in &mut encoded_rows {
+        row.membership_proof_bytes = membership.proofs.remove(&row.cx_id).ok_or_else(|| {
+            invalid(format!(
+                "membership builder omitted proof for compressed row {}",
+                row.cx_id
+            ))
+        })?;
+    }
+    if !membership.proofs.is_empty() {
+        return Err(invalid(
+            "membership builder produced proofs without compressed rows",
+        ));
+    }
+    let assay_attestation_id = match &codec {
+        CodecContext::MxFp4 {
+            attestation_id: Some(attestation_id),
+            ..
+        } => *attestation_id,
+        CodecContext::MxFp4 {
+            attestation_id: None,
+            ..
+        } => {
+            return Err(invalid(
+                "MXFP4 encoder omitted the exact Assay attestation identity",
+            ));
+        }
+        _ => [0; 32],
+    };
+    let manifest = CompressionManifest {
+        codec: codec.stored_codec(),
+        level: codec.level(),
+        raw_dim,
+        stored_dim: u32::try_from(codec.dim())
+            .map_err(|_| invalid("stored dimension exceeds u32"))?,
+        codec_context_id,
+        generation_root,
+        raw_generation_root,
+        generation_rows,
+        membership_version: COMPRESSION_MEMBERSHIP_VERSION,
+        membership_root: membership.root,
+        assay_attestation_id,
+    };
+    let manifest_bytes = encode_manifest(&manifest)?;
     Ok(EncodedBatch {
         codec,
         rows: encoded_rows,
@@ -1171,7 +1215,7 @@ fn score_mxfp(packed: calyx_forge::Result<(f32, f64)>, query_norm: f64) -> Resul
     )
 }
 
-fn validate_context(slot: &Slot, lens: &LensSpec, policy: QuantPolicy) -> Result<usize> {
+pub(super) fn validate_context(slot: &Slot, lens: &LensSpec, policy: QuantPolicy) -> Result<usize> {
     if slot.slot_key.id() != slot.slot_id {
         return Err(invalid(format!(
             "slot key id {} does not match slot id {}",
@@ -1438,6 +1482,23 @@ fn encode_manifest(manifest: &CompressionManifest) -> Result<Vec<u8>> {
             manifest.raw_dim, manifest.stored_dim, manifest.generation_rows
         )));
     }
+    if manifest.membership_version != COMPRESSION_MEMBERSHIP_VERSION {
+        return Err(invalid(format!(
+            "unsupported compression membership version {}; expected {COMPRESSION_MEMBERSHIP_VERSION}",
+            manifest.membership_version
+        )));
+    }
+    if manifest.codec == StoredSlotCodec::MxFp4 {
+        if manifest.assay_attestation_id == [0; 32] {
+            return Err(invalid(
+                "MXFP4 compression manifest is missing its Assay attestation identity",
+            ));
+        }
+    } else if manifest.assay_attestation_id != [0; 32] {
+        return Err(invalid(
+            "non-MXFP4 compression manifest carries an Assay attestation identity",
+        ));
+    }
     let mut bytes = Vec::with_capacity(MANIFEST_BYTES);
     bytes.extend_from_slice(MANIFEST_MAGIC);
     bytes.push(MANIFEST_VERSION);
@@ -1450,6 +1511,10 @@ fn encode_manifest(manifest: &CompressionManifest) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&manifest.generation_root);
     bytes.extend_from_slice(&manifest.raw_generation_root);
     bytes.extend_from_slice(&manifest.generation_rows.to_be_bytes());
+    bytes.push(manifest.membership_version);
+    bytes.extend_from_slice(&[0; 3]);
+    bytes.extend_from_slice(&manifest.membership_root);
+    bytes.extend_from_slice(&manifest.assay_attestation_id);
     if bytes.len() != MANIFEST_PREFIX_BYTES {
         return Err(invalid(
             "internal compression manifest prefix length mismatch",
@@ -1461,9 +1526,9 @@ fn encode_manifest(manifest: &CompressionManifest) -> Result<Vec<u8>> {
 }
 
 pub(super) fn parse_compression_manifest(bytes: &[u8]) -> Result<CompressionManifest> {
-    if bytes.len() != MANIFEST_BYTES {
+    if bytes.len() < 5 {
         return Err(invalid(format!(
-            "compression manifest length must be {MANIFEST_BYTES} bytes, got {}",
+            "compression manifest is too short to carry its magic and version: got {} bytes",
             bytes.len()
         )));
     }
@@ -1472,8 +1537,14 @@ pub(super) fn parse_compression_manifest(bytes: &[u8]) -> Result<CompressionMani
     }
     if bytes[4] != MANIFEST_VERSION {
         return Err(invalid(format!(
-            "unsupported compression manifest version {}; expected {MANIFEST_VERSION}",
+            "unsupported compression manifest version {}; expected {MANIFEST_VERSION}; re-commission or re-ingest the generation to bind authenticated point reads to their exact Assay attestation",
             bytes[4]
+        )));
+    }
+    if bytes.len() != MANIFEST_BYTES {
+        return Err(invalid(format!(
+            "compression manifest length must be {MANIFEST_BYTES} bytes, got {}",
+            bytes.len()
         )));
     }
     let codec = decode_codec(bytes[5])?;
@@ -1485,10 +1556,21 @@ pub(super) fn parse_compression_manifest(bytes: &[u8]) -> Result<CompressionMani
     let raw_dim = read_u32(bytes, 8, "manifest_raw_dim")?;
     let stored_dim = read_u32(bytes, 12, "manifest_stored_dim")?;
     let generation_rows = read_u32(bytes, 112, "manifest_generation_rows")?;
+    let membership_version = bytes[116];
     if raw_dim == 0 || stored_dim == 0 || stored_dim > raw_dim || generation_rows == 0 {
         return Err(invalid(format!(
             "invalid compression manifest geometry raw_dim={raw_dim} stored_dim={stored_dim} rows={generation_rows}"
         )));
+    }
+    if membership_version != COMPRESSION_MEMBERSHIP_VERSION {
+        return Err(invalid(format!(
+            "unsupported compression membership version {membership_version}; expected {COMPRESSION_MEMBERSHIP_VERSION}"
+        )));
+    }
+    if bytes[117..120].iter().any(|byte| *byte != 0) {
+        return Err(invalid(
+            "compression manifest membership reserved bytes must be zero",
+        ));
     }
     let computed = manifest_digest(&bytes[..MANIFEST_PREFIX_BYTES]);
     if bytes[MANIFEST_PREFIX_BYTES..] != computed {
@@ -1504,6 +1586,21 @@ pub(super) fn parse_compression_manifest(bytes: &[u8]) -> Result<CompressionMani
     generation_root.copy_from_slice(&bytes[48..80]);
     let mut raw_generation_root = [0_u8; 32];
     raw_generation_root.copy_from_slice(&bytes[80..112]);
+    let mut membership_root = [0_u8; 32];
+    membership_root.copy_from_slice(&bytes[120..152]);
+    let mut assay_attestation_id = [0_u8; 32];
+    assay_attestation_id.copy_from_slice(&bytes[152..184]);
+    if codec == StoredSlotCodec::MxFp4 {
+        if assay_attestation_id == [0; 32] {
+            return Err(invalid(
+                "MXFP4 compression manifest is missing its Assay attestation identity",
+            ));
+        }
+    } else if assay_attestation_id != [0; 32] {
+        return Err(invalid(
+            "non-MXFP4 compression manifest carries an Assay attestation identity",
+        ));
+    }
     Ok(CompressionManifest {
         codec,
         level,
@@ -1513,6 +1610,9 @@ pub(super) fn parse_compression_manifest(bytes: &[u8]) -> Result<CompressionMani
         generation_root,
         raw_generation_root,
         generation_rows,
+        membership_version,
+        membership_root,
+        assay_attestation_id,
     })
 }
 

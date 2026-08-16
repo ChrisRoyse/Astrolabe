@@ -31,8 +31,10 @@ const PANEL_VERSION: u32 = 1;
 const HAPPY_DIM: u32 = 128;
 const MAX_DIM: u32 = 4096;
 const OVER_LIMIT_DIM: u32 = 4097;
-const MANIFEST_BYTES: usize = 148;
-const MANIFEST_PREFIX_BYTES: usize = 116;
+const CURRENT_MANIFEST_BYTES: usize = 216;
+const CURRENT_MANIFEST_PREFIX_BYTES: usize = 184;
+const LEGACY_MANIFEST_BYTES: usize = 148;
+const LEGACY_MANIFEST_PREFIX_BYTES: usize = 116;
 const CURRENT_OUTER_V3_PREFIX_BYTES: usize = 137;
 const LEGACY_OUTER_V2_HEADER_BYTES: usize = 85;
 const LEGACY_TQPR_V1_HEADER_BYTES: usize = 88;
@@ -1238,7 +1240,7 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
         "raw-sidecar row count mismatch",
     )?;
     require(
-        manifest.len() == MANIFEST_BYTES,
+        manifest.len() == CURRENT_MANIFEST_BYTES,
         "manifest physical length mismatch",
     )?;
     require(&manifest[..4] == b"CSMF", "manifest magic mismatch")?;
@@ -1496,7 +1498,7 @@ fn validate_report(
         "TQPR header report is not exact",
     )?;
     require(
-        report.generation_manifest_bytes_total == MANIFEST_BYTES,
+        report.generation_manifest_bytes_total == CURRENT_MANIFEST_BYTES,
         "manifest report is not exact",
     )?;
     require(
@@ -1986,16 +1988,16 @@ fn legacy_staging_manifest(
     raw: &[(Vec<u8>, Vec<u8>)],
 ) -> AnyResult<Vec<u8>> {
     require(
-        template.len() == MANIFEST_BYTES
+        template.len() == CURRENT_MANIFEST_BYTES
             && &template[..4] == b"CSMF"
-            && template[4] == 1
+            && template[4] == 3
             && template[7] == 0,
-        "legacy staging manifest template is not canonical CSMF-v1",
+        "legacy staging manifest template is not canonical CSMF-v3",
     )?;
     require(
-        template[MANIFEST_PREFIX_BYTES..]
-            == legacy_manifest_digest(&template[..MANIFEST_PREFIX_BYTES]),
-        "legacy staging manifest template digest is invalid",
+        template[CURRENT_MANIFEST_PREFIX_BYTES..]
+            == current_manifest_digest(&template[..CURRENT_MANIFEST_PREFIX_BYTES]),
+        "current staging manifest template digest is invalid",
     )?;
     require(
         !primary.is_empty() && primary.len() == raw.len(),
@@ -2046,14 +2048,15 @@ fn legacy_staging_manifest(
     let raw_generation_root =
         legacy_fixture_raw_generation_root(&codec_context_id, generation_rows, raw)?;
 
-    let mut manifest = template[..MANIFEST_PREFIX_BYTES].to_vec();
+    let mut manifest = template[..LEGACY_MANIFEST_PREFIX_BYTES].to_vec();
+    manifest[4] = 1;
     manifest[48..80].copy_from_slice(&generation_root);
     manifest[80..112].copy_from_slice(&raw_generation_root);
     manifest[112..116].copy_from_slice(&generation_rows.to_be_bytes());
     let digest = legacy_manifest_digest(&manifest);
     manifest.extend_from_slice(&digest);
     require(
-        manifest.len() == MANIFEST_BYTES,
+        manifest.len() == LEGACY_MANIFEST_BYTES,
         "legacy staging manifest length mismatch",
     )?;
     Ok(manifest)
@@ -2243,6 +2246,14 @@ fn legacy_fixture_raw_generation_root(
 fn legacy_manifest_digest(prefix: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"calyx-registry-compression-manifest-v1");
+    hasher.update((prefix.len() as u64).to_be_bytes());
+    hasher.update(prefix);
+    hasher.finalize().into()
+}
+
+fn current_manifest_digest(prefix: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"calyx-registry-compression-manifest-v3");
     hasher.update((prefix.len() as u64).to_be_bytes());
     hasher.update(prefix);
     hasher.finalize().into()

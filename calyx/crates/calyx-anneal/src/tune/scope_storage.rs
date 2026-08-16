@@ -158,9 +158,15 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        match cache.get(&storage_autotune_key(key, DEFAULT_STORAGE_RECALL_TARGET)) {
+        match cache
+            .get(&storage_autotune_key(key, DEFAULT_STORAGE_RECALL_TARGET))
+            .map_err(cache_write_fail)?
+        {
             Some(config) => StorageConfig::from_best_config(config),
-            None => Ok(StorageConfig::default()),
+            None => Err(invalid_config(format!(
+                "no measured storage incumbent exists for shape {}; install and persist an explicitly evaluated bandit/config before serving it",
+                key.label()
+            ))),
         }
     }
 
@@ -239,11 +245,13 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        cache.insert(
-            storage_autotune_key(&record.key, DEFAULT_STORAGE_RECALL_TARGET),
-            record.new_config.to_best_config(&record.key),
-        );
-        cache.persist().map_err(cache_write_fail)
+        cache
+            .apply_and_persist(
+                storage_autotune_key(&record.key, DEFAULT_STORAGE_RECALL_TARGET),
+                record.new_config.to_best_config(&record.key),
+            )
+            .map(|_| ())
+            .map_err(cache_write_fail)
     }
 
     fn save_bandit(&self, key: &StorageShapeKey) -> Result<()> {
@@ -282,7 +290,7 @@ pub(super) fn invalid_config(message: impl Into<String>) -> CalyxError {
 fn cache_write_fail(error: calyx_forge::ForgeError) -> CalyxError {
     CalyxError {
         code: CALYX_STORAGE_CACHE_WRITE_FAIL,
-        message: format!("Storage autotune cache write failed: {error}"),
-        remediation: "repair the PH16 autotune cache path before persisting a Storage promotion",
+        message: format!("Storage autotune cache access failed: {error}"),
+        remediation: "repair and reopen the PH16 autotune cache before reading or persisting a Storage promotion",
     }
 }

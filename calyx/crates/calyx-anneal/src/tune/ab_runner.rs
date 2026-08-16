@@ -262,8 +262,10 @@ where
         let mut cache = cache
             .lock()
             .map_err(|_| invalid_result("autotune cache lock poisoned"))?;
-        cache.insert(promotion.key.clone(), promotion.config.clone());
-        cache.persist().map_err(cache_write_fail)
+        cache
+            .apply_and_persist(promotion.key.clone(), promotion.config.clone())
+            .map(|_| ())
+            .map_err(cache_write_fail)
     }
 
     fn record_for(

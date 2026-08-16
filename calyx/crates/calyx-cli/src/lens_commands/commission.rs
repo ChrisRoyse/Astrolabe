@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use calyx_core::{Input, Lens, Modality, QuantPolicy, SlotShape};
+use calyx_core::{Input, Lens, Modality, SlotShape};
 use calyx_registry::{
     DEFAULT_TEI_ENDPOINT, FrozenLensContract, LensForgeManifest, LensForgeShape,
     LensForgeSourceTensorDtypeProfile, NormPolicy, OnnxInt8Attestation, OnnxInt8Toolchain,

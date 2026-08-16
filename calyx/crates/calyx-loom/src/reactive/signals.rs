@@ -3,9 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::vault::AsterVault;
-use calyx_aster::vault::encode::decode_slot_vector;
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId, SlotVector};
 use calyx_ward::{GuardProfile, NoveltyAction, ProducedSlots, WardError};
 
@@ -268,14 +266,10 @@ fn slots_for<C: Clock>(
 }
 
 fn dense_slot<C: Clock>(vault: &AsterVault<C>, cx_id: CxId, slot: SlotId) -> Result<Vec<f32>> {
-    let bytes = vault
-        .read_cf_at(
-            vault.latest_seq(),
-            ColumnFamily::slot(slot),
-            &slot_key(cx_id),
-        )?
+    let vector = vault
+        .read_slot_vector_at(vault.latest_seq(), cx_id, slot)?
         .ok_or_else(|| unavailable(format!("missing dense slot {slot} for {cx_id}")))?;
-    match decode_slot_vector(&bytes)? {
+    match vector {
         SlotVector::Dense { data, .. } => Ok(data),
         other => Err(unavailable(format!(
             "slot {slot} for {cx_id} is not dense: {other:?}"

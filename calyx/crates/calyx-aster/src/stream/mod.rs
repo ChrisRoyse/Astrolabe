@@ -46,8 +46,8 @@ use calyx_core::{CalyxError, Clock, CxId, LedgerRef, Result, SlotVector, VaultSt
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
 use crate::cf::{ColumnFamily, ledger_key};
-use crate::dedup::{DedupResult, EpochSecs, IngestInput, ingest_at};
-use crate::vault::AsterVault;
+use crate::dedup::{DedupResult, EpochSecs, IngestInput, ingest_at_resolved};
+use crate::vault::{AsterVault, SlotVectorResolver, StrictRawSlotResolver};
 
 /// Maximum number of events drained into a single microbatch.
 pub const MICROBATCH_MAX: usize = 256;
@@ -132,7 +132,12 @@ where
 {
     /// Builds an ingester over `vault`, spawning the background flush task.
     pub fn new(vault: Arc<AsterVault<C>>, guard: BackpressureGuard) -> Self {
-        Self::new_with_post_ingest_hook(vault, guard, None)
+        Self::new_resolved_with_post_ingest_hook(
+            vault,
+            guard,
+            Arc::new(StrictRawSlotResolver),
+            None,
+        )
     }
 
     /// Builds an ingester with a post-ingest hook for reactive evaluation.
@@ -141,6 +146,37 @@ where
         guard: BackpressureGuard,
         post_ingest: Option<PostIngestHook<C>>,
     ) -> Self {
+        Self::new_resolved_with_post_ingest_hook(
+            vault,
+            guard,
+            Arc::new(StrictRawSlotResolver),
+            post_ingest,
+        )
+    }
+
+    /// Builds an ingester with one retained slot-interpretation owner shared by
+    /// every background microbatch.
+    pub fn new_resolved<R>(
+        vault: Arc<AsterVault<C>>,
+        guard: BackpressureGuard,
+        resolver: Arc<R>,
+    ) -> Self
+    where
+        R: SlotVectorResolver<C> + Send + Sync + 'static,
+    {
+        Self::new_resolved_with_post_ingest_hook(vault, guard, resolver, None)
+    }
+
+    /// Resolver-aware form of [`Self::new_with_post_ingest_hook`].
+    pub fn new_resolved_with_post_ingest_hook<R>(
+        vault: Arc<AsterVault<C>>,
+        guard: BackpressureGuard,
+        resolver: Arc<R>,
+        post_ingest: Option<PostIngestHook<C>>,
+    ) -> Self
+    where
+        R: SlotVectorResolver<C> + Send + Sync + 'static,
+    {
         let (sender, receiver) = mpsc::channel::<StreamEvent>();
         let guard = Arc::new(guard);
         let backpressured = Arc::new(AtomicUsize::new(0));
@@ -148,7 +184,15 @@ where
         let handle = {
             let vault = Arc::clone(&vault);
             let flush = Arc::clone(&flush);
-            thread::spawn(move || flush_loop(&vault, &receiver, &flush, post_ingest.as_ref()))
+            thread::spawn(move || {
+                flush_loop(
+                    &vault,
+                    &receiver,
+                    &flush,
+                    post_ingest.as_ref(),
+                    resolver.as_ref(),
+                )
+            })
         };
         Self {
             sender: Some(sender),
@@ -238,13 +282,15 @@ fn nonfinite_index(vector: &SlotVector) -> Option<usize> {
 
 /// Drains the channel into microbatches and processes each, capturing the first
 /// storage fault into shared state and stopping (fail-closed).
-fn flush_loop<C>(
+fn flush_loop<C, R>(
     vault: &AsterVault<C>,
     receiver: &Receiver<StreamEvent>,
     flush: &Arc<Mutex<FlushState>>,
     post_ingest: Option<&PostIngestHook<C>>,
+    resolver: &R,
 ) where
     C: Clock + Send + Sync + 'static,
+    R: SlotVectorResolver<C> + ?Sized,
 {
     loop {
         let mut batch = Vec::new();
@@ -258,7 +304,7 @@ fn flush_loop<C>(
                 Err(_) => break,
             }
         }
-        match process_batch(vault, &batch, post_ingest) {
+        match process_batch(vault, &batch, post_ingest, resolver) {
             Ok(ingested) => {
                 if let Ok(mut state) = flush.lock() {
                     state.stats.ingested += ingested;
@@ -276,20 +322,22 @@ fn flush_loop<C>(
 }
 
 /// Persists and ledger-marks one microbatch. Returns the ingested-event count.
-fn process_batch<C>(
+fn process_batch<C, R>(
     vault: &AsterVault<C>,
     batch: &[StreamEvent],
     post_ingest: Option<&PostIngestHook<C>>,
+    resolver: &R,
 ) -> Result<usize>
 where
     C: Clock + Send + Sync + 'static,
+    R: SlotVectorResolver<C> + ?Sized,
 {
     if batch.is_empty() {
         return Ok(0);
     }
     let mut ingested = 0_usize;
     for event in batch {
-        let result = ingest_at(vault, &event.input, event.at, None)?;
+        let result = ingest_at_resolved(vault, &event.input, event.at, None, resolver)?;
         let ledger_ref = latest_ledger_ref(vault)?;
         if let Some(hook) = post_ingest {
             hook(vault, result_cx_id(&result), ledger_ref)?;

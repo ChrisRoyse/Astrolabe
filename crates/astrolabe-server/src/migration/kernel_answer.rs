@@ -162,7 +162,7 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         // (Base/Graph to project, Anchors for the trust map, Kernel + Ledger to
         // persist the artifact inside the verified chain).
         let vault = open_shadow_vault_writable(&vault_dir, &vault_id, &vault_salt, Vec::new())?;
-        let summary = persist_index_time_kernel_artifact(&vault, &project);
+        let summary = persist_index_time_kernel_artifact(&vault, &vault_dir, &project);
         let response = get_kernel_build_response_json(&project, &summary);
         return if response.get("status").and_then(Value::as_str) == Some("built") {
             tool_json_result(response)

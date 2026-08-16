@@ -2,18 +2,20 @@
 //!
 //! Base rows persist only slot ids plus payload hashes, so
 //! [`decode_constellation_base`] always yields `Absent` placeholders that carry
-//! no payload state. The slot CFs (and `slot_raw` for compressed slots) are the
-//! only physical source of truth `--include-slots` may report from. Split out of
-//! the parent module to keep each file within the modularization line budget
-//! (issue #1098); behavior is unchanged.
+//! no payload state. The primary slot CF is the only payload source this command
+//! reports. Compressed primaries are interpreted by the persisted Registry
+//! context; `slot_raw` is checked only as a required lifecycle sidecar and is
+//! never decoded or substituted. Split out of the parent module to keep each
+//! file within the modularization line budget (issue #1098).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use calyx_aster::cf::{ColumnFamily, slot_key};
+use calyx_aster::cf::{ColumnFamily, compression_manifest_key, slot_key};
 use calyx_aster::mvcc::is_tombstone_value;
 use calyx_aster::vault::encode::decode_slot_vector;
-use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
+use calyx_core::{CalyxError, Constellation, CxId, QuantPolicy, Slot, SlotId, SlotVector};
+use calyx_registry::{COMPRESSED_SLOT_TAG, VaultPanelState, load_vault_panel_state};
 use serde_json::json;
 
 use super::check_deadline;
@@ -21,6 +23,10 @@ use crate::bounded_progress::{Deadline, ProgressSink};
 use crate::cf_read::hex_bytes;
 use crate::error::{CliError, CliResult};
 use crate::provenance_read::{ResolvedRow, RowSource, VaultReadContext};
+
+mod compressed;
+
+use compressed::{CompressedCandidate, resolve_compressed_slots};
 
 pub(super) fn slot_row_json(slot: SlotId, state: &PhysicalSlotState) -> serde_json::Value {
     match state {
@@ -61,6 +67,19 @@ pub(super) fn slot_row_json(slot: SlotId, state: &PhysicalSlotState) -> serde_js
                 "reason": reason,
             }),
         },
+        PhysicalSlotState::Compressed {
+            dim,
+            values,
+            payload_source,
+        } => json!({
+            "slot": slot.get(),
+            "kind": "compressed",
+            "payload_source": payload_source,
+            "interpretation_source": "registry_compressed_slot_index",
+            "validation": "frozen_context_and_membership_proof",
+            "dim": dim,
+            "values": values,
+        }),
     }
 }
 
@@ -87,16 +106,26 @@ pub(super) enum PhysicalSlotState {
         vector: SlotVector,
         payload_source: &'static str,
     },
+    Compressed {
+        dim: u32,
+        values: usize,
+        payload_source: &'static str,
+    },
     Tombstoned {
         payload_source: &'static str,
     },
 }
 
-/// Reads the physical slot CF rows for every base-listed slot of every live
-/// constellation, grouped per slot CF (the same exact provenance-resolved
-/// read path `weave-loom` dense-slot coverage uses, issue #1096). Ingest
-/// stages one physical slot row per base-listed slot in the same WAL batch as
-/// the base row, so a base-listed slot with no physical
+enum LocatedSlotState {
+    Resolved(PhysicalSlotState),
+    Compressed(CompressedCandidate),
+}
+
+/// Reads the current physical slot CF rows for every base-listed slot of every
+/// live constellation, grouped per slot CF. Compression create/reseal mutates
+/// slot keys after their Base rows were committed, so the Base Ledger sequence
+/// remains diagnostic context and must not select the original pre-compression
+/// commit. A base-listed slot with no current physical
 /// `slot_XX`/`slot_raw_XX` row fails closed as `CALYX_ASTER_CORRUPT_SHARD`
 /// instead of being reported as absent.
 pub(super) fn physical_slot_states(
@@ -105,6 +134,8 @@ pub(super) fn physical_slot_states(
     deadline: &Deadline,
     progress: &mut ProgressSink,
 ) -> CliResult<BTreeMap<(CxId, SlotId), PhysicalSlotState>> {
+    let panel_state = load_vault_panel_state(vault)?;
+    let panel_slots = validated_panel_slots(vault, &panel_state, constellations)?;
     let mut per_slot: BTreeMap<SlotId, Vec<(CxId, Vec<u8>, u64)>> = BTreeMap::new();
     for cx in constellations {
         for slot in cx.slots.keys() {
@@ -116,8 +147,15 @@ pub(super) fn physical_slot_states(
         }
     }
     let mut read_context = VaultReadContext::new(vault);
+    let manifest_keys = per_slot
+        .keys()
+        .map(|slot| compression_manifest_key(*slot))
+        .collect::<Vec<_>>();
+    let manifests =
+        read_context.latest_cf_rows_for_current_state(ColumnFamily::Compression, &manifest_keys)?;
     let mut out = BTreeMap::new();
-    for (slot, members) in per_slot {
+    let mut compressed = BTreeMap::<SlotId, Vec<CompressedCandidate>>::new();
+    for (slot, members) in &per_slot {
         check_deadline(deadline, progress, "slot_lookup", out.len() as u64)?;
         progress.emit(json!({
             "event": "cx_list.progress",
@@ -126,30 +164,119 @@ pub(super) fn physical_slot_states(
             "rows": members.len(),
             "elapsed_ms": deadline.elapsed_ms(),
         }))?;
-        let pairs = members
+        let keys = members
             .iter()
-            .map(|(_, key, seq)| (key.clone(), *seq))
+            .map(|(_, key, _)| key.clone())
             .collect::<Vec<_>>();
-        let batch = read_context.latest_cf_rows_for_provenance(ColumnFamily::slot(slot), &pairs)?;
+        let batch =
+            read_context.latest_cf_rows_for_current_state(ColumnFamily::slot(*slot), &keys)?;
+        let raw_batch =
+            read_context.latest_cf_rows_for_current_state(ColumnFamily::slot_raw(*slot), &keys)?;
         progress.emit(json!({
             "event": "cx_list.progress",
             "phase": "slot_lookup_resolved",
             "slot": slot.get(),
             "read_stats": batch.stats,
+            "primary_read_stats": batch.stats,
+            "raw_sidecar_read_stats": raw_batch.stats,
             "elapsed_ms": deadline.elapsed_ms(),
         }))?;
-        for (cx_id, key, seq) in &members {
-            let located = batch
-                .rows
-                .get(key)
-                .and_then(Option::as_ref)
-                .map(|row| (row.value.clone(), slot_cf_payload_source(row)));
-            let state =
-                resolve_slot_state(vault, &mut read_context, *cx_id, slot, key, *seq, located)?;
-            out.insert((*cx_id, slot), state);
+        let panel_slot = panel_slots.get(slot).copied().ok_or_else(|| {
+            missing_panel_slot_error(vault, *slot, "slot disappeared from validated panel map")
+        })?;
+        let manifest_key = compression_manifest_key(*slot);
+        let has_live_compression_manifest = manifests
+            .rows
+            .get(&manifest_key)
+            .and_then(Option::as_ref)
+            .is_some_and(|row| !is_tombstone_value(&row.value));
+        for (cx_id, key, seq) in members {
+            let primary = batch.rows.get(key).and_then(Option::as_ref);
+            let raw = raw_batch.rows.get(key).and_then(Option::as_ref);
+            match resolve_located_slot(
+                vault,
+                panel_slot,
+                has_live_compression_manifest,
+                *cx_id,
+                key,
+                *seq,
+                primary,
+                raw,
+            )? {
+                LocatedSlotState::Resolved(state) => {
+                    out.insert((*cx_id, *slot), state);
+                }
+                LocatedSlotState::Compressed(candidate) => {
+                    compressed.entry(*slot).or_default().push(candidate);
+                }
+            }
         }
     }
+    resolve_compressed_slots(
+        vault,
+        &panel_state,
+        &panel_slots,
+        constellations,
+        compressed,
+        deadline,
+        progress,
+        &mut out,
+    )?;
     Ok(out)
+}
+
+fn validated_panel_slots<'a>(
+    vault: &Path,
+    state: &'a VaultPanelState,
+    constellations: &[&Constellation],
+) -> CliResult<BTreeMap<SlotId, &'a Slot>> {
+    let mut slots = BTreeMap::new();
+    for slot in &state.panel.slots {
+        if slot.slot_key.id() != slot.slot_id {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "cx-list --include-slots registry context in {} has slot id {} paired with slot-key id {}",
+                vault.display(),
+                slot.slot_id.get(),
+                slot.slot_key.id().get()
+            ))
+            .into());
+        }
+        if slots.insert(slot.slot_id, slot).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "cx-list --include-slots registry context in {} contains duplicate slot id {}",
+                vault.display(),
+                slot.slot_id.get()
+            ))
+            .into());
+        }
+    }
+    let expected_vault_id = constellations.first().map(|cx| cx.vault_id);
+    for cx in constellations {
+        if Some(cx.vault_id) != expected_vault_id {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "cx-list --include-slots loaded mixed vault ids from {}",
+                vault.display()
+            ))
+            .into());
+        }
+        if cx.panel_version > state.panel.version {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "cx-list --include-slots base row {} requires panel version {}, but persisted VaultPanelState is version {}",
+                cx.cx_id, cx.panel_version, state.panel.version
+            ))
+            .into());
+        }
+        for slot in cx.slots.keys() {
+            if !slots.contains_key(slot) {
+                return Err(missing_panel_slot_error(
+                    vault,
+                    *slot,
+                    &format!("base row {} lists the slot", cx.cx_id),
+                ));
+            }
+        }
+    }
+    Ok(slots)
 }
 
 /// `payload_source` label for a slot-CF row by resolution stage. Commit-batch
@@ -162,107 +289,139 @@ fn slot_cf_payload_source(row: &ResolvedRow) -> &'static str {
     }
 }
 
-fn resolve_slot_state(
+#[allow(clippy::too_many_arguments)]
+fn resolve_located_slot(
     vault: &Path,
-    read_context: &mut VaultReadContext,
+    panel_slot: &Slot,
+    has_live_compression_manifest: bool,
     cx_id: CxId,
-    slot: SlotId,
     key: &[u8],
     seq: u64,
-    located: Option<(Vec<u8>, &'static str)>,
-) -> CliResult<PhysicalSlotState> {
-    let Some((bytes, payload_source)) = located else {
-        // No physical slot CF row at all: the raw CF is the only remaining
-        // physical location a payload could live in (compression writes both).
-        return match physical_raw_row(read_context, slot, key, seq)? {
-            Some((raw_bytes, raw_source)) if is_tombstone_value(&raw_bytes) => {
-                Ok(PhysicalSlotState::Tombstoned {
-                    payload_source: raw_source,
-                })
-            }
-            Some((raw_bytes, raw_source)) => decode_slot_vector(&raw_bytes)
-                .map(|vector| PhysicalSlotState::Vector {
-                    vector,
-                    payload_source: raw_source,
-                })
-                .map_err(|error| {
-                    missing_slot_row_error(
-                        vault,
-                        cx_id,
-                        slot,
-                        seq,
-                        &format!("slot_raw row exists but failed to decode: {error}"),
-                    )
-                }),
-            None => Err(missing_slot_row_error(
+    primary: Option<&ResolvedRow>,
+    raw: Option<&ResolvedRow>,
+) -> CliResult<LocatedSlotState> {
+    let slot = panel_slot.slot_id;
+    let Some(primary) = primary else {
+        let detail = raw.map_or_else(
+            || "no primary or raw-sidecar row exists".to_string(),
+            |row| {
+                format!(
+                    "orphan raw-sidecar row exists at {} (tombstone={}); it was not decoded or substituted",
+                    raw_cf_payload_source(row),
+                    is_tombstone_value(&row.value)
+                )
+            },
+        );
+        return Err(missing_slot_row_error(vault, cx_id, slot, seq, &detail));
+    };
+    let bytes = &primary.value;
+    let payload_source = slot_cf_payload_source(primary);
+    if is_tombstone_value(bytes) {
+        if has_live_compression_manifest {
+            return Err(undecodable_slot_row_error(
                 vault,
                 cx_id,
                 slot,
                 seq,
-                "no row found in the slot CF (commit batch, full SST set, or WAL tail) nor in the slot_raw CF",
-            )),
-        };
-    };
-    if is_tombstone_value(&bytes) {
-        return Ok(PhysicalSlotState::Tombstoned {
+                "active compression manifest names a generation whose requested primary is tombstoned",
+            ));
+        }
+        if raw.is_some_and(|row| !is_tombstone_value(&row.value)) {
+            return Err(undecodable_slot_row_error(
+                vault,
+                cx_id,
+                slot,
+                seq,
+                "primary is tombstoned but a live raw sidecar remains; sidecar was not substituted",
+            ));
+        }
+        return Ok(LocatedSlotState::Resolved(PhysicalSlotState::Tombstoned {
             payload_source: match payload_source {
                 "slot_cf" => "slot_cf_tombstone",
                 _ => "slot_cf_full_set_tombstone",
             },
-        });
+        }));
     }
-    match decode_slot_vector(&bytes) {
-        Ok(vector) => Ok(PhysicalSlotState::Vector {
-            vector,
-            payload_source,
-        }),
-        Err(decode_error) => match physical_raw_row(read_context, slot, key, seq)? {
-            // Compressed slots persist opaque compressed bytes in the slot CF
-            // and the decodable payload in slot_raw.
-            Some((raw_bytes, raw_source)) if !is_tombstone_value(&raw_bytes) => {
-                decode_slot_vector(&raw_bytes)
-                    .map(|vector| PhysicalSlotState::Vector {
-                        vector,
-                        payload_source: raw_source,
-                    })
-                    .map_err(|raw_error| {
-                        undecodable_slot_row_error(
-                            vault,
-                            cx_id,
-                            slot,
-                            seq,
-                            &format!(
-                                "slot CF decode failed ({decode_error}) and slot_raw CF decode failed ({raw_error})"
-                            ),
-                        )
-                    })
-            }
-            _ => Err(undecodable_slot_row_error(
+    let expects_compressed = has_live_compression_manifest
+        || bytes.first() == Some(&COMPRESSED_SLOT_TAG)
+        || !matches!(&panel_slot.quant, QuantPolicy::None);
+    if expects_compressed {
+        let raw = raw.ok_or_else(|| {
+            undecodable_slot_row_error(
                 vault,
                 cx_id,
                 slot,
                 seq,
-                &format!("slot CF decode failed ({decode_error}) and no decodable slot_raw row exists"),
-            )),
-        },
+                "compressed primary has no raw sidecar; Registry decode was not attempted against an incomplete generation",
+            )
+        })?;
+        if is_tombstone_value(&raw.value) {
+            return Err(undecodable_slot_row_error(
+                vault,
+                cx_id,
+                slot,
+                seq,
+                "compressed primary is live but its raw sidecar is tombstoned; sidecar was not decoded or substituted",
+            ));
+        }
+        return Ok(LocatedSlotState::Compressed(CompressedCandidate {
+            cx_id,
+            slot,
+            provenance_seq: seq,
+            key: key.to_vec(),
+            primary_bytes: bytes.clone(),
+            raw_bytes: raw.value.clone(),
+            primary_source: payload_source,
+            raw_source: raw_cf_payload_source(raw),
+        }));
+    }
+    if let Some(raw) = raw {
+        return Err(undecodable_slot_row_error(
+            vault,
+            cx_id,
+            slot,
+            seq,
+            &format!(
+                "plain primary has an orphan raw-sidecar row at {} (tombstone={}); sidecar was not decoded or substituted",
+                raw_cf_payload_source(raw),
+                is_tombstone_value(&raw.value)
+            ),
+        ));
+    }
+    decode_slot_vector(bytes)
+        .map(|vector| {
+            LocatedSlotState::Resolved(PhysicalSlotState::Vector {
+                vector,
+                payload_source,
+            })
+        })
+        .map_err(|decode_error| {
+            undecodable_slot_row_error(
+                vault,
+                cx_id,
+                slot,
+                seq,
+                &format!(
+                    "primary decode failed ({decode_error}); raw sidecars are never substituted"
+                ),
+            )
+        })
+}
+
+fn raw_cf_payload_source(row: &ResolvedRow) -> &'static str {
+    match row.source {
+        RowSource::CommitBatch | RowSource::WalTail => "slot_raw_cf",
+        RowSource::FullSet => "slot_raw_cf_full_set",
     }
 }
 
-fn physical_raw_row(
-    read_context: &mut VaultReadContext,
-    slot: SlotId,
-    key: &[u8],
-    seq: u64,
-) -> CliResult<Option<(Vec<u8>, &'static str)>> {
-    let batch = read_context
-        .latest_cf_rows_for_provenance(ColumnFamily::slot_raw(slot), &[(key.to_vec(), seq)])?;
-    Ok(batch.rows.get(key).and_then(Option::as_ref).map(|row| {
-        let source = match row.source {
-            RowSource::CommitBatch | RowSource::WalTail => "slot_raw_cf",
-            RowSource::FullSet => "slot_raw_cf_full_set",
-        };
-        (row.value.clone(), source)
-    }))
+fn missing_panel_slot_error(vault: &Path, slot: SlotId, detail: &str) -> CliError {
+    CalyxError::aster_corrupt_shard(format!(
+        "cx-list --include-slots cannot interpret slot {} in {} from the persisted VaultPanelState: {detail}",
+        slot.get(),
+        vault.display()
+    ))
+    .into()
 }
 
 fn missing_slot_row_error(
@@ -303,11 +462,13 @@ pub(super) fn slot_summary<'a>(
     let mut dense_slots = 0usize;
     let mut sparse_slots = 0usize;
     let mut multi_slots = 0usize;
+    let mut compressed_slots = 0usize;
     let mut tombstoned_slots = 0usize;
     let mut absent_reasons = BTreeMap::<String, usize>::new();
     for state in states {
         match state {
             PhysicalSlotState::Tombstoned { .. } => tombstoned_slots += 1,
+            PhysicalSlotState::Compressed { .. } => compressed_slots += 1,
             PhysicalSlotState::Vector { vector, .. } => match vector {
                 SlotVector::Dense { .. } => dense_slots += 1,
                 SlotVector::Sparse { .. } => sparse_slots += 1,
@@ -324,10 +485,11 @@ pub(super) fn slot_summary<'a>(
     }
     let absent_slots = absent_reasons.values().sum::<usize>();
     json!({
-        "slot_count": dense_slots + sparse_slots + multi_slots + tombstoned_slots + absent_slots,
+        "slot_count": dense_slots + sparse_slots + multi_slots + compressed_slots + tombstoned_slots + absent_slots,
         "dense_slots": dense_slots,
         "sparse_slots": sparse_slots,
         "multi_slots": multi_slots,
+        "compressed_slots": compressed_slots,
         "tombstoned_slots": tombstoned_slots,
         "absent_slots": absent_slots,
         "absent_reasons": absent_reasons,

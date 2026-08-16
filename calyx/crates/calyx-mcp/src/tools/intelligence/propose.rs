@@ -8,11 +8,14 @@ use calyx_assay::PanelResourceBudget;
 use calyx_aster::cf::ColumnFamily;
 use calyx_core::{CalyxError, Clock, CxId, SystemClock};
 use calyx_ledger::{ActorId, LedgerAppender};
-use calyx_registry::{SwapController, persist_vault_panel_state};
+use calyx_registry::{SwapController, VaultPanelState, persist_vault_panel_state};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::core::{VaultContext, active_slot_ids, load_context, load_docs, parse_anchor};
+use super::core::{
+    VaultContext, active_slot_ids, load_context, load_docs_resolved, load_docs_with_state,
+    parse_anchor,
+};
 use super::metrics;
 use super::model::{BitsOut, ProposeLensOut, assay_key, proposal_key};
 use super::propose_backfill::{apply_slot_backfill, restore_slot_backfill};
@@ -31,7 +34,7 @@ pub(super) fn run(
     resource_budget: Option<PanelResourceBudget>,
 ) -> ToolResult<Value> {
     let ctx = load_context(vault_name)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs_resolved(&ctx)?;
     let anchor = parse_anchor(anchor)?;
     let label = super::core::anchor_label(&anchor);
     let assay_key = assay_key(&label);
@@ -159,7 +162,12 @@ fn finalize_admission(
     };
     let (backfill, undo) =
         apply_slot_backfill(&inputs.ctx.vault, inputs.docs, &candidate_backfill)?;
-    let reloaded = load_docs(&inputs.ctx.vault)?;
+    let candidate_state = VaultPanelState {
+        panel: inputs.controller.panel().clone(),
+        registry: inputs.registry.clone(),
+        registry_snapshot: inputs.ctx.state.registry_snapshot.clone(),
+    };
+    let reloaded = load_docs_with_state(&inputs.ctx.vault, &candidate_state)?;
     let after = metrics::bits(
         inputs.controller.panel(),
         &reloaded,

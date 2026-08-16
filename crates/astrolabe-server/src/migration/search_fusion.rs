@@ -35,8 +35,9 @@ use astrolabe_weave::search_index::{
     split_identifier_tokens,
 };
 use astrolabe_weave::search_production::{
-    ASTRO_SEARCH_PRODUCTION_STALE, PRODUCTION_VECTOR_SLOTS, build_search_index_manifest_from_vault,
-    load_manifest_if_fresh, persist_manifest,
+    ASTRO_SEARCH_PRODUCTION_STALE, PRODUCTION_VECTOR_SLOTS,
+    build_search_index_manifest_from_vault_with_panel_root, load_manifest_if_fresh,
+    persist_manifest,
 };
 
 use super::*;
@@ -178,11 +179,16 @@ pub(crate) fn run_fused_search_graph(args: &Map<String, Value>) -> Result<String
     let current_seq = vault.latest_seq();
     let manifest_path = manifest_cache_path(&cache_dir, &project);
 
-    let (manifest, manifest_status) =
-        match load_or_rebuild_manifest(&vault, &project, &manifest_path, current_seq) {
-            Ok(resolved) => resolved,
-            Err(error) => return search_error_result(&error),
-        };
+    let (manifest, manifest_status) = match load_or_rebuild_manifest(
+        &vault,
+        &project,
+        &manifest_path,
+        current_seq,
+        Some(vault_dir.as_path()),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return search_error_result(&error),
+    };
 
     let index_set = match SlotIndexSet::from_manifest(&manifest) {
         Ok(set) => set,
@@ -296,6 +302,7 @@ pub(crate) fn load_or_rebuild_manifest<C>(
     project: &str,
     manifest_path: &Path,
     current_seq: u64,
+    vault_panel_root: Option<&Path>,
 ) -> Result<(SlotIndexManifest, ManifestStatus), SearchError>
 where
     C: Clock,
@@ -304,13 +311,13 @@ where
         match load_manifest_if_fresh(manifest_path, current_seq) {
             Ok(manifest) => return Ok((manifest, ManifestStatus::LoadedFresh)),
             Err(error) if error.code() == ASTRO_SEARCH_PRODUCTION_STALE => {
-                let manifest = rebuild_manifest(vault, project, manifest_path)?;
+                let manifest = rebuild_manifest(vault, project, manifest_path, vault_panel_root)?;
                 return Ok((manifest, ManifestStatus::RebuiltStale));
             }
             Err(corrupt) => return Err(corrupt),
         }
     }
-    let manifest = rebuild_manifest(vault, project, manifest_path)?;
+    let manifest = rebuild_manifest(vault, project, manifest_path, vault_panel_root)?;
     Ok((manifest, ManifestStatus::RebuiltAbsent))
 }
 
@@ -318,15 +325,17 @@ fn rebuild_manifest<C>(
     vault: &AsterVault<C>,
     project: &str,
     manifest_path: &Path,
+    vault_panel_root: Option<&Path>,
 ) -> Result<SlotIndexManifest, SearchError>
 where
     C: Clock,
 {
-    let (manifest, _report) = build_search_index_manifest_from_vault(
+    let (manifest, _report) = build_search_index_manifest_from_vault_with_panel_root(
         vault,
         project,
         &PRODUCTION_VECTOR_SLOTS,
         IndexKnobs::defaults(FUSION_INDEX_SEED),
+        vault_panel_root,
     )?;
     persist_manifest(manifest_path, &manifest)?;
     Ok(manifest)
@@ -684,6 +693,8 @@ pub(crate) fn fusion_selected_cfs() -> Vec<ColumnFamily> {
         ColumnFamily::Ledger,
         ColumnFamily::Kv,
         ColumnFamily::Recurrence,
+        ColumnFamily::Compression,
+        ColumnFamily::Assay,
         ColumnFamily::slot(SLOT_CODE_SEMANTIC),
         ColumnFamily::slot(SLOT_NAME_SEMANTIC),
     ]

@@ -10,8 +10,7 @@
 use std::path::Path;
 
 use super::slot_column::read_materialized_slot_column;
-use super::{AsterVault, SlotColumnMaterialization, encode};
-use crate::cf::{ColumnFamily, slot_key};
+use super::{AsterVault, SlotColumnMaterialization, SlotVectorResolver, StrictRawSlotResolver};
 use crate::olap::{OlapScanPlan, OlapScanResult, scan_materialized_slot_column_aggregate};
 use calyx_core::{CalyxError, Clock, Result, Seq, SlotId, SlotVector};
 
@@ -64,27 +63,73 @@ where
         value_column: usize,
         output_dir: impl AsRef<Path>,
     ) -> Result<HtapDualRead> {
+        self.htap_dual_read_resolved_at(
+            snapshot,
+            slot,
+            value_column,
+            output_dir,
+            &StrictRawSlotResolver,
+        )
+    }
+
+    /// HTAP dual read through an explicit slot interpretation owner. The full
+    /// column and declared point roster are separate resolver operations at the
+    /// same sequence; the batch method prevents per-row snapshot/manifest setup.
+    pub fn htap_dual_read_resolved_at<R>(
+        &self,
+        snapshot: Seq,
+        slot: SlotId,
+        value_column: usize,
+        output_dir: impl AsRef<Path>,
+        resolver: &R,
+    ) -> Result<HtapDualRead>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let snapshot_lease = self.retain_snapshot_at(snapshot);
         // --- Analytical (column) path ---
-        let column = self.materialize_slot_column_at(snapshot, slot, &output_dir)?;
+        let column =
+            self.materialize_slot_column_resolved_at(snapshot, slot, &output_dir, resolver)?;
+        snapshot_lease.record_progress();
         let plan = OlapScanPlan::new(value_column);
         let olap = scan_materialized_slot_column_aggregate(&column.manifest_path, plan)?;
         let readback = read_materialized_slot_column(&column.manifest_path)?;
+        snapshot_lease.record_progress();
 
         // --- Transactional (row) path: independent point reads at the same seq ---
+        let point_rows =
+            resolver.resolve_slot_vectors_at(self, snapshot, slot, column.cx_ids.as_slice())?;
+        if point_rows.len() != column.cx_ids.len() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "htap resolver returned {} point rows for {} requested CxIds",
+                point_rows.len(),
+                column.cx_ids.len()
+            )));
+        }
         let mut per_row_bit_identical = readback.rows.len() == column.cx_ids.len();
         let mut count = 0usize;
         let mut sum = 0.0f64;
         let mut min = 0.0f32;
         let mut max = 0.0f32;
-        for (idx, cx) in column.cx_ids.iter().enumerate() {
-            let raw = self
-                .read_cf_at(snapshot, ColumnFamily::slot(slot), &slot_key(*cx))?
-                .ok_or_else(|| {
-                    CalyxError::stale_derived(format!(
-                        "htap point read missing cx {cx} at snapshot {snapshot}"
-                    ))
-                })?;
-            let SlotVector::Dense { data, .. } = encode::decode_slot_vector(&raw)? else {
+        for (idx, ((expected_cx, (resolved_cx, vector)), column_row)) in column
+            .cx_ids
+            .iter()
+            .zip(point_rows.into_iter())
+            .zip(readback.rows.iter())
+            .enumerate()
+        {
+            if *expected_cx != resolved_cx || column_row.cx_id != *expected_cx {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "htap resolver/order mismatch at ordinal {idx}: requested={expected_cx} resolved={resolved_cx} column={}",
+                    column_row.cx_id
+                )));
+            }
+            let vector = vector.ok_or_else(|| {
+                CalyxError::stale_derived(format!(
+                    "htap point read missing cx {expected_cx} at snapshot {snapshot}"
+                ))
+            })?;
+            let SlotVector::Dense { data, .. } = vector else {
                 return Err(CalyxError::stale_derived(
                     "htap dual read requires dense slot vectors",
                 ));
@@ -96,9 +141,8 @@ where
                 )));
             }
             // Independent access paths must yield bit-identical row bytes.
-            match readback.rows.get(idx) {
-                Some(col_row) if col_row.values == data => {}
-                _ => per_row_bit_identical = false,
+            if column_row.values != data {
+                per_row_bit_identical = false;
             }
             let value = data[value_column];
             if count == 0 {

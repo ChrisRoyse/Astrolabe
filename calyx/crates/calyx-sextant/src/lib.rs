@@ -101,7 +101,8 @@ pub use query::{
     DocFilter, DocPathFilter, ExplainOutput, ExplainStep, FieldOp, FieldPredicate,
     FreshnessRequirement, GraphHop, KvLookup, MetadataPredicate, PlanStep, PlanStepKind, Query,
     QueryFilters, QueryGuard, RelationalFilter, ScalarOp, ScalarPredicate, TsRange, UniversalQuery,
-    VectorQuery, ask, plan as plan_cross_model,
+    VectorQuery, ask, ask_resolved, execute as execute_cross_model,
+    execute_resolved as execute_cross_model_resolved, plan as plan_cross_model,
 };
 pub use query_admission::{QueryAdmissionConfig, QueryAdmissionController, QueryAdmissionStats};
 pub use reranker::{RerankCandidateText, RerankRequest, RerankResponse, RerankerClient};

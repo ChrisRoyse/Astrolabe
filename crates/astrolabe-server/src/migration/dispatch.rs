@@ -2501,8 +2501,86 @@ pub(crate) fn handle_optimizer_status(args_json: &str) -> Result<String, DynErro
                 tool_json_result(value)
             }
         }
+        "commission_compression_candidates" => {
+            let Some(raw_slots) = args_obj.get("candidate_slot_ids").and_then(Value::as_array)
+            else {
+                return tool_error_result(
+                    "ASTRO_OPTIMIZER_COMPRESSION_CANDIDATES_REQUIRED: commission_compression_candidates requires candidate_slot_ids with at least two registered slot ids",
+                );
+            };
+            let mut slot_ids = Vec::with_capacity(raw_slots.len());
+            for raw in raw_slots {
+                let Some(value) = raw.as_u64().and_then(|value| u16::try_from(value).ok()) else {
+                    return tool_error_result(
+                        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_INVALID: every candidate_slot_ids value must be a u16 integer",
+                    );
+                };
+                slot_ids.push(SlotId::new(value));
+            }
+            let Some(request_value) = args_obj.get("candidate_request") else {
+                return tool_error_result(
+                    "ASTRO_OPTIMIZER_COMPRESSION_REQUEST_REQUIRED: commission_compression_candidates requires candidate_request with real disjoint queries, backend, protocol runs, work limits, and gates",
+                );
+            };
+            let request = match serde_json::from_value::<
+                calyx_registry::CompressionCandidateEvaluationRequest,
+            >(request_value.clone())
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    return tool_error_result(format!(
+                        "ASTRO_OPTIMIZER_COMPRESSION_REQUEST_INVALID: candidate_request is invalid: {error}"
+                    ));
+                }
+            };
+            tool_json_result(commission_optimizer_compression_candidates_json_at(
+                &cache_dir, &project, &slot_ids, request,
+            )?)
+        }
+        "select_compression_candidates" => {
+            let Some(raw_receipts) = args_obj.get("candidate_receipts").and_then(Value::as_array)
+            else {
+                return tool_error_result(
+                    "ASTRO_OPTIMIZER_COMPRESSION_RECEIPTS_REQUIRED: select_compression_candidates requires at least two {slot_id,receipt_sha256} source candidates",
+                );
+            };
+            let mut receipts = Vec::with_capacity(raw_receipts.len());
+            for raw in raw_receipts {
+                let Some(object) = raw.as_object() else {
+                    return tool_error_result(
+                        "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_INVALID: every candidate_receipts entry must be an object",
+                    );
+                };
+                let Some(slot_id) = object
+                    .get("slot_id")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                else {
+                    return tool_error_result(
+                        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_INVALID: candidate receipt slot_id must be a u16 integer",
+                    );
+                };
+                let Some(receipt_hex) = object.get("receipt_sha256").and_then(Value::as_str) else {
+                    return tool_error_result(
+                        "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_INVALID: candidate receipt_sha256 is required",
+                    );
+                };
+                let digest = match decode_hex_32_arg(
+                    receipt_hex,
+                    "receipt_sha256",
+                    "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_INVALID",
+                ) {
+                    Ok(digest) => digest,
+                    Err(error) => return tool_error_result(error),
+                };
+                receipts.push((SlotId::new(slot_id), digest));
+            }
+            tool_json_result(select_optimizer_compression_candidates_json_at(
+                &cache_dir, &project, &receipts,
+            )?)
+        }
         other => tool_error_result(format!(
-            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {other:?} is not available; remediation: use mode=\"status\", mode=\"ack_triggers\", or mode=\"propose\""
+            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {other:?} is not available; remediation: use mode=\"status\", mode=\"ack_triggers\", mode=\"propose\", mode=\"commission_compression_candidates\", or mode=\"select_compression_candidates\""
         )),
     }
 }

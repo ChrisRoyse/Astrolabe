@@ -12,8 +12,8 @@ use calyx_ward::{
 use serde::Deserialize;
 
 use super::core::{
-    dense, dense_dim, load_context, load_docs, parse_cx_id, read_json_row, text_vector,
-    write_json_row,
+    dense, dense_dim, load_context, load_docs, load_read_context, parse_cx_id, read_json_row,
+    text_vector, write_json_row,
 };
 use super::model::{
     GuardCheckOut, GuardProfileOut, SlotTauOut, default_guard_key, guard_profile_key,
@@ -106,9 +106,9 @@ fn calibrate_command(vault_name: &str, domain: &str, set: &Path, target_far: f32
 }
 
 fn check_command(vault_name: &str, cx_id: &str, identity_cx: Option<&str>) -> CliResult {
-    let ctx = load_context(vault_name)?;
+    let ctx = load_read_context(vault_name, [ColumnFamily::Guard])?;
     let profile = load_profile(&ctx.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs(&ctx)?;
     let cx = parse_cx_id(cx_id, "--cx")?;
     let identity = identity_cx
         .map(|raw| parse_cx_id(raw, "--identity-cx"))
@@ -121,9 +121,9 @@ fn check_command(vault_name: &str, cx_id: &str, identity_cx: Option<&str>) -> Cl
 }
 
 fn generate_command(vault_name: &str, text: &str, identity_cx: Option<&str>) -> CliResult {
-    let ctx = load_context(vault_name)?;
+    let ctx = load_read_context(vault_name, [ColumnFamily::Guard])?;
     let profile = load_profile(&ctx.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs(&ctx)?;
     let identity =
         match identity_cx {
             Some(raw) => parse_cx_id(raw, "--identity-cx")?,

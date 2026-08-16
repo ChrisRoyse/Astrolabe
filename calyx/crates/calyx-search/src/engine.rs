@@ -9,8 +9,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use calyx_aster::vault::AsterVault;
-use calyx_core::{SlotId, SlotVector};
+use calyx_aster::vault::{AsterVault, SlotVectorResolver, StrictRawSlotResolver};
+use calyx_core::{SlotId, SlotVector, SystemClock};
 
 use crate::engine_measure::measure_query_vectors_with_slots_traced;
 pub use crate::engine_measure::{measure_query_vectors, measure_query_vectors_with_slots};
@@ -151,6 +151,7 @@ pub fn search_outcome_with_slots_traced(
         measure_query_vectors_with_slots_traced(state, query, allowed_slots, Some(&mut trace))?;
     search_outcome_with_measured_slots(
         vault,
+        state,
         vault_dir,
         &query_vectors,
         k,
@@ -258,6 +259,118 @@ pub fn search_outcome_with_query_vectors_freshness_cached(
     slot_cache: Option<&mut SearchSlotCache>,
     trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
 ) -> CliResult<SearchOutcome> {
+    search_outcome_with_query_vectors_freshness_cached_resolver(
+        vault,
+        &StrictRawSlotResolver,
+        vault_dir,
+        query_vectors,
+        k,
+        fusion,
+        guard,
+        guard_tau,
+        guard_panel_version,
+        filter,
+        explain,
+        freshness,
+        budget,
+        slot_cache,
+        trace_sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_outcome_with_query_vectors_freshness_resolved(
+    vault: &AsterVault,
+    state: &calyx_registry::VaultPanelState,
+    vault_dir: &Path,
+    query_vectors: &[(SlotId, SlotVector)],
+    k: usize,
+    fusion: FusionChoice,
+    guard: GuardChoice,
+    guard_panel_version: Option<u64>,
+    filter: Option<&str>,
+    explain: bool,
+    freshness: SearchFreshness,
+    budget: SearchBudget<'_>,
+    trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
+) -> CliResult<SearchOutcome> {
+    search_outcome_with_query_vectors_freshness_cached_resolved(
+        vault,
+        state,
+        vault_dir,
+        query_vectors,
+        k,
+        fusion,
+        guard,
+        None,
+        guard_panel_version,
+        filter,
+        explain,
+        freshness,
+        budget,
+        None,
+        trace_sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_outcome_with_query_vectors_freshness_cached_resolved(
+    vault: &AsterVault,
+    state: &calyx_registry::VaultPanelState,
+    vault_dir: &Path,
+    query_vectors: &[(SlotId, SlotVector)],
+    k: usize,
+    fusion: FusionChoice,
+    guard: GuardChoice,
+    guard_tau: Option<f32>,
+    guard_panel_version: Option<u64>,
+    filter: Option<&str>,
+    explain: bool,
+    freshness: SearchFreshness,
+    budget: SearchBudget<'_>,
+    slot_cache: Option<&mut SearchSlotCache>,
+    trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
+) -> CliResult<SearchOutcome> {
+    search_outcome_with_query_vectors_freshness_cached_resolver(
+        vault,
+        state,
+        vault_dir,
+        query_vectors,
+        k,
+        fusion,
+        guard,
+        guard_tau,
+        guard_panel_version,
+        filter,
+        explain,
+        freshness,
+        budget,
+        slot_cache,
+        trace_sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_outcome_with_query_vectors_freshness_cached_resolver<R>(
+    vault: &AsterVault,
+    resolver: &R,
+    vault_dir: &Path,
+    query_vectors: &[(SlotId, SlotVector)],
+    k: usize,
+    fusion: FusionChoice,
+    guard: GuardChoice,
+    guard_tau: Option<f32>,
+    guard_panel_version: Option<u64>,
+    filter: Option<&str>,
+    explain: bool,
+    freshness: SearchFreshness,
+    budget: SearchBudget<'_>,
+    slot_cache: Option<&mut SearchSlotCache>,
+    trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
+) -> CliResult<SearchOutcome>
+where
+    R: SlotVectorResolver<SystemClock> + ?Sized,
+{
     let allowed_slots = query_vectors
         .iter()
         .map(|(slot, _)| *slot)
@@ -265,6 +378,7 @@ pub fn search_outcome_with_query_vectors_freshness_cached(
     let mut trace = SearchTracer::new(trace_sink);
     search_outcome_with_measured_slots(
         vault,
+        resolver,
         vault_dir,
         query_vectors,
         k,

@@ -28,6 +28,7 @@ pub mod placement;
 pub mod profile;
 pub mod runtime;
 mod runtime_limit;
+mod slot_resolution;
 pub mod spec;
 pub mod swap;
 pub mod temporal;
@@ -58,16 +59,28 @@ pub use commission::{
     profile_safetensors_source, profile_safetensors_sources, resolve_safetensors_weight_set,
 };
 pub use compression::{
-    CALYX_MULTIVECTOR_ADMISSION_FAILED, CALYX_MULTIVECTOR_CONTEXT_MISMATCH,
-    CALYX_MULTIVECTOR_PACK_INVALID, CALYX_MULTIVECTOR_SHAPE_UNSUPPORTED,
-    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
-    COMPRESSED_SLOT_VERSION, COMPRESSION_GENERATION_MARKER, CompressedSlotHit, CompressedSlotIndex,
-    CompressionQuery, GenerationDeleteReport, MULTIVECTOR_MANIFEST_MAGIC,
-    MULTIVECTOR_MANIFEST_VERSION, MULTIVECTOR_ROW_HEADER_BYTES, MULTIVECTOR_ROW_MAGIC,
-    MULTIVECTOR_ROW_VERSION, MultiVectorCompressionConfig, MultiVectorCompressionQuery,
-    MultiVectorCompressionReport, MultiVectorCompressionRow, MultiVectorStorageCodec,
-    MxFp4AssayEvidence, PackedMaxSimScratch, PackedMultiVectorBytes, PackedMultiVectorHit,
-    PackedMultiVectorIndex, PackedMultiVectorManifest, PackedMultiVectorRow,
+    CALYX_COMPRESSION_ADMISSION_REFUSED, CALYX_MULTIVECTOR_ADMISSION_FAILED,
+    CALYX_MULTIVECTOR_CONTEXT_MISMATCH, CALYX_MULTIVECTOR_PACK_INVALID,
+    CALYX_MULTIVECTOR_SHAPE_UNSUPPORTED, CALYX_VECTOR_COMPRESSION_EMPTY,
+    CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG, COMPRESSED_SLOT_VERSION,
+    COMPRESSION_ADMISSION_SCHEMA, COMPRESSION_CANDIDATE_SELECTION_SCHEMA,
+    COMPRESSION_GENERATION_MARKER, CompressedGenerationIdentity, CompressedSlotHit,
+    CompressedSlotIndex, CompressionAdmissionGates, CompressionAdmissionReadback,
+    CompressionAdmissionReceipt, CompressionAdmissionRequest, CompressionAdmissionStatus,
+    CompressionAdmissionVerdict, CompressionAdmissionWorkLimits, CompressionAllocationObservation,
+    CompressionBuildObservation, CompressionCandidateCommissionReadback,
+    CompressionCandidateEvaluationReadback, CompressionCandidateEvaluationRequest,
+    CompressionCandidateReference, CompressionCandidateSelectionEntry,
+    CompressionCandidateSelectionReceipt, CompressionGateComparison, CompressionGateObservation,
+    CompressionPhysicalComponent, CompressionPlacementObservation, CompressionQuery,
+    CompressionQueryObservation, CompressionReconstructionEvidence,
+    CompressionReconstructionObservation, CompressionResourceObservation, CompressionScoredHit,
+    CompressionVramObservation, CompressionWorkObservation, GenerationDeleteReport,
+    MULTIVECTOR_MANIFEST_MAGIC, MULTIVECTOR_MANIFEST_VERSION, MULTIVECTOR_ROW_HEADER_BYTES,
+    MULTIVECTOR_ROW_MAGIC, MULTIVECTOR_ROW_VERSION, MultiVectorCompressionConfig,
+    MultiVectorCompressionQuery, MultiVectorCompressionReport, MultiVectorCompressionRow,
+    MultiVectorStorageCodec, MxFp4AssayEvidence, PackedMaxSimScratch, PackedMultiVectorBytes,
+    PackedMultiVectorHit, PackedMultiVectorIndex, PackedMultiVectorManifest, PackedMultiVectorRow,
     ParsedPackedMultiVectorRow, REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport,
     SlotCompressionRow, StoredSlotCodec, StoredSlotEnvelope, append_reseal_compressed_rows,
     append_reseal_packed_multivector_rows, compress_slot_batch,
@@ -174,6 +187,7 @@ pub use runtime::static_lookup::{
 };
 pub use runtime::tei_http::{DEFAULT_TEI_ENDPOINT, TeiHttpLens};
 pub use runtime_limit::measure_registry_batch_with_runtime_limit;
+pub use slot_resolution::resolved_constellation_read_cfs;
 pub use spec::{FastembedBgem3Output, LensHealth, LensRuntime, LensSpec};
 pub use swap::{BackfillCandidate, BackfillQueue, SlotSpec, SwapController};
 pub use temporal::{

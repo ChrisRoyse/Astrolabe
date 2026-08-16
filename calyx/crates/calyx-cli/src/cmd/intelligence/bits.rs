@@ -18,7 +18,7 @@ const ESTIMATOR: &str = "centroid_cosine_v1";
 
 pub(super) fn command(args: BitsArgs) -> CliResult {
     let ctx = load_context(&args.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs(&ctx)?;
     let anchor = parse_anchor(&args.anchor_kind)?;
     let label = anchor_label(&anchor);
     let key = assay_key(&label);

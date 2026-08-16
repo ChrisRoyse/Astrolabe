@@ -319,7 +319,7 @@ fn readback(
 ) -> CliResult<MolecularVaultReadback> {
     let snapshot = vault.snapshot();
     for cx in expected {
-        let stored = vault.get(cx.cx_id, snapshot)?;
+        let stored = vault.get_base_at(cx.cx_id, snapshot)?;
         if stored.metadata != cx.metadata || stored.anchors != cx.anchors {
             return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
                 "molecular vault readback mismatch for cx {}",

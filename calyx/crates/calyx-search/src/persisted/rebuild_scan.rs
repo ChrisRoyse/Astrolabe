@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{ColumnFamily, KeyRange};
 use calyx_aster::mvcc::Snapshot;
-use calyx_aster::vault::AsterVault;
-use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
-use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
+use calyx_aster::vault::encode::decode_constellation_base;
+use calyx_aster::vault::{AsterVault, SlotVectorResolver};
+use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector, SystemClock};
 use rayon::prelude::*;
 
 use super::super::rebuild::RebuildProgress;
@@ -86,18 +86,18 @@ enum SlotRowShape {
     Multi,
 }
 
-pub(super) fn collect_slot_rows_from_cf<F>(
+pub(super) fn collect_slot_rows_resolved<F, R>(
     vault: &AsterVault,
     snapshot: Snapshot,
     plan: &SlotBuildPlan,
-    page_rows: usize,
+    resolver: &R,
     progress: Option<&SharedRebuildProgress<'_, F>>,
 ) -> CliResult<SlotRows>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+    R: SlotVectorResolver<SystemClock> + Sync + ?Sized,
 {
     let expected = plan.expected_ids.iter().copied().collect::<BTreeSet<_>>();
-    let range = all_rows();
     let mut found = BTreeSet::new();
     let mut shape = None;
     let mut dense_dim = None;
@@ -106,50 +106,44 @@ where
     let mut dense_rows = Vec::new();
     let mut sparse_rows = Vec::new();
     let mut multi_rows = Vec::new();
-    vault.scan_cf_range_pages_snapshot(
-        snapshot,
-        ColumnFamily::slot(plan.slot),
-        &range,
-        page_rows,
-        |page| {
-            for (key, bytes) in page {
-                let cx_id = cx_id_from_cf_key(&key, "slot CF")?;
-                if !expected.contains(&cx_id) {
-                    continue;
-                }
-                if !found.insert(cx_id) {
-                    return Err(stale(format!(
-                        "slot CF repeats row for slot {} cx_id {cx_id}",
-                        plan.slot
-                    )));
-                }
-                push_slot_vector(
-                    plan,
-                    cx_id,
-                    decode_slot_vector(&bytes)?,
-                    &mut shape,
-                    &mut dense_dim,
-                    &mut sparse_dim,
-                    &mut multi_token_dim,
-                    &mut dense_rows,
-                    &mut sparse_rows,
-                    &mut multi_rows,
-                )?;
-            }
-            if let Some(progress) = progress {
-                emit_shared_progress(
-                    progress,
-                    RebuildProgress::slot(
-                        "slot_scan_page",
-                        plan.slot,
-                        Some(found.len()),
-                        Some(snapshot.seq()),
-                    ),
-                )?;
-            }
-            Ok(())
-        },
-    )?;
+    let rows = resolver.resolve_slot_column_at(vault, snapshot.seq(), plan.slot)?;
+    for (cx_id, vector) in rows {
+        if !expected.contains(&cx_id) {
+            return Err(stale(format!(
+                "resolved slot {} contains cx_id {cx_id} absent from Base",
+                plan.slot
+            )));
+        }
+        if !found.insert(cx_id) {
+            return Err(stale(format!(
+                "resolved slot {} repeats row for cx_id {cx_id}",
+                plan.slot
+            )));
+        }
+        push_slot_vector(
+            plan,
+            cx_id,
+            vector,
+            &mut shape,
+            &mut dense_dim,
+            &mut sparse_dim,
+            &mut multi_token_dim,
+            &mut dense_rows,
+            &mut sparse_rows,
+            &mut multi_rows,
+        )?;
+    }
+    if let Some(progress) = progress {
+        emit_shared_progress(
+            progress,
+            RebuildProgress::slot(
+                "slot_column_resolved",
+                plan.slot,
+                Some(found.len()),
+                Some(snapshot.seq()),
+            ),
+        )?;
+    }
     if found.len() != expected.len() {
         let missing = expected
             .difference(&found)

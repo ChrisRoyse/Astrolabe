@@ -13,7 +13,7 @@ use crate::output::print_json;
 
 pub(super) fn command(args: ProposeLensArgs) -> CliResult {
     let ctx = load_context(&args.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs(&ctx)?;
     let anchor = parse_anchor(&args.anchor)?;
     let label = anchor_label(&anchor);
     let corpus = docs.values().cloned().collect::<Vec<_>>();

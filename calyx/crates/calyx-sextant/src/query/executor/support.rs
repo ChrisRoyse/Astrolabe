@@ -11,7 +11,7 @@ use calyx_aster::layers::relational::{
     RecordKey, RecordValue, Row, collection_id as rel_collection_id,
 };
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId, LedgerRef, Result, Seq, VaultStore};
+use calyx_core::{Clock, CxId, Result, Seq};
 use serde_json::Value;
 
 use crate::error::{CALYX_SEXTANT_QUERY_SHAPE, sextant_error};
@@ -209,14 +209,6 @@ pub(super) fn doc_value_matches(actual: Option<&Value>, expected: Option<&Value>
         (Some(_), None) => true,
         (None, _) => false,
     }
-}
-
-pub(super) fn ledger_ref<C: Clock>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-    cx_id: CxId,
-) -> Option<LedgerRef> {
-    vault.get(cx_id, snapshot).ok().map(|cx| cx.provenance)
 }
 
 pub(super) fn scoped_u64(value: &str, default_collection: &str) -> (String, u64) {

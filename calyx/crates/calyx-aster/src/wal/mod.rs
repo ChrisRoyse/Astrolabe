@@ -19,7 +19,7 @@ pub use batch::GroupCommitBatcher;
 pub use migration::{
     LegacyWalMigrationDisposition, LegacyWalMigrationReport, migrate_legacy_wal_tail,
 };
-pub(crate) use point_read::read_record_at;
+pub(crate) use point_read::{read_record_at, read_record_by_seq, read_tip_record};
 pub use replay::replay_dir;
 pub use replay::replay_dir_after;
 pub use replay::replay_dir_read_only_after;

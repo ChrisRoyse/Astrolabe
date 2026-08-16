@@ -17,6 +17,7 @@ calyx-core.workspace = true
 calyx-forge.workspace = true
 calyx-ledger.workspace = true
 calyx-loom.workspace = true
+calyx-registry.workspace = true
 calyx-sextant.workspace = true
 blake3 = "1"
 rayon = "1"

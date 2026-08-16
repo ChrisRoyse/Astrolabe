@@ -2,15 +2,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use calyx_core::{Constellation, CxId, SlotId};
+use calyx_core::{Constellation, CxId, SlotId, SystemClock};
 
 use calyx_aster::mvcc::{Freshness, Snapshot};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::vault::{AsterVault, SlotVectorResolver};
 use rayon::prelude::*;
 
 #[path = "rebuild_scan.rs"]
 mod rebuild_scan;
-use rebuild_scan::{SlotRows, collect_slot_rows_from_cf, load_base_docs_at};
+use rebuild_scan::{SlotRows, collect_slot_rows_resolved, load_base_docs_at};
 
 use super::rebuild::{RebuildProgress, previous_manifest, prune_stale_index_artifacts};
 use super::rebuild_plan::{
@@ -34,13 +34,15 @@ where
     (**progress)(event)
 }
 
-pub(super) fn rebuild_for_vault_with_progress<F>(
+pub(super) fn rebuild_for_vault_with_progress<F, R>(
     vault_dir: &Path,
     vault: &AsterVault,
+    resolver: &R,
     mut progress: F,
 ) -> CliResult
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+    R: SlotVectorResolver<SystemClock> + Sync + ?Sized,
 {
     validate_parallel_rebuild_config()?;
     let snapshot = vault.pin_reader(
@@ -78,7 +80,7 @@ where
         vault,
         guard.snapshot(),
         &base_docs,
-        page_rows,
+        resolver,
         &mut progress,
     )?;
     progress(RebuildProgress {
@@ -91,16 +93,17 @@ where
     Ok(())
 }
 
-fn rebuild_from_base_with_progress<F>(
+fn rebuild_from_base_with_progress<F, R>(
     vault_dir: &Path,
     vault: &AsterVault,
     snapshot: Snapshot,
     base_docs: &BTreeMap<CxId, Constellation>,
-    page_rows: usize,
+    resolver: &R,
     progress: &mut F,
 ) -> CliResult<RebuildSummary>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+    R: SlotVectorResolver<SystemClock> + Sync + ?Sized,
 {
     let root = vault_dir.join(INDEX_ROOT);
     fs::create_dir_all(&root)?;
@@ -147,8 +150,8 @@ where
                     vault,
                     snapshot,
                     plan,
+                    resolver,
                     previous_manifest.as_ref(),
-                    page_rows,
                     Some(&progress_lock),
                 )
             })
@@ -260,18 +263,19 @@ pub(super) fn validate_staged_manifest_artifacts(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_slot_entry<F>(
+fn build_slot_entry<F, R>(
     vault_dir: &Path,
     root: &Path,
     vault: &AsterVault,
     snapshot: Snapshot,
     plan: &SlotBuildPlan,
+    resolver: &R,
     previous_manifest: Option<&SearchIndexManifest>,
-    page_rows: usize,
     progress: Option<&SharedRebuildProgress<'_, F>>,
 ) -> CliResult<BuiltSlot>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+    R: SlotVectorResolver<SystemClock> + Sync + ?Sized,
 {
     let base_seq = snapshot.seq();
     if let Some(built) = reuse_staged_slot_entry(vault_dir, root, plan, base_seq)? {
@@ -288,7 +292,7 @@ where
         }
         return Ok(built);
     }
-    let rows = collect_slot_rows_from_cf(vault, snapshot, plan, page_rows, progress)?;
+    let rows = collect_slot_rows_resolved(vault, snapshot, plan, resolver, progress)?;
     let row_count = rows.len();
     if let Some(progress) = progress {
         emit_shared_progress(

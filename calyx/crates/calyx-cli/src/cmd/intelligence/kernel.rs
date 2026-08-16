@@ -13,7 +13,7 @@ use crate::output::print_json;
 
 pub(super) fn command(args: KernelArgs) -> CliResult {
     let ctx = load_context(&args.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let docs = load_docs(&ctx)?;
     let anchor = args.anchor.as_deref().map(parse_anchor).transpose()?;
     let label = anchor.as_ref().map(anchor_label);
     let report = calculate(&docs, anchor.as_ref())?;

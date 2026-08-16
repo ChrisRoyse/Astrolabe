@@ -6,6 +6,7 @@ pub mod search;
 pub mod search_eval;
 pub mod search_index;
 pub mod search_production;
+pub mod slot_source;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -59,7 +60,7 @@ pub use complete_xterms::{
     CompleteAssociationPersistReport, CompleteAssociationSourceReceipt, CompleteAssociationState,
     PairMetricCounts, PairReasonCounts, read_complete_association_state,
     read_complete_association_state_at, read_complete_association_state_vault_path,
-    reconcile_complete_associations,
+    reconcile_complete_associations, reconcile_complete_associations_with_panel_root,
 };
 pub use drift_producer::{
     DRIFT_REFERENCE_CHUNK_BUDGET_KNOB, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
@@ -71,7 +72,8 @@ pub use drift_producer::{
     SlotSamplingProvenance, bound_reference_window, drift_reference_chunk_budget_bytes,
     drift_reference_sample_cap, load_drift_reference, load_drift_reference_counted,
     persist_drift_reference, produce_drift_cards, read_slot_samples_from_vault,
-    run_index_time_drift,
+    read_slot_samples_from_vault_with_panel_root, run_index_time_drift,
+    run_index_time_drift_with_panel_root,
 };
 pub use kernel_index::{
     ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_CORRUPT, ASTRO_KERNEL_INDEX_MEMBER_ABSENT,
@@ -89,7 +91,8 @@ pub use ordered_parallel::ParallelScheduleTelemetry;
 pub use signal_cards::{
     ASTRO_WEAVE_SIGNAL_CARD_INPUT_INVALID, ProducedSignalCard, SIGNAL_AXIS_STRUCTURAL_DEGREE,
     SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes, derive_symbol_axes,
-    measure_index_time_signal_cards, signal_cards_from_symbol_axes,
+    measure_index_time_signal_cards, measure_index_time_signal_cards_with_panel_root,
+    signal_cards_from_symbol_axes, signal_cards_from_symbol_axes_with_panel_root,
 };
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT,
@@ -100,6 +103,7 @@ pub use sim_rows::{
     persist_similarity_family_run, persist_similarity_family_run_delta, plan_similarity_family_run,
     read_similarity_edge_rows, scan_similarity_physical_state, sim_edge_graph_key,
 };
+pub use slot_source::{ASTRO_WEAVE_SLOT_CONTEXT_REQUIRED, WeaveSlotSource};
 pub use xterm_cotenant::{
     XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
     XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA, accepted_xterm_cotenant_schemas,

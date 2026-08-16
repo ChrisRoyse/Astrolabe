@@ -8,8 +8,8 @@ use super::{put_bytes, put_string};
 use crate::vault::anchor_codec::{decode_anchor, encode_anchor};
 use crate::vault::cursor::Cursor;
 use calyx_core::{
-    AbsentReason, CalyxError, Constellation, CxFlags, CxId, InputRef, LedgerRef, Result, SlotId,
-    SlotVector, VaultId,
+    AbsentReason, Anchor, CalyxError, Constellation, CxFlags, CxId, InputRef, LedgerRef, Result,
+    SlotId, SlotVector, VaultId,
 };
 use std::collections::BTreeMap;
 
@@ -203,6 +203,27 @@ impl BaseRecord {
     /// placeholders; the durable hashes live in [`Self::slot_hashes`]).
     pub fn constellation(&self) -> &Constellation {
         &self.constellation
+    }
+
+    /// Mutable access to grounded outcomes for a Base-only anchor update. Slot
+    /// hashes remain sealed in this record and are re-emitted unchanged.
+    pub(crate) fn anchors_mut(&mut self) -> &mut Vec<Anchor> {
+        &mut self.constellation.anchors
+    }
+
+    /// Canonical duplicate-ingest identity with anchor-only variance removed.
+    /// This is derived through the lossless record so persisted slot hashes are
+    /// compared without hydrating or re-encoding slot values.
+    pub(crate) fn anchor_merge_identity(&self) -> Result<Vec<u8>> {
+        let mut normalized = self.clone();
+        normalized.constellation.anchors.clear();
+        normalized.constellation.created_at = 0;
+        normalized.constellation.flags.ungrounded = false;
+        normalized.constellation.provenance = LedgerRef {
+            seq: 0,
+            hash: [0; 32],
+        };
+        normalized.encode()
     }
 
     /// The exact stored per-slot hashes preserved from the persisted row.

@@ -328,7 +328,7 @@ fn cx_list_rows(
             "base_slot_count": cx.slots.len(),
             "base_hex": hex_bytes(&value),
             "slot_payloads_decoded": include_slots,
-            "slot_payload_decode_mode": if include_slots { "physical_slot_cf_readback" } else { "base_only" },
+            "slot_payload_decode_mode": if include_slots { "registry_context_physical_slot_readback" } else { "base_only" },
         });
         if include_slots {
             let states = cx

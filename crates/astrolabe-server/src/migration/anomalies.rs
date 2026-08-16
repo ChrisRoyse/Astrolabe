@@ -207,9 +207,7 @@ pub(crate) fn read_anomaly_report(cache_dir: &Path, project: &str) -> Result<Val
     match read_live_anomaly_report(cache_dir, project) {
         Ok(Some(report)) => Ok(report),
         Ok(None) => read_anomaly_report_metadata(cache_dir, project),
-        Err(error) => Ok(anomaly_report_unavailable_json(&format!(
-            "live anomaly CF read failed: {error}"
-        ))),
+        Err(error) => Err(error),
     }
 }
 
@@ -239,9 +237,12 @@ pub(crate) fn read_live_anomaly_report(
             .into_iter()
             .map(ColumnFamily::slot),
     );
+    selected_cfs.push(ColumnFamily::Compression);
+    selected_cfs.sort();
+    selected_cfs.dedup();
     let vault = open_shadow_vault_read_only(&vault_dir, &vault_id, &vault_salt, selected_cfs)?;
     let mut inputs = live_anomaly_inputs_from_vault(&vault)?;
-    let blind_spot = merge_live_blind_spot_inputs(&vault, project, &mut inputs);
+    let blind_spot = merge_live_blind_spot_inputs(&vault, &vault_dir, project, &mut inputs)?;
     if !inputs.has_anomaly_inputs() {
         return Ok(None);
     }
@@ -272,38 +273,34 @@ pub(crate) enum BlindSpotMergeOutcome {
 /// aborting the whole `detect_anomalies` call.
 pub(crate) fn merge_live_blind_spot_inputs<C: Clock>(
     vault: &AsterVault<C>,
+    vault_panel_root: &Path,
     project: &str,
     inputs: &mut LiveAnomalyInputs,
-) -> BlindSpotMergeOutcome {
+) -> Result<BlindSpotMergeOutcome, DynError> {
     let slots = blind_spot_slots(&DEFAULT_BLIND_SPOT_PAIRS);
-    let nodes = match reconstruct_similarity_nodes(vault, project, &slots) {
-        Ok(nodes) => nodes,
-        Err(error) => {
-            return BlindSpotMergeOutcome::Unavailable(format!(
-                "blind-spot reconstruction failed: {error}"
-            ));
-        }
-    };
-    match blind_spot_anomaly_inputs(
-        &nodes,
-        &DEFAULT_BLIND_SPOT_PAIRS,
-        &BlindSpotConfig::default(),
-    ) {
-        Ok(blind_spot) => {
-            inputs
-                .substrates
-                .extend(blind_spot.substrates.iter().cloned());
-            inputs
-                .calibrations
-                .extend(blind_spot.calibrations.iter().cloned());
-            BlindSpotMergeOutcome::Swept(blind_spot)
-        }
-        Err(error) => BlindSpotMergeOutcome::Unavailable(format!(
-            "blind-spot sweep refused: {} ({})",
-            error.message(),
-            error.code()
-        )),
-    }
+    let nodes = reconstruct_similarity_nodes(vault, vault_panel_root, project, &slots)?;
+    Ok(
+        match blind_spot_anomaly_inputs(
+            &nodes,
+            &DEFAULT_BLIND_SPOT_PAIRS,
+            &BlindSpotConfig::default(),
+        ) {
+            Ok(blind_spot) => {
+                inputs
+                    .substrates
+                    .extend(blind_spot.substrates.iter().cloned());
+                inputs
+                    .calibrations
+                    .extend(blind_spot.calibrations.iter().cloned());
+                BlindSpotMergeOutcome::Swept(blind_spot)
+            }
+            Err(error) => BlindSpotMergeOutcome::Unavailable(format!(
+                "blind-spot sweep refused: {} ({})",
+                error.message(),
+                error.code()
+            )),
+        },
+    )
 }
 
 /// Reconstructs the live corpus's [`SimilarityNode`]s (non-structural symbols,
@@ -311,21 +308,24 @@ pub(crate) fn merge_live_blind_spot_inputs<C: Clock>(
 /// column families — the read-side twin of the shadow importer's slot load.
 pub(crate) fn reconstruct_similarity_nodes<C: Clock>(
     vault: &AsterVault<C>,
+    vault_panel_root: &Path,
     project: &str,
     slots: &[SlotId],
 ) -> Result<Vec<SimilarityNode>, DynError> {
-    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
-    let at_seq = vault.snapshot();
-    let mut slot_rows =
-        std::collections::BTreeMap::<SlotId, std::collections::BTreeMap<Vec<u8>, Vec<u8>>>::new();
+    let snapshot_lease = vault.retain_latest_snapshot();
+    let at_seq = snapshot_lease.seq();
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot_at(vault, project, at_seq)?;
+    let source = WeaveSlotSource::open(at_seq, Some(vault_panel_root), snapshot.panel_version)?;
+    let mut slot_rows = std::collections::BTreeMap::<
+        SlotId,
+        std::collections::BTreeMap<calyx_core::CxId, SlotVector>,
+    >::new();
     for slot in slots {
         slot_rows.insert(
             *slot,
-            vault
-                .scan_cf_at(at_seq, ColumnFamily::slot(*slot))?
-                .into_iter()
-                .collect(),
+            source.resolve_column(vault, *slot)?.into_iter().collect(),
         );
+        snapshot_lease.record_progress();
     }
     let mut nodes = Vec::new();
     for node in snapshot.nodes.iter().filter(|node| !node.structural) {
@@ -335,12 +335,8 @@ pub(crate) fn reconstruct_similarity_nodes<C: Clock>(
         let mut similarity_node =
             SimilarityNode::new(node.atom_id.clone(), node.qualified_name.clone());
         for slot in slots {
-            if let Some(bytes) = slot_rows
-                .get(slot)
-                .and_then(|rows| rows.get(slot_key(cx_id).as_slice()))
-            {
-                let vector = calyx_aster::vault::encode::decode_slot_vector(bytes)?;
-                similarity_node.slots.insert(*slot, vector);
+            if let Some(vector) = slot_rows.get(slot).and_then(|rows| rows.get(&cx_id)) {
+                similarity_node.slots.insert(*slot, vector.clone());
             }
         }
         nodes.push(similarity_node);

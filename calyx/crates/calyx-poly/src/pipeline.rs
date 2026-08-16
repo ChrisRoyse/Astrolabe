@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Anchor, AnchorKind, AnchorValue, Clock, CxId, LedgerRef, VaultId, VaultStore};
+use calyx_core::{
+    Anchor, AnchorKind, AnchorValue, Clock, Constellation, CxId, LedgerRef, VaultId, VaultStore,
+};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
 use crate::constellation::{build_constellation, resolution_anchor, resolution_label_anchor};
@@ -200,6 +202,10 @@ fn hex_chunks(hex: &str) -> Vec<String> {
 
 /// Store capability required for ledger-stamped outcome grounding.
 pub trait GroundingLedgerStore: VaultStore {
+    /// Reads only the persisted Base row needed for no-lookahead timing. Slot
+    /// hydration is forbidden here because grounding does not consume vectors.
+    fn get_base(&self, id: CxId, snapshot: u64) -> calyx_core::Result<Constellation>;
+
     /// Writes outcome anchors and a same-commit grounding ledger entry.
     fn anchors_with_grounding_ledger(
         &self,
@@ -213,6 +219,10 @@ impl<C> GroundingLedgerStore for AsterVault<C>
 where
     C: Clock,
 {
+    fn get_base(&self, id: CxId, snapshot: u64) -> calyx_core::Result<Constellation> {
+        self.get_base_at(id, snapshot)
+    }
+
     fn anchors_with_grounding_ledger(
         &self,
         id: CxId,
@@ -251,7 +261,7 @@ pub fn ground_market<S: GroundingLedgerStore>(
     ];
     let mut refs = Vec::with_capacity(snapshot_cx_ids.len());
     for cx in snapshot_cx_ids {
-        let stored = store.get(*cx, store.snapshot())?;
+        let stored = store.get_base(*cx, store.snapshot())?;
         let resolution_observed_at = resolution.resolved_ts.saturating_mul(1000);
         let timing = NoLookaheadTiming {
             feature_max_observed_at: stored.created_at,

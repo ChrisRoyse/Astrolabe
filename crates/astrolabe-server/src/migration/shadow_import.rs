@@ -922,7 +922,7 @@ where
         vault.vault_id(),
         calyx_core::AnchorKind::Reward,
     );
-    match run_index_time_drift(
+    match run_index_time_drift_with_panel_root(
         vault,
         project,
         &shadow_available_slots(),
@@ -931,6 +931,7 @@ where
         SHADOW_DRIFT_SEED,
         &config,
         Some(&ledger),
+        Some(vault_dir),
     ) {
         Ok(report) => json!({
             "status": "produced",
@@ -946,6 +947,8 @@ where
             "current_total_retained": report.current_total_retained,
             "current_sampling_per_slot": report.current_sampling_per_slot,
             "slot_readback": ordered_readback_summary(&report.slot_readback),
+            "compressed_slots_read": report.compressed_slots_read,
+            "compressed_rows_read": report.compressed_rows_read,
             "trust": "measured",
             "provenance": "index_time_drift",
         }),
@@ -1016,11 +1019,12 @@ where
     }
 
     let slots = shadow_available_slots();
-    let mut production = astrolabe_weave::measure_index_time_signal_cards(
+    let mut production = astrolabe_weave::measure_index_time_signal_cards_with_panel_root(
         vault,
         project,
         &slots,
         SHADOW_SIGNAL_CARDS_SEED,
+        Some(vault_dir),
     )
     .map_err(|error| stage_error("measure", error))?;
     // Request order is part of both the ledger batch and transaction identity.
@@ -1131,6 +1135,8 @@ where
         "axes_skipped_degenerate": production.axes_skipped_degenerate,
         "slots_skipped_no_dense": production.slots_skipped_no_dense,
         "slot_readback": ordered_readback_summary(&production.readback),
+        "compressed_slots_read": production.compressed_slots_read,
+        "compressed_rows_read": production.compressed_rows_read,
         "axes": axes,
         "trust": "measured",
         "provenance": "index_time_signal_cards",
@@ -2630,6 +2636,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let mut weave = run_live_weave_with_snapshot(
         &vault,
         cache_dir,
+        &vault_dir,
         project,
         derived_changed,
         derived_delta,
@@ -2646,7 +2653,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         Some(&after_snapshot),
     )?;
     shadow_phase!("invalidations");
-    let layout_frames = persist_layout_frames(&vault, project, derived_changed)?;
+    let layout_frames = persist_layout_frames(&vault, &vault_dir, project, derived_changed)?;
     shadow_phase!("layout_frames");
     let drift = index_time_drift_summary(&vault, project, &vault_dir);
     shadow_phase!("drift");
@@ -2658,7 +2665,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // write is inside the verified chain). Best-effort: a scope that cannot yet
     // build a kernel is a labeled surface, never an index failure. (Overlaps lane
     // A's shadow_import.rs — keep this to exactly this one call.)
-    let kernel_artifact = persist_index_time_kernel_artifact(&vault, project);
+    let kernel_artifact = persist_index_time_kernel_artifact(&vault, &vault_dir, project);
     shadow_phase!("kernel_artifact");
     // #379 index-time hook (lane A/w15): produce and persist the per-axis
     // signal-ranking cards the get_architecture signal_ranking aspect reads, so
@@ -2804,6 +2811,12 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 #[derive(Debug, Clone, serde::Serialize)]
 struct WeaveSlotScanReceipt {
     slot: u16,
+    representation: String,
+    compression_generation_identity_sha256: Option<String>,
+    /// True only when `scanned_bytes`/page fields cover the exact raw Slot CF.
+    /// Registry's authenticated reconstruction API does not fabricate physical
+    /// byte telemetry, so compressed receipts label this false.
+    physical_accounting_complete: bool,
     read_snapshot_seq: u64,
     source_cf_generation_seq: u64,
     content_sha256: String,
@@ -2882,6 +2895,7 @@ fn slot_vector_owned_bytes(vector: &SlotVector) -> u64 {
 
 fn load_weave_slot_latest<C>(
     vault: &AsterVault<C>,
+    slot_source: &WeaveSlotSource,
     expected_source_cf_generation: u64,
     slot: SlotId,
     node_by_cx: &BTreeMap<calyx_core::CxId, usize>,
@@ -2915,6 +2929,19 @@ where
             slot.get(), source_cf_generation_before, read_snapshot_seq,
         )
         .into());
+    }
+    if let Some(identity) = slot_source.compressed_generation_identity(vault, slot)? {
+        return load_weave_compressed_slot_latest(
+            vault,
+            slot_source,
+            identity,
+            expected_source_cf_generation,
+            slot,
+            node_by_cx,
+            nodes,
+            storage_before,
+            read_snapshot_seq,
+        );
     }
     let process_before = vault.process_usage_snapshot()?;
     let mut pages = 0u64;
@@ -2965,7 +2992,9 @@ where
                         rows_for_other_constellations.saturating_add(1);
                     continue;
                 };
-                let vector = calyx_aster::vault::encode::decode_slot_vector(&value)?;
+                let vector = calyx_aster::vault::decode_strict_raw_slot_value(
+                    slot, cx_id, &value,
+                )?;
                 if matches!(vector, SlotVector::Absent { .. }) {
                     rows_absent = rows_absent.saturating_add(1);
                 }
@@ -3005,6 +3034,9 @@ where
     }
     Ok(WeaveSlotScanReceipt {
         slot: slot.get(),
+        representation: "aster_raw_slot_vector".to_string(),
+        compression_generation_identity_sha256: None,
+        physical_accounting_complete: true,
         read_snapshot_seq,
         source_cf_generation_seq: expected_source_cf_generation,
         content_sha256: hex_lower(&content_hasher.finalize()),
@@ -3016,6 +3048,103 @@ where
         rows_absent,
         rows_missing: (nodes.len() as u64).saturating_sub(rows_loaded),
         scanned_bytes,
+        encoded_bytes,
+        decoded_owned_bytes,
+        storage: storage_before,
+        process: process_phase_usage_value(process),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_weave_compressed_slot_latest<C>(
+    vault: &AsterVault<C>,
+    slot_source: &WeaveSlotSource,
+    identity: calyx_registry::CompressedGenerationIdentity,
+    expected_source_cf_generation: u64,
+    slot: SlotId,
+    node_by_cx: &BTreeMap<calyx_core::CxId, usize>,
+    nodes: &mut [SimilarityNode],
+    storage_before: calyx_aster::mvcc::LatestOnlyReadbackStatus,
+    operation_seq_before: u64,
+) -> Result<WeaveSlotScanReceipt, DynError>
+where
+    C: Clock,
+{
+    let process_before = vault.process_usage_snapshot()?;
+    let identity_bytes = serde_json::to_vec(&identity)?;
+    let identity_sha256 = hex_lower(&Sha256::digest(&identity_bytes));
+    let mut content_hasher = Sha256::new();
+    hash_str(
+        &mut content_hasher,
+        "astrolabe.weave-slot-registry-content.v1",
+    );
+    hash_u64(&mut content_hasher, slot.get() as u64);
+    hash_u64(&mut content_hasher, identity_bytes.len() as u64);
+    content_hasher.update(&identity_bytes);
+    let rows = slot_source.resolve_column(vault, slot)?;
+    let mut rows_loaded = 0u64;
+    let mut rows_for_other_constellations = 0u64;
+    let mut rows_absent = 0u64;
+    let mut encoded_bytes = 0u64;
+    let mut decoded_owned_bytes = 0u64;
+    for (cx_id, vector) in rows {
+        let canonical = calyx_aster::vault::encode::encode_slot_vector(&vector)?;
+        hash_u64(&mut content_hasher, cx_id.as_bytes().len() as u64);
+        content_hasher.update(cx_id.as_bytes());
+        hash_u64(&mut content_hasher, canonical.len() as u64);
+        content_hasher.update(&canonical);
+        let Some(&node_index) = node_by_cx.get(&cx_id) else {
+            rows_for_other_constellations = rows_for_other_constellations.saturating_add(1);
+            continue;
+        };
+        if matches!(vector, SlotVector::Absent { .. }) {
+            rows_absent = rows_absent.saturating_add(1);
+        }
+        decoded_owned_bytes = decoded_owned_bytes.saturating_add(slot_vector_owned_bytes(&vector));
+        encoded_bytes = encoded_bytes.saturating_add(canonical.len() as u64);
+        if nodes[node_index].slots.insert(slot, vector).is_some() {
+            return Err(format!(
+                "ASTRO_WEAVE_SLOT_DUPLICATE: Registry compressed S{} produced duplicate live row for CxId {cx_id}; remediation: preserve the staged vault and rebuild the corrupt generation",
+                slot.get()
+            )
+            .into());
+        }
+        rows_loaded = rows_loaded.saturating_add(1);
+    }
+    let process = vault.process_usage_snapshot()?.phase_since(process_before);
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_weave_storage(
+        &storage_after,
+        &format!("compressed S{} post-read", slot.get()),
+    )?;
+    let read_snapshot_seq_after = vault.latest_seq();
+    let source_cf_generation_after = vault.cf_content_generation(ColumnFamily::slot(slot))?;
+    if storage_after != storage_before
+        || read_snapshot_seq_after != operation_seq_before
+        || source_cf_generation_after != expected_source_cf_generation
+    {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN: Registry compressed S{} generation changed during authenticated materialization: operation_seq_before={operation_seq_before}, seq_after={read_snapshot_seq_after}, expected_cf_generation={expected_source_cf_generation}, cf_generation_after={source_cf_generation_after}; remediation: preserve the staged generation and inspect the exact source writer",
+            slot.get()
+        )
+        .into());
+    }
+    Ok(WeaveSlotScanReceipt {
+        slot: slot.get(),
+        representation: "registry_authenticated_compressed".to_string(),
+        compression_generation_identity_sha256: Some(identity_sha256),
+        physical_accounting_complete: false,
+        read_snapshot_seq: slot_source.snapshot(),
+        source_cf_generation_seq: expected_source_cf_generation,
+        content_sha256: hex_lower(&content_hasher.finalize()),
+        pages: 0,
+        page_high_water_rows: 0,
+        page_high_water_bytes: 0,
+        rows_loaded,
+        rows_for_other_constellations,
+        rows_absent,
+        rows_missing: (nodes.len() as u64).saturating_sub(rows_loaded),
+        scanned_bytes: 0,
         encoded_bytes,
         decoded_owned_bytes,
         storage: storage_before,
@@ -3048,6 +3177,7 @@ fn eager_kind_index(kind: EagerAgreementKind) -> usize {
 pub(crate) fn run_live_weave_with_snapshot<C>(
     vault: &AsterVault<C>,
     run_parent: &Path,
+    vault_panel_root: &Path,
     project: &str,
     import_changed: bool,
     delta: Option<&WeaveDelta>,
@@ -3079,6 +3209,12 @@ where
         .expect("weave snapshot present by construction");
     let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
     let source_snapshot_seq = snapshot.receipt.snapshot_seq;
+    let slot_snapshot_lease = vault.retain_latest_snapshot();
+    let slot_source = WeaveSlotSource::open(
+        slot_snapshot_lease.seq(),
+        Some(vault_panel_root),
+        Some(SHADOW_PANEL_VERSION),
+    )?;
     let t_slot_load = std::time::Instant::now();
     let mut nodes = Vec::with_capacity(snapshot.nodes.len());
     let mut node_by_cx = BTreeMap::new();
@@ -3127,6 +3263,7 @@ where
             ))
         })
         .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    let source_compression_generation = vault.cf_content_generation(ColumnFamily::Compression)?;
     let mut slot_scans = Vec::<WeaveSlotScanReceipt>::new();
     let mut slot_content_witnesses = BTreeMap::<SlotId, (u64, u64, String)>::new();
     let mut similarity_prepass_slot_scan_count = 0usize;
@@ -3134,6 +3271,7 @@ where
     let mut decoded_slot_bytes_high_water = 0u64;
     macro_rules! load_slot {
         ($slot:expr) => {{
+            slot_snapshot_lease.record_progress();
             let expected_source_cf_generation = *source_slot_generations
                 .get(&$slot)
                 .ok_or_else(|| -> DynError {
@@ -3145,6 +3283,7 @@ where
                 })?;
             let receipt = load_weave_slot_latest(
                 vault,
+                &slot_source,
                 expected_source_cf_generation,
                 $slot,
                 &node_by_cx,
@@ -3161,7 +3300,7 @@ where
                 && expected != &content_witness
             {
                 return Err(format!(
-                    "ASTRO_WEAVE_SOURCE_CONTENT_CHANGED: repeated S{} scan disagrees with its first ordered physical witness: expected={expected:?}, observed={content_witness:?}; remediation: preserve the staged generation and inspect source Slot-CF mutation or corruption",
+                    "ASTRO_WEAVE_SOURCE_CONTENT_CHANGED: repeated S{} materialization disagrees with its first representation-bound content witness: expected={expected:?}, observed={content_witness:?}; remediation: preserve the staged generation and inspect the raw Slot CF or manifested compressed generation",
                     $slot.get(),
                 )
                 .into());
@@ -3174,6 +3313,7 @@ where
             decoded_slot_bytes_high_water =
                 decoded_slot_bytes_high_water.max(decoded_slot_bytes_live);
             slot_scans.push(receipt);
+            slot_snapshot_lease.record_progress();
         }};
     }
     macro_rules! release_slot {
@@ -3341,6 +3481,7 @@ where
                 "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
+            slot_snapshot_lease.record_progress();
         }};
     }
 
@@ -3484,6 +3625,7 @@ where
                 "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
+            slot_snapshot_lease.record_progress();
         }};
     }
 
@@ -3534,6 +3676,7 @@ where
         release_slot!(right);
         release_slot!(left);
     }
+    drop(slot_snapshot_lease);
     let xterm_physical_scan = if delta.is_some() {
         xterm_scalar_bits.fill([None; 6]);
         Some(stream_eager_cross_term_rows(
@@ -3630,7 +3773,7 @@ where
         .skip(similarity_prepass_slot_scan_count)
         .map(|receipt| receipt.encoded_bytes)
         .sum::<u64>();
-    let physical_slot_rows = slot_scans
+    let logical_slot_rows_resolved = slot_scans
         .iter()
         .map(|receipt| {
             receipt
@@ -3638,10 +3781,15 @@ where
                 .saturating_add(receipt.rows_for_other_constellations)
         })
         .sum::<u64>();
-    let physical_slot_encoded_bytes = slot_scans
+    let physical_slot_accounting_complete = slot_scans
         .iter()
-        .map(|receipt| receipt.scanned_bytes)
-        .sum::<u64>();
+        .all(|receipt| receipt.physical_accounting_complete);
+    let physical_slot_encoded_bytes = physical_slot_accounting_complete.then(|| {
+        slot_scans
+            .iter()
+            .map(|receipt| receipt.scanned_bytes)
+            .sum::<u64>()
+    });
     let ms_sim_plan = similarity_plan_timing.values().copied().sum::<u64>();
     let ms_sim_persist = similarity_persist_timing.values().copied().sum::<u64>();
     let ms_similarity = ms_sim_read_rows
@@ -3664,8 +3812,11 @@ where
     // prefix-disjoint XTerm witness for every unordered pair (#522/#980). It
     // validates existing completion bytes before source-hash skipping, so an
     // unchanged constellation avoids all pair arithmetic and all ledger writes.
-    let complete_xterms =
-        reconcile_complete_associations(vault, "astrolabe-shadow-complete-associations")?;
+    let complete_xterms = reconcile_complete_associations_with_panel_root(
+        vault,
+        "astrolabe-shadow-complete-associations",
+        Some(vault_panel_root),
+    )?;
     let source_slot_generations_after = source_slot_generations
         .keys()
         .map(|slot| {
@@ -3678,6 +3829,14 @@ where
     if source_slot_generations_after != source_slot_generations {
         return Err(format!(
             "ASTRO_WEAVE_SOURCE_CF_CHANGED: source Slot-CF generations changed across derived reconciliation: before={source_slot_generations:?}, after={source_slot_generations_after:?}; remediation: preserve the staged generation and identify the source Slot writer"
+        )
+        .into());
+    }
+    let source_compression_generation_after =
+        vault.cf_content_generation(ColumnFamily::Compression)?;
+    if source_compression_generation_after != source_compression_generation {
+        return Err(format!(
+            "ASTRO_WEAVE_SOURCE_CF_CHANGED: Compression generation changed across derived reconciliation: before={source_compression_generation}, after={source_compression_generation_after}; remediation: preserve the staged generation and identify the compression lifecycle writer"
         )
         .into());
     }
@@ -3729,12 +3888,16 @@ where
                     "generation_seq": generation,
                 }))
                 .collect::<Vec<_>>(),
+            "compression_cf_generation": source_compression_generation,
             "slot_page_row_cap": 1_024,
             "slot_scan_count": slot_scans.len(),
             "similarity_prepass_slot_scan_count": similarity_prepass_slot_scan_count,
             "distinct_slot_count": slots.len(),
-            "physical_slot_rows_read": physical_slot_rows,
+            "logical_slot_rows_resolved": logical_slot_rows_resolved,
+            "physical_slot_rows_read": physical_slot_accounting_complete
+                .then_some(logical_slot_rows_resolved),
             "physical_slot_encoded_bytes": physical_slot_encoded_bytes,
+            "physical_slot_accounting_complete": physical_slot_accounting_complete,
             "decoded_slot_bytes_high_water": decoded_slot_bytes_high_water,
             "decoded_slot_bytes_terminal": decoded_slot_bytes_live,
             "slot_scans": slot_scans,

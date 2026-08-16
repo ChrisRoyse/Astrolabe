@@ -22,7 +22,8 @@ use crate::ledger_view::parse_aster_ledger_seq;
 use crate::manifest::ManifestStore;
 use crate::sst::SstEntry;
 use crate::sst::level::SstLevel;
-use crate::vault::encode::{decode_constellation_base, decode_slot_vector, decode_write_batch};
+use crate::vault::decode_strict_raw_slot_value;
+use crate::vault::encode::{decode_constellation_base, decode_write_batch};
 use crate::wal::replay_dir_read_only_after;
 use calyx_core::{CalyxError, Result};
 use calyx_ledger::{
@@ -327,7 +328,7 @@ fn read_back_first_constellation(
                     hex(constellation.cx_id.as_bytes())
                 ))
             })?;
-        decode_slot_vector(bytes)?;
+        decode_strict_raw_slot_value(*slot, constellation.cx_id, bytes)?;
     }
     Ok(hex(key))
 }

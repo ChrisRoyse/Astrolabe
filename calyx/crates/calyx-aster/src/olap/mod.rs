@@ -7,7 +7,7 @@ pub use types::{
 
 use crate::mmap_col::MmapColumn;
 use crate::sst::arrow::{ArrowColumnView, decode_column_shape};
-use crate::vault::{AsterVault, SlotColumnManifest};
+use crate::vault::{AsterVault, SlotColumnManifest, SlotVectorResolver};
 use calyx_core::{CalyxError, Clock, Result, Seq, SlotId};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -30,6 +30,23 @@ where
         plan: OlapScanPlan,
     ) -> Result<OlapScanResult> {
         let materialized = self.materialize_slot_column_at(snapshot, slot, output_dir)?;
+        scan_materialized_slot_column_aggregate(&materialized.manifest_path, plan)
+    }
+
+    /// Materializes and scans a slot through an explicit interpretation owner.
+    pub fn olap_scan_aggregate_slot_resolved_at<R>(
+        &self,
+        snapshot: Seq,
+        slot: SlotId,
+        output_dir: impl AsRef<Path>,
+        plan: OlapScanPlan,
+        resolver: &R,
+    ) -> Result<OlapScanResult>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let materialized =
+            self.materialize_slot_column_resolved_at(snapshot, slot, output_dir, resolver)?;
         scan_materialized_slot_column_aggregate(&materialized.manifest_path, plan)
     }
 }

@@ -12,7 +12,7 @@ use calyx_lodestar::{
 };
 use calyx_search::{
     FusionChoice, GuardChoice, SearchBudget, SearchFreshness,
-    search_outcome_with_query_vectors_freshness_cached,
+    search_outcome_with_query_vectors_freshness_cached_resolved,
 };
 use calyx_sextant::{Hit, RrfProfile};
 
@@ -160,8 +160,9 @@ fn probe_variant(
             .check("probe-matrix", phase, processed as u64)
             .map_err(search_budget_error)
     };
-    let outcome = search_outcome_with_query_vectors_freshness_cached(
+    let outcome = search_outcome_with_query_vectors_freshness_cached_resolved(
         vault,
+        ctx.state,
         ctx.vault_dir,
         query_vectors,
         variant.top_k,

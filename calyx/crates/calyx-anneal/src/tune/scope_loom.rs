@@ -319,8 +319,10 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        cache.insert(loom_plan_tune_key(), record.new_plan.to_best_config(score)?);
-        cache.persist().map_err(cache_write_fail)
+        cache
+            .apply_and_persist(loom_plan_tune_key(), record.new_plan.to_best_config(score)?)
+            .map(|_| ())
+            .map_err(cache_write_fail)
     }
 
     fn save_bandit(&self) -> Result<()> {

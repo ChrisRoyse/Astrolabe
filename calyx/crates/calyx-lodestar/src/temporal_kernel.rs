@@ -229,7 +229,7 @@ fn read_frequency<C>(
 where
     C: Clock,
 {
-    let cx = match vault.get(cx_id, vault.snapshot()) {
+    let cx = match vault.get_base_at(cx_id, vault.snapshot()) {
         Ok(cx) => cx,
         Err(_) => {
             warnings.push(missing_frequency_warning(cx_id, "base row missing"));

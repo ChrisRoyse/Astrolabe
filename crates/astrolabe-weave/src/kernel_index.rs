@@ -28,12 +28,14 @@
 //!   the kernel build persists under).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use astrolabe_ingest::read_cbm_graph_snapshot_at;
-use calyx_aster::cf::ColumnFamily;
-use calyx_aster::vault::AsterVault;
+use calyx_aster::cf::{ColumnFamily, compression_manifest_key};
+use calyx_aster::vault::{AsterVault, SlotVectorResolver, StrictRawSlotResolver};
 use calyx_core::{Clock, CxId, LedgerRef, SlotId, SlotVector};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_registry::{VaultPanelState, load_vault_panel_state};
 use calyx_sextant::{HnswArtifactExpectation, HnswIndex, QuantKind, SextantIndex};
 use serde::{Deserialize, Serialize};
 
@@ -213,6 +215,7 @@ pub struct KernelRecallMeasurement {
 /// (never a silently-empty ANN).
 pub fn build_kernel_member_index<C>(
     vault: &AsterVault<C>,
+    vault_dir: &Path,
     project: &str,
     member_cx_ids: &[CxId],
     members_hash: &str,
@@ -233,6 +236,37 @@ where
     // reconstruction is a publication-time cost only; the persisted binding map
     // removes it entirely from the serving path (#996).
     let base_seq = vault.latest_seq();
+    let compressed_manifest = vault
+        .read_cf_at(
+            base_seq,
+            ColumnFamily::Compression,
+            &compression_manifest_key(SLOT_CODE_SEMANTIC),
+        )
+        .map_err(|error| {
+            SearchError::new(
+                ASTRO_KERNEL_INDEX_VAULT,
+                format!("read S18 compression discriminator at seq {base_seq}: {error}"),
+                "Repair the exact Compression/S18 generation before rebuilding the kernel-member index.",
+            )
+        })?;
+    let panel_state: Option<VaultPanelState> = if compressed_manifest.is_some() {
+        Some(load_vault_panel_state(vault_dir).map_err(|error| {
+            SearchError::new(
+                ASTRO_KERNEL_INDEX_VAULT,
+                format!(
+                    "load manifest-backed panel/registry context for compressed S18: {error}"
+                ),
+                "Restore the exact MANIFEST panel_ref/registry_ref assets that own S18, then rebuild the kernel-member index.",
+            )
+        })?)
+    } else {
+        None
+    };
+    let raw_resolver = StrictRawSlotResolver;
+    let slot_resolver: &dyn SlotVectorResolver<C> = match &panel_state {
+        Some(state) => state,
+        None => &raw_resolver,
+    };
     let snapshot = read_cbm_graph_snapshot_at(vault, project, base_seq).map_err(|error| {
         SearchError::new(
             ASTRO_KERNEL_INDEX_VAULT,
@@ -285,11 +319,43 @@ where
         ));
     }
 
+    let resolved_vectors = slot_resolver
+        .resolve_slot_vectors_at(vault, base_seq, SLOT_CODE_SEMANTIC, &members)
+        .map_err(|error| {
+            SearchError::new(
+                ASTRO_KERNEL_INDEX_VAULT,
+                format!(
+                    "resolve persisted S18 member batch at seq {base_seq}: {error}"
+                ),
+                "Repair the exact S18 primary/manifest/proof context; raw sidecars are never substituted.",
+            )
+        })?;
+    if resolved_vectors.len() != members.len() {
+        return Err(SearchError::new(
+            ASTRO_KERNEL_INDEX_VAULT,
+            format!(
+                "S18 resolver returned {} rows for {} kernel members",
+                resolved_vectors.len(),
+                members.len()
+            ),
+            "Repair the slot resolver generation before rebuilding the kernel-member index.",
+        ));
+    }
+
     let mut member_bindings = Vec::with_capacity(members.len());
     let mut member_symbols = Vec::new();
     let mut missing_vector_members = Vec::new();
     let mut semantic_dim = None;
-    for cx in members {
+    for (expected_cx, (cx, vector)) in members.into_iter().zip(resolved_vectors) {
+        if expected_cx != cx {
+            return Err(SearchError::new(
+                ASTRO_KERNEL_INDEX_VAULT,
+                format!(
+                    "S18 resolver changed requested order: expected {expected_cx}, returned {cx}"
+                ),
+                "Repair the slot resolver ordering contract before rebuilding the kernel-member index.",
+            ));
+        }
         let Some(node) = node_by_cx.get(&cx) else {
             return Err(SearchError::new(
                 ASTRO_KERNEL_INDEX_MEMBER_ABSENT,
@@ -305,18 +371,6 @@ where
             cx_id: cx,
             symbol_id: node.atom_id.clone(),
         });
-        let vector = vault
-            .read_slot_vector_at(base_seq, cx, SLOT_CODE_SEMANTIC)
-            .map_err(|error| {
-                SearchError::new(
-                    ASTRO_KERNEL_INDEX_VAULT,
-                    format!(
-                        "read persisted S18 vector for kernel member {} ({cx}): {error}",
-                        node.atom_id
-                    ),
-                    "Re-index the project so every kernel member's S18 row is readable at the kernel generation.",
-                )
-            })?;
         let Some(vector) = vector else {
             missing_vector_members.push(node.atom_id.clone());
             continue;

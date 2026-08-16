@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
+use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::ledger_view::read_ledger_seqs_traced;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
+use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{CalyxError, Constellation, CxId, LedgerRef};
 use calyx_ledger::{EntryKind, LedgerEntry, SubjectId, decode};
 use calyx_sextant::{
@@ -18,29 +20,54 @@ pub(crate) fn hit_docs_at(
     vault: &AsterVault,
     hits: &[Hit],
     snapshot: Snapshot,
-    hydrate_slots: bool,
 ) -> CliResult<BTreeMap<CxId, Constellation>> {
     let mut docs = BTreeMap::new();
     for hit in hits {
         let cx_id = hit.cx_id;
-        let read = if hydrate_slots {
-            let required_slots = hit
-                .per_lens
-                .iter()
-                .map(|lens_hit| lens_hit.slot)
-                .collect::<BTreeSet<_>>();
-            vault.get_selected_slots_at_snapshot(cx_id, snapshot, required_slots)
-        } else {
-            vault.get_base_at_snapshot(cx_id, snapshot)
-        };
-        let cx = read.map_err(|error| {
-            if error.code == "CALYX_STALE_DERIVED" && error.message.contains("missing") {
-                missing_provenance(format!("stored constellation missing for hit {cx_id}"))
-            } else {
-                error
-            }
-        })?;
+        let cx = vault
+            .get_base_at_snapshot(cx_id, snapshot)
+            .map_err(|error| {
+                if error.code == "CALYX_STALE_DERIVED" && error.message.contains("missing") {
+                    missing_provenance(format!("stored constellation missing for hit {cx_id}"))
+                } else {
+                    error
+                }
+            })?;
         docs.insert(cx_id, cx);
+    }
+    Ok(docs)
+}
+
+/// Reads hit Base rows while retaining their declared `Absent` slot
+/// placeholders. The resolved hydration path uses those declarations to
+/// validate one slot-batched resolver result per requested slot.
+pub(crate) fn hit_base_docs_with_slot_declarations_at(
+    vault: &AsterVault,
+    hits: &[Hit],
+    snapshot: Snapshot,
+) -> CliResult<BTreeMap<CxId, Constellation>> {
+    let mut docs = BTreeMap::new();
+    for hit in hits {
+        let cx_id = hit.cx_id;
+        let bytes = vault
+            .read_cf_snapshot(snapshot, ColumnFamily::Base, &base_key(cx_id))?
+            .ok_or_else(|| {
+                missing_provenance(format!("stored constellation missing for hit {cx_id}"))
+            })?;
+        let constellation = decode_constellation_base(&bytes)?;
+        if constellation.cx_id != cx_id {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "Base row key {cx_id} differs from embedded CxId {}",
+                constellation.cx_id
+            ))
+            .into());
+        }
+        if docs.insert(cx_id, constellation).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "search hit set repeats CxId {cx_id}"
+            ))
+            .into());
+        }
     }
     Ok(docs)
 }

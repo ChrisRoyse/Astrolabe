@@ -321,12 +321,13 @@ fn read_base_frequency<C>(vault: &AsterVault<C>, cx_id: CxId) -> Result<u64, War
 where
     C: Clock,
 {
-    let cx = vault
-        .get(cx_id, vault.snapshot())
-        .map_err(|_| WardError::MissingFrequency {
-            cx_id,
-            detail: "base row missing",
-        })?;
+    let cx =
+        vault
+            .get_base_at(cx_id, vault.snapshot())
+            .map_err(|_| WardError::MissingFrequency {
+                cx_id,
+                detail: "base row missing",
+            })?;
     let Some(value) = cx.scalars.get(FREQUENCY_SCALAR) else {
         return Err(WardError::MissingFrequency {
             cx_id,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use calyx_aster::compaction::CompactionSchedulerOptions;
@@ -78,7 +78,7 @@ impl StorageConfig {
             tile_m: self.compaction_interval_ms as usize,
             tile_n: self.debt_trigger_score_milli as usize,
             tile_k: self.max_write_amp_milli as usize,
-            extra: HashMap::from([
+            extra: BTreeMap::from([
                 ("scope".to_string(), "storage".to_string()),
                 ("source".to_string(), "anneal-storage-scope".to_string()),
                 ("shape_key".to_string(), key.label()),

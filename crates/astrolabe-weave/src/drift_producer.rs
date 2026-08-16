@@ -20,6 +20,7 @@
 //! fabricated baseline.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use astrolabe_assay::rng::DeterministicRng;
 use astrolabe_assay::{DiffConfig, DiffLedger, DifferentiationCard, DriftCard, measure_drift};
@@ -28,12 +29,12 @@ use astrolabe_ingest::read_cbm_graph_snapshot;
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag};
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::mvcc::{OrderedReadbackMetrics, is_tombstone_value};
-use calyx_aster::vault::encode::decode_slot_vector;
-use calyx_aster::vault::{AsterVault, OrderedCfRead};
+use calyx_aster::vault::{AsterVault, OrderedCfRead, decode_strict_raw_slot_value};
 use calyx_core::{CalyxError, Clock, Result, SlotId, SlotVector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::slot_source::WeaveSlotSource;
 use crate::{ASSAY_ANOMALY_PAYLOAD_SCHEMA, ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA};
 
 /// Loads the Assay store co-tenant-aware. `ColumnFamily::Assay` is shared: the
@@ -552,7 +553,13 @@ pub struct DriftProductionReport {
     /// full corpus population from the bounded exact-MMD window.
     pub current_sampling_per_slot: Vec<SlotSamplingProvenance>,
     /// Exact physical accounting for current Slot-CF hydration.
+    /// This covers raw ordered plans; authenticated compressed rows use the
+    /// separate exact logical counters below.
     pub slot_readback: OrderedReadbackMetrics,
+    /// Manifested compressed slots reconstructed through Registry.
+    pub compressed_slots_read: usize,
+    /// Authenticated compressed member rows reconstructed through Registry.
+    pub compressed_rows_read: usize,
 }
 
 /// Reads the current import's per-slot samples from the persisted Slot column
@@ -568,14 +575,29 @@ pub fn read_slot_samples_from_vault<C>(
 where
     C: Clock,
 {
-    Ok(read_slot_samples_from_vault_counted(vault, project, slots)?.0)
+    read_slot_samples_from_vault_with_panel_root(vault, project, slots, None)
+}
+
+/// Compression-aware current-window read with one persisted panel/Registry
+/// interpretation retained for the pinned operation.
+pub fn read_slot_samples_from_vault_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    slots: &[SlotId],
+    vault_panel_root: Option<&Path>,
+) -> Result<Vec<DriftSlotSamples>>
+where
+    C: Clock,
+{
+    Ok(read_slot_samples_from_vault_counted(vault, project, slots, vault_panel_root)?.0)
 }
 
 fn read_slot_samples_from_vault_counted<C>(
     vault: &AsterVault<C>,
     project: &str,
     slots: &[SlotId],
-) -> Result<(Vec<DriftSlotSamples>, OrderedReadbackMetrics)>
+    vault_panel_root: Option<&Path>,
+) -> Result<(Vec<DriftSlotSamples>, OrderedReadbackMetrics, usize, usize)>
 where
     C: Clock,
 {
@@ -583,6 +605,7 @@ where
         CalyxError::aster_corrupt_shard(format!("read graph snapshot: {error}"))
     })?;
     let at_seq = vault.latest_seq();
+    let source = WeaveSlotSource::open(at_seq, vault_panel_root, snapshot.panel_version)?;
     let session = vault.sst_read_session_at(at_seq)?;
     let symbols = snapshot
         .nodes
@@ -596,31 +619,67 @@ where
         session_snapshot_seq: at_seq,
         ..OrderedReadbackMetrics::default()
     };
+    let mut compressed_slots_read = 0usize;
+    let mut compressed_rows_read = 0usize;
     for slot in slots {
-        let keys = symbols
-            .iter()
-            .map(|cx_id| slot_key(*cx_id))
-            .collect::<Vec<_>>();
-        let reads = keys
-            .iter()
-            .enumerate()
-            .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::slot(*slot), key))
-            .collect::<Vec<_>>();
         let mut dense_by_symbol = vec![None; symbols.len()];
-        let slot_metrics = session.visit_ordered_cf_plan::<CalyxError, _>(
-            &reads,
-            |ordinal, _, _, persisted| {
-                let Some(bytes) = persisted.filter(|bytes| !is_tombstone_value(bytes)) else {
-                    return Ok(());
-                };
-                if let SlotVector::Dense { data, .. } = decode_slot_vector(bytes)? {
-                    dense_by_symbol[ordinal] =
-                        Some(data.into_iter().map(f64::from).collect::<Vec<_>>());
+        if source
+            .compressed_generation_identity(vault, *slot)?
+            .is_some()
+        {
+            compressed_slots_read = compressed_slots_read.checked_add(1).ok_or_else(|| {
+                CalyxError::aster_corrupt_shard("compressed drift slot count overflow")
+            })?;
+            if !symbols.is_empty() {
+                let resolved = source.resolve_many(vault, *slot, &symbols)?;
+                compressed_rows_read = compressed_rows_read
+                    .checked_add(resolved.len())
+                    .ok_or_else(|| {
+                        CalyxError::aster_corrupt_shard("compressed drift row count overflow")
+                    })?;
+                for (ordinal, (observed_cx_id, vector)) in resolved.into_iter().enumerate() {
+                    if observed_cx_id != symbols[ordinal] {
+                        return Err(CalyxError::aster_corrupt_shard(format!(
+                            "compressed drift S{} batch changed ordinal {ordinal} identity from {} to {observed_cx_id}",
+                            slot.get(),
+                            symbols[ordinal]
+                        )));
+                    }
+                    if let Some(SlotVector::Dense { data, .. }) = vector {
+                        dense_by_symbol[ordinal] =
+                            Some(data.into_iter().map(f64::from).collect::<Vec<_>>());
+                    }
                 }
-                Ok(())
-            },
-        )?;
-        readback.checked_merge(slot_metrics)?;
+            }
+        } else {
+            // Manifest absence authorizes the raw plan. The strict decoder still
+            // refuses a compressed tag if the manifest was lost or corrupted.
+            let keys = symbols
+                .iter()
+                .map(|cx_id| slot_key(*cx_id))
+                .collect::<Vec<_>>();
+            let reads = keys
+                .iter()
+                .enumerate()
+                .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::slot(*slot), key))
+                .collect::<Vec<_>>();
+            let slot_metrics = session.visit_ordered_cf_plan::<CalyxError, _>(
+                &reads,
+                |ordinal, _, _, persisted| {
+                    let Some(bytes) = persisted.filter(|bytes| !is_tombstone_value(bytes)) else {
+                        return Ok(());
+                    };
+                    if let SlotVector::Dense { data, .. } =
+                        decode_strict_raw_slot_value(*slot, symbols[ordinal], bytes)?
+                    {
+                        dense_by_symbol[ordinal] =
+                            Some(data.into_iter().map(f64::from).collect::<Vec<_>>());
+                    }
+                    Ok(())
+                },
+            )?;
+            readback.checked_merge(slot_metrics)?;
+        }
         let samples = per_slot
             .get_mut(slot)
             .expect("slot present in initialized map");
@@ -635,6 +694,8 @@ where
             })
             .collect(),
         readback,
+        compressed_slots_read,
+        compressed_rows_read,
     ))
 }
 
@@ -996,9 +1057,31 @@ pub fn run_index_time_drift<C>(
 where
     C: Clock,
 {
+    run_index_time_drift_with_panel_root(
+        vault, project, slots, cache_key, provenance, seed, config, ledger, None,
+    )
+}
+
+/// Compression-aware index-time drift pass using the exact persisted
+/// panel/Registry state at `vault_panel_root`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_index_time_drift_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    slots: &[SlotId],
+    cache_key: AssayCacheKey,
+    provenance: impl Into<String>,
+    seed: u64,
+    config: &DiffConfig,
+    ledger: Option<&DiffLedger>,
+    vault_panel_root: Option<&Path>,
+) -> Result<DriftProductionReport>
+where
+    C: Clock,
+{
     let provenance = provenance.into();
-    let (current_population, slot_readback) =
-        read_slot_samples_from_vault_counted(vault, project, slots)?;
+    let (current_population, slot_readback, compressed_slots_read, compressed_rows_read) =
+        read_slot_samples_from_vault_counted(vault, project, slots, vault_panel_root)?;
     let current_sample_cap = drift_current_sample_cap()?;
     let (current, current_sampling) =
         bound_slot_sample_window(&current_population, current_sample_cap, seed);
@@ -1042,6 +1125,8 @@ where
     )?;
     report.reference_persisted = true;
     report.slot_readback = slot_readback;
+    report.compressed_slots_read = compressed_slots_read;
+    report.compressed_rows_read = compressed_rows_read;
     report.assay_cotenant_rows_skipped +=
         reference_load_skips + sampling.assay_cotenant_rows_skipped;
     Ok(report)

@@ -742,6 +742,7 @@ dependencies = [
  "memmap2",
  "onnx-rs",
  "ort",
+ "rusqlite",
  "safetensors 0.7.0",
  "serde",
  "serde_json",

@@ -36,17 +36,9 @@ fn dense_text_panel_slots(slots: &[Slot]) -> Vec<&Slot> {
         .collect()
 }
 
-fn cx_id_from_base_key(key: &[u8]) -> Result<CxId, ApiError> {
-    let bytes: [u8; 16] = key.try_into().map_err(|_| {
-        ApiError::new(
-            ErrorCode::Internal,
-            format!("base CF key has {} bytes, expected 16", key.len()),
-        )
-    })?;
-    Ok(CxId::from_bytes(bytes))
-}
-
-fn select_kernel_content_slot(ctx: &MeasureCtx) -> Result<KernelContentSlotCoverage, ApiError> {
+fn kernel_content_slot_candidates(
+    ctx: &MeasureCtx,
+) -> Result<Vec<KernelContentSlotCoverage>, ApiError> {
     let candidates = dense_text_panel_slots(&ctx.state.panel.slots);
     if candidates.is_empty() {
         return Err(ApiError::new(
@@ -55,35 +47,6 @@ fn select_kernel_content_slot(ctx: &MeasureCtx) -> Result<KernelContentSlotCover
         ));
     }
 
-    let mut coverage_by_slot: std::collections::BTreeMap<SlotId, usize> =
-        std::collections::BTreeMap::new();
-    let snapshot = ctx.vault.snapshot();
-    let base_rows = ctx
-        .vault
-        .scan_cf_at(snapshot, ColumnFamily::Base)
-        .map_err(|error| {
-            tracing::error!(error = ?error, "CALYX_WEB_API_KERNEL_COVERAGE_SCAN_FAILED");
-            ApiError::of(ErrorCode::Internal)
-        })?;
-    for (key, _) in &base_rows {
-        let cx_id = cx_id_from_base_key(key)?;
-        let cx = ctx.vault.get(cx_id, snapshot).map_err(|error| {
-            tracing::error!(error = ?error, cx_id = %cx_id, "CALYX_WEB_API_KERNEL_COVERAGE_READ_FAILED");
-            ApiError::of(ErrorCode::Internal)
-        })?;
-        for slot in &candidates {
-            if cx
-                .slots
-                .get(&slot.slot_id)
-                .and_then(|vector| vector.as_dense())
-                .is_some()
-            {
-                *coverage_by_slot.entry(slot.slot_id).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let vault_total = base_rows.len();
     let mut coverage: Vec<KernelContentSlotCoverage> = candidates
         .iter()
         .map(|slot| KernelContentSlotCoverage {
@@ -94,30 +57,16 @@ fn select_kernel_content_slot(ctx: &MeasureCtx) -> Result<KernelContentSlotCover
                 SlotShape::Dense(dim) => dim,
                 SlotShape::Sparse(_) | SlotShape::Multi { .. } => 0,
             },
-            embedded: coverage_by_slot
-                .get(&slot.slot_id)
-                .copied()
-                .unwrap_or_default(),
-            vault_total,
+            embedded: 0,
+            vault_total: 0,
         })
         .collect();
     coverage.sort_by(|left, right| {
-        right
-            .embedded
-            .cmp(&left.embedded)
-            .then_with(|| slot_state_rank(left.state).cmp(&slot_state_rank(right.state)))
+        slot_state_rank(left.state)
+            .cmp(&slot_state_rank(right.state))
             .then_with(|| left.slot_id.cmp(&right.slot_id))
     });
-
-    coverage
-        .into_iter()
-        .find(|slot| slot.embedded >= 2)
-        .ok_or_else(|| {
-            ApiError::new(
-                ErrorCode::BadRequest,
-                "vault has fewer than two embedded concepts across dense text slots",
-            )
-        })
+    Ok(coverage)
 }
 
 /// `GET /v1/kernel` — the real doc-corpus kernel for the loaded vault, with
@@ -139,8 +88,8 @@ pub(crate) async fn kernel_handler(State(ctx): State<Arc<MeasureCtx>>) -> Respon
     // parked slots remain interpretable for historical rows, so they can be a
     // better origin-artifact substrate than a newly-active lens with sparse
     // backfill.
-    let content_slot = match select_kernel_content_slot(&ctx) {
-        Ok(slot) => slot,
+    let mut content_slots = match kernel_content_slot_candidates(&ctx) {
+        Ok(slots) => slots,
         Err(error) => return error.into_response(),
     };
     let kernel_params = KernelParams {
@@ -153,14 +102,19 @@ pub(crate) async fn kernel_handler(State(ctx): State<Arc<MeasureCtx>>) -> Respon
         min_recall_ratio: KERNEL_RECALL_GATE,
         ..RecallTestParams::default()
     };
-    let (measured, contributions) =
-        match measured_kernel_with_contributions_from_vault_allow_partial(
+    let candidate_ids = content_slots
+        .iter()
+        .map(|candidate| candidate.slot_id)
+        .collect::<Vec<_>>();
+    let selection =
+        match measured_kernel_with_contributions_from_vault_candidates_allow_partial_resolved(
             &ctx.vault,
-            content_slot.slot_id,
+            &candidate_ids,
             &kernel_params,
             &recall_params,
             8,
             0.5,
+            &ctx.state,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -168,6 +122,23 @@ pub(crate) async fn kernel_handler(State(ctx): State<Arc<MeasureCtx>>) -> Respon
                 return ApiError::of(ErrorCode::Internal).into_response();
             }
         };
+    let mut content_slot = match content_slots
+        .drain(..)
+        .find(|candidate| candidate.slot_id == selection.content_slot)
+    {
+        Some(content_slot) => content_slot,
+        None => {
+            tracing::error!(
+                slot_id = selection.content_slot.get(),
+                "CALYX_WEB_API_KERNEL_SELECTED_SLOT_NOT_IN_ROSTER"
+            );
+            return ApiError::of(ErrorCode::Internal).into_response();
+        }
+    };
+    let measured = selection.measured;
+    let contributions = selection.contributions;
+    content_slot.embedded = measured.corpus_size;
+    content_slot.vault_total = measured.vault_corpus_size;
     let unanchored: std::collections::BTreeSet<_> = measured
         .kernel
         .groundedness
@@ -179,24 +150,13 @@ pub(crate) async fn kernel_handler(State(ctx): State<Arc<MeasureCtx>>) -> Respon
         .iter()
         .map(|(id, drop)| (*id, *drop))
         .collect();
-    // Concept label = the constellation's real `label:` anchor value, read from
-    // the vault — null when the concept carries no label anchor (no fabrication).
-    let snapshot = ctx.vault.snapshot();
+    // Labels came from the same one-time Base scan as kernel construction.
     let members: Vec<Value> = measured
         .kernel
         .members
         .iter()
         .map(|cx_id| {
-            let label = match ctx.vault.get(*cx_id, snapshot) {
-                Ok(cx) => cx.anchors.iter().find_map(|anchor| match &anchor.kind {
-                    AnchorKind::Label(value) => Some(value.clone()),
-                    _ => None,
-                }),
-                Err(error) => {
-                    tracing::error!(error = ?error, cx_id = %cx_id, "CALYX_WEB_API_KERNEL_LABEL_READ_FAILED");
-                    None
-                }
-            };
+            let label = measured.labels.get(cx_id);
             json!({
                 "id": cx_id.to_string(),
                 "trust": if unanchored.contains(cx_id) { "provisional" } else { "anchored" },

@@ -4,7 +4,7 @@
 //! batch reconstructs exactly one slot's compressed primary column with a
 //! matching raw sidecar and never publishes a manifest or lifecycle record, so
 //! injection can only stage a legacy/corrupted/torn-down generation, never forge
-//! a manifested one.
+//! a manifested one. Membership-proof mutations are not part of this exception.
 
 use crate::cf::{
     COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, SlotFamilyKind, parse_compression_lifecycle_key,
@@ -68,7 +68,7 @@ pub(super) fn validate_generation_injection_shape(rows: &[encode::WriteRow]) -> 
                     }
                 } else {
                     return Err(generation_injection_error(format!(
-                        "generation-injection compression key must be a manifest or lifecycle key, got {} bytes",
+                        "generation-injection compression key must be a manifest or lifecycle key; membership-proof mutations are refused; got {} bytes",
                         row.key.len()
                     )));
                 }
@@ -132,6 +132,6 @@ fn generation_injection_error(message: String) -> CalyxError {
     CalyxError {
         code: CALYX_ASTER_GENERATION_INJECTION_INVALID,
         message,
-        remediation: "stage a single slot's compressed primary column, its matching raw sidecar, and tombstones for any existing manifest/lifecycle records — reconstruction never publishes a manifested generation",
+        remediation: "stage a single slot's compressed primary column, its matching raw sidecar, and tombstones for existing manifest/lifecycle records only when no membership proofs exist — reconstruction never publishes a manifested generation",
     }
 }

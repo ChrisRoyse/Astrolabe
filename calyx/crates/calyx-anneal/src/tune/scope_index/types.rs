@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use calyx_core::{Result, SlotId};
 use calyx_forge::{AutotuneKey, BackendKind, BestConfig};
@@ -44,7 +44,7 @@ impl IndexConfig {
             tile_m: self.hnsw_ef as usize,
             tile_n: self.hnsw_m as usize,
             tile_k: self.diskann_beamwidth as usize,
-            extra: HashMap::from([
+            extra: BTreeMap::from([
                 ("scope".to_string(), "index".to_string()),
                 ("slot".to_string(), slot_id.get().to_string()),
                 ("slot_key".to_string(), slot),

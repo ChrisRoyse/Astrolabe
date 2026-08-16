@@ -1085,11 +1085,17 @@ fn read_project_measured_symbols(
             .iter()
             .map(|slot| ColumnFamily::slot(SlotId::new(*slot))),
     );
+    selected_cfs.extend([ColumnFamily::Compression, ColumnFamily::Assay]);
+    selected_cfs.sort();
+    selected_cfs.dedup();
     let vault = open_shadow_vault_read_only(&vault_dir, &vault_id, &vault_salt, selected_cfs)
         .map_err(vault_read_refusal)?;
-    let snapshot =
-        astrolabe_ingest::read_cbm_graph_snapshot(&vault, project).map_err(vault_read_refusal)?;
-    let at_seq = vault.latest_seq();
+    let snapshot_lease = vault.retain_latest_snapshot();
+    let at_seq = snapshot_lease.seq();
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot_at(&vault, project, at_seq)
+        .map_err(vault_read_refusal)?;
+    let source = WeaveSlotSource::open(at_seq, Some(&vault_dir), snapshot.panel_version)
+        .map_err(vault_read_refusal)?;
 
     // #367: bound the reparse population up front. Only non-structural, cx-bearing
     // nodes are ever kept, so they form the sampling pool; a seeded selection caps
@@ -1102,27 +1108,64 @@ fn read_project_measured_symbols(
     let population_total = candidates.len();
     let selection = seeded_sample_indices(population_total, cap, seed);
 
+    let selected_candidates = selection
+        .iter()
+        .map(|candidate_index| candidates[*candidate_index])
+        .collect::<Vec<_>>();
+    let selected_cx_ids = selected_candidates
+        .iter()
+        .map(|node| {
+            node.cx_id.ok_or_else(|| {
+                vault_read_refusal(calyx_core::CalyxError::aster_corrupt_shard(
+                    "guard candidate lost its required CxId after deterministic selection",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut persisted_slots = vec![BTreeMap::<u16, SlotVector>::new(); selected_cx_ids.len()];
+    for panel_slot in &panel_slots {
+        let slot = SlotId::new(*panel_slot);
+        let resolved = source
+            .resolve_many(&vault, slot, &selected_cx_ids)
+            .map_err(vault_read_refusal)?;
+        if resolved.len() != selected_cx_ids.len() {
+            return Err(vault_read_refusal(
+                calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "guard slot {} batch returned {} rows for {} selected identities",
+                    slot.get(),
+                    resolved.len(),
+                    selected_cx_ids.len()
+                )),
+            ));
+        }
+        for (ordinal, ((expected_cx_id, (resolved_cx_id, vector)), slots)) in selected_cx_ids
+            .iter()
+            .zip(resolved)
+            .zip(persisted_slots.iter_mut())
+            .enumerate()
+        {
+            if *expected_cx_id != resolved_cx_id {
+                return Err(vault_read_refusal(
+                    calyx_core::CalyxError::aster_corrupt_shard(format!(
+                        "guard slot {} batch ordinal {ordinal} returned {resolved_cx_id} for expected {expected_cx_id}",
+                        slot.get()
+                    )),
+                ));
+            }
+            if let Some(vector) = vector
+                && !vector.is_absent()
+            {
+                slots.insert(*panel_slot, vector);
+            }
+        }
+        snapshot_lease.record_progress();
+    }
+
     let mut out = Vec::new();
-    for &candidate_index in &selection {
-        let node = candidates[candidate_index];
+    for (node, mut slots) in selected_candidates.into_iter().zip(persisted_slots) {
         let Some(cx_id) = node.cx_id else {
             continue;
         };
-        let key = slot_key(cx_id);
-        let mut slots: BTreeMap<u16, SlotVector> = BTreeMap::new();
-        for panel_slot in &panel_slots {
-            let cf = ColumnFamily::slot(SlotId::new(*panel_slot));
-            if let Some(bytes) = vault
-                .read_cf_at(at_seq, cf, &key)
-                .map_err(vault_read_refusal)?
-            {
-                let vector = calyx_aster::vault::encode::decode_slot_vector(&bytes)
-                    .map_err(vault_read_refusal)?;
-                if !vector.is_absent() {
-                    slots.insert(*panel_slot, vector);
-                }
-            }
-        }
         // #334: the shadow importer never persists the S1 (struct-trigram) / S4
         // (api-callee) panel sources — they are reparse-derived (#341), so a good
         // or alien population read from persisted vectors alone could never

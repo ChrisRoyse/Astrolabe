@@ -430,9 +430,15 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        match cache.get(&slot_autotune_key(slot_id, self.recall_target)) {
+        match cache
+            .get(&slot_autotune_key(slot_id, self.recall_target))
+            .map_err(cache_write_fail)?
+        {
             Some(config) => IndexConfig::from_best_config(config),
-            None => Ok(IndexConfig::default()),
+            None => Err(invalid_config(format!(
+                "no measured index incumbent exists for slot {}; install and persist an explicitly evaluated bandit/config before serving it",
+                slot_id.get()
+            ))),
         }
     }
 
@@ -603,11 +609,13 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned during rollback"))?;
-        cache.insert(
-            slot_autotune_key(record.slot_id, self.recall_target),
-            record.old_config.to_best_config(record.slot_id),
-        );
-        cache.persist().map_err(cache_write_fail)
+        cache
+            .apply_and_persist(
+                slot_autotune_key(record.slot_id, self.recall_target),
+                record.old_config.to_best_config(record.slot_id),
+            )
+            .map(|_| ())
+            .map_err(cache_write_fail)
     }
 
     fn write_cache(&self, record: &IndexPromotionRecord) -> Result<()> {
@@ -615,11 +623,13 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        cache.insert(
-            slot_autotune_key(record.slot_id, self.recall_target),
-            record.new_config.to_best_config(record.slot_id),
-        );
-        cache.persist().map_err(cache_write_fail)
+        cache
+            .apply_and_persist(
+                slot_autotune_key(record.slot_id, self.recall_target),
+                record.new_config.to_best_config(record.slot_id),
+            )
+            .map(|_| ())
+            .map_err(cache_write_fail)
     }
 
     fn save_bandit(&self, slot_id: SlotId) -> Result<()> {
@@ -669,7 +679,7 @@ pub(super) fn invalid_config(message: impl Into<String>) -> CalyxError {
 fn cache_write_fail(error: calyx_forge::ForgeError) -> CalyxError {
     CalyxError {
         code: CALYX_INDEX_CACHE_WRITE_FAIL,
-        message: format!("Index autotune cache write failed: {error}"),
-        remediation: "repair the PH16 autotune cache path before persisting an Index promotion",
+        message: format!("Index autotune cache access failed: {error}"),
+        remediation: "repair and reopen the PH16 autotune cache before reading or persisting an Index promotion",
     }
 }

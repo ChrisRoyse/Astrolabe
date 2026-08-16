@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -66,12 +66,13 @@ impl fmt::Display for BackendKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BestConfig {
     pub backend: BackendKind,
     pub tile_m: usize,
     pub tile_n: usize,
     pub tile_k: usize,
-    pub extra: HashMap<String, String>,
+    pub extra: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

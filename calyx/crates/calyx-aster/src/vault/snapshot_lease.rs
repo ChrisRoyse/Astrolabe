@@ -2,9 +2,16 @@ use super::AsterVault;
 use crate::mvcc::{Freshness, Snapshot, SstReadGeneration, VersionedCfStore};
 use calyx_core::{Clock, Result, Seq};
 
-pub(super) struct ScopedSnapshot<'a> {
+/// Opaque operation-scoped lease that keeps one MVCC sequence reclaim-safe.
+///
+/// Registry-owned interpretation layers retain this guard while a logical
+/// read spans more than one Aster plan (for example manifest discrimination
+/// followed by primary/proof reads). The guard exposes no row access and does
+/// not request a full MVCC restore; dropping it releases the exact sequence.
+pub struct RetainedSnapshot<'a> {
     rows: &'a VersionedCfStore,
     snapshot: Snapshot,
+    clock: &'a dyn Clock,
 }
 
 /// Operation-scoped immutable-SST read session bound to one retained MVCC
@@ -20,7 +27,7 @@ where
     // compaction cannot observe an unpinned sequence between those events.
     pub(super) generation: SstReadGeneration<'a>,
     pub(super) vault: &'a AsterVault<C>,
-    pub(super) snapshot: ScopedSnapshot<'a>,
+    pub(super) snapshot: RetainedSnapshot<'a>,
 }
 
 impl<C> SstReadSession<'_, C>
@@ -33,13 +40,23 @@ where
     }
 }
 
-impl ScopedSnapshot<'_> {
+impl RetainedSnapshot<'_> {
     pub(super) const fn snapshot(&self) -> Snapshot {
         self.snapshot
     }
+
+    /// Exact sequence protected for the guard's lifetime.
+    pub const fn seq(&self) -> Seq {
+        self.snapshot.seq()
+    }
+
+    /// Records a phase boundary for a progressing multi-plan operation.
+    pub fn record_progress(&self) {
+        self.rows.record_reader_progress(self.snapshot, self.clock);
+    }
 }
 
-impl Drop for ScopedSnapshot<'_> {
+impl Drop for RetainedSnapshot<'_> {
     fn drop(&mut self) {
         self.rows.release_lease(self.snapshot.lease().id());
     }
@@ -49,7 +66,7 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
-    pub(super) fn snapshot_handle(&self, seq: Seq) -> ScopedSnapshot<'_> {
+    pub(super) fn snapshot_handle(&self, seq: Seq) -> RetainedSnapshot<'_> {
         self.snapshot_handle_with_stall_window(
             seq,
             crate::knobs::SNAPSHOT_PIN_STALL_WINDOW_MS.default,
@@ -67,13 +84,46 @@ where
         &self,
         seq: Seq,
         stall_window_ms: u64,
-    ) -> ScopedSnapshot<'_> {
+    ) -> RetainedSnapshot<'_> {
         let snapshot =
             self.rows
                 .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, stall_window_ms);
-        ScopedSnapshot {
+        RetainedSnapshot {
             rows: &self.rows,
             snapshot,
+            clock: &self.clock,
+        }
+    }
+
+    /// Retains one MVCC sequence across a caller-owned logical operation.
+    ///
+    /// This is the narrow cross-crate continuity primitive: it neither opens a
+    /// column family nor restores rows. Callers continue to issue explicit,
+    /// narrow read plans while this opaque guard prevents snapshot GC from
+    /// reclaiming the sequence between those plans.
+    pub fn retain_snapshot_at(&self, seq: Seq) -> RetainedSnapshot<'_> {
+        self.snapshot_handle_with_stall_window(
+            seq,
+            crate::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default,
+        )
+    }
+
+    /// Atomically retains the latest MVCC sequence for a caller-owned logical
+    /// operation.
+    ///
+    /// Unlike `retain_snapshot_at(self.latest_seq())`, the sequence observation
+    /// and lease registration are one store operation, so a concurrent commit
+    /// cannot create an unpinned gap between them.
+    pub fn retain_latest_snapshot(&self) -> RetainedSnapshot<'_> {
+        let snapshot = self.rows.pin_snapshot(
+            Freshness::FreshDerived,
+            &self.clock,
+            crate::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default,
+        );
+        RetainedSnapshot {
+            rows: &self.rows,
+            snapshot,
+            clock: &self.clock,
         }
     }
 

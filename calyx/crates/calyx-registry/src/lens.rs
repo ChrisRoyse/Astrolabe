@@ -14,9 +14,12 @@ mod contract;
 pub use contract::validate_quant_policy_for_shape;
 
 use crate::compression::{
-    self, CompressedSlotIndex, CompressionQuery, GenerationDeleteReport,
-    MultiVectorCompressionConfig, MultiVectorCompressionQuery, MultiVectorCompressionReport,
-    MultiVectorCompressionRow, MxFp4AssayEvidence, PackedMultiVectorIndex, SlotCompressionReport,
+    self, CompressedSlotIndex, CompressionAdmissionReadback, CompressionAdmissionStatus,
+    CompressionCandidateCommissionReadback, CompressionCandidateEvaluationReadback,
+    CompressionCandidateEvaluationRequest, CompressionCandidateReference, CompressionQuery,
+    GenerationDeleteReport, MultiVectorCompressionConfig, MultiVectorCompressionQuery,
+    MultiVectorCompressionReport, MultiVectorCompressionRow, MxFp4AssayEvidence,
+    PackedMultiVectorIndex, SlotCompressionReport,
 };
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
@@ -291,6 +294,79 @@ impl Registry {
     {
         let spec = self.compression_spec(slot)?;
         CompressedSlotIndex::open(vault, slot, spec)
+    }
+
+    /// Builds and times one real candidate generation, then evaluates and
+    /// persists its physical-truth receipt without publishing it as current.
+    pub fn build_and_evaluate_compression_candidate<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        request: CompressionCandidateEvaluationRequest,
+    ) -> Result<CompressionCandidateEvaluationReadback>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::build_and_evaluate_candidate(vault, slot, spec, request)
+    }
+
+    /// Selects across at least two separate persisted candidate slots and
+    /// publishes only the independently re-read deterministic winner.
+    pub fn select_compression_candidate<C>(
+        &self,
+        vault: &AsterVault<C>,
+        candidates: &[CompressionCandidateReference],
+    ) -> Result<CompressionAdmissionReadback>
+    where
+        C: Clock,
+    {
+        compression::select_compression_candidate(vault, candidates, |slot| {
+            self.compression_spec(slot)
+        })
+    }
+
+    /// Preflights, builds, evaluates, and selects registered raw candidate
+    /// slots as one explicit production commission orchestration.
+    pub fn commission_and_select_compression_candidates<C>(
+        &self,
+        vault: &AsterVault<C>,
+        candidate_slots: &[Slot],
+        request: CompressionCandidateEvaluationRequest,
+    ) -> Result<CompressionCandidateCommissionReadback>
+    where
+        C: Clock,
+    {
+        compression::commission_and_select_candidates(vault, candidate_slots, request, |slot| {
+            self.compression_spec(slot)
+        })
+    }
+
+    /// Reads the current admitted receipt, or one explicitly named historical
+    /// receipt. An absent current pointer returns `None` before lens resolution.
+    pub fn read_compression_admission<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        receipt_sha256: Option<[u8; 32]>,
+    ) -> Result<Option<CompressionAdmissionReadback>>
+    where
+        C: Clock,
+    {
+        compression::read_admission(vault, slot, receipt_sha256, || self.compression_spec(slot))
+    }
+
+    /// Reads exactly the latest-evaluation and current-admission pointers. Raw
+    /// or unmeasured slots return an empty status without requiring LensSpec.
+    pub fn compression_admission_status<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+    ) -> Result<CompressionAdmissionStatus>
+    where
+        C: Clock,
+    {
+        compression::admission_status(vault, slot, || self.compression_spec(slot))
     }
 
     /// Opens one verified residual-packed Multi slot view. Dense/raw sidecars

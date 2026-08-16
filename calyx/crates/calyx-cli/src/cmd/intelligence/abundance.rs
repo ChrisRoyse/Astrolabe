@@ -1,14 +1,14 @@
 use calyx_core::{SlotId, SlotVector};
 
-use super::core::{active_slots, load_context, load_docs};
+use super::core::{active_slots, load_docs, load_read_context};
 use super::model::AbundanceOut;
 use super::parse::AbundanceArgs;
 use crate::error::CliResult;
 use crate::output::print_json;
 
 pub(super) fn command(args: AbundanceArgs) -> CliResult {
-    let ctx = load_context(&args.vault)?;
-    let docs = load_docs(&ctx.vault)?;
+    let ctx = load_read_context(&args.vault, [])?;
+    let docs = load_docs(&ctx)?;
     let slots = active_slots(&ctx.state.panel)
         .into_iter()
         .map(|slot| slot.slot_id)

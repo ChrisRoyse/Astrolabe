@@ -29,8 +29,8 @@ use astrolabe_weave::search::{
 use astrolabe_weave::search_index::{IndexKnobs, SlotIndexSet};
 use astrolabe_weave::search_production::{
     CloneCandidate, CloneClass, SEMANTIC_QUERY_SLOTS, STRUCTURAL_QUERY_SLOTS,
-    build_search_index_manifest_from_vault, classify_clone_taxonomy, semantic_more_like_this,
-    structural_more_like_this,
+    build_search_index_manifest_from_vault_with_panel_root, classify_clone_taxonomy,
+    semantic_more_like_this, structural_more_like_this,
 };
 
 use super::*;
@@ -85,6 +85,8 @@ fn find_similar_selected_cfs() -> Vec<ColumnFamily> {
         ColumnFamily::Ledger,
         ColumnFamily::Kv,
         ColumnFamily::Recurrence,
+        ColumnFamily::Compression,
+        ColumnFamily::Assay,
         ColumnFamily::slot(SLOT_STRUCT_TRIGRAMS),
         ColumnFamily::slot(SLOT_API_CALLEES),
         ColumnFamily::slot(SLOT_CODE_SEMANTIC),
@@ -261,11 +263,12 @@ pub(crate) fn handle_find_similar(args_json: &str) -> Result<String, DynError> {
 
     // Build the combined manifest fresh from the vault (the source of truth) so the
     // anchor is always ranked against the current graph — never a stale index.
-    let (manifest, report) = match build_search_index_manifest_from_vault(
+    let (manifest, report) = match build_search_index_manifest_from_vault_with_panel_root(
         &vault,
         &project,
         &FIND_SIMILAR_SLOTS,
         IndexKnobs::defaults(FIND_SIMILAR_INDEX_SEED),
+        Some(vault_dir.as_path()),
     ) {
         Ok(resolved) => resolved,
         Err(error) => return fs_search_error(&error),

@@ -28,6 +28,7 @@
 //! the aspect stays labeled-`unavailable` — genuinely absent, not faked.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use astrolabe_assay::{
     AxisValues, BitsConfig, SignalBits, SignalRankingCard, SlotObservations, SlotValues,
@@ -36,9 +37,10 @@ use astrolabe_assay::{
 use astrolabe_ingest::{CbmGraphSnapshot, read_cbm_graph_snapshot};
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::mvcc::{OrderedReadbackMetrics, is_tombstone_value};
-use calyx_aster::vault::encode::decode_slot_vector;
-use calyx_aster::vault::{AsterVault, OrderedCfRead, SstReadSession};
+use calyx_aster::vault::{AsterVault, OrderedCfRead, SstReadSession, decode_strict_raw_slot_value};
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId, SlotVector};
+
+use crate::slot_source::WeaveSlotSource;
 
 /// Axis name for the discrete symbol-kind (node-label) axis.
 pub const SIGNAL_AXIS_SYMBOL_KIND: &str = "symbol_kind";
@@ -94,7 +96,14 @@ pub struct SignalCardProduction {
     /// Slots skipped because they had no dense vector across the sample — labeled.
     pub slots_skipped_no_dense: usize,
     /// Exact physical accounting for every Slot-CF key requested by this pass.
+    /// This covers only ordinary raw Slot-CF plans; Registry-authenticated
+    /// compressed rows are counted separately below because its point-read API
+    /// does not fabricate `OrderedReadbackMetrics` for a different read engine.
     pub readback: OrderedReadbackMetrics,
+    /// Manifested compressed slots reconstructed through Registry.
+    pub compressed_slots_read: usize,
+    /// Authenticated compressed member rows reconstructed through Registry.
+    pub compressed_rows_read: usize,
 }
 
 /// One measured card paired with the exact content identity of every input that
@@ -184,33 +193,75 @@ struct SlotAlignment {
 /// and the bits estimator both need equal-dimension points); alignment across the
 /// row, kind, and degree vectors is preserved.
 fn align_slot<C>(
+    vault: &AsterVault<C>,
     session: &SstReadSession<'_, C>,
+    source: &WeaveSlotSource,
     slot: SlotId,
     symbols: &[SymbolAxes],
-) -> Result<(Option<SlotAlignment>, OrderedReadbackMetrics)>
+) -> Result<(Option<SlotAlignment>, OrderedReadbackMetrics, bool, usize)>
 where
     C: Clock,
 {
-    let keys = symbols
-        .iter()
-        .map(|symbol| slot_key(symbol.cx_id))
-        .collect::<Vec<_>>();
-    let reads = keys
-        .iter()
-        .enumerate()
-        .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::slot(slot), key))
-        .collect::<Vec<_>>();
     let mut dense_by_symbol: Vec<Option<Vec<f64>>> = vec![None; symbols.len()];
-    let metrics =
-        session.visit_ordered_cf_plan::<CalyxError, _>(&reads, |ordinal, _, _, persisted| {
-            let Some(bytes) = persisted.filter(|bytes| !is_tombstone_value(bytes)) else {
-                return Ok(());
-            };
-            if let SlotVector::Dense { data, .. } = decode_slot_vector(bytes)? {
-                dense_by_symbol[ordinal] = Some(data.into_iter().map(f64::from).collect());
+    let compressed = source
+        .compressed_generation_identity(vault, slot)?
+        .is_some();
+    let (metrics, compressed_rows_read) = if compressed {
+        let cx_ids = symbols
+            .iter()
+            .map(|symbol| symbol.cx_id)
+            .collect::<Vec<_>>();
+        if !cx_ids.is_empty() {
+            let resolved = source.resolve_many(vault, slot, &cx_ids)?;
+            for (ordinal, (observed_cx_id, vector)) in resolved.into_iter().enumerate() {
+                if observed_cx_id != symbols[ordinal].cx_id {
+                    return Err(signal_card_input_invalid(format!(
+                        "compressed slot S{} batch changed ordinal {ordinal} identity from {} to {observed_cx_id}",
+                        slot.get(),
+                        symbols[ordinal].cx_id
+                    )));
+                }
+                if let Some(SlotVector::Dense { data, .. }) = vector {
+                    dense_by_symbol[ordinal] = Some(data.into_iter().map(f64::from).collect());
+                }
             }
-            Ok(())
-        })?;
+        }
+        (
+            OrderedReadbackMetrics {
+                session_snapshot_seq: source.snapshot(),
+                ..OrderedReadbackMetrics::default()
+            },
+            cx_ids.len(),
+        )
+    } else {
+        // Manifest absence above is the sole authorization for canonical raw
+        // decoding. The strict decoder still rejects a compressed row tag, so a
+        // missing/corrupt manifest cannot fall through as raw data.
+        let keys = symbols
+            .iter()
+            .map(|symbol| slot_key(symbol.cx_id))
+            .collect::<Vec<_>>();
+        let reads = keys
+            .iter()
+            .enumerate()
+            .map(|(ordinal, key)| OrderedCfRead::new(ordinal, ColumnFamily::slot(slot), key))
+            .collect::<Vec<_>>();
+        let metrics = session.visit_ordered_cf_plan::<CalyxError, _>(
+            &reads,
+            |ordinal, _, _, persisted| {
+                let Some(bytes) = persisted.filter(|bytes| !is_tombstone_value(bytes)) else {
+                    return Ok(());
+                };
+                if let SlotVector::Dense { data, .. } =
+                    decode_strict_raw_slot_value(slot, symbols[ordinal].cx_id, bytes)?
+                {
+                    dense_by_symbol[ordinal] = Some(data.into_iter().map(f64::from).collect());
+                }
+                Ok(())
+            },
+        )?;
+        (metrics, 0)
+    };
     let mut rows: Vec<Vec<f64>> = Vec::new();
     let mut kind: Vec<i64> = Vec::new();
     let mut degree: Vec<f64> = Vec::new();
@@ -281,9 +332,11 @@ where
                     degree_fingerprint: *degree_hasher.finalize().as_bytes(),
                 }),
                 metrics,
+                compressed,
+                compressed_rows_read,
             ))
         }
-        _ => Ok((None, metrics)),
+        _ => Ok((None, metrics, compressed, compressed_rows_read)),
     }
 }
 
@@ -400,6 +453,24 @@ pub fn signal_cards_from_symbol_axes<C>(
 where
     C: Clock,
 {
+    signal_cards_from_symbol_axes_with_panel_root(vault, symbols, slots, seed, None, None)
+}
+
+/// Compression-aware signal-card pass. `vault_panel_root` is loaded once and
+/// retained for the entire pinned snapshot. Omitting it is valid only while all
+/// requested rows are raw; a compressed envelope then produces a structured
+/// context refusal rather than a sidecar substitution.
+pub fn signal_cards_from_symbol_axes_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    symbols: &[SymbolAxes],
+    slots: &[SlotId],
+    seed: u64,
+    vault_panel_root: Option<&Path>,
+    expected_panel_version: Option<u32>,
+) -> Result<SignalCardProduction>
+where
+    C: Clock,
+{
     let cfg = BitsConfig::from_defaults().map_err(|error| {
         CalyxError::aster_corrupt_shard(format!("bits config unavailable: {error}"))
     })?;
@@ -415,6 +486,7 @@ where
         prior_slot = Some(*slot);
     }
     let at_seq = vault.latest_seq();
+    let source = WeaveSlotSource::open(at_seq, vault_panel_root, expected_panel_version)?;
     let session = vault.sst_read_session_at(at_seq)?;
 
     let mut kind_signals: Vec<SignalBits> = Vec::new();
@@ -443,8 +515,18 @@ where
     };
 
     for slot in slots {
-        let (alignment, readback) = align_slot(&session, *slot, symbols)?;
+        let (alignment, readback, compressed, compressed_rows_read) =
+            align_slot(vault, &session, &source, *slot, symbols)?;
         report.readback.checked_merge(readback)?;
+        if compressed {
+            report.compressed_slots_read += 1;
+            report.compressed_rows_read = report
+                .compressed_rows_read
+                .checked_add(compressed_rows_read)
+                .ok_or_else(|| {
+                    signal_card_input_invalid("compressed signal-card row count overflow")
+                })?;
+        }
         let Some(alignment) = alignment else {
             kind_input.absent_slot(*slot);
             degree_input.absent_slot(*slot);
@@ -523,9 +605,31 @@ pub fn measure_index_time_signal_cards<C>(
 where
     C: Clock,
 {
+    measure_index_time_signal_cards_with_panel_root(vault, project, slots, seed, None)
+}
+
+/// Index-time signal-card pass with the exact vault root required to interpret
+/// any manifested compressed generation.
+pub fn measure_index_time_signal_cards_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    slots: &[SlotId],
+    seed: u64,
+    vault_panel_root: Option<&Path>,
+) -> Result<SignalCardProduction>
+where
+    C: Clock,
+{
     let snapshot = read_cbm_graph_snapshot(vault, project).map_err(|error| {
         CalyxError::aster_corrupt_shard(format!("read graph snapshot: {error}"))
     })?;
     let symbols = derive_symbol_axes(&snapshot)?;
-    signal_cards_from_symbol_axes(vault, &symbols, slots, seed)
+    signal_cards_from_symbol_axes_with_panel_root(
+        vault,
+        &symbols,
+        slots,
+        seed,
+        vault_panel_root,
+        snapshot.panel_version,
+    )
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use calyx_core::{LensId, Result};
 use calyx_forge::{AutotuneKey, BackendKind, BestConfig};
@@ -53,7 +53,7 @@ impl MatPlanConfig {
             tile_m: self.eager_pairs.len(),
             tile_n: self.indexed_concat_keys.len(),
             tile_k: score.avg_latency_ns as usize,
-            extra: HashMap::from([
+            extra: BTreeMap::from([
                 ("scope".to_string(), "loom".to_string()),
                 ("source".to_string(), "anneal-loom-scope".to_string()),
                 (

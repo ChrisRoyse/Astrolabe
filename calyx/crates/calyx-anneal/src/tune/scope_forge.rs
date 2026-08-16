@@ -184,10 +184,16 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        Ok(cache
+        cache
             .get(&key.autotune_key(self.recall_target))
+            .map_err(cache_write_fail)?
             .map(|config| ForgeConfig::from_best_config(config, key.dtype))
-            .unwrap_or_else(|| ForgeConfig::default_for(key)))
+            .ok_or_else(|| {
+                invalid_config(format!(
+                    "no measured Forge incumbent exists for shape {}; install and persist an explicitly evaluated bandit/config before serving it",
+                    key.label()
+                ))
+            })
     }
 
     pub fn promotions(&self) -> &[ForgePromotionRecord] {
@@ -269,11 +275,13 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        cache.insert(
-            record.key.autotune_key(self.recall_target),
-            record.new_config.to_best_config(&record.key),
-        );
-        cache.persist().map_err(cache_write_fail)
+        cache
+            .apply_and_persist(
+                record.key.autotune_key(self.recall_target),
+                record.new_config.to_best_config(&record.key),
+            )
+            .map(|_| ())
+            .map_err(cache_write_fail)
     }
 
     fn save_bandit(&self, key: &ShapeKey) -> Result<()> {
@@ -305,7 +313,7 @@ pub(super) fn invalid_config(message: impl Into<String>) -> CalyxError {
 fn cache_write_fail(error: calyx_forge::ForgeError) -> CalyxError {
     CalyxError {
         code: CALYX_FORGE_CACHE_WRITE_FAIL,
-        message: format!("Forge autotune cache write failed: {error}"),
-        remediation: "repair the PH16 autotune cache path before persisting a Forge promotion",
+        message: format!("Forge autotune cache access failed: {error}"),
+        remediation: "repair and reopen the PH16 autotune cache before reading or persisting a Forge promotion",
     }
 }

@@ -4,9 +4,9 @@ use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
     AnchorKind, AnchorValue, CalyxError, Constellation, CxId, Input, Modality, SlotId, SlotState,
-    SlotVector, VaultStore,
+    SlotVector,
 };
-use calyx_registry::{VaultPanelState, load_vault_panel_state};
+use calyx_registry::{VaultPanelState, load_vault_panel_state, resolved_constellation_read_cfs};
 use calyx_sextant::fusion;
 use calyx_sextant::{
     AnchorPredicate, DroppedGuardHit, FreshnessRequirement, FusionContext, FusionStrategy, Hit,
@@ -43,9 +43,13 @@ pub(super) struct NeighborOut {
 pub(super) fn search(request: &SearchRequest) -> ToolResult<SearchOutcome> {
     let resolved = resolve_requested_vault(&request.vault)?;
     let ledger = VerifiedSearchLedger::open(&resolved.path)?;
-    let vault = open_vault(&resolved)?;
     let state = load_vault_panel_state(&resolved.path)?;
-    let loaded = load_docs(&vault)?;
+    let vault = open_vault_resolved(
+        &resolved,
+        &state,
+        (request.guard == SearchGuard::InRegion).then_some(ColumnFamily::Guard),
+    )?;
+    let loaded = load_docs_resolved(&vault, &state)?;
     let snapshot_seq = loaded.snapshot_seq;
     let docs = filtered_docs(loaded.docs, request.filter.clone())?;
     if docs.is_empty() {
@@ -102,7 +106,7 @@ fn load_default_guard_profile(
     state: &VaultPanelState,
 ) -> ToolResult<GuardProfile> {
     let Some(bytes) =
-        vault.read_cf_at(vault.snapshot(), ColumnFamily::Guard, default_guard_key())?
+        vault.read_cf_at(vault.latest_seq(), ColumnFamily::Guard, default_guard_key())?
     else {
         return Err(CalyxError::guard_provisional(
             "search guard requires a calibrated default guard profile",
@@ -131,8 +135,9 @@ fn default_guard_key() -> &'static [u8] {
 
 pub(super) fn neighbors(request: &NeighborsRequest) -> ToolResult<Vec<NeighborOut>> {
     let resolved = resolve_requested_vault(&request.vault)?;
-    let vault = open_vault(&resolved)?;
-    let loaded = load_docs(&vault)?;
+    let state = load_vault_panel_state(&resolved.path)?;
+    let vault = open_vault_resolved(&resolved, &state, [])?;
+    let loaded = load_docs_resolved(&vault, &state)?;
     let docs = loaded.docs;
     let seed = docs.get(&request.cx_id).ok_or_else(|| {
         CalyxError::vault_access_denied(format!("cx_id {} does not exist in vault", request.cx_id))
@@ -314,16 +319,16 @@ pub(super) struct LoadedDocs {
     pub(super) snapshot_seq: u64,
 }
 
-pub(super) fn load_docs(vault: &AsterVault) -> ToolResult<LoadedDocs> {
-    let snapshot = vault.snapshot();
-    let mut docs = BTreeMap::new();
-    for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let bytes: [u8; 16] = key.as_slice().try_into().map_err(|_| {
-            CalyxError::vault_access_denied(format!("base CF key has {} bytes", key.len()))
-        })?;
-        let cx_id = CxId::from_bytes(bytes);
-        docs.insert(cx_id, vault.get(cx_id, snapshot)?);
-    }
+pub(super) fn load_docs_resolved(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+) -> ToolResult<LoadedDocs> {
+    let snapshot = vault.latest_seq();
+    let docs = vault
+        .load_constellations_resolved_at(snapshot, state)?
+        .into_iter()
+        .map(|constellation| (constellation.cx_id, constellation))
+        .collect();
     Ok(LoadedDocs {
         docs,
         snapshot_seq: snapshot,
@@ -334,7 +339,30 @@ pub(super) fn resolve_requested_vault(vault: &str) -> ToolResult<ResolvedVault> 
     resolve_vault_info(&home_dir()?, vault)
 }
 
-pub(super) fn open_vault(resolved: &ResolvedVault) -> ToolResult<AsterVault> {
+pub(super) fn open_vault_resolved(
+    resolved: &ResolvedVault,
+    state: &VaultPanelState,
+    additional_cfs: impl IntoIterator<Item = ColumnFamily>,
+) -> ToolResult<AsterVault> {
+    let mut selected_cfs = resolved_constellation_read_cfs(&state.panel);
+    selected_cfs.extend(additional_cfs);
+    selected_cfs.sort();
+    selected_cfs.dedup();
+    Ok(AsterVault::open(
+        &resolved.path,
+        resolved.vault_id,
+        vault_salt(resolved.vault_id, &resolved.name),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(selected_cfs),
+            ..VaultOptions::default()
+        },
+    )?)
+}
+
+pub(super) fn open_vault_write(resolved: &ResolvedVault) -> ToolResult<AsterVault> {
     Ok(AsterVault::open(
         &resolved.path,
         resolved.vault_id,

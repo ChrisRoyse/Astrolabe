@@ -732,9 +732,9 @@ impl VersionedCfStore {
     /// Latest-only mode deliberately does not retain the complete MVCC keyset.
     /// Ordinary rows are safe because their latest state lives in the router;
     /// compression generation changes are not, because the lifecycle validator
-    /// must reconcile the complete primary/raw keysets. Refuse those operations
-    /// before WAL append and also refuse ordinary mutations to any slot whose
-    /// live manifest is visible in the router.
+    /// must reconcile the complete primary/raw/proof keysets. Refuse those
+    /// operations before WAL append and also refuse ordinary mutations to any
+    /// slot whose live manifest is visible in the router.
     fn validate_latest_only_compression_admission(
         &self,
         rows: &[CompressionGuardRow<'_>],
@@ -748,7 +748,7 @@ impl VersionedCfStore {
             match cf {
                 ColumnFamily::Compression => {
                     return Err(latest_only_compression_error(
-                        "a compression manifest or lifecycle row was included in the batch"
+                        "a compression manifest, lifecycle row, or membership proof was included in the batch"
                             .to_string(),
                     ));
                 }

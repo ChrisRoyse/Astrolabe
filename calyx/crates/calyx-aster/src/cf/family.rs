@@ -46,7 +46,8 @@ pub enum ColumnFamily {
     Kernel,
     /// Persisted Ward guard calibration profiles.
     Guard,
-    /// Per-slot compressed-column generation manifests.
+    /// Per-slot compressed-column manifests, lifecycle rows, and point-read
+    /// membership proofs.
     Compression,
     /// `(CxId, OccurrenceId) -> recurrence occurrence or summary`.
     Recurrence,

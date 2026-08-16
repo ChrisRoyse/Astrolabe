@@ -22,9 +22,8 @@ use calyx_aster::ledger_head::read_head_anchor;
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::sst::SstEntry;
 use calyx_aster::sst::level::SstLevel;
-use calyx_aster::vault::encode::{
-    decode_constellation_base, decode_slot_vector, decode_write_batch,
-};
+use calyx_aster::vault::decode_strict_raw_slot_value;
+use calyx_aster::vault::encode::{decode_constellation_base, decode_write_batch};
 use calyx_aster::wal::replay_dir;
 use calyx_core::{CalyxError, Result as CalyxResult};
 use calyx_ledger::{
@@ -353,7 +352,7 @@ fn read_back_first_constellation(
                     hex(constellation.cx_id.as_bytes())
                 ))
             })?;
-        decode_slot_vector(bytes)?;
+        decode_strict_raw_slot_value(*slot, constellation.cx_id, bytes)?;
     }
     Ok(hex(key))
 }

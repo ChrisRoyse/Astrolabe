@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use calyx_core::Result;
@@ -109,7 +109,7 @@ impl ForgeConfig {
             tile_m: self.tile_m as usize,
             tile_n: self.tile_n as usize,
             tile_k: self.tile_k as usize,
-            extra: HashMap::from([
+            extra: BTreeMap::from([
                 ("op".to_string(), key.op_id.clone()),
                 ("dtype".to_string(), self.dtype.to_string()),
                 ("batch_size".to_string(), self.batch_size.to_string()),

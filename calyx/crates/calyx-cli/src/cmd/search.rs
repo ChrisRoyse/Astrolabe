@@ -11,7 +11,10 @@ use crate::bounded_progress::ProgressSink;
 use crate::error::{CliError, CliResult};
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_registry::{load_vault_panel_state, require_vault_registry_contracts};
+use calyx_registry::{
+    VaultPanelState, load_vault_panel_state, require_vault_registry_contracts,
+    resolved_constellation_read_cfs,
+};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,10 +53,12 @@ fn run_rebuild_search_index(args: VaultRefArgs) -> CliResult {
             "progress_artifact": progress_path.display().to_string(),
         }),
     )?;
-    let rebuild =
-        calyx_search::rebuild_for_vault_with_fallible_progress(&resolved.path, &vault, |event| {
-            emit_rebuild_progress(&mut progress, event).map_err(search_progress_error)
-        });
+    let rebuild = calyx_search::rebuild_for_vault_with_fallible_progress_resolved(
+        &resolved.path,
+        &vault,
+        &state,
+        |event| emit_rebuild_progress(&mut progress, event).map_err(search_progress_error),
+    );
     if let Err(error) = rebuild {
         let cli_error = CliError::from(error);
         let _ = emit_rebuild_progress_record(
@@ -94,8 +99,14 @@ fn run_rebuild_search_index(args: VaultRefArgs) -> CliResult {
     }))
 }
 
-pub(crate) fn rebuild_persistent_indexes(vault_dir: &Path, vault: &AsterVault) -> CliResult {
-    Ok(calyx_search::rebuild_for_vault(vault_dir, vault)?)
+pub(crate) fn rebuild_persistent_indexes(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &VaultPanelState,
+) -> CliResult {
+    Ok(calyx_search::rebuild_for_vault_resolved(
+        vault_dir, vault, state,
+    )?)
 }
 
 fn rebuild_progress_path(vault_dir: &Path) -> CliResult<PathBuf> {
@@ -155,13 +166,14 @@ fn emit_rebuild_progress_record(
 pub(crate) fn rebuild_persistent_indexes_with_progress<F>(
     vault_dir: &Path,
     vault: &AsterVault,
+    state: &VaultPanelState,
     progress: F,
 ) -> CliResult
 where
     F: FnMut(calyx_search::RebuildProgress<'_>) + Send,
 {
-    Ok(calyx_search::rebuild_for_vault_with_progress(
-        vault_dir, vault, progress,
+    Ok(calyx_search::rebuild_for_vault_with_progress_resolved(
+        vault_dir, vault, state, progress,
     )?)
 }
 
@@ -182,16 +194,7 @@ pub(super) fn base_read_cfs() -> Vec<ColumnFamily> {
 }
 
 pub(super) fn panel_read_cfs(panel: &calyx_core::Panel) -> Option<Vec<ColumnFamily>> {
-    let mut cfs = vec![ColumnFamily::Base];
-    cfs.extend(
-        panel
-            .slots
-            .iter()
-            .map(|slot| ColumnFamily::slot(slot.slot_id)),
-    );
-    cfs.sort();
-    cfs.dedup();
-    Some(cfs)
+    Some(resolved_constellation_read_cfs(panel))
 }
 
 pub(crate) fn measure_text_query_vectors(

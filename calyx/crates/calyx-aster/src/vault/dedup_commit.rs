@@ -56,13 +56,21 @@ where
     pub(crate) fn commit_dedup_ingest(
         &self,
         mut constellation: Option<Constellation>,
-        updated_base: Option<Constellation>,
+        updated_base: Option<(Seq, encode::BaseRecord)>,
         online_rows: Vec<(Vec<u8>, Vec<u8>)>,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
         subject: CxId,
         ledger_payload: Vec<u8>,
     ) -> Result<Seq> {
         self.with_durable_commit_lock(|| {
+            if let Some((expected_seq, _)) = updated_base.as_ref()
+                && self.latest_seq() != *expected_seq
+            {
+                return Err(CalyxError::stale_derived(format!(
+                    "dedup recurrence evaluation snapshot {expected_seq} is stale at commit seq {}",
+                    self.latest_seq()
+                )));
+            }
             let mut rows = Vec::new();
             let mut hook_guard = match &self.ledger_hook {
                 Some(hook) => Some(ledger_hook::lock_hook(hook)?),
@@ -98,16 +106,16 @@ where
             if let Some(cx) = constellation.as_ref() {
                 self.stage_constellation_rows(&mut rows, cx)?;
             }
-            if let Some(cx) = updated_base.as_ref() {
-                if cx.vault_id != self.vault_id {
+            if let Some((_, record)) = updated_base.as_ref() {
+                if record.vault_id() != self.vault_id {
                     return Err(CalyxError::vault_access_denied(
                         "dedup recurrence base update belongs to another vault",
                     ));
                 }
                 rows.push(encode::WriteRow {
                     cf: ColumnFamily::Base,
-                    key: base_key(cx.cx_id),
-                    value: encode::encode_constellation_base(cx)?,
+                    key: base_key(record.cx_id()),
+                    value: record.encode()?,
                 });
             }
             for (key, value) in online_rows {

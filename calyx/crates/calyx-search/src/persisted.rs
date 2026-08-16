@@ -38,10 +38,10 @@ pub use marker::{
     read_rebuild_required_marker, rebuild_required_marker_path, write_rebuild_required_marker,
 };
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
-pub(crate) use rebuild::load_docs_at;
 pub use rebuild::{
-    RebuildProgress, load_docs, rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
-    rebuild_for_vault_with_progress,
+    RebuildProgress, load_docs, load_docs_resolved, rebuild_for_vault, rebuild_for_vault_resolved,
+    rebuild_for_vault_with_fallible_progress, rebuild_for_vault_with_fallible_progress_resolved,
+    rebuild_for_vault_with_progress, rebuild_for_vault_with_progress_resolved,
 };
 
 const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v1";

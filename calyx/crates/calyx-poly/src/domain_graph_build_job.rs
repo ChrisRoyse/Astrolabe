@@ -10,12 +10,13 @@ use calyx_core::{Clock, CxId, SlotId};
 use calyx_lodestar::{KernelParams, RecallQuery, RecallTestParams};
 use calyx_loom::{CrossTermKind, CrossTermValue, MaterializationAction};
 use calyx_mincut::{AgreementEdge as MincutAgreementEdge, FrequencyEntry};
+use calyx_registry::persistence::load_vault_panel_state;
 
 use crate::domain::Domain;
 pub use crate::domain_graph_build_job_types::*;
 use crate::error::{PolyError, Result};
 use crate::kernel_recall_admission::{ComputedKernelRecallRequest, measure_computed_kernel_recall};
-use crate::loom_shape_weave::run_shape_aware_loom_weave_for_cx_ids;
+use crate::loom_shape_weave::run_shape_aware_loom_weave_for_cx_ids_resolved;
 use crate::pair_gain_gate::{
     DEFAULT_PAIR_GAIN_K, compute_pair_gain_plan, read_pair_gain_plan, write_pair_gain_plan,
 };
@@ -25,6 +26,9 @@ const LOOM_SLOT_NODE_PANEL_VERSION: u32 = 73;
 const LOOM_SLOT_NODE_SALT: &[u8] = b"poly-domain-graph-build-loom-slot-v1";
 
 pub struct DomainGraphBuildRequest<'a> {
+    /// Exact durable root retained by `vault`; owns the persisted panel and
+    /// registry snapshot used to interpret compressed slot generations.
+    pub vault_root: &'a Path,
     pub domain: Domain,
     pub collection: &'a str,
     pub panel_version: u32,
@@ -45,6 +49,32 @@ pub fn run_domain_graph_build_job<C: Clock>(
     clock: &dyn Clock,
 ) -> Result<DomainGraphBuildRun> {
     validate_request(request)?;
+    let retained_root = vault.durable_vault_root().ok_or_else(|| {
+        PolyError::diagnostics(
+            ERR_DOMAIN_GRAPH_INVALID_INPUT,
+            "domain graph build requires a durable Aster vault root",
+        )
+    })?;
+    if retained_root != request.vault_root {
+        return Err(PolyError::diagnostics(
+            ERR_DOMAIN_GRAPH_INVALID_INPUT,
+            format!(
+                "domain graph vault root {} differs from request root {}",
+                retained_root.display(),
+                request.vault_root.display()
+            ),
+        ));
+    }
+    let panel_state = load_vault_panel_state(request.vault_root)?;
+    if panel_state.panel.version != request.panel_version {
+        return Err(PolyError::diagnostics(
+            ERR_DOMAIN_GRAPH_INVALID_INPUT,
+            format!(
+                "persisted panel version {} differs from domain graph request {}",
+                panel_state.panel.version, request.panel_version
+            ),
+        ));
+    }
     let pair_gain = compute_pair_gain_plan(
         request.domain.slug(),
         request.panel_version,
@@ -58,13 +88,14 @@ pub fn run_domain_graph_build_job<C: Clock>(
         return Err(readback_error("pair-gain plan readback mismatch"));
     }
 
-    let loom = run_shape_aware_loom_weave_for_cx_ids(
+    let loom = run_shape_aware_loom_weave_for_cx_ids_resolved(
         vault,
         request.domain.slug(),
         request.panel_version,
         request.source_cx_ids,
         request.output_dir,
         request.loom_cache_capacity,
+        &panel_state,
     )?;
     let loom_edges = loom_edges_from_xterms(&loom.report.xterm_rows);
     let mut all_edges = request.supplied_edges.to_vec();

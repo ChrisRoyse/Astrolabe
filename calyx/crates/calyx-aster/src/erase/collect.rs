@@ -5,8 +5,10 @@
 use super::handler::{EraseScope, METADATA_SUBJECT_ID};
 use crate::cf::{
     ColumnFamily, KeyRange, anchor_prefix_range, base_key, compression_lifecycle_key,
-    compression_manifest_key, recurrence_prefix_range, slot_key, temporal_xterm_prefix_range,
-    xterm_prefix_range,
+    compression_manifest_key, parse_compression_admission_evaluation_pointer_key,
+    parse_compression_admission_pointer_key, parse_compression_admission_receipt_key,
+    parse_compression_lifecycle_key, parse_compression_membership_proof_key,
+    recurrence_prefix_range, slot_key, temporal_xterm_prefix_range, xterm_prefix_range,
 };
 use crate::compression_lifecycle::{
     CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,
@@ -15,7 +17,7 @@ use crate::mvcc::{is_tombstone_value, tombstone_value};
 use crate::vault::{AsterVault, VaultContext, encode};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, SlotId};
 use calyx_ledger::SubjectId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How a lawful erase treats a targeted slot that carries a live compressed
 /// generation manifest (issue #562).
@@ -149,34 +151,72 @@ where
     C: Clock,
 {
     let mut targets = EraseTargets::default();
+
+    // Inventory the shared Compression CF once. The manifest set is invariant
+    // across this locked selection, so per-Base point reads would repeat the
+    // same store work (#564/#1064 PC-05/09).
+    let mut live_manifest_slots = BTreeSet::new();
+    let mut proof_rows_by_slot: BTreeMap<u16, Vec<(Vec<u8>, CxId)>> = BTreeMap::new();
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Compression)? {
+        if is_tombstone_value(&value) {
+            continue;
+        }
+        if key.len() == 2 {
+            live_manifest_slots.insert(u16::from_be_bytes([key[0], key[1]]));
+        } else if let Some((slot, cx_id)) = parse_compression_membership_proof_key(&key) {
+            proof_rows_by_slot
+                .entry(slot.get())
+                .or_default()
+                .push((key, cx_id));
+        } else if parse_compression_lifecycle_key(&key).is_none()
+            && parse_compression_admission_receipt_key(&key).is_none()
+            && parse_compression_admission_evaluation_pointer_key(&key).is_none()
+            && parse_compression_admission_pointer_key(&key).is_none()
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "compression CF contains an unclassified live key of {} bytes during vault erase",
+                key.len()
+            )));
+        }
+    }
+
     for cf in ColumnFamily::STATIC {
-        // Ledger is append-only; Compression is handled per-generation below so a
-        // manifest tombstone is always paired with its DeleteGeneration record and
-        // append-only lifecycle records are never tombstoned (issue #562).
+        // Ledger is append-only. Compression was inventoried above and is
+        // handled per generation below, so lifecycle rows remain append-only.
         if cf == ColumnFamily::Ledger || cf == ColumnFamily::Compression {
             continue;
         }
-        for (key, _) in vault.scan_cf_at(snapshot, cf)? {
+        for (key, value) in vault.scan_cf_at(snapshot, cf)? {
             push_unique(&mut targets.rows, cf, key);
+            if cf == ColumnFamily::Base {
+                let cx = encode::decode_constellation_base(&value)?;
+                targets.records_deleted += 1;
+                collect_slot_targets(
+                    vault,
+                    snapshot,
+                    &cx,
+                    &mut targets,
+                    CompressionErasePolicy::CoordinatedDelete,
+                    Some(&live_manifest_slots),
+                )?;
+            }
         }
     }
-    for (_, base) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let cx = encode::decode_constellation_base(&base)?;
-        targets.records_deleted += 1;
-        collect_slot_targets(
+
+    // Sweep every manifested generation and any proof-only fragment not reached
+    // through Base. Each proof row is selected with its manifest transition, so
+    // a completed vault delete cannot leave an orphan (#564).
+    let mut generation_slots = live_manifest_slots;
+    generation_slots.extend(proof_rows_by_slot.keys().copied());
+    for slot in generation_slots {
+        let proof_rows = proof_rows_by_slot.remove(&slot).unwrap_or_default();
+        stage_generation_delete(
             vault,
             snapshot,
-            &cx,
+            SlotId::new(slot),
+            &proof_rows,
             &mut targets,
-            CompressionErasePolicy::CoordinatedDelete,
         )?;
-    }
-    // Sweep any compressed generation not reached through a base constellation.
-    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Compression)? {
-        if key.len() == 2 && !is_tombstone_value(&value) {
-            let slot = SlotId::new(u16::from_be_bytes([key[0], key[1]]));
-            stage_generation_delete(vault, snapshot, slot, &mut targets)?;
-        }
     }
     Ok(targets)
 }
@@ -231,6 +271,7 @@ where
             cx,
             &mut targets,
             CompressionErasePolicy::RouteReseal,
+            None,
         )?;
     }
     collect_range_targets(
@@ -265,16 +306,22 @@ fn collect_slot_targets<C>(
     cx: &Constellation,
     targets: &mut EraseTargets,
     policy: CompressionErasePolicy,
+    known_live_manifests: Option<&BTreeSet<u16>>,
 ) -> Result<()>
 where
     C: Clock,
 {
     for slot in cx.slots.keys().copied() {
-        if slot_has_live_manifest(vault, snapshot, slot)? {
+        let has_live_manifest = match known_live_manifests {
+            Some(slots) => slots.contains(&slot.get()),
+            None => slot_has_live_manifest(vault, snapshot, slot)?,
+        };
+        if has_live_manifest {
             match policy {
                 CompressionErasePolicy::RouteReseal => return Err(lifecycle_route_error(slot)),
                 CompressionErasePolicy::CoordinatedDelete => {
-                    stage_generation_delete(vault, snapshot, slot, targets)?;
+                    // Vault scope stages all generations from its one shared-CF
+                    // inventory after Base traversal.
                     continue;
                 }
             }
@@ -312,12 +359,14 @@ where
 }
 
 /// Stages a coordinated full-generation delete for one manifested slot: tombstone
-/// every compressed primary row and raw sidecar, tombstone the manifest, and add
-/// one append-only DeleteGeneration lifecycle record. Idempotent per slot.
+/// every compressed primary row, raw sidecar, and membership proof, tombstone
+/// the manifest, and add one append-only DeleteGeneration lifecycle record.
+/// Idempotent per slot.
 fn stage_generation_delete<C>(
     vault: &AsterVault<C>,
     snapshot: u64,
     slot: SlotId,
+    proof_rows: &[(Vec<u8>, CxId)],
     targets: &mut EraseTargets,
 ) -> Result<()>
 where
@@ -344,11 +393,18 @@ where
         }
         push_unique(&mut targets.rows, ColumnFamily::slot_raw(slot), key);
     }
+    for (key, cx_id) in proof_rows {
+        if deleted_set.insert(*cx_id) {
+            deleted.push(*cx_id);
+        }
+        push_unique(&mut targets.rows, ColumnFamily::Compression, key.clone());
+    }
     push_unique(
         &mut targets.rows,
         ColumnFamily::Compression,
         compression_manifest_key(slot),
     );
+    deleted.sort_unstable();
     let record = GenerationLifecycleRecord::new(
         GenerationTransition::DeleteGeneration,
         slot.get(),

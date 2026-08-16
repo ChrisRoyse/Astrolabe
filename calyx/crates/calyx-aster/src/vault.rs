@@ -27,6 +27,7 @@ mod ledger_bound_group_batch;
 mod ledger_hook;
 pub mod ledger_stub;
 mod open;
+mod physical_inventory;
 pub mod quota;
 mod retention_horizon;
 mod router_bridge;
@@ -34,6 +35,7 @@ mod scan;
 mod seq_readback;
 mod slot_backfill;
 mod slot_column;
+mod slot_resolution;
 mod snapshot_lease;
 mod store;
 mod temporal_xterm;
@@ -76,12 +78,21 @@ pub use ledger_append::CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY;
 pub use ledger_bound_group_batch::{
     LedgerBoundGroupBatchReceipt, LedgerBoundGroupReceipt, LedgerBoundWriteGroup,
 };
+pub use physical_inventory::{
+    CALYX_ASTER_PHYSICAL_COMMIT_INVENTORY_INVALID, PhysicalCommitComponent,
+    PhysicalCommitComponentRole, PhysicalCommitContainer, PhysicalCommitInventory,
+    PhysicalCommitRowDigest,
+};
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
     read_materialized_slot_column,
 };
-pub use snapshot_lease::SstReadSession;
+pub use slot_resolution::{
+    CALYX_ASTER_SLOT_CONTEXT_REQUIRED, SlotVectorResolver, StrictRawSlotResolver,
+    decode_strict_raw_slot_value,
+};
+pub use snapshot_lease::{RetainedSnapshot, SstReadSession};
 
 /// Digest-only receipt for one ledger-bound data row.
 ///

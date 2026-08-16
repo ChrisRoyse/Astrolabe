@@ -51,14 +51,14 @@ use calyx_aster::ledger_view::AsterLedgerCfStore;
 use calyx_aster::manifest::is_vault_seq_quarantined;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    AnchorKind, CxId, Input, Modality, Result as CalyxResult, Slot, SlotId, SlotShape, SlotState,
-    VaultId, VaultStore,
+    Input, Modality, Result as CalyxResult, Slot, SlotId, SlotShape, SlotState, VaultId, VaultStore,
 };
 use calyx_ledger::{
     LedgerCfStore, LedgerEntry, QuarantineLookup, VerifyResult, get_answer_trace, verify_chain,
 };
 use calyx_lodestar::{
-    KernelParams, RecallTestParams, measured_kernel_with_contributions_from_vault_allow_partial,
+    KernelParams, RecallTestParams,
+    measured_kernel_with_contributions_from_vault_candidates_allow_partial_resolved,
 };
 use calyx_registry::VaultPanelState;
 use calyx_registry::measure::measure_constellation;

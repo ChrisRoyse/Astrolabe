@@ -17,8 +17,8 @@ use crate::server::{McpServer, Tool, ToolError, ToolResult};
 use super::output;
 use super::{decode, def, enum_string, integer_range, validate_text};
 use runtime::{
-    NavRuntime, ensure_doc_exists, load_runtime, parse_cx_id, query_vector_for_skill, score01,
-    skill_tree,
+    NavRuntime, ensure_doc_exists, load_runtime_read, load_runtime_write, parse_cx_id,
+    query_vector_for_skill, score01, skill_tree,
 };
 
 const CONSENSUS_K: usize = 5;
@@ -108,7 +108,7 @@ impl Tool for DefineTool {
 
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: DefineArgs = decode("calyx.define", params)?;
-        let runtime = load_runtime(&args.vault)?;
+        let runtime = load_runtime_read(&args.vault, [])?;
         let lens = SlotId::new(args.lens);
         let Some(cx_id) = runtime.docs.keys().copied().nth(args.index) else {
             return Err(CalyxError::stale_derived(format!(
@@ -150,7 +150,7 @@ impl Tool for GuardGenerateTool {
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: GuardGenerateArgs = decode("calyx.guard_generate", params)?;
         validate_text(&args.candidate_text, "candidate_text")?;
-        let runtime = load_runtime(&args.vault)?;
+        let runtime = load_runtime_read(&args.vault, [calyx_aster::cf::ColumnFamily::Guard])?;
         guard_generate::run(&runtime, &args.candidate_text, args.identity_cx.as_deref())
     }
 
@@ -186,7 +186,7 @@ impl Tool for TraverseTool {
             )));
         }
         let cx_id = parse_cx_id(&args.cx_id)?;
-        let runtime = load_runtime(&args.vault)?;
+        let runtime = load_runtime_read(&args.vault, [])?;
         ensure_doc_exists(&runtime.docs, cx_id)?;
         let direction = parse_direction(&args.direction)?;
         let path = calyx_sextant::traverse(&runtime.engine, cx_id, direction, args.hops)?;
@@ -218,7 +218,7 @@ impl Tool for SkillsTool {
 
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: SkillsArgs = decode("calyx.skills", params)?;
-        let runtime = load_runtime(&args.vault)?;
+        let runtime = load_runtime_read(&args.vault, [])?;
         Ok(json!({ "skill_tree": skill_tree(&runtime.engine)? }))
     }
 
@@ -245,7 +245,7 @@ impl Tool for SearchSkillTool {
         let args: SearchSkillArgs = decode("calyx.search_skill", params)?;
         validate_text(&args.skill, "skill")?;
         validate_text(&args.query, "query")?;
-        let runtime = load_runtime(&args.vault)?;
+        let runtime = load_runtime_read(&args.vault, [])?;
         let tree = skill_tree(&runtime.engine)?;
         if !tree.nodes.contains_key(&args.skill) {
             return Err(sextant_error(
@@ -326,7 +326,11 @@ enum ConsensusPolarity {
 
 fn consensus_call(args: ConsensusArgs, polarity: ConsensusPolarity) -> ToolResult<Value> {
     let cx_id = parse_cx_id(&args.cx_id)?;
-    let runtime = load_runtime(&args.vault)?;
+    let runtime = if args.slot.is_some() {
+        load_runtime_read(&args.vault, [])?
+    } else {
+        load_runtime_write(&args.vault)?
+    };
     ensure_doc_exists(&runtime.docs, cx_id)?;
     let rows = if let Some(slot) = args.slot {
         slot_consensus(&runtime, cx_id, SlotId::new(slot), polarity)?

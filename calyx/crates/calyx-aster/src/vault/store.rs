@@ -3,19 +3,230 @@ use crate::mvcc::{CfRead, Snapshot};
 use calyx_core::{Anchor, CalyxError, Clock, Constellation, CxId, Result, Seq, SlotId, VaultStore};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{AsterVault, anchor_merge, encode, ledger_hook, ledger_stub};
+use super::{
+    AsterVault, SlotVectorResolver, StrictRawSlotResolver, anchor_merge,
+    decode_strict_raw_slot_value, encode, ledger_hook, ledger_stub,
+};
 
-const COMPRESSED_SLOT_TAG: u8 = 16;
+fn cx_id_from_base_key(key: &[u8]) -> Result<CxId> {
+    if key.len() != 16 {
+        return Err(CalyxError::aster_corrupt_shard(
+            "Base row key is not a CxId",
+        ));
+    }
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(key);
+    Ok(CxId::from_bytes(bytes))
+}
 
 impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Reads a duplicate-free requested roster using ordinary Aster slot
+    /// encodings. A compressed primary row is a context refusal.
+    pub fn get_many_at(&self, snapshot: Seq, cx_ids: &[CxId]) -> Result<Vec<Constellation>> {
+        self.get_many_resolved_at(snapshot, cx_ids, &StrictRawSlotResolver)
+    }
+
+    /// Reads a duplicate-free requested roster through one explicit slot
+    /// interpretation owner while preserving input order.
+    ///
+    /// Base is read in one batch. Candidate IDs are grouped by declared slot,
+    /// and each distinct slot is resolved once for its exact requested roster.
+    pub fn get_many_resolved_at<R>(
+        &self,
+        snapshot: Seq,
+        cx_ids: &[CxId],
+        resolver: &R,
+    ) -> Result<Vec<Constellation>>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let unique = cx_ids.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != cx_ids.len() {
+            return Err(CalyxError::aster_corrupt_shard(
+                "constellation batch request contains a duplicate CxId",
+            ));
+        }
+        let snapshot_lease = self.retain_snapshot_at(snapshot);
+        let base_reads = cx_ids
+            .iter()
+            .map(|cx_id| (ColumnFamily::Base, base_key(*cx_id)))
+            .collect::<Vec<_>>();
+        let base_values = self.read_cf_batch_at(snapshot, base_reads)?;
+        snapshot_lease.record_progress();
+        let mut constellations = Vec::with_capacity(cx_ids.len());
+        let mut expected_by_slot = BTreeMap::<SlotId, Vec<(CxId, usize)>>::new();
+        for (index, (cx_id, value)) in cx_ids.iter().copied().zip(base_values).enumerate() {
+            let value = value.ok_or_else(|| {
+                CalyxError::stale_derived(format!(
+                    "constellation {cx_id} missing from Base at snapshot {snapshot}"
+                ))
+            })?;
+            let constellation = encode::decode_constellation_base(&value)?;
+            if constellation.cx_id != cx_id {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "Base key {cx_id} differs from embedded CxId {}",
+                    constellation.cx_id
+                )));
+            }
+            for slot in constellation.slots.keys() {
+                expected_by_slot
+                    .entry(*slot)
+                    .or_default()
+                    .push((cx_id, index));
+            }
+            constellations.push(constellation);
+        }
+        for (slot, expected) in expected_by_slot {
+            snapshot_lease.record_progress();
+            let expected_ids = expected.iter().map(|(cx_id, _)| *cx_id).collect::<Vec<_>>();
+            let resolved = resolver.resolve_slot_vectors_at(self, snapshot, slot, &expected_ids)?;
+            if resolved.len() != expected_ids.len() {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "slot {} resolved {} rows for {} requested constellations",
+                    slot.get(),
+                    resolved.len(),
+                    expected_ids.len()
+                )));
+            }
+            for ((expected_id, index), (resolved_id, vector)) in expected.into_iter().zip(resolved)
+            {
+                if expected_id != resolved_id {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "slot {} resolved CxId {resolved_id} where {expected_id} was requested",
+                        slot.get()
+                    )));
+                }
+                let vector = vector.ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "slot {} row missing for Base-declared constellation {resolved_id}",
+                        slot.get()
+                    ))
+                })?;
+                constellations[index].slots.insert(slot, vector);
+            }
+        }
+        Ok(constellations)
+    }
+
+    /// Loads the complete visible constellation corpus using only ordinary
+    /// Aster slot encodings. A compressed primary row is a context refusal.
+    pub fn load_constellations_at(&self, snapshot: Seq) -> Result<Vec<Constellation>> {
+        self.load_constellations_resolved_at(snapshot, &StrictRawSlotResolver)
+    }
+
+    /// Loads and hydrates the complete visible constellation corpus through an
+    /// explicit slot interpretation owner.
+    ///
+    /// Base is scanned once. Each distinct slot declared by Base is then
+    /// resolved exactly once as a complete column; no resolver operation occurs
+    /// inside the constellation loop. The resolved column must have exactly the
+    /// same ordered CxId roster as Base declares for that slot.
+    pub fn load_constellations_resolved_at<R>(
+        &self,
+        snapshot: Seq,
+        resolver: &R,
+    ) -> Result<Vec<Constellation>>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let snapshot_lease = self.retain_snapshot_at(snapshot);
+        let base_rows = self.scan_cf_at(snapshot, ColumnFamily::Base)?;
+        snapshot_lease.record_progress();
+        let mut constellations = BTreeMap::<CxId, Constellation>::new();
+        let mut expected_by_slot = BTreeMap::<SlotId, BTreeSet<CxId>>::new();
+
+        for (key, bytes) in base_rows {
+            let cx_id = cx_id_from_base_key(&key)?;
+            let constellation = encode::decode_constellation_base(&bytes)?;
+            if constellation.cx_id != cx_id {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "Base row key {cx_id} differs from embedded CxId {}",
+                    constellation.cx_id
+                )));
+            }
+            for slot_id in constellation.slots.keys() {
+                expected_by_slot.entry(*slot_id).or_default().insert(cx_id);
+            }
+            if constellations.insert(cx_id, constellation).is_some() {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "Base scan returned duplicate CxId {cx_id}"
+                )));
+            }
+        }
+
+        for (slot_id, expected_cx_ids) in expected_by_slot {
+            snapshot_lease.record_progress();
+            let resolved = resolver.resolve_slot_column_at(self, snapshot, slot_id)?;
+            if resolved.len() != expected_cx_ids.len() {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "slot {} resolved {} rows but Base declares {}",
+                    slot_id.get(),
+                    resolved.len(),
+                    expected_cx_ids.len()
+                )));
+            }
+            for (expected_cx_id, (resolved_cx_id, vector)) in
+                expected_cx_ids.into_iter().zip(resolved)
+            {
+                if expected_cx_id != resolved_cx_id {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "slot {} resolved CxId {resolved_cx_id} where Base declares {expected_cx_id}",
+                        slot_id.get()
+                    )));
+                }
+                let constellation = constellations.get_mut(&resolved_cx_id).ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "slot {} resolved orphan CxId {resolved_cx_id}",
+                        slot_id.get()
+                    ))
+                })?;
+                if !constellation.slots.contains_key(&slot_id) {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "slot {} resolved row {resolved_cx_id} absent from its Base declaration",
+                        slot_id.get()
+                    )));
+                }
+                constellation.slots.insert(slot_id, vector);
+            }
+        }
+
+        Ok(constellations.into_values().collect())
+    }
+
     /// Reads one stored constellation through an already-pinned snapshot lease.
     pub fn get_at_snapshot(&self, id: CxId, snapshot: Snapshot) -> Result<Constellation> {
         let constellation = self.read_base_at_snapshot(id, snapshot)?;
         let slot_ids: Vec<SlotId> = constellation.slots.keys().copied().collect();
         self.hydrate_slots_at_snapshot(id, snapshot, constellation, slot_ids)
+    }
+
+    /// Reads one stored constellation at `snapshot` through an explicit slot
+    /// interpretation owner, pinning and releasing the MVCC lease internally.
+    pub fn get_resolved_at<R>(&self, id: CxId, snapshot: Seq, resolver: &R) -> Result<Constellation>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let snapshot = self.snapshot_handle(snapshot);
+        self.get_at_snapshot_resolved(id, snapshot.snapshot(), resolver)
+    }
+
+    /// Reads one stored constellation through an explicit slot interpretation
+    /// owner. The Base row and every resolved slot remain bound to `snapshot`.
+    pub fn get_at_snapshot_resolved<R>(
+        &self,
+        id: CxId,
+        snapshot: Snapshot,
+        resolver: &R,
+    ) -> Result<Constellation>
+    where
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let constellation = self.read_base_at_snapshot(id, snapshot)?;
+        let slot_ids = constellation.slots.keys().copied().collect::<Vec<_>>();
+        self.hydrate_slots_at_snapshot_resolved(id, snapshot, constellation, slot_ids, resolver)
     }
 
     /// Reads one stored constellation through an already-pinned snapshot lease,
@@ -43,6 +254,54 @@ where
         self.hydrate_slots_at_snapshot(id, snapshot, constellation, slot_ids)
     }
 
+    /// Reads caller-selected slots at `snapshot` through an explicit slot
+    /// interpretation owner, pinning and releasing the MVCC lease internally.
+    pub fn get_selected_slots_resolved_at<I, R>(
+        &self,
+        id: CxId,
+        snapshot: Seq,
+        selected_slots: I,
+        resolver: &R,
+    ) -> Result<Constellation>
+    where
+        I: IntoIterator<Item = SlotId>,
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let snapshot = self.snapshot_handle(snapshot);
+        self.get_selected_slots_at_snapshot_resolved(
+            id,
+            snapshot.snapshot(),
+            selected_slots,
+            resolver,
+        )
+    }
+
+    /// Hydrates only caller-selected slots through an explicit interpretation
+    /// owner. A selected slot absent from the Base row is stale derived state.
+    pub fn get_selected_slots_at_snapshot_resolved<I, R>(
+        &self,
+        id: CxId,
+        snapshot: Snapshot,
+        selected_slots: I,
+        resolver: &R,
+    ) -> Result<Constellation>
+    where
+        I: IntoIterator<Item = SlotId>,
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let constellation = self.read_base_at_snapshot(id, snapshot)?;
+        let available_slots = constellation.slots.keys().copied().collect::<BTreeSet<_>>();
+        let slot_ids = selected_slots.into_iter().collect::<BTreeSet<_>>();
+        for slot in &slot_ids {
+            if !available_slots.contains(slot) {
+                return Err(CalyxError::stale_derived(format!(
+                    "selected slot {slot} is absent from Base row for {id}"
+                )));
+            }
+        }
+        self.hydrate_slots_at_snapshot_resolved(id, snapshot, constellation, slot_ids, resolver)
+    }
+
     fn hydrate_slots_at_snapshot<I>(
         &self,
         id: CxId,
@@ -67,15 +326,35 @@ where
         for (slot, value) in slot_ids.into_iter().zip(values) {
             let value =
                 value.ok_or_else(|| CalyxError::aster_corrupt_shard("slot CF row missing"))?;
-            let vector = match encode::decode_slot_vector(&value) {
-                Ok(vector) => vector,
-                Err(error) if value.first().copied() == Some(COMPRESSED_SLOT_TAG) => {
-                    return Err(CalyxError::aster_corrupt_shard(format!(
-                        "AsterVault::get_at_snapshot encountered compressed slot CF row for slot {slot}; use a compression-aware read path instead of raw sidecar fallback ({error})"
-                    )));
-                }
-                Err(error) => return Err(error),
-            };
+            let vector = decode_strict_raw_slot_value(slot, id, &value)?;
+            slots.insert(slot, vector);
+        }
+        constellation.slots = slots;
+        Ok(constellation)
+    }
+
+    fn hydrate_slots_at_snapshot_resolved<I, R>(
+        &self,
+        id: CxId,
+        snapshot: Snapshot,
+        mut constellation: Constellation,
+        slot_ids: I,
+        resolver: &R,
+    ) -> Result<Constellation>
+    where
+        I: IntoIterator<Item = SlotId>,
+        R: SlotVectorResolver<C> + ?Sized,
+    {
+        let slot_ids = slot_ids.into_iter().collect::<Vec<_>>();
+        if slot_ids.is_empty() {
+            constellation.slots.clear();
+            return Ok(constellation);
+        }
+        let mut slots = BTreeMap::new();
+        for slot in slot_ids {
+            let vector = resolver
+                .resolve_slot_vector_at(self, snapshot.seq(), id, slot)?
+                .ok_or_else(|| CalyxError::aster_corrupt_shard("slot CF row missing"))?;
             slots.insert(slot, vector);
         }
         constellation.slots = slots;
@@ -84,6 +363,14 @@ where
 
     /// Reads the Base CF row only, preserving metadata, anchors, and stored
     /// provenance without hydrating slot vectors.
+    pub fn get_base_at(&self, id: CxId, snapshot: Seq) -> Result<Constellation> {
+        let snapshot = self.snapshot_handle(snapshot);
+        self.get_base_at_snapshot(id, snapshot.snapshot())
+    }
+
+    /// Reads the Base CF row only through an already-pinned snapshot lease,
+    /// preserving metadata, anchors, and stored provenance without hydrating
+    /// slot vectors.
     pub fn get_base_at_snapshot(&self, id: CxId, snapshot: Snapshot) -> Result<Constellation> {
         let mut constellation = self.read_base_at_snapshot(id, snapshot)?;
         constellation.slots.clear();
@@ -95,7 +382,14 @@ where
             .rows
             .read_at(snapshot, ColumnFamily::Base, &base_key(id), &self.clock)?
             .ok_or_else(|| CalyxError::stale_derived("constellation missing at snapshot"))?;
-        encode::decode_constellation_base(&base)
+        let constellation = encode::decode_constellation_base(&base)?;
+        if constellation.cx_id != id {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "Base key {id} differs from embedded CxId {}",
+                constellation.cx_id
+            )));
+        }
+        Ok(constellation)
     }
 }
 
@@ -143,10 +437,11 @@ where
                 if existing == base_bytes {
                     return Ok(id);
                 }
-                let mut merged = self.get_at_snapshot(id, snapshot.snapshot())?;
-                let added = anchor_merge::merge_duplicate_anchors(&mut merged, &constellation)?;
+                let mut merged = encode::BaseRecord::decode_for_key(id, &existing)?;
+                let added =
+                    anchor_merge::merge_duplicate_anchors_base(&mut merged, &constellation)?;
                 if !added.is_empty() {
-                    let rows = anchor_merge::stage_anchor_merge_rows(id, &merged, &added)?;
+                    let rows = anchor_merge::stage_anchor_merge_base_rows(id, &merged, &added)?;
                     self.commit_rows_locked(&rows)?;
                 }
                 return Ok(id);
@@ -236,15 +531,23 @@ where
         anchor.validate_schema()?;
         self.with_recurrence_write_lock(|| {
             let latest = self.snapshot();
-            let mut constellation = self.get(id, latest)?;
-            constellation.anchors.push(anchor.clone());
-            constellation.flags.ungrounded = constellation.anchors.is_empty();
-            let rows = [
-                (
+            let snapshot = self.snapshot_handle(latest);
+            let base = self
+                .rows
+                .read_at(
+                    snapshot.snapshot(),
                     ColumnFamily::Base,
-                    base_key(id),
-                    encode::encode_constellation_base(&constellation)?,
-                ),
+                    &base_key(id),
+                    &self.clock,
+                )?
+                .ok_or_else(|| CalyxError::stale_derived("constellation missing at snapshot"))?;
+            let mut record = encode::BaseRecord::decode_for_key(id, &base)?;
+            record.anchors_mut().push(anchor.clone());
+            let ungrounded = record.constellation().anchors.is_empty();
+            record.flags_mut().ungrounded = ungrounded;
+            record.constellation().validate_schema()?;
+            let rows = [
+                (ColumnFamily::Base, base_key(id), record.encode()?),
                 (
                     ColumnFamily::Anchors,
                     anchor_key(id, &anchor.kind),

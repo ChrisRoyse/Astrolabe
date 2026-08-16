@@ -144,6 +144,9 @@ fn run_weave_loom(args: WeaveLoomArgs) -> CliResult {
     progress.write("running", "coverage_preflight_start", json!({}))?;
     let scan = match coverage::scan_dense_slot_coverage(
         &resolved.path,
+        resolved.vault_id,
+        vault_salt(resolved.vault_id, &resolved.name),
+        &state,
         &content_slots,
         requested_slot,
         args.limit,

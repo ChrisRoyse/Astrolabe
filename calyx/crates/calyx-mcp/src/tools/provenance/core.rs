@@ -5,12 +5,12 @@ use std::str::FromStr;
 
 use calyx_aster::ledger_view::AsterLedgerCfStore;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{Anchor, AnchorKind, CalyxError, CxId, SlotId, SlotVector, VaultStore};
+use calyx_core::{Anchor, AnchorKind, CalyxError, CxId, SlotId, SlotVector};
 use calyx_ledger::{
     EntryKind, LedgerCfStore, LedgerEntry, REPRODUCE_PAYLOAD_TAG, SubjectId, VerifyResult, decode,
     get_answer_trace, get_provenance, verify_chain,
 };
-use calyx_registry::load_vault_panel_state;
+use calyx_registry::{load_vault_panel_state, resolved_constellation_read_cfs};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -141,14 +141,28 @@ pub(super) fn lineage_for_resolved(
     resolved: &ResolvedVault,
     cx_id: CxId,
 ) -> ToolResult<LineageOut> {
-    let vault = open_vault(resolved)?;
-    let stored = vault.get(cx_id, vault.snapshot()).map_err(|error| {
-        if error.code == "CALYX_STALE_DERIVED" {
-            CalyxError::vault_access_denied(format!("cx_id {cx_id} does not exist in vault"))
-        } else {
-            error
-        }
-    })?;
+    let state = load_vault_panel_state(&resolved.path)?;
+    let vault = AsterVault::open(
+        &resolved.path,
+        resolved.vault_id,
+        vault_salt(resolved.vault_id, &resolved.name),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(resolved_constellation_read_cfs(&state.panel)),
+            ..VaultOptions::default()
+        },
+    )?;
+    let stored = vault
+        .get_resolved_at(cx_id, vault.latest_seq(), &state)
+        .map_err(|error| {
+            if error.code == "CALYX_STALE_DERIVED" {
+                CalyxError::vault_access_denied(format!("cx_id {cx_id} does not exist in vault"))
+            } else {
+                error
+            }
+        })?;
     let store = AsterLedgerCfStore::open(&resolved.path)?;
     let entries = get_provenance(&store, &NoQuarantine, cx_id)?;
     verify_current_base_ref(
@@ -158,7 +172,6 @@ pub(super) fn lineage_for_resolved(
         &entries,
     )?;
     let ingest = ingest_entry(cx_id, &entries)?;
-    let state = load_vault_panel_state(&resolved.path)?;
     let lens_measures = state
         .panel
         .slots

@@ -174,6 +174,29 @@ where
 
 pub(crate) fn build_append<C>(
     vault: &AsterVault<C>,
+    base: Constellation,
+    t_k: EpochSecs,
+    context: OccurrenceContext,
+    observed_at: EpochSecs,
+    retention: RetentionPolicy,
+) -> Result<RecurrenceAppend>
+where
+    C: Clock,
+{
+    build_append_at(
+        vault,
+        vault.snapshot(),
+        base,
+        t_k,
+        context,
+        observed_at,
+        retention,
+    )
+}
+
+pub(crate) fn build_append_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: calyx_core::Seq,
     mut base: Constellation,
     t_k: EpochSecs,
     context: OccurrenceContext,
@@ -186,7 +209,7 @@ where
     retention.validate()?;
     t_k.to_u64()?;
     observed_at.to_u64()?;
-    let existing = read_rows(vault, base.cx_id)?;
+    let existing = read_rows_at(vault, snapshot, base.cx_id)?;
     let frequency = frequency_from_base(&base)?
         .unwrap_or(0)
         .max(existing.total_count());
@@ -304,11 +327,27 @@ fn read_base<C: Clock>(vault: &AsterVault<C>, cx_id: CxId) -> Result<Option<Cons
 }
 
 fn read_rows<C: Clock>(vault: &AsterVault<C>, cx_id: CxId) -> Result<SeriesRows> {
-    Ok(read_rows_with_stats(vault, cx_id)?.0)
+    read_rows_at(vault, vault.snapshot(), cx_id)
+}
+
+fn read_rows_at<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: calyx_core::Seq,
+    cx_id: CxId,
+) -> Result<SeriesRows> {
+    Ok(read_rows_with_stats_at(vault, snapshot, cx_id)?.0)
 }
 
 fn read_rows_with_stats<C: Clock>(
     vault: &AsterVault<C>,
+    cx_id: CxId,
+) -> Result<(SeriesRows, RecurrenceReadStats)> {
+    read_rows_with_stats_at(vault, vault.snapshot(), cx_id)
+}
+
+fn read_rows_with_stats_at<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: calyx_core::Seq,
     cx_id: CxId,
 ) -> Result<(SeriesRows, RecurrenceReadStats)> {
     let range = recurrence_prefix_range(cx_id);
@@ -316,7 +355,7 @@ fn read_rows_with_stats<C: Clock>(
     let mut rollup_summary = None;
     let mut has_tombstone = false;
     let mut stats = RecurrenceReadStats::default();
-    let rows = vault.scan_cf_range_at(vault.snapshot(), ColumnFamily::Recurrence, &range)?;
+    let rows = vault.scan_cf_range_at(snapshot, ColumnFamily::Recurrence, &range)?;
     stats.range_scan_rows = rows.len();
     for (_, value) in rows {
         stats.decoded_rows += 1;

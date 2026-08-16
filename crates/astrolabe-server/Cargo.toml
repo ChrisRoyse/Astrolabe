@@ -27,6 +27,7 @@ calyx-aster.workspace = true
 calyx-assay.workspace = true
 calyx-core.workspace = true
 calyx-ledger.workspace = true
+calyx-registry.workspace = true
 cbm-sys.workspace = true
 blake3 = "1"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
@@ -66,4 +67,8 @@ required-features = ["manual-fsv"]
 
 [[example]]
 name = "issue_1134_causal_numeric_fsv"
+required-features = ["manual-fsv"]
+
+[[example]]
+name = "issue_557_564_compression_mcp_fsv"
 required-features = ["manual-fsv"]

@@ -51,8 +51,8 @@ impl Tool for AbundanceTool {
 
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: VaultArgs = decode("calyx.abundance", params)?;
-        let ctx = core::load_context(&args.vault)?;
-        let docs = core::load_docs(&ctx.vault)?;
+        let ctx = core::load_read_context(&args.vault, [])?;
+        let docs = core::load_docs_resolved(&ctx)?;
         let slots = core::active_slot_ids(&ctx.state.panel);
         Ok(json!(metrics::abundance(&docs, &slots)))
     }
@@ -79,7 +79,7 @@ impl Tool for BitsTool {
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: BitsArgs = decode("calyx.bits", params)?;
         let ctx = core::load_context(&args.vault)?;
-        let docs = core::load_docs(&ctx.vault)?;
+        let docs = core::load_docs_resolved(&ctx)?;
         let anchor = core::parse_anchor(&args.anchor)?;
         let label = core::anchor_label(&anchor);
         let key = model::assay_key(&label);
@@ -122,7 +122,7 @@ impl Tool for KernelTool {
     fn call(&self, params: Value) -> ToolResult<Value> {
         let args: KernelArgs = decode("calyx.kernel", params)?;
         let ctx = core::load_context(&args.vault)?;
-        let docs = core::load_docs(&ctx.vault)?;
+        let docs = core::load_docs_resolved(&ctx)?;
         let anchor = args.anchor.as_deref().map(core::parse_anchor).transpose()?;
         let label = anchor.as_ref().map(core::anchor_label);
         let key = model::kernel_key(label.as_deref());

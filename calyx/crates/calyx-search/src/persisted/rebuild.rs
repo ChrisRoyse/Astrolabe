@@ -1,8 +1,7 @@
-use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::Snapshot;
-use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
-use calyx_core::{CalyxError, CxId, SlotId};
-use rayon::prelude::*;
+use calyx_aster::vault::{SlotVectorResolver, StrictRawSlotResolver};
+use calyx_core::{CxId, SlotId, SystemClock};
+use calyx_registry::VaultPanelState;
 
 use super::*;
 
@@ -66,7 +65,18 @@ impl<'a> RebuildProgress<'a> {
 }
 
 pub fn rebuild_for_vault(vault_dir: &Path, vault: &AsterVault) -> CliResult {
-    rebuild_for_vault_with_progress(vault_dir, vault, |_| {})
+    rebuild_for_vault_with_resolver(vault_dir, vault, &StrictRawSlotResolver, |_| Ok(()))
+}
+
+/// Rebuilds persistent search indexes through the exact persisted panel and
+/// registry interpretation. Compressed generations are decoded only after the
+/// Registry whole-column primary/proof/Assay serving audit succeeds.
+pub fn rebuild_for_vault_resolved(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &VaultPanelState,
+) -> CliResult {
+    rebuild_for_vault_with_resolver(vault_dir, vault, state, |_| Ok(()))
 }
 
 pub fn rebuild_for_vault_with_progress<F>(
@@ -77,7 +87,23 @@ pub fn rebuild_for_vault_with_progress<F>(
 where
     F: FnMut(RebuildProgress<'_>) + Send,
 {
-    rebuild_for_vault_with_fallible_progress(vault_dir, vault, |event| {
+    rebuild_for_vault_with_resolver(vault_dir, vault, &StrictRawSlotResolver, |event| {
+        progress(event);
+        Ok(())
+    })
+}
+
+/// Progress-reporting variant of [`rebuild_for_vault_resolved`].
+pub fn rebuild_for_vault_with_progress_resolved<F>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    mut progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) + Send,
+{
+    rebuild_for_vault_with_resolver(vault_dir, vault, state, |event| {
         progress(event);
         Ok(())
     })
@@ -91,7 +117,33 @@ pub fn rebuild_for_vault_with_fallible_progress<F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
-    super::rebuild_stream::rebuild_for_vault_with_progress(vault_dir, vault, progress)
+    rebuild_for_vault_with_resolver(vault_dir, vault, &StrictRawSlotResolver, progress)
+}
+
+/// Fallible progress-reporting variant of [`rebuild_for_vault_resolved`].
+pub fn rebuild_for_vault_with_fallible_progress_resolved<F>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    state: &VaultPanelState,
+    progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
+    rebuild_for_vault_with_resolver(vault_dir, vault, state, progress)
+}
+
+fn rebuild_for_vault_with_resolver<F, R>(
+    vault_dir: &Path,
+    vault: &AsterVault,
+    resolver: &R,
+    progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+    R: SlotVectorResolver<SystemClock> + Sync + ?Sized,
+{
+    super::rebuild_stream::rebuild_for_vault_with_progress(vault_dir, vault, resolver, progress)
 }
 
 pub(super) fn previous_manifest(vault_dir: &Path) -> CliResult<Option<SearchIndexManifest>> {
@@ -117,39 +169,46 @@ pub(super) fn previous_manifest(vault_dir: &Path) -> CliResult<Option<SearchInde
 }
 
 pub fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
+    load_docs_with_resolver(vault, &StrictRawSlotResolver)
+}
+
+/// Loads the complete visible corpus through the exact persisted panel and
+/// registry interpretation.
+pub fn load_docs_resolved(
+    vault: &AsterVault,
+    state: &VaultPanelState,
+) -> CliResult<BTreeMap<CxId, Constellation>> {
+    load_docs_with_resolver(vault, state)
+}
+
+fn load_docs_with_resolver<R>(
+    vault: &AsterVault,
+    resolver: &R,
+) -> CliResult<BTreeMap<CxId, Constellation>>
+where
+    R: SlotVectorResolver<SystemClock> + ?Sized,
+{
     let snapshot = vault.pin_reader(
         calyx_aster::mvcc::Freshness::FreshDerived,
         calyx_aster::knobs::SNAPSHOT_PIN_SESSION_STALL_WINDOW_MS.default,
     );
     let _guard = PinnedReadGuard::new(vault, snapshot);
-    load_docs_at(vault, _guard.snapshot())
+    load_docs_at_with_resolver(vault, _guard.snapshot(), resolver)
 }
 
-pub fn load_docs_at(
+fn load_docs_at_with_resolver<R>(
     vault: &AsterVault,
     snapshot: Snapshot,
-) -> CliResult<BTreeMap<CxId, Constellation>> {
-    let base_rows = vault.scan_cf_snapshot(snapshot, ColumnFamily::Base)?;
-    let decoded_base = base_rows
-        .into_par_iter()
-        .map(|(key, bytes)| {
-            let cx_id = cx_id_from_cf_key(&key, "base CF")?;
-            let cx = decode_constellation_base(&bytes)?;
-            if cx.cx_id != cx_id {
-                return Err(CalyxError::aster_corrupt_shard(format!(
-                    "base CF key {cx_id} contains constellation {}",
-                    cx.cx_id
-                )));
-            }
-            Ok((cx_id, cx))
-        })
-        .collect::<calyx_core::Result<Vec<_>>>()?;
-    let mut docs = decoded_base.into_iter().collect::<BTreeMap<_, _>>();
-    let slots = indexed_slots(&docs);
-    for slot in slots {
-        load_slot_rows(vault, snapshot, slot, &mut docs)?;
-    }
-    Ok(docs)
+    resolver: &R,
+) -> CliResult<BTreeMap<CxId, Constellation>>
+where
+    R: SlotVectorResolver<SystemClock> + ?Sized,
+{
+    Ok(vault
+        .load_constellations_resolved_at(snapshot.seq(), resolver)?
+        .into_iter()
+        .map(|constellation| (constellation.cx_id, constellation))
+        .collect())
 }
 
 struct PinnedReadGuard<'a> {
@@ -171,67 +230,6 @@ impl Drop for PinnedReadGuard<'_> {
     fn drop(&mut self) {
         let _ = self.vault.release_reader(self.snapshot.lease().id());
     }
-}
-
-fn indexed_slots(docs: &BTreeMap<CxId, Constellation>) -> Vec<SlotId> {
-    let mut slots = docs
-        .values()
-        .flat_map(|cx| cx.slots.keys().copied())
-        .collect::<Vec<_>>();
-    slots.sort();
-    slots.dedup();
-    slots
-}
-
-fn load_slot_rows(
-    vault: &AsterVault,
-    snapshot: Snapshot,
-    slot: SlotId,
-    docs: &mut BTreeMap<CxId, Constellation>,
-) -> CliResult {
-    let expected = docs
-        .iter()
-        .filter_map(|(cx_id, cx)| cx.slots.contains_key(&slot).then_some(*cx_id))
-        .collect::<std::collections::BTreeSet<_>>();
-    let rows = vault.scan_cf_snapshot(snapshot, ColumnFamily::slot(slot))?;
-    let decoded = rows
-        .into_par_iter()
-        .map(|(key, bytes)| {
-            let cx_id = cx_id_from_cf_key(&key, "slot CF")?;
-            let vector = decode_slot_vector(&bytes)?;
-            Ok((cx_id, vector))
-        })
-        .collect::<calyx_core::Result<Vec<_>>>()?;
-    let mut found = std::collections::BTreeSet::new();
-    for (cx_id, vector) in decoded {
-        if !expected.contains(&cx_id) {
-            continue;
-        }
-        let Some(cx) = docs.get_mut(&cx_id) else {
-            continue;
-        };
-        cx.slots.insert(slot, vector);
-        found.insert(cx_id);
-    }
-    if found.len() != expected.len() {
-        let missing = expected
-            .difference(&found)
-            .next()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "<unknown>".to_string());
-        return Err(CalyxError::aster_corrupt_shard(format!(
-            "slot CF row missing for slot {slot} cx_id {missing}"
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-fn cx_id_from_cf_key(key: &[u8], cf_name: &str) -> calyx_core::Result<CxId> {
-    let bytes: [u8; 16] = key.try_into().map_err(|_| {
-        CalyxError::vault_access_denied(format!("{cf_name} key has {} bytes", key.len()))
-    })?;
-    Ok(CxId::from_bytes(bytes))
 }
 
 pub(super) fn prune_stale_index_artifacts(

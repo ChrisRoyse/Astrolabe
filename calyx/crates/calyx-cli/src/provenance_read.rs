@@ -150,6 +150,69 @@ impl VaultReadContext {
         Ok(ProvenanceReadBatch { rows, stats })
     }
 
+    /// Reads the current visible value of each exact key without consulting
+    /// the original Ledger-provenance commit. This is the required path for
+    /// mutable CF keys: a compression create/reseal rewrites an existing slot
+    /// key in a later commit while the Base row retains its original Ledger
+    /// provenance sequence. Resolving that original commit would return the
+    /// pre-compression value. The complete immutable level is consulted with
+    /// key-range/bloom pruning, then the current WAL tail is overlaid.
+    pub(crate) fn latest_cf_rows_for_current_state(
+        &mut self,
+        cf: ColumnFamily,
+        keys: &[Vec<u8>],
+    ) -> CliResult<ProvenanceReadBatch> {
+        let mut rows = keys
+            .iter()
+            .map(|key| (key.clone(), None))
+            .collect::<BTreeMap<Vec<u8>, Option<ResolvedRow>>>();
+        if rows.is_empty() {
+            return Ok(ProvenanceReadBatch {
+                rows,
+                stats: ProvenanceReadStats::default(),
+            });
+        }
+        self.read_current_from_full_level(&cf, &mut rows)?;
+        self.overlay_wal_tail(&cf, &mut rows)?;
+
+        let mut stats = ProvenanceReadStats::default();
+        for row in rows.values() {
+            stats.record(row.as_ref());
+        }
+        self.totals.accumulate(stats);
+        Ok(ProvenanceReadBatch { rows, stats })
+    }
+
+    /// Resolves a current-state key plan newest-first while opening each SST at
+    /// most once for the complete plan. The reader's key range, bloom filter,
+    /// and sparse index reject non-candidate files/keys without materializing
+    /// the column.
+    fn read_current_from_full_level(
+        &mut self,
+        cf: &ColumnFamily,
+        rows: &mut BTreeMap<Vec<u8>, Option<ResolvedRow>>,
+    ) -> CliResult {
+        let paths = self
+            .cf_listing(cf)?
+            .files
+            .iter()
+            .rev()
+            .map(|(_, _, path)| path.clone())
+            .collect::<Vec<_>>();
+        for path in paths {
+            let reader = SstReader::open(&path)?;
+            for (key, row) in rows.iter_mut().filter(|(_, row)| row.is_none()) {
+                if let Some(value) = reader.get(key)? {
+                    *row = Some(ResolvedRow {
+                        value,
+                        source: RowSource::FullSet,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Stage 1: resolve provenance seqs to commit seqs through the ledger
     /// provenance index and read each key from its own commit batch SST(s).
     ///

@@ -9,6 +9,8 @@ mod janitor;
 pub(crate) use janitor::*;
 mod profiles;
 pub(crate) use profiles::*;
+mod compression_admission;
+pub(crate) use compression_admission::*;
 mod ledger;
 pub(crate) use ledger::*;
 pub(crate) const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
@@ -18,6 +20,8 @@ pub(crate) const OPTIMIZER_GUARD_HEALTH_SCHEMA: &str = "astrolabe.optimizer_guar
 pub(crate) const OPTIMIZER_TRIPWIRES_SCHEMA: &str = "astrolabe.optimizer_tripwires.v1";
 pub(crate) const OPTIMIZER_PROPOSALS_SCHEMA: &str = "astrolabe.optimizer_proposals.v1";
 pub(crate) const OPTIMIZER_DEFICITS_SCHEMA: &str = "astrolabe.optimizer_deficits.v1";
+pub(crate) const OPTIMIZER_COMPRESSION_ADMISSION_SCHEMA: &str =
+    "astrolabe.optimizer_compression_admission.v1";
 pub(crate) const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 pub(crate) const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
 pub(crate) const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
@@ -51,6 +55,8 @@ pub(crate) fn optimizer_status_json_at(
     let frozen_knobs = optimizer_freeze_status_json(cache_dir, project, global_freeze)?;
     let recent_changes = optimizer_recent_changes_json(cache_dir, project);
     let reactive_triggers = optimizer_reactive_triggers_json(cache_dir, project);
+    let compression_admission =
+        optimizer_compression_admission_json_at(cache_dir, project, &verify_status)?;
     let drift_alarms = optimizer_drift_alarms_json(cache_dir, project);
     let janitor = optimizer_janitor_status_json_at(
         cache_dir,
@@ -96,6 +102,7 @@ pub(crate) fn optimizer_status_json_at(
         "commit_ood": commit_ood_reviews_section(cache_dir, project),
         "drift_alarms": drift_alarms,
         "reactive_triggers": reactive_triggers,
+        "compression_admission": compression_admission,
         "capabilities": {
             "status": "enabled",
             "propose": "enabled_from_measured_deficits_to_persisted_queue",
@@ -105,6 +112,25 @@ pub(crate) fn optimizer_status_json_at(
                 "source": "AsterVault:ColumnFamily::Ledger+Reactive",
             },
             "loom_trigger_ack": "enabled_durable_ledger_action",
+            "compression_admission_read": {
+                "status": "enabled",
+                "provider": "calyx-registry",
+                "source": "AsterVault:ColumnFamily::Compression Registry pointer/receipt point reads",
+                "selected_column_families": ["compression", "ledger"],
+                "receipt_publication_ledger_binding": "not_exposed_by_registry_point_read",
+            },
+            "compression_candidate_commission": {
+                "status": "enabled_explicit_mutation",
+                "provider": "calyx-registry",
+                "mode": "commission_compression_candidates",
+                "source": "registered raw candidate slots -> all-slot preflight -> timed durable builds -> persisted evaluations -> independently recomputed selection -> selected current pointer",
+            },
+            "compression_candidate_selection_replay": {
+                "status": "enabled_explicit_mutation",
+                "provider": "calyx-registry",
+                "mode": "select_compression_candidates",
+                "source": "explicit immutable source receipts -> independent candidate-set recomputation -> idempotent selected current pointer",
+            },
             "janitor": "enabled_budgeted_tick",
         },
     }))

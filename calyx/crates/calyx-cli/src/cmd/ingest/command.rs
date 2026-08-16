@@ -292,6 +292,7 @@ fn ingest_command(args: IngestArgs) -> CliResult {
 fn anchor_command(args: AnchorArgs) -> CliResult {
     let resolved = resolve_cli_vault(&args.vault)?;
     let vault = open_vault(&resolved)?;
+    let state = load_vault_panel_state(&resolved.path)?;
     let cx_id = args
         .cx_id
         .parse::<CxId>()
@@ -316,7 +317,7 @@ fn anchor_command(args: AnchorArgs) -> CliResult {
     )?;
     let ledger_seq = append_anchor_ledger(&vault, cx_id, &kind, anchor)?;
     vault.flush()?;
-    rebuild_persistent_indexes(&resolved.path, &vault)?;
+    rebuild_persistent_indexes(&resolved.path, &vault, &state)?;
     print_json(&AnchorReport {
         status: "anchored",
         cx_id: cx_id.to_string(),
@@ -504,7 +505,7 @@ fn ingest_prepared_inputs(
     // FSV in the write path (#446): the persisted input bytes are read back
     // through the fail-closed store reader and byte-compared before reporting.
     verify_persisted_inputs(&vault, &staged_inputs)?;
-    rebuild_persistent_indexes(&resolved.path, &vault)?;
+    rebuild_persistent_indexes(&resolved.path, &vault, &state)?;
     let snapshot = vault.snapshot();
     let mut reports = Vec::with_capacity(prepared.len());
     for (cx_id, new) in prepared {

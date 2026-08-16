@@ -18,10 +18,12 @@
 //! - **S7 lexical text** — the symbol identifier (`CbmGraphNode::name`), split
 //!   into BM25 tokens at build time by
 //!   [`split_identifier_tokens`](crate::search_index::split_identifier_tokens).
-//! - **Vector slots** — the dense [`SlotVector`]s the panel runtime persisted at
-//!   `ColumnFamily::slot(slot)` under [`slot_key`], read back and decoded with
-//!   [`decode_slot_vector`]. Structural nodes (no constellation, no slots) are
-//!   excluded exactly as the shadow weave planner excludes them.
+//! - **Vector slots** — the [`SlotVector`]s the panel runtime persisted at
+//!   `ColumnFamily::slot(slot)`. Raw generations use Aster's strict raw
+//!   decoder; compressed generations are reconstructed only by a
+//!   Registry [`calyx_registry::CompressedSlotIndex`] bound to the exact
+//!   persisted panel/lens state. Structural nodes (no constellation, no slots)
+//!   are excluded exactly as the shadow weave planner excludes them.
 //!
 //! Fail-closed contract (no silent fallback, standing invariant #3):
 //! - a corrupt/undecodable slot row or graph read is a coded refusal, never a
@@ -33,14 +35,16 @@
 //!   sequence fail-closes [`ASTRO_SEARCH_PRODUCTION_STALE`] rather than serving
 //!   a stale index (the fused planner must never rank against a stale corpus).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use astrolabe_ingest::read_cbm_graph_snapshot;
-use calyx_aster::cf::{ColumnFamily, slot_key};
-use calyx_aster::vault::AsterVault;
-use calyx_aster::vault::encode::decode_slot_vector;
-use calyx_core::{Clock, SlotId, SlotVector, SparseEntry};
+use calyx_aster::cf::{
+    COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, KeyRange, compression_manifest_key,
+};
+use calyx_aster::vault::{AsterVault, decode_strict_raw_slot_value};
+use calyx_core::{Clock, CxId, SlotId, SlotVector, SparseEntry};
+use calyx_registry::{VaultPanelState, load_vault_panel_state};
 
 use crate::search::{
     FusedResult, SLOT_API_CALLEES, SLOT_CODE_SEMANTIC, SLOT_LEXICAL_BM25, SLOT_NAME_SEMANTIC,
@@ -68,6 +72,14 @@ pub const ASTRO_SEARCH_PRODUCTION_VAULT: &str = "ASTRO_SEARCH_PRODUCTION_VAULT";
 pub const ASTRO_SEARCH_PRODUCTION_STALE: &str = "ASTRO_SEARCH_PRODUCTION_STALE";
 /// Fail-closed: manifest persistence/load I/O failed.
 pub const ASTRO_SEARCH_PRODUCTION_IO: &str = "ASTRO_SEARCH_PRODUCTION_IO";
+/// Fail-closed: a compressed generation had no exact persisted panel/registry
+/// interpretation, or that interpretation did not match the graph snapshot.
+pub const ASTRO_SEARCH_PRODUCTION_COMPRESSION_CONTEXT: &str =
+    "ASTRO_SEARCH_PRODUCTION_COMPRESSION_CONTEXT";
+/// Fail-closed: a compressed generation or one of its authenticated rows could
+/// not be read through the Registry-owned compressed-slot API.
+pub const ASTRO_SEARCH_PRODUCTION_COMPRESSION_GENERATION: &str =
+    "ASTRO_SEARCH_PRODUCTION_COMPRESSION_GENERATION";
 
 /// The vector slots a **free-text query** can actually rank against: the two
 /// semantic embedding slots (S18 code-semantic, S20 name-semantic) that the
@@ -179,6 +191,192 @@ fn vault_error(context: &str, detail: impl std::fmt::Display) -> SearchError {
     )
 }
 
+fn compression_context_error(slot: SlotId, detail: impl std::fmt::Display) -> SearchError {
+    SearchError::new(
+        ASTRO_SEARCH_PRODUCTION_COMPRESSION_CONTEXT,
+        format!("compressed slot {} context: {detail}", slot.get()),
+        "Open the exact shadow-vault root that owns this generation and restore its persisted \
+         panel and registered lens state; compressed rows are never decoded without that context.",
+    )
+}
+
+fn compression_generation_error(
+    slot: SlotId,
+    context: &str,
+    error: calyx_core::CalyxError,
+) -> SearchError {
+    SearchError::new(
+        ASTRO_SEARCH_PRODUCTION_COMPRESSION_GENERATION,
+        format!(
+            "compressed slot {} {context}: {}: {}; registry remediation: {}",
+            slot.get(),
+            error.code,
+            error.message,
+            error.remediation
+        ),
+        "Inspect the persisted compression manifest, primary rows, membership proofs, Assay \
+         attestations, and registered lens state, then rebuild the exact generation if any differ.",
+    )
+}
+
+fn slot_row_cx_id(slot: SlotId, key: &[u8]) -> Result<CxId, SearchError> {
+    let bytes: [u8; 16] = key.try_into().map_err(|_| {
+        SearchError::new(
+            ASTRO_SEARCH_PRODUCTION_COMPRESSION_GENERATION,
+            format!(
+                "slot {} contains a row key with length {}; expected one 16-byte CxId",
+                slot.get(),
+                key.len()
+            ),
+            "Inspect and rebuild the slot generation; every primary slot row must be keyed by \
+             exactly one canonical CxId.",
+        )
+    })?;
+    Ok(CxId::from_bytes(bytes))
+}
+
+fn load_slot_rows<C>(
+    vault: &AsterVault<C>,
+    at_seq: u64,
+    slot: SlotId,
+    vault_panel_root: Option<&Path>,
+    snapshot_panel_version: Option<u32>,
+    panel_state: &mut Option<VaultPanelState>,
+) -> Result<BTreeMap<CxId, SlotVector>, SearchError>
+where
+    C: Clock,
+{
+    let manifest_present = vault
+        .read_cf_at(
+            at_seq,
+            ColumnFamily::Compression,
+            &compression_manifest_key(slot),
+        )
+        .map_err(|error| vault_error(&format!("slot {} compression manifest", slot.get()), error))?
+        .is_some();
+
+    // A raw generation needs one canonical column scan. Besides avoiding an
+    // N-symbol point-read loop, this lets a compressed tag without its manifest
+    // cross the same Registry refusal boundary instead of reaching Aster decode.
+    let raw_rows = if manifest_present {
+        None
+    } else {
+        Some(
+            vault
+                .scan_cf_at(at_seq, ColumnFamily::slot(slot))
+                .map_err(|error| vault_error(&format!("slot {} column scan", slot.get()), error))?,
+        )
+    };
+    let compressed_tag_present = raw_rows.as_ref().is_some_and(|rows| {
+        rows.iter()
+            .any(|(_, value)| value.first().copied() == Some(COMPRESSED_SLOT_VALUE_TAG))
+    });
+
+    if manifest_present || compressed_tag_present {
+        if panel_state.is_none() {
+            let root = vault_panel_root.ok_or_else(|| {
+                compression_context_error(
+                    slot,
+                    "the generation is compressed but no exact shadow-vault root was supplied",
+                )
+            })?;
+            *panel_state = Some(load_vault_panel_state(root).map_err(|error| {
+                compression_context_error(
+                    slot,
+                    format!(
+                        "load persisted VaultPanelState from {}: {}: {}; remediation: {}",
+                        root.display(),
+                        error.code,
+                        error.message,
+                        error.remediation
+                    ),
+                )
+            })?);
+        }
+        let state = panel_state.as_ref().ok_or_else(|| {
+            compression_context_error(slot, "persisted VaultPanelState was not retained")
+        })?;
+        if snapshot_panel_version != Some(state.panel.version) {
+            return Err(compression_context_error(
+                slot,
+                format!(
+                    "graph snapshot panel_version {:?} does not equal persisted panel version {}",
+                    snapshot_panel_version, state.panel.version
+                ),
+            ));
+        }
+        let mut matching_slots = state
+            .panel
+            .slots
+            .iter()
+            .filter(|registered| registered.slot_id == slot);
+        let registered_slot = matching_slots.next().ok_or_else(|| {
+            compression_context_error(
+                slot,
+                format!(
+                    "persisted panel version {} does not register the requested slot",
+                    state.panel.version
+                ),
+            )
+        })?;
+        if matching_slots.next().is_some() {
+            return Err(compression_context_error(
+                slot,
+                format!(
+                    "persisted panel version {} registers the slot more than once",
+                    state.panel.version
+                ),
+            ));
+        }
+        let index = state
+            .registry
+            .compressed_slot_index(vault, registered_slot)
+            .map_err(|error| compression_generation_error(slot, "open", error))?;
+
+        let keys = match raw_rows.as_ref() {
+            Some(rows) => rows.iter().map(|(key, _)| key.clone()).collect(),
+            None => vault
+                .scan_cf_range_keys_at(
+                    at_seq,
+                    ColumnFamily::slot(slot),
+                    &KeyRange {
+                        start: Vec::new(),
+                        end: None,
+                    },
+                )
+                .map_err(|error| {
+                    vault_error(&format!("slot {} compressed key scan", slot.get()), error)
+                })?,
+        };
+        let cx_ids = keys
+            .iter()
+            .map(|key| slot_row_cx_id(slot, key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = index
+            .read_many_at(&cx_ids, at_seq)
+            .map_err(|error| compression_generation_error(slot, "read", error))?;
+        return Ok(rows.into_iter().collect());
+    }
+
+    let mut decoded = BTreeMap::new();
+    for (key, bytes) in raw_rows.unwrap_or_default() {
+        let cx_id = slot_row_cx_id(slot, &key)?;
+        let vector = decode_strict_raw_slot_value(slot, cx_id, &bytes).map_err(|error| {
+            vault_error(
+                &format!("decode raw slot {} vector for {cx_id}", slot.get()),
+                error,
+            )
+        })?;
+        if decoded.insert(cx_id, vector).is_some() {
+            return Err(vault_error(
+                &format!("slot {} column", slot.get()),
+                format!("duplicate row for CxId {cx_id}"),
+            ));
+        }
+    }
+    Ok(decoded)
+}
+
 /// Reads the production search corpus from a persisted shadow vault.
 ///
 /// Reads the live graph snapshot (`read_cbm_graph_snapshot`) for identity + S7
@@ -193,9 +391,75 @@ pub fn read_search_corpus_from_vault<C>(
 where
     C: Clock,
 {
+    read_search_corpus_from_vault_with_panel_root(vault, project, vector_slots, None)
+}
+
+/// Reads the production corpus with an optional exact vault root from which a
+/// compressed generation may load its persisted [`VaultPanelState`]. The root
+/// is ignored for raw generations; compressed generations refuse when absent or
+/// mismatched rather than inferring a panel or consulting raw sidecars.
+pub fn read_search_corpus_from_vault_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    vector_slots: &[SlotId],
+    vault_panel_root: Option<&Path>,
+) -> Result<CorpusReadReport, SearchError>
+where
+    C: Clock,
+{
     let snapshot = read_cbm_graph_snapshot(vault, project)
         .map_err(|error| vault_error("graph snapshot", error))?;
     let at_seq = vault.latest_seq();
+
+    let mut unique_slots = BTreeSet::new();
+    for slot in vector_slots {
+        if !unique_slots.insert(*slot) {
+            return Err(SearchError::new(
+                ASTRO_SEARCH_INDEX_CORPUS,
+                format!(
+                    "requested vector slot {} appears more than once",
+                    slot.get()
+                ),
+                "Request each production vector slot exactly once.",
+            ));
+        }
+    }
+    let mut unique_graph_ids = BTreeSet::new();
+    for node in snapshot.nodes.iter().filter(|node| !node.structural) {
+        let cx_id = node.cx_id.ok_or_else(|| {
+            vault_error(
+                "graph node identity",
+                format!(
+                    "live non-structural node {:?} has no CxId",
+                    node.qualified_name
+                ),
+            )
+        })?;
+        if !unique_graph_ids.insert(cx_id) {
+            return Err(vault_error(
+                "graph node identity",
+                format!(
+                    "live non-structural node {:?} repeats CxId {cx_id}",
+                    node.qualified_name
+                ),
+            ));
+        }
+    }
+    let mut panel_state = None;
+    let mut slot_rows = BTreeMap::new();
+    for slot in vector_slots {
+        slot_rows.insert(
+            *slot,
+            load_slot_rows(
+                vault,
+                at_seq,
+                *slot,
+                vault_panel_root,
+                snapshot.panel_version,
+                &mut panel_state,
+            )?,
+        );
+    }
 
     let mut symbols = Vec::new();
     let mut symbols_total = 0usize;
@@ -209,43 +473,21 @@ where
     let mut declared_structural_slots: BTreeMap<SlotId, u32> = BTreeMap::new();
 
     for node in snapshot.nodes.into_iter().filter(|node| !node.structural) {
-        let Some(cx_id) = node.cx_id else {
-            // A live non-structural node without a CxId is a corrupt snapshot, not
-            // a skippable symbol: refuse rather than silently drop it.
-            return Err(vault_error(
+        // Prevalidated above before any slot-generation I/O.
+        let cx_id = node.cx_id.ok_or_else(|| {
+            vault_error(
                 "graph node identity",
-                format!(
-                    "live non-structural node {:?} has no CxId",
-                    node.qualified_name
-                ),
-            ));
-        };
+                "a node lost its prevalidated CxId while assembling the corpus",
+            )
+        })?;
         symbols_total += 1;
         let mut vectors: BTreeMap<SlotId, Vec<f32>> = BTreeMap::new();
         let mut sparse_vectors: BTreeMap<SlotId, SlotVector> = BTreeMap::new();
         for slot in vector_slots {
-            let Some(bytes) = vault
-                .read_cf_at(at_seq, ColumnFamily::slot(*slot), &slot_key(cx_id))
-                .map_err(|error| {
-                    vault_error(
-                        &format!("slot {} row for {:?}", slot.get(), node.qualified_name),
-                        error,
-                    )
-                })?
-            else {
+            let Some(vector) = slot_rows.get_mut(slot).and_then(|rows| rows.remove(&cx_id)) else {
                 missing_slot_rows += 1;
                 continue;
             };
-            let vector = decode_slot_vector(&bytes).map_err(|error| {
-                vault_error(
-                    &format!(
-                        "decode slot {} vector for {:?}",
-                        slot.get(),
-                        node.qualified_name
-                    ),
-                    error,
-                )
-            })?;
             match vector {
                 SlotVector::Dense { dim, data } => {
                     match declared_vector_slots.entry(*slot) {
@@ -383,7 +625,33 @@ pub fn build_search_index_manifest_from_vault<C>(
 where
     C: Clock,
 {
-    let report = read_search_corpus_from_vault(vault, project, vector_slots)?;
+    build_search_index_manifest_from_vault_with_panel_root(
+        vault,
+        project,
+        vector_slots,
+        knobs,
+        None,
+    )
+}
+
+/// End-to-end production owner with an optional exact vault root for resolving
+/// compressed slot generations through their persisted Registry state.
+pub fn build_search_index_manifest_from_vault_with_panel_root<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    vector_slots: &[SlotId],
+    knobs: IndexKnobs,
+    vault_panel_root: Option<&Path>,
+) -> Result<(SlotIndexManifest, CorpusReadReport), SearchError>
+where
+    C: Clock,
+{
+    let report = read_search_corpus_from_vault_with_panel_root(
+        vault,
+        project,
+        vector_slots,
+        vault_panel_root,
+    )?;
     let manifest = build_manifest_from_corpus(&report, knobs)?;
     Ok((manifest, report))
 }

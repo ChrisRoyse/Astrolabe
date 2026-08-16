@@ -37,7 +37,28 @@ pub(super) struct DenseSlotCoverage {
     pub absent_rows: usize,
     pub tombstoned_rows: usize,
     pub example_missing_cx_ids: Vec<String>,
-    pub read_stats: crate::provenance_read::ProvenanceReadStats,
+    pub read_stats: CoverageSlotReadStats,
+}
+
+/// Read accounting for one slot under the coverage operation's retained
+/// current-state snapshot. These counters deliberately do not mention Base
+/// ledger provenance: Ledger sequences and Aster MVCC sequences are distinct.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(super) struct CoverageSlotReadStats {
+    pub snapshot_seq: u64,
+    pub storage: Option<&'static str>,
+    pub physical_batches: u64,
+    pub physical_requested_rows: u64,
+    pub physical_rows_read_back: u64,
+    pub semantic_batches: u64,
+    pub semantic_requested_rows: u64,
+    pub semantic_resolved_rows: u64,
+    pub physical_primary_bytes: u64,
+    pub physical_source_read_operations: u64,
+    pub physical_sst_files_opened: u64,
+    pub physical_sst_key_probes: u64,
+    pub physical_sst_map_reuses: u64,
+    pub physical_max_readback_batch_bytes: u64,
 }
 
 impl DenseSlotCoverage {

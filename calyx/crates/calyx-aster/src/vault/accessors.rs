@@ -4,8 +4,9 @@
 
 use super::{AsterVault, OrderedCfRead, SstReadSession, encode};
 use crate::cf::{ColumnFamily, KeyRange};
-use crate::mvcc::{OrderedReadbackMetrics, Snapshot, SstReadGeneration};
+use crate::mvcc::{CfRead, OrderedReadbackMetrics, Snapshot, SstReadGeneration};
 use calyx_core::{Clock, Result, Seq};
+use std::path::Path;
 
 /// Pin-independent part of one ordered readback plan (#980 g25).
 ///
@@ -88,6 +89,12 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Exact durable root retained by this vault handle, or `None` for an
+    /// in-memory/router-backed vault.
+    pub fn durable_vault_root(&self) -> Option<&Path> {
+        self.durable_root.as_deref()
+    }
+
     /// Writes raw CF rows through the same WAL/MVCC commit path as vault puts.
     pub fn write_cf_batch(
         &self,
@@ -151,6 +158,25 @@ where
     ) -> Result<Option<Vec<u8>>> {
         let snapshot = self.snapshot_handle(snapshot);
         self.rows.read_at(snapshot.snapshot(), cf, key, &self.clock)
+    }
+
+    /// Reads a caller-declared raw CF plan under one scoped snapshot lease.
+    /// Results preserve the plan's exact input order.
+    pub fn read_cf_batch_at(
+        &self,
+        snapshot: Seq,
+        reads: impl IntoIterator<Item = (ColumnFamily, Vec<u8>)>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let reads = reads
+            .into_iter()
+            .map(|(cf, key)| CfRead::new(cf, key))
+            .collect::<Vec<_>>();
+        if reads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let snapshot = self.snapshot_handle(snapshot);
+        self.rows
+            .read_batch(snapshot.snapshot(), &reads, &self.clock)
     }
 
     /// Reads one raw CF row using an already-pinned snapshot lease.

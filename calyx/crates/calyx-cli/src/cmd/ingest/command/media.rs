@@ -92,7 +92,7 @@ pub(super) fn ingest_media_with_derived_text(
         artifact_draft,
     )?;
     vault.flush()?;
-    rebuild_persistent_indexes(&resolved.path, &vault)?;
+    rebuild_persistent_indexes(&resolved.path, &vault, &state)?;
 
     let snapshot = vault.snapshot();
     if media_new {
