@@ -1059,7 +1059,7 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
 
     let inputs = (0..2)
         .map(|row| dimension_input("max-d4096", row, registered.slot.slot_id, MAX_SUPPORTED_DIM))
-        .collect::<Vec<_>>();
+        .collect::<AnyResult<Vec<_>>>()?;
     let cx_ids = inputs
         .iter()
         .map(|input| vault.cx_id_for_input(&input.raw_bytes, input.panel_version))
@@ -1076,7 +1076,7 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
     )?;
     let after_ingest = slot_state(&vault, registered.slot.slot_id)?;
 
-    let query_values = dimension_values(0, MAX_SUPPORTED_DIM);
+    let query_values = dimension_query_values(MAX_SUPPORTED_DIM)?;
     let query = CompressionQuery {
         cx_id: vault.cx_id_for_input(b"issues-557-564-max-d4096-held-out", PANEL_VERSION),
         values: query_values.clone(),
@@ -1114,7 +1114,7 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
     let hits = index.search_at(&query_values, 1, generation_seq)?;
     require(
         hits.first().map(|hit| hit.cx_id) == Some(cx_ids[0]),
-        "D=4096 known one-hot query returned the wrong top-1 row",
+        "D=4096 directionally distinct mixture query returned the wrong top-1 row",
     )?;
     let after_compression = slot_state(&vault, registered.slot.slot_id)?;
     let manifest = required_row(
@@ -1214,7 +1214,7 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
                 OVER_LIMIT_DIM,
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<AnyResult<Vec<_>>>()?;
     let ingester = StreamIngester::new(Arc::clone(&vault), BackpressureGuard::new(2, 0));
     for (row, input) in inputs.into_iter().enumerate() {
         ingester.send(input, EpochSecs(30_000 + row as i64))?;
@@ -1225,7 +1225,7 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
     )?;
     let query = CompressionQuery {
         cx_id: vault.cx_id_for_input(b"issues-557-564-over-limit-held-out", PANEL_VERSION),
-        values: dimension_values(0, OVER_LIMIT_DIM),
+        values: dimension_query_values(OVER_LIMIT_DIM)?,
     };
     let before = slot_state(&vault, registered.slot.slot_id)?;
     let files_before = disk_inventory(&vault_dir)?;
@@ -1294,8 +1294,8 @@ fn persist_single_slot_panel(
     )
 }
 
-fn dimension_input(label: &str, row: usize, slot_id: SlotId, dim: u32) -> IngestInput {
-    IngestInput::new(
+fn dimension_input(label: &str, row: usize, slot_id: SlotId, dim: u32) -> AnyResult<IngestInput> {
+    Ok(IngestInput::new(
         format!("issues-557-564-{label}-row-{row}").into_bytes(),
         PANEL_VERSION,
         Modality::Text,
@@ -1304,15 +1304,30 @@ fn dimension_input(label: &str, row: usize, slot_id: SlotId, dim: u32) -> Ingest
         slot_id,
         SlotVector::Dense {
             dim,
-            data: dimension_values(row, dim),
+            data: dimension_row_values(row, dim)?,
         },
-    )
+    ))
 }
 
-fn dimension_values(row: usize, dim: u32) -> Vec<f32> {
+fn dimension_row_values(row: usize, dim: u32) -> AnyResult<Vec<f32>> {
     let mut values = vec![0.0; dim as usize];
-    values[row] = 1.0;
-    values
+    let value = values.get_mut(row).ok_or_else(|| {
+        format!("dimension fixture row {row} is outside the declared dimension {dim}")
+    })?;
+    *value = 1.0;
+    Ok(values)
+}
+
+fn dimension_query_values(dim: u32) -> AnyResult<Vec<f32>> {
+    if dim < 2 {
+        return Err(
+            "directionally distinct dimension query requires at least two dimensions".into(),
+        );
+    }
+    let mut values = vec![0.0; dim as usize];
+    values[0] = 4.0;
+    values[1] = 1.0;
+    Ok(values)
 }
 
 #[derive(Clone, Debug, Serialize)]
