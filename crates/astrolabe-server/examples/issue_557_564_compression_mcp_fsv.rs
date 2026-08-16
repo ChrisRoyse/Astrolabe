@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use astrolabe_bridge::{CbmToolRunner, initialize_cbm_host_process, set_cbm_cache_dir};
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, compression_manifest_key};
 use calyx_aster::dedup::DedupPolicy;
 use calyx_aster::manifest::ManifestStore;
 use calyx_aster::vault::{AsterVault, VaultOptions};
@@ -39,6 +39,25 @@ struct PreparedInput {
     cache_dir: PathBuf,
     slot_ids: Vec<u16>,
     candidate_request: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateLayout {
+    RawUnmanifested,
+    CompressedWithRawSidecar,
+}
+
+impl CandidateLayout {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RawUnmanifested => "raw_primary_without_sidecar",
+            Self::CompressedWithRawSidecar => "compressed_primary_with_raw_sidecar",
+        }
+    }
+
+    const fn requires_raw_sidecar(self) -> bool {
+        matches!(self, Self::CompressedWithRawSidecar)
+    }
 }
 
 struct JsonRpcExchange {
@@ -212,7 +231,7 @@ fn config_state(cache_dir: &Path) -> AnyResult<Value> {
 
 fn hash_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-issue-557-564-row-state-v1");
+    hasher.update(b"issues-557-564-cf-rows-v1");
     for (key, value) in rows {
         hasher.update((key.len() as u64).to_be_bytes());
         hasher.update(key);
@@ -235,6 +254,7 @@ fn column_state(
         .sum::<u64>();
     Ok(json!({
         "column_family": column_family.name(),
+        "physical_namespace": "present",
         "rows": rows.len(),
         "key_bytes": key_bytes,
         "value_bytes": value_bytes,
@@ -242,14 +262,45 @@ fn column_state(
     }))
 }
 
-/// #1064 PC-03/05/29/41: each reality snapshot intentionally reads `B` vault
-/// and cache file bytes plus `C + L + sum(R_i + U_i)` Compression, Ledger,
-/// candidate-primary, and raw-sidecar rows. This executable takes a fixed 15
-/// snapshots, so its audit cost is `O(15 * (B + C + L + sum(R_i + U_i)))`.
-/// Project/config identity, candidate SlotIds, and immutable Panel/Registry refs
-/// remain invariant across the sequence. The driver's eight-row fixture proves
-/// correctness only; it makes no production-N or throughput claim.
-fn physical_state(cache_dir: &Path, project: &str, slot_ids: &[u16]) -> AnyResult<Value> {
+fn absent_column_state(column_family: ColumnFamily) -> Value {
+    json!({
+        "column_family": column_family.name(),
+        "physical_namespace": "absent",
+    })
+}
+
+fn require_raw_sidecar_absent(vault_dir: &Path, slot_id: SlotId) -> AnyResult<()> {
+    let raw_cf = ColumnFamily::slot_raw(slot_id);
+    let path = vault_dir.join("cf").join(raw_cf.name());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Err(format!(
+            "ISSUE_557_564_FSV_RAW_SIDECAR_NAMESPACE_PRESENT: raw/unmanifested slot {} has a physical namespace at {}",
+            slot_id.get(),
+            path.display()
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "ISSUE_557_564_FSV_RAW_SIDECAR_NAMESPACE_INSPECTION_FAILED: inspect {}: {error}",
+            path.display()
+        )
+        .into()),
+    }
+}
+
+/// #1064 PC-02/03/04/05/09/29/41/43: every snapshot opens only Compression,
+/// Ledger, the declared primaries, and the raw sidecars required by `layout`.
+/// The first snapshot proves two sidecar namespaces absent; the remaining 14
+/// require both sidecars and read their rows. Project/config identity,
+/// candidate SlotIds, and immutable Panel/Registry refs stay invariant. The
+/// eight-row fixture is correctness evidence only, not a production-N cost
+/// measurement.
+fn physical_state(
+    cache_dir: &Path,
+    project: &str,
+    slot_ids: &[u16],
+    layout: CandidateLayout,
+) -> AnyResult<Value> {
     let config = config_state(cache_dir)?;
     let prefix = format!("astrolabe.calyx.{project}");
     let rows = config["rows"]
@@ -279,8 +330,13 @@ fn physical_state(cache_dir: &Path, project: &str, slot_ids: &[u16]) -> AnyResul
 
     let mut selected_cfs = vec![ColumnFamily::Compression, ColumnFamily::Ledger];
     for slot_id in slot_ids {
-        selected_cfs.push(ColumnFamily::slot(SlotId::new(*slot_id)));
-        selected_cfs.push(ColumnFamily::slot_raw(SlotId::new(*slot_id)));
+        let slot_id = SlotId::new(*slot_id);
+        selected_cfs.push(ColumnFamily::slot(slot_id));
+        if layout.requires_raw_sidecar() {
+            selected_cfs.push(ColumnFamily::slot_raw(slot_id));
+        } else {
+            require_raw_sidecar_absent(&vault_dir, slot_id)?;
+        }
     }
     let vault = AsterVault::open(
         &vault_dir,
@@ -300,10 +356,33 @@ fn physical_state(cache_dir: &Path, project: &str, slot_ids: &[u16]) -> AnyResul
     let ledger = column_state(&vault, snapshot, ColumnFamily::Ledger)?;
     let mut slots = Vec::with_capacity(slot_ids.len());
     for slot_id in slot_ids {
+        let slot_id = SlotId::new(*slot_id);
+        let manifest_present = vault
+            .read_cf_at(
+                snapshot,
+                ColumnFamily::Compression,
+                &compression_manifest_key(slot_id),
+            )?
+            .is_some();
+        require(
+            manifest_present == layout.requires_raw_sidecar(),
+            "ISSUE_557_564_FSV_CANDIDATE_LAYOUT_MISMATCH",
+            format!(
+                "slot={} expected_layout={} manifest_present={manifest_present}",
+                slot_id.get(),
+                layout.label()
+            ),
+        )?;
+        let raw_cf = ColumnFamily::slot_raw(slot_id);
+        let raw = if layout.requires_raw_sidecar() {
+            column_state(&vault, snapshot, raw_cf)?
+        } else {
+            absent_column_state(raw_cf)
+        };
         slots.push(json!({
-            "slot_id": slot_id,
-            "primary": column_state(&vault, snapshot, ColumnFamily::slot(SlotId::new(*slot_id)))?,
-            "raw": column_state(&vault, snapshot, ColumnFamily::slot_raw(SlotId::new(*slot_id)))?,
+            "slot_id": slot_id.get(),
+            "primary": column_state(&vault, snapshot, ColumnFamily::slot(slot_id))?,
+            "raw": raw,
         }));
     }
     drop(vault);
@@ -326,6 +405,7 @@ fn physical_state(cache_dir: &Path, project: &str, slot_ids: &[u16]) -> AnyResul
         "config": config,
         "vault_dir": vault_dir,
         "snapshot_seq": snapshot,
+        "candidate_layout": layout.label(),
         "manifest": {
             "current_pointer": current_pointer,
             "current_bytes": current_bytes.len(),
@@ -656,8 +736,9 @@ fn expect_refusal(
     cache_dir: &Path,
     project: &str,
     slot_ids: &[u16],
+    layout: CandidateLayout,
 ) -> AnyResult<Value> {
-    let before = physical_state(cache_dir, project, slot_ids)?;
+    let before = physical_state(cache_dir, project, slot_ids, layout)?;
     println!(
         "{}",
         serde_json::to_string(&json!({"case": case, "phase": "before", "physical": before}))?
@@ -674,7 +755,7 @@ fn expect_refusal(
         "ISSUE_557_564_FSV_REFUSAL_CONTRACT_MISMATCH",
         format!("case={case} payload={payload}"),
     )?;
-    let after = physical_state(cache_dir, project, slot_ids)?;
+    let after = physical_state(cache_dir, project, slot_ids, layout)?;
     println!(
         "{}",
         serde_json::to_string(&json!({"case": case, "phase": "after", "physical": after}))?
@@ -727,7 +808,12 @@ fn run(root: PathBuf) -> AnyResult<()> {
     let tools = tools_list(&runner)?;
 
     let commission_args = commission_arguments(&input);
-    let commission_before = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let commission_before = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::RawUnmanifested,
+    )?;
     println!(
         "{}",
         serde_json::to_string(&json!({
@@ -746,7 +832,12 @@ fn run(root: PathBuf) -> AnyResult<()> {
     let (replay_args, selected_receipt) =
         extract_replay_arguments(&input.project, commission_payload, &input.slot_ids)?;
     verify_commission_payload(commission_payload, &selected_receipt)?;
-    let commission_after = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let commission_after = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     println!(
         "{}",
         serde_json::to_string(&json!({
@@ -771,7 +862,12 @@ fn run(root: PathBuf) -> AnyResult<()> {
     )?;
 
     let status_args = json!({"project": input.project, "mode": "status"});
-    let status_before = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let status_before = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     let status_exchange = call_optimizer(&runner, 55_756_402, &status_args)?;
     let (status_payload, status_error) = status_exchange.tool_result()?;
     require(
@@ -781,14 +877,24 @@ fn run(root: PathBuf) -> AnyResult<()> {
     )?;
     let status_evidence =
         verify_status_payload(status_payload, &input.slot_ids, &selected_receipt)?;
-    let status_after = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let status_after = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     require(
         status_before["fingerprint"] == status_after["fingerprint"],
         "ISSUE_557_564_FSV_STATUS_MUTATED_STATE",
         "optimizer status changed physical state",
     )?;
 
-    let replay_before = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let replay_before = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     let replay_exchange = call_optimizer(&runner, 55_756_403, &replay_args)?;
     let (replay_payload, replay_error) = replay_exchange.tool_result()?;
     require(
@@ -799,14 +905,24 @@ fn run(root: PathBuf) -> AnyResult<()> {
         "ISSUE_557_564_FSV_REPLAY_INVALID",
         replay_payload,
     )?;
-    let replay_after = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let replay_after = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     require(
         replay_before["fingerprint"] == replay_after["fingerprint"],
         "ISSUE_557_564_FSV_REPLAY_MUTATED_STATE",
         "exact selector replay changed physical state",
     )?;
 
-    let repeat_before = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let repeat_before = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     let repeat_exchange = call_optimizer(&runner, 55_756_404, &replay_args)?;
     let (repeat_payload, repeat_error) = repeat_exchange.tool_result()?;
     require(
@@ -817,7 +933,12 @@ fn run(root: PathBuf) -> AnyResult<()> {
         "ISSUE_557_564_FSV_IDEMPOTENT_REPEAT_INVALID",
         repeat_payload,
     )?;
-    let repeat_after = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let repeat_after = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     require(
         repeat_before["fingerprint"] == repeat_after["fingerprint"],
         "ISSUE_557_564_FSV_IDEMPOTENT_REPEAT_MUTATED_STATE",
@@ -843,6 +964,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
         &input.cache_dir,
         &input.project,
         &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
     )?;
 
     let mut duplicate_slot = commission_args.clone();
@@ -856,6 +978,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
         &input.cache_dir,
         &input.project,
         &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
     )?;
 
     let mut invalid_backend = commission_args.clone();
@@ -869,9 +992,15 @@ fn run(root: PathBuf) -> AnyResult<()> {
         &input.cache_dir,
         &input.project,
         &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
     )?;
 
-    let final_state = physical_state(&input.cache_dir, &input.project, &input.slot_ids)?;
+    let final_state = physical_state(
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
     require(
         final_state["fingerprint"] == commission_after["fingerprint"],
         "ISSUE_557_564_FSV_FINAL_STATE_DRIFT",
@@ -880,7 +1009,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
     let report = json!({
         "schema": "astrolabe.issue-557-564.compression-mcp-fsv.v1",
         "project": input.project,
-        "source_of_truth": "driver-prepared query_only _config.db; CURRENT and its immutable MANIFEST; independently scanned candidate primary/raw, Compression, and Ledger column families; intact physical Ledger chain; complete vault-file hashes",
+        "source_of_truth": "driver-prepared query_only _config.db; CURRENT and its immutable MANIFEST; physical raw-sidecar namespace absence before commission; independently scanned candidate primary and representation-required raw, Compression, and Ledger column families after commission; intact physical Ledger chain; complete vault-file hashes",
         "input": {
             "path": root.join(INPUT_FILE),
             "bytes": input.bytes.len(),
