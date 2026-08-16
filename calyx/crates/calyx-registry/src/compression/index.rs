@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BinaryHeap};
 
 use super::codec::{
-    CodecContext, CompressionManifest, ParsedStoredSlot, codec_context_id, generation_root,
-    parse_compression_manifest, parse_stored_slot, raw_generation_root,
+    CodecContext, CodecDescriptor, CompressionManifest, ParsedStoredSlot, codec_context_id,
+    codec_context_id_for_descriptor, generation_root, parse_compression_manifest,
+    parse_stored_slot, raw_generation_root,
 };
 use super::membership::{membership_root_from_leaf_hashes, verify_membership_proof};
 use super::recall::prepare_dense;
@@ -65,6 +66,85 @@ pub struct CompressedSlotIndex<'a, C: Clock> {
     codec_context_id: [u8; 32],
 }
 
+/// Reads only the immutable manifest and validates it against a pure codec
+/// descriptor. Status, selection, and publication use this path so a metadata
+/// request cannot instantiate codec geometry (#1064 PC-43).
+pub(super) fn generation_identity_without_codec_at<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    snapshot: Seq,
+) -> Result<CompressedGenerationIdentity> {
+    let descriptor = CodecDescriptor::for_read(slot, lens)?;
+    let codec_context_id = codec_context_id_for_descriptor(slot, lens, descriptor)?;
+    let snapshot_lease = vault.retain_snapshot_at(snapshot);
+    let manifest_bytes = vault
+        .read_cf_at(
+            snapshot,
+            ColumnFamily::Compression,
+            &compression_manifest_key(slot.slot_id),
+        )?
+        .ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_EMPTY,
+                format!(
+                    "compression manifest is missing: slot={} snapshot={snapshot}",
+                    slot.slot_key.key()
+                ),
+            )
+        })?;
+    let manifest = parse_compression_manifest(&manifest_bytes)?;
+    validate_manifest_descriptor(slot, descriptor, codec_context_id, &manifest)?;
+    snapshot_lease.record_progress();
+    Ok(identity_from_manifest(slot, &manifest))
+}
+
+fn validate_manifest_descriptor(
+    slot: &Slot,
+    descriptor: CodecDescriptor,
+    codec_context_id: [u8; 32],
+    manifest: &CompressionManifest,
+) -> Result<()> {
+    let SlotShape::Dense(raw_dim) = slot.shape else {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "compressed manifest belongs to a non-dense slot",
+        ));
+    };
+    if manifest.codec != descriptor.stored_codec()
+        || manifest.level != descriptor.level()
+        || manifest.raw_dim != raw_dim
+        || manifest.stored_dim as usize != descriptor.dim()
+        || manifest.codec_context_id != codec_context_id
+    {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "compression manifest does not match the frozen slot/lens codec context",
+        ));
+    }
+    Ok(())
+}
+
+fn identity_from_manifest(
+    slot: &Slot,
+    manifest: &CompressionManifest,
+) -> CompressedGenerationIdentity {
+    CompressedGenerationIdentity {
+        slot_id: slot.slot_id.get(),
+        codec: manifest.codec,
+        level: manifest.level.to_string(),
+        raw_dim: manifest.raw_dim,
+        stored_dim: manifest.stored_dim,
+        row_count: manifest.generation_rows,
+        codec_context_sha256: hex(&manifest.codec_context_id),
+        generation_sha256: hex(&manifest.generation_root),
+        raw_generation_sha256: hex(&manifest.raw_generation_root),
+        membership_sha256: hex(&manifest.membership_root),
+        assay_attestation_sha256: (manifest.codec == StoredSlotCodec::MxFp4)
+            .then(|| hex(&manifest.assay_attestation_id)),
+    }
+}
+
 impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
     pub(crate) fn open(
         vault: &'a AsterVault<C>,
@@ -80,6 +160,31 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
             codec,
             codec_context_id,
         })
+    }
+
+    /// Reuses the exact codec context returned by this candidate's encoder. The
+    /// pure descriptor and context hash are re-derived before ownership moves
+    /// into the index; manifest and row validation retain their seed bindings.
+    pub(super) fn open_with_context(
+        vault: &'a AsterVault<C>,
+        slot: &'a Slot,
+        lens: &'a LensSpec,
+        codec: CodecContext,
+    ) -> Result<Self> {
+        let descriptor = CodecDescriptor::for_read(slot, lens)?;
+        codec.validate_descriptor(descriptor)?;
+        let codec_context_id = codec_context_id_for_descriptor(slot, lens, descriptor)?;
+        Ok(Self {
+            vault,
+            slot,
+            lens,
+            codec,
+            codec_context_id,
+        })
+    }
+
+    pub(super) fn codec_geometry_physical_bytes(&self) -> Result<u64> {
+        self.codec.geometry_physical_bytes()
     }
 
     /// Reads and reconstructs one persisted compressed row at `snapshot`.
@@ -346,20 +451,7 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
         let snapshot_lease = self.vault.retain_snapshot_at(snapshot);
         let manifest = self.manifest_at(snapshot)?;
         snapshot_lease.record_progress();
-        Ok(CompressedGenerationIdentity {
-            slot_id: self.slot.slot_id.get(),
-            codec: manifest.codec,
-            level: manifest.level.to_string(),
-            raw_dim: manifest.raw_dim,
-            stored_dim: manifest.stored_dim,
-            row_count: manifest.generation_rows,
-            codec_context_sha256: hex(&manifest.codec_context_id),
-            generation_sha256: hex(&manifest.generation_root),
-            raw_generation_sha256: hex(&manifest.raw_generation_root),
-            membership_sha256: hex(&manifest.membership_root),
-            assay_attestation_sha256: (manifest.codec == StoredSlotCodec::MxFp4)
-                .then(|| hex(&manifest.assay_attestation_id)),
-        })
+        Ok(identity_from_manifest(self.slot, &manifest))
     }
 
     /// Computes reconstruction error without retaining a decoded corpus. The
@@ -879,30 +971,14 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
     }
 
     fn validate_manifest(&self, manifest: &CompressionManifest) -> Result<()> {
-        let SlotShape::Dense(raw_dim) = self.slot.shape else {
-            return Err(compression_error(
-                CALYX_VECTOR_COMPRESSION_INVALID,
-                "compressed manifest belongs to a non-dense slot",
-            ));
-        };
-        if manifest.codec != self.codec.stored_codec()
-            || manifest.level != self.codec.level()
-            || manifest.raw_dim != raw_dim
-            || manifest.stored_dim as usize != self.codec.dim()
-            || manifest.codec_context_id != self.codec_context_id
-        {
-            return Err(compression_error(
-                CALYX_VECTOR_COMPRESSION_INVALID,
-                "compression manifest does not match the frozen slot/lens codec context",
-            ));
-        }
-        Ok(())
+        let descriptor = CodecDescriptor::for_read(self.slot, self.lens)?;
+        validate_manifest_descriptor(self.slot, descriptor, self.codec_context_id, manifest)
     }
 
     /// Revalidates the original Assay source and recovery raw sidecar for a
-    /// whole-generation audit. Serving reads do not call this O(R*D + A)
-    /// verifier: their exact immutable manifest identity is checked against
-    /// every requested row's bound seed instead.
+    /// whole-generation audit. Serving reads do not call this verifier: their
+    /// exact immutable manifest identity is checked against every requested
+    /// row's bound seed instead.
     fn verify_manifest_assay_source_at(
         &self,
         snapshot: Seq,

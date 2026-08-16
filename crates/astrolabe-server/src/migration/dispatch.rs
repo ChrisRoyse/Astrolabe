@@ -2508,13 +2508,54 @@ pub(crate) fn handle_optimizer_status(args_json: &str) -> Result<String, DynErro
                     "ASTRO_OPTIMIZER_COMPRESSION_CANDIDATES_REQUIRED: commission_compression_candidates requires candidate_slot_ids with at least two registered slot ids",
                 );
             };
+            const MAX_CANDIDATE_SLOTS: usize = u16::MAX as usize + 1;
+            if !(2..=MAX_CANDIDATE_SLOTS).contains(&raw_slots.len()) {
+                return ToolFault::new(
+                    "ASTRO_OPTIMIZER_COMPRESSION_SLOT_COUNT_INVALID",
+                    format!(
+                        "commission_compression_candidates requires 2..={MAX_CANDIDATE_SLOTS} candidate_slot_ids, got {}",
+                        raw_slots.len()
+                    ),
+                    "Pass a bounded roster of at least two unique registered candidate slots.",
+                )
+                .with_detail("argument", "candidate_slot_ids")
+                .with_detail("minimum_items", 2_u64)
+                .with_detail("maximum_items", MAX_CANDIDATE_SLOTS as u64)
+                .with_detail("observed_items", raw_slots.len() as u64)
+                .with_detail(
+                    "stage",
+                    "candidate slot count validation before slot Vec allocation",
+                )
+                .with_detail("vault_or_manifest_opened", false)
+                .with_detail("ledger_chain_scanned", false)
+                .into_result();
+            }
             let mut slot_ids = Vec::with_capacity(raw_slots.len());
+            let mut unique_slot_ids = BTreeSet::new();
             for raw in raw_slots {
                 let Some(value) = raw.as_u64().and_then(|value| u16::try_from(value).ok()) else {
                     return tool_error_result(
                         "ASTRO_OPTIMIZER_COMPRESSION_SLOT_INVALID: every candidate_slot_ids value must be a u16 integer",
                     );
                 };
+                if !unique_slot_ids.insert(value) {
+                    return ToolFault::new(
+                        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_DUPLICATE",
+                        format!(
+                            "candidate_slot_ids repeats slot id {value}; commission requires each candidate once"
+                        ),
+                        "Pass each exact registered candidate slot id once.",
+                    )
+                    .with_detail("argument", "candidate_slot_ids")
+                    .with_detail("slot_id", u64::from(value))
+                    .with_detail(
+                        "stage",
+                        "candidate slot parse before vault/manifest/Ledger open",
+                    )
+                    .with_detail("vault_or_manifest_opened", false)
+                    .with_detail("ledger_chain_scanned", false)
+                    .into_result();
+                }
                 slot_ids.push(SlotId::new(value));
             }
             let Some(request_value) = args_obj.get("candidate_request") else {
@@ -2544,7 +2585,30 @@ pub(crate) fn handle_optimizer_status(args_json: &str) -> Result<String, DynErro
                     "ASTRO_OPTIMIZER_COMPRESSION_RECEIPTS_REQUIRED: select_compression_candidates requires at least two {slot_id,receipt_sha256} source candidates",
                 );
             };
+            const MAX_CANDIDATE_RECEIPTS: usize = u16::MAX as usize + 1;
+            if !(2..=MAX_CANDIDATE_RECEIPTS).contains(&raw_receipts.len()) {
+                return ToolFault::new(
+                    "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_COUNT_INVALID",
+                    format!(
+                        "select_compression_candidates requires 2..={MAX_CANDIDATE_RECEIPTS} candidate_receipts, got {}",
+                        raw_receipts.len()
+                    ),
+                    "Pass the bounded exact candidate roster from the immutable selection receipt.",
+                )
+                .with_detail("argument", "candidate_receipts")
+                .with_detail("minimum_items", 2_u64)
+                .with_detail("maximum_items", MAX_CANDIDATE_RECEIPTS as u64)
+                .with_detail("observed_items", raw_receipts.len() as u64)
+                .with_detail(
+                    "stage",
+                    "candidate receipt count validation before receipt Vec allocation",
+                )
+                .with_detail("vault_or_manifest_opened", false)
+                .with_detail("ledger_chain_scanned", false)
+                .into_result();
+            }
             let mut receipts = Vec::with_capacity(raw_receipts.len());
+            let mut unique_slot_ids = BTreeSet::new();
             for raw in raw_receipts {
                 let Some(object) = raw.as_object() else {
                     return tool_error_result(
@@ -2560,6 +2624,24 @@ pub(crate) fn handle_optimizer_status(args_json: &str) -> Result<String, DynErro
                         "ASTRO_OPTIMIZER_COMPRESSION_SLOT_INVALID: candidate receipt slot_id must be a u16 integer",
                     );
                 };
+                if !unique_slot_ids.insert(slot_id) {
+                    return ToolFault::new(
+                        "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_DUPLICATE_SLOT",
+                        format!(
+                            "candidate_receipts repeats slot_id {slot_id}; selection replay requires one exact receipt per slot"
+                        ),
+                        "Pass every exact source candidate slot once.",
+                    )
+                    .with_detail("argument", "candidate_receipts")
+                    .with_detail("slot_id", u64::from(slot_id))
+                    .with_detail(
+                        "stage",
+                        "candidate receipt parse before vault/manifest/Ledger open",
+                    )
+                    .with_detail("vault_or_manifest_opened", false)
+                    .with_detail("ledger_chain_scanned", false)
+                    .into_result();
+                }
                 let Some(receipt_hex) = object.get("receipt_sha256").and_then(Value::as_str) else {
                     return tool_error_result(
                         "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_INVALID: candidate receipt_sha256 is required",

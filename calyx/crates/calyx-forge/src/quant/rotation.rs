@@ -13,6 +13,69 @@ const ROTATION_MAX_DIM: usize = 4096;
 const SEED_DOMAIN: &[u8] = b"calyx/rotation-seed/v2\0";
 const HAAR_DOMAIN: &[u8] = b"calyx/haar-householder/v1\0";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HaarWorkShape {
+    pub(crate) factor_coefficients: u64,
+    pub(crate) geometry_physical_bytes: u64,
+    pub(crate) geometry_retained_entries: u64,
+    pub(crate) transform_coefficient_visits: u64,
+}
+
+/// Structural Haar cardinalities shared by Binary and TurboQuant planning.
+///
+/// These checked values describe retained buffer contents and a nonzero
+/// transform's admission bound. They are not runtime, allocator, or RSS
+/// measurements.
+pub(crate) fn haar_work_shape(dim: usize) -> Result<HaarWorkShape> {
+    if dim == 0 || dim > ROTATION_MAX_DIM {
+        return Err(rotation_error(
+            "haar_work_shape",
+            format!("dimension must be in 1..={ROTATION_MAX_DIM}, got {dim}"),
+        ));
+    }
+    let dim = u64::try_from(dim)
+        .map_err(|_| rotation_error("haar_work_shape", "dimension exceeds u64"))?;
+    let factor_starts = dim
+        .checked_sub(1)
+        .ok_or_else(|| rotation_error("haar_work_shape", "factor offset count underflow"))?;
+    let factor_coefficients = dim
+        .checked_mul(
+            dim.checked_add(1)
+                .ok_or_else(|| rotation_error("haar_work_shape", "dimension overflow"))?,
+        )
+        .and_then(|value| value.checked_div(2))
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| rotation_error("haar_work_shape", "factor count overflow"))?;
+    let column_signs = dim;
+    let geometry_retained_entries = factor_starts
+        .checked_add(factor_coefficients)
+        .and_then(|value| value.checked_add(column_signs))
+        .ok_or_else(|| rotation_error("haar_work_shape", "retained entry count overflow"))?;
+    let usize_bytes = u64::try_from(std::mem::size_of::<usize>())
+        .map_err(|_| rotation_error("haar_work_shape", "usize byte width exceeds u64"))?;
+    let f32_bytes = u64::try_from(std::mem::size_of::<f32>())
+        .map_err(|_| rotation_error("haar_work_shape", "f32 byte width exceeds u64"))?;
+    let geometry_physical_bytes = factor_starts
+        .checked_mul(usize_bytes)
+        .and_then(|value| {
+            factor_coefficients
+                .checked_add(column_signs)
+                .and_then(|coefficients| coefficients.checked_mul(f32_bytes))
+                .and_then(|coefficient_bytes| value.checked_add(coefficient_bytes))
+        })
+        .ok_or_else(|| rotation_error("haar_work_shape", "geometry byte count overflow"))?;
+    let transform_coefficient_visits = factor_coefficients
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(column_signs))
+        .ok_or_else(|| rotation_error("haar_work_shape", "transform visit count overflow"))?;
+    Ok(HaarWorkShape {
+        factor_coefficients,
+        geometry_physical_bytes,
+        geometry_retained_entries,
+        transform_coefficient_visits,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 /// Content-addressed deterministic geometry seed.
 pub struct RotationSeed {
@@ -82,12 +145,8 @@ impl HaarRotation {
         seed.validate()?;
         let rng_seed = domain_seed(HAAR_DOMAIN, &seed.id, seed.dim);
         let mut normal = DeterministicNormal::new(rng_seed);
-        let factor_capacity = seed
-            .dim
-            .checked_mul(seed.dim.saturating_add(1))
-            .and_then(|value| value.checked_div(2))
-            .and_then(|value| value.checked_sub(1))
-            .ok_or_else(|| rotation_error("haar_setup", "Householder geometry size overflow"))?;
+        let factor_capacity = usize::try_from(haar_work_shape(seed.dim)?.factor_coefficients)
+            .map_err(|_| rotation_error("haar_setup", "Householder geometry size exceeds usize"))?;
         let mut factors = Vec::new();
         factors
             .try_reserve_exact(factor_capacity)

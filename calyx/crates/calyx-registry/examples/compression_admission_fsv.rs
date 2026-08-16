@@ -24,13 +24,14 @@
 //! runs, and S=5 slots. The optional production leg preflights an exact
 //! 49,497-row database, removes one exact row for Q=1, and measures
 //! R=49,496, D=768, U=1, M=3; physical B is read from the real receipt, never
-//! extrapolated. The small fixture makes no production cost claim. Admission
-//! is O(B + R*D + Q*R*D + (U+M)*Q*R*D); direct packed search is O(R*D);
-//! resolved point/batch reads are bounded by the requested CxIds plus their
-//! proofs; whole-column verification is O(R*D + B_column).
+//! extrapolated. The small fixture makes no production cost claim. The driver
+//! emits its current versioned deterministic planned-upper-bound work
+//! accounting plus observed resource/physical measurements; no production
+//! cost conclusion is drawn from the fixture.
+//! Exact cost evidence is bound to its measured N and date on the driving issue.
 //! Panel/Registry state and query values are invariant for the complete run and
-//! are loaded once per process. The final filesystem audit is FSV-only O(F+B)
-//! over file count F and retained bytes B; it is not reachable from production.
+//! are loaded once per process. The final filesystem audit is FSV-only and is
+//! not reachable from production.
 //!
 //! Build/stage the real example with the canonical native launcher, then run
 //! the same staged artifact twice through `scripts/native-fsv-run.ps1`:
@@ -73,15 +74,16 @@ use calyx_core::{
     Asymmetry, CxId, LensId, Modality, Panel, QuantPolicy, Seq, Slot, SlotId, SlotResource,
     SlotShape, SlotState, SlotVector, SystemClock, VaultId,
 };
-use calyx_forge::BackendKind;
+use calyx_forge::quant::{binary_work_shape, turboquant_work_shape};
+use calyx_forge::{BackendKind, QuantLevel, TurboQuantGeometryKind};
 use calyx_ledger::{EntryKind, LedgerCfStore, VerifyResult, verify_chain};
 use calyx_registry::{
     AlgorithmicLens, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
     COMPRESSION_ADMISSION_SCHEMA, CompressionAdmissionGates, CompressionAdmissionReadback,
     CompressionAdmissionReceipt, CompressionAdmissionVerdict, CompressionAdmissionWorkLimits,
-    CompressionCandidateEvaluationRequest, CompressionCandidateReference, CompressionQuery,
-    LensRuntime, LensSpec, Registry, StoredSlotCodec, VaultPanelState, load_vault_panel_state,
-    persist_vault_panel_state,
+    CompressionCandidateCommissionEntry, CompressionCandidateEvaluationRequest,
+    CompressionCandidateWorkObservation, CompressionQuery, LensRuntime, LensSpec, Registry,
+    StoredSlotCodec, VaultPanelState, load_vault_panel_state, persist_vault_panel_state,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
@@ -114,8 +116,7 @@ const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SALT: &[u8] = b"issues-557-564-compression-admission-fsv";
 const ROOT_ENV: &str = "ASTROLABE_COMPRESSION_FSV_ROOT";
 const MODE_ENV: &str = "ASTROLABE_COMPRESSION_FSV_MODE";
-const ADMISSION_MARKER: &str = COMPRESSION_ADMISSION_SCHEMA;
-
+const COMPRESSION_WORK_MODEL: &str = "calyx.registry.compression_work.v3";
 type AnyResult<T> = Result<T, Box<dyn Error>>;
 
 #[derive(Clone)]
@@ -127,6 +128,41 @@ struct Registered {
 struct KnownQuery {
     query: CompressionQuery,
     expected_top_k: Vec<CxId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidateWorkSpec {
+    slot_id: u16,
+    quant_policy: QuantPolicy,
+    raw_dim: u32,
+    stored_dim: u32,
+    corpus_rows: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ExpectedLegacyWork {
+    corpus_rows: u64,
+    held_out_queries: u64,
+    warmup_packed_searches: u64,
+    measured_packed_searches: u64,
+    exact_truth_pairwise_scores: u64,
+    packed_pairwise_scores: u64,
+    reconstruction_rows: u64,
+    coefficient_evaluations: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ExactWorkPlan {
+    limits: CompressionAdmissionWorkLimits,
+    candidate_work: Vec<CompressionCandidateWorkObservation>,
+    legacy_by_slot: BTreeMap<u16, ExpectedLegacyWork>,
+    peak_codec_geometry_bytes: u64,
+    aggregate_codec_retained_entry_and_sample_bound: u64,
+    aggregate_codec_transform_coefficient_visits: u64,
+    aggregate_codec_auxiliary_work_units: u64,
+    aggregate_pairwise_score_evaluations: u64,
+    aggregate_registry_coefficient_evaluations: u64,
+    total_accounted_work_units: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -185,14 +221,19 @@ struct PersistedSlotEvidence {
     proof_sha256: String,
     current_receipt_sha256: Option<String>,
     latest_receipt_sha256: String,
+    receipt_schema: String,
     verdict: CompressionAdmissionVerdict,
+    work_model: String,
+    candidate_slots: u64,
+    candidate_work: Vec<CompressionCandidateWorkObservation>,
+    total_accounted_work_units: u64,
     allocation_scope: String,
     materialized_primary_rows_per_packed_search: u64,
     materialized_primary_bytes_per_packed_search: u64,
     packed_result_buffers_returned: u64,
     build_elapsed_ns: u64,
     vram_applicability: String,
-    working_set_bytes_after: u64,
+    working_set_bytes_after_measured_search: u64,
     immutable_physical_components_verified: usize,
 }
 
@@ -334,7 +375,7 @@ fn exercise(root: &Path) -> AnyResult<()> {
             &empty.slot,
             candidate_request(
                 query_inputs(&queries),
-                exact_work_limits_for(1, DIM, DIM, queries.len())?,
+                refusal_work_limits(1, DIM, DIM, queries.len())?,
                 passing_gates(),
             ),
         )
@@ -363,7 +404,7 @@ fn exercise(root: &Path) -> AnyResult<()> {
             &unsupported.slot,
             candidate_request(
                 query_inputs(&queries),
-                exact_work_limits_for(ROWS as u32, DIM, DIM, queries.len())?,
+                refusal_work_limits(ROWS as u32, DIM, DIM, queries.len())?,
                 passing_gates(),
             ),
         )
@@ -384,14 +425,18 @@ fn exercise(root: &Path) -> AnyResult<()> {
         })
     );
 
-    let tq35_request = candidate_request(
+    let tq35_single_work = exact_work_plan(
+        &[candidate_work_spec(&tq35.slot, ROWS as u32, DIM)?],
+        queries.len(),
+    )?;
+    let tq35_single_request = candidate_request(
         query_inputs(&queries),
-        exact_work_limits_for(ROWS as u32, DIM, DIM, queries.len())?,
+        tq35_single_work.limits.clone(),
         passing_gates(),
     );
 
     let empty_before = slot_state(&vault, tq35.slot.slot_id)?;
-    let mut empty_request = tq35_request.clone();
+    let mut empty_request = tq35_single_request.clone();
     empty_request.queries.clear();
     let empty_error = registry
         .build_and_evaluate_compression_candidate(&vault, &tq35.slot, empty_request)
@@ -412,7 +457,7 @@ fn exercise(root: &Path) -> AnyResult<()> {
     );
 
     let backend_before = slot_state(&vault, tq35.slot.slot_id)?;
-    let mut cuda_request = tq35_request.clone();
+    let mut cuda_request = tq35_single_request.clone();
     cuda_request.requested_backend = BackendKind::Cuda;
     let cuda_error = registry
         .build_and_evaluate_compression_candidate(&vault, &tq35.slot, cuda_request)
@@ -432,89 +477,75 @@ fn exercise(root: &Path) -> AnyResult<()> {
         })
     );
 
-    let tq35_admission_before = slot_state(&vault, tq35.slot.slot_id)?;
-    let tq35_candidate =
-        registry.build_and_evaluate_compression_candidate(&vault, &tq35.slot, tq35_request)?;
-    let tq35_report = &tq35_candidate.generation;
-    require(
-        tq35_report.stored_codec == StoredSlotCodec::TurboQuantBits3p5
-            && tq35_report.fallback_reason.is_none(),
-        "TurboQuant-3.5 generation was substituted",
+    let commission_work = exact_work_plan(
+        &[
+            candidate_work_spec(&tq35.slot, ROWS as u32, DIM)?,
+            candidate_work_spec(&int8.slot, ROWS as u32, DIM)?,
+        ],
+        queries.len(),
     )?;
-    let tq35_generation_seq = tq35_report.snapshot.ok_or("TQ3.5 snapshot missing")?;
-    verify_direct_search(&registry, &vault, &tq35.slot, tq35_generation_seq, &queries)?;
-
-    let tq35_index = registry.compressed_slot_index(&vault, &tq35.slot)?;
-    let tq35_identity = tq35_index.generation_identity_at(tq35_generation_seq)?;
-    let tq35_limits = exact_work_limits(&tq35_identity, queries.len())?;
-    let (tq35_inventory, tq35_physical) =
-        live_generation_inventory(&vault, &vault_dir, tq35.slot.slot_id, tq35_generation_seq)?;
-    let tq35_admission = tq35_candidate.evaluation;
-    require_unpublished_candidate(&tq35_admission)?;
-    require_receipt_matches_inventory(&tq35_admission.receipt, &tq35_inventory)?;
-    require(
-        tq35_admission.receipt.work_limits == tq35_limits,
-        "TQ3.5 receipt did not retain its exact work boundary",
-    )?;
-    let tq35_admission_after = slot_state(&vault, tq35.slot.slot_id)?;
-    println!(
-        "{}",
-        json!({
-            "event": "maximum_declared_work_boundary_admitted",
-            "slot": TQ35_SLOT,
-            "codec": tq35_report.stored_codec,
-            "before": tq35_admission_before,
-            "after": tq35_admission_after,
-            "limits": tq35_limits,
-            "observed_work": tq35_admission.receipt.work,
-            "pre_admission_physical_inventory": tq35_physical,
-            "allocation_materialization": tq35_admission.receipt.allocations,
-            "process_resources": tq35_admission.receipt.resources,
-            "receipt_sha256": tq35_admission.receipt_sha256,
-            "physical_bytes": tq35_admission.receipt.total_physical_bytes,
-        })
+    let commission_request = candidate_request(
+        query_inputs(&queries),
+        commission_work.limits.clone(),
+        passing_gates(),
     );
-
-    let int8_candidate = registry.build_and_evaluate_compression_candidate(
-        &vault,
-        &int8.slot,
-        candidate_request(
-            query_inputs(&queries),
-            exact_work_limits_for(ROWS as u32, DIM, DIM, queries.len())?,
-            passing_gates(),
-        ),
-    )?;
-    let int8_report = &int8_candidate.generation;
+    let work_limit_before_tq = slot_state(&vault, tq35.slot.slot_id)?;
+    let work_limit_before_int8 = slot_state(&vault, int8.slot.slot_id)?;
+    let work_limit_files_before = disk_inventory(&vault_dir)?;
+    let exact_transform = commission_work.aggregate_codec_transform_coefficient_visits;
     require(
-        int8_report.stored_codec == StoredSlotCodec::ScalarInt8
-            && int8_report.fallback_reason.is_none(),
-        "ScalarInt8 generation was substituted",
+        exact_transform > 1,
+        "TQ3.5 fixture aggregate transform boundary cannot exercise exact-minus-one",
     )?;
-    let int8_generation_seq = int8_report.snapshot.ok_or("ScalarInt8 snapshot missing")?;
-    verify_direct_search(&registry, &vault, &int8.slot, int8_generation_seq, &queries)?;
-    let int8_identity = registry
-        .compressed_slot_index(&vault, &int8.slot)?
-        .generation_identity_at(int8_generation_seq)?;
-    let int8_limits = exact_work_limits(&int8_identity, queries.len())?;
-    let (int8_inventory, int8_physical) =
-        live_generation_inventory(&vault, &vault_dir, int8.slot.slot_id, int8_generation_seq)?;
-    let int8_admission = int8_candidate.evaluation;
-    require_unpublished_candidate(&int8_admission)?;
-    require_receipt_matches_inventory(&int8_admission.receipt, &int8_inventory)?;
+    let mut exact_minus_one_request = commission_request.clone();
+    exact_minus_one_request
+        .work_limits
+        .maximum_aggregate_codec_transform_coefficient_visits = exact_transform - 1;
+    let exact_minus_one_error = registry
+        .commission_and_select_compression_candidates(
+            &vault,
+            &[tq35.slot.clone(), int8.slot.clone()],
+            exact_minus_one_request,
+        )
+        .expect_err("aggregate transform exact-minus-one limit must refuse before mutation");
+    let work_limit_after_tq = slot_state(&vault, tq35.slot.slot_id)?;
+    let work_limit_after_int8 = slot_state(&vault, int8.slot.slot_id)?;
+    let work_limit_files_after = disk_inventory(&vault_dir)?;
+    let exact_transform_diagnostic = format!(
+        "aggregate_codec_transform_coefficient_visits={exact_transform}/{}",
+        exact_transform - 1
+    );
     require(
-        int8_admission.receipt.work_limits == int8_limits,
-        "ScalarInt8 receipt did not retain its exact work boundary",
+        exact_minus_one_error.code == "CALYX_COMPRESSION_ADMISSION_REFUSED"
+            && exact_minus_one_error
+                .message
+                .contains(&exact_transform_diagnostic)
+            && work_limit_before_tq == work_limit_after_tq
+            && work_limit_before_int8 == work_limit_after_int8
+            && work_limit_files_before == work_limit_files_after,
+        "aggregate transform exact-minus-one refusal changed seq/CF/pointer/Ledger/file state or omitted its exact diagnostic",
     )?;
     println!(
         "{}",
         json!({
-            "event": "second_codec_evaluated_without_publication",
-            "slot": INT8_SLOT,
-            "codec": int8_report.stored_codec,
-            "receipt_sha256": int8_admission.receipt_sha256,
-            "verdict": int8_admission.receipt.verdict,
-            "physical_bytes": int8_admission.receipt.total_physical_bytes,
-            "pre_admission_physical_inventory": int8_physical,
+            "event": "edge_aggregate_transform_exact_minus_one_refused_before_mutation",
+            "error": {
+                "code": exact_minus_one_error.code,
+                "message": exact_minus_one_error.message,
+            },
+            "required_aggregate_codec_transform_coefficient_visits": exact_transform,
+            "declared_limit": exact_transform - 1,
+            "before": {
+                "tq35": work_limit_before_tq,
+                "scalar_int8": work_limit_before_int8,
+            },
+            "after": {
+                "tq35": work_limit_after_tq,
+                "scalar_int8": work_limit_after_int8,
+            },
+            "files_before": work_limit_files_before,
+            "files_after": work_limit_files_after,
+            "seq_cf_pointer_ledger_and_full_file_identity_unchanged": true,
         })
     );
 
@@ -522,23 +553,104 @@ fn exercise(root: &Path) -> AnyResult<()> {
     let selection_before_int8 = slot_state(&vault, int8.slot.slot_id)?;
     require(
         selection_before_tq.current_admission.is_none()
-            && selection_before_int8.current_admission.is_none(),
-        "passing candidates were published before multi-candidate selection",
+            && selection_before_tq.latest_evaluation.is_none()
+            && selection_before_int8.current_admission.is_none()
+            && selection_before_int8.latest_evaluation.is_none(),
+        "fresh C=2 commission candidates had an admission pointer before commission",
     )?;
-    let selected = registry.select_compression_candidate(
+    let commission = registry.commission_and_select_compression_candidates(
         &vault,
-        &[
-            CompressionCandidateReference {
-                slot: tq35.slot.clone(),
-                receipt_sha256: decode_hex_32(&tq35_admission.receipt_sha256)?,
-            },
-            CompressionCandidateReference {
-                slot: int8.slot.clone(),
-                receipt_sha256: decode_hex_32(&int8_admission.receipt_sha256)?,
-            },
-        ],
+        &[tq35.slot.clone(), int8.slot.clone()],
+        commission_request,
     )?;
-    require_admitted(&selected)?;
+    require(
+        commission.candidates.len() == 2,
+        "C=2 commission did not return two independently persisted candidates",
+    )?;
+    let tq35_candidate = commission
+        .candidates
+        .iter()
+        .find(|candidate| candidate.generation.slot_id == TQ35_SLOT)
+        .ok_or("C=2 commission omitted the TQ3.5 candidate")?;
+    let int8_candidate = commission
+        .candidates
+        .iter()
+        .find(|candidate| candidate.generation.slot_id == INT8_SLOT)
+        .ok_or("C=2 commission omitted the ScalarInt8 candidate")?;
+    let tq35_report = &tq35_candidate.generation;
+    let int8_report = &int8_candidate.generation;
+    require(
+        tq35_report.stored_codec == StoredSlotCodec::TurboQuantBits3p5
+            && tq35_report.fallback_reason.is_none()
+            && tq35_report.corpus_rows == ROWS as u32
+            && int8_report.stored_codec == StoredSlotCodec::ScalarInt8
+            && int8_report.fallback_reason.is_none()
+            && int8_report.corpus_rows == ROWS as u32,
+        "C=2 commission substituted a requested codec",
+    )?;
+    let tq35_generation_seq = tq35_report.generation_seq;
+    let int8_generation_seq = int8_report.generation_seq;
+    verify_direct_search(&registry, &vault, &tq35.slot, tq35_generation_seq, &queries)?;
+    verify_direct_search(&registry, &vault, &int8.slot, int8_generation_seq, &queries)?;
+    let tq35_identity = registry
+        .compressed_slot_index(&vault, &tq35.slot)?
+        .generation_identity_at(tq35_generation_seq)?;
+    let int8_identity = registry
+        .compressed_slot_index(&vault, &int8.slot)?
+        .generation_identity_at(int8_generation_seq)?;
+    let (tq35_inventory, tq35_physical) =
+        live_generation_inventory(&vault, &vault_dir, tq35.slot.slot_id, tq35_generation_seq)?;
+    let (int8_inventory, int8_physical) =
+        live_generation_inventory(&vault, &vault_dir, int8.slot.slot_id, int8_generation_seq)?;
+    let tq35_admission = registry
+        .read_compression_admission(
+            &vault,
+            &tq35.slot,
+            Some(decode_hex_32(&tq35_candidate.receipt_sha256)?),
+        )?
+        .ok_or("exact TQ3.5 candidate receipt is absent after commission")?;
+    let int8_admission = registry
+        .read_compression_admission(
+            &vault,
+            &int8.slot,
+            Some(decode_hex_32(&int8_candidate.receipt_sha256)?),
+        )?
+        .ok_or("exact ScalarInt8 candidate receipt is absent after commission")?;
+    require_historical_candidate_receipt(&tq35_admission)?;
+    require_historical_candidate_receipt(&int8_admission)?;
+    require_compact_commission_candidate(tq35_candidate, &tq35_admission)?;
+    require_compact_commission_candidate(int8_candidate, &int8_admission)?;
+    require_receipt_matches_generation(&tq35_admission.receipt, &tq35_identity)?;
+    require_receipt_matches_generation(&int8_admission.receipt, &int8_identity)?;
+    require_receipt_matches_inventory(&tq35_admission.receipt, &tq35_inventory)?;
+    require_receipt_matches_inventory(&int8_admission.receipt, &int8_inventory)?;
+    require_v3_work_plan(&tq35_admission.receipt, &commission_work)?;
+    require_v3_work_plan(&int8_admission.receipt, &commission_work)?;
+    let commission_ledger_rows = vault.scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)?;
+    require_ledger_ref(
+        &commission_ledger_rows,
+        &tq35_candidate.generation.generation_ledger,
+        "TQ3.5 generation",
+    )?;
+    require_ledger_ref(
+        &commission_ledger_rows,
+        &int8_candidate.generation.generation_ledger,
+        "ScalarInt8 generation",
+    )?;
+    require_admission_ledger_binding_ref(
+        &commission_ledger_rows,
+        tq35_candidate,
+        &tq35_admission.receipt,
+    )?;
+    require_admission_ledger_binding_ref(
+        &commission_ledger_rows,
+        int8_candidate,
+        &int8_admission.receipt,
+    )?;
+
+    let selected = &commission.selected;
+    require_admitted(selected)?;
+    require_v3_work_plan(&selected.receipt, &commission_work)?;
     let selection = selected
         .receipt
         .candidate_selection
@@ -573,9 +685,28 @@ fn exercise(root: &Path) -> AnyResult<()> {
     println!(
         "{}",
         json!({
-            "event": "multi_codec_most_aggressive_selection",
+            "event": "multi_codec_commission_planned_boundary_and_selection",
             "before": { "tq35": selection_before_tq, "scalar_int8": selection_before_int8 },
             "after": { "tq35": selection_after_tq, "scalar_int8": selection_after_int8 },
+            "independently_calculated_aggregate_planned_upper_bound": commission_work,
+            "candidate_receipts": {
+                "tq35": {
+                    "compact_commission_identity": tq35_candidate,
+                    "receipt_sha256": tq35_admission.receipt_sha256,
+                    "persisted_planned_upper_bound": tq35_admission.receipt.work,
+                    "physical_inventory": tq35_physical,
+                    "allocation_materialization": tq35_admission.receipt.allocations,
+                    "measured_search_process_resources": tq35_admission.receipt.resources,
+                },
+                "scalar_int8": {
+                    "compact_commission_identity": int8_candidate,
+                    "receipt_sha256": int8_admission.receipt_sha256,
+                    "persisted_planned_upper_bound": int8_admission.receipt.work,
+                    "physical_inventory": int8_physical,
+                    "allocation_materialization": int8_admission.receipt.allocations,
+                    "measured_search_process_resources": int8_admission.receipt.resources,
+                },
+            },
             "selection_receipt_sha256": selected.receipt_sha256,
             "selection": selection,
             "build": selected.receipt.build,
@@ -591,12 +722,16 @@ fn exercise(root: &Path) -> AnyResult<()> {
     )?;
     let mut refusal_gates = passing_gates();
     refusal_gates.maximum_total_physical_bytes = 1;
+    let refusal_work = exact_work_plan(
+        &[candidate_work_spec(&refusal.slot, ROWS as u32, DIM)?],
+        queries.len(),
+    )?;
     let refusal_candidate = registry.build_and_evaluate_compression_candidate(
         &vault,
         &refusal.slot,
         candidate_request(
             query_inputs(&queries),
-            exact_work_limits_for(ROWS as u32, DIM, DIM, queries.len())?,
+            refusal_work.limits.clone(),
             refusal_gates,
         ),
     )?;
@@ -607,9 +742,6 @@ fn exercise(root: &Path) -> AnyResult<()> {
         "gate-refusal generation was substituted",
     )?;
     let refusal_generation_seq = refusal_report.snapshot.ok_or("refusal snapshot missing")?;
-    let refusal_identity = registry
-        .compressed_slot_index(&vault, &refusal.slot)?
-        .generation_identity_at(refusal_generation_seq)?;
     let (refusal_inventory, refusal_physical) = live_generation_inventory(
         &vault,
         &vault_dir,
@@ -617,11 +749,7 @@ fn exercise(root: &Path) -> AnyResult<()> {
         refusal_generation_seq,
     )?;
     let refusal_readback = refusal_candidate.evaluation;
-    require(
-        refusal_readback.receipt.work_limits
-            == exact_work_limits(&refusal_identity, queries.len())?,
-        "refusal receipt did not retain its exact work boundary",
-    )?;
+    require_v3_work_plan(&refusal_readback.receipt, &refusal_work)?;
     require_receipt_matches_inventory(&refusal_readback.receipt, &refusal_inventory)?;
     require(
         refusal_readback.receipt.verdict == CompressionAdmissionVerdict::Refused
@@ -1081,6 +1209,16 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
         cx_id: vault.cx_id_for_input(b"issues-557-564-max-d4096-held-out", PANEL_VERSION),
         values: query_values.clone(),
     };
+    let maximum_work = exact_work_plan(
+        &[candidate_work_spec(&registered.slot, 2, MAX_SUPPORTED_DIM)?],
+        1,
+    )?;
+    let maximum_dim_usize = usize::try_from(MAX_SUPPORTED_DIM)?;
+    let maximum_shape = turboquant_work_shape(
+        maximum_dim_usize,
+        QuantLevel::Bits3p5,
+        TurboQuantGeometryKind::DenseHaarGaussianV2,
+    )?;
     let before_compression = slot_state(&vault, registered.slot.slot_id)?;
     let candidate = registry.build_and_evaluate_compression_candidate(
         &vault,
@@ -1088,7 +1226,7 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
         candidate_request_with_k(
             vec![query.clone()],
             1,
-            exact_work_limits_for(2, MAX_SUPPORTED_DIM, MAX_SUPPORTED_DIM, 1)?,
+            maximum_work.limits.clone(),
             passing_gates(),
         ),
     )?;
@@ -1098,6 +1236,21 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
         "D=4096 build substituted its requested codec",
     )?;
     require_unpublished_candidate(&candidate.evaluation)?;
+    require_v3_work_plan(&candidate.evaluation.receipt, &maximum_work)?;
+    let maximum_candidate_work = maximum_work
+        .candidate_work
+        .first()
+        .ok_or("D=4096 independent work plan omitted its candidate")?;
+    require(
+        maximum_candidate_work.geometry_physical_bytes == maximum_shape.geometry_physical_bytes
+            && maximum_candidate_work.codec_retained_entry_and_sample_bound
+                == maximum_shape
+                    .geometry_retained_entries
+                    .checked_add(maximum_shape.codebook_setup_sample_evaluations)
+                    .ok_or("D=4096 retained-entry/sample proxy overflow")?
+            && candidate.evaluation.receipt.schema == COMPRESSION_ADMISSION_SCHEMA,
+        "D=4096 maximum-shape claim differs from the v3 Forge geometry/readback fields",
+    )?;
     let generation_seq = candidate
         .generation
         .snapshot
@@ -1108,7 +1261,7 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
     require(
         point
             .as_dense()
-            .is_some_and(|values| values.len() == MAX_SUPPORTED_DIM as usize),
+            .is_some_and(|values| values.len() == maximum_dim_usize),
         "D=4096 point read returned the wrong dense shape",
     )?;
     let hits = index.search_at(&query_values, 1, generation_seq)?;
@@ -1155,6 +1308,25 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
             "proof": { "bytes": proof.len(), "sha256": sha256_hex(&proof) },
             "primary": { "bytes": primary.len(), "sha256": sha256_hex(&primary) },
             "receipt_sha256": candidate.evaluation.receipt_sha256,
+            "forge_work_shape": {
+                "dim": maximum_shape.dim,
+                "level": maximum_shape.level.to_string(),
+                "geometry_kind": format!("{:?}", maximum_shape.geometry_kind),
+                "geometry_physical_bytes": maximum_shape.geometry_physical_bytes,
+                "geometry_retained_entries": maximum_shape.geometry_retained_entries,
+                "codebook_setup_sample_evaluations": maximum_shape.codebook_setup_sample_evaluations,
+                "rotation_transform_coefficient_visits": maximum_shape.rotation_transform_coefficient_visits,
+                "projection_transform_coefficient_visits": maximum_shape.projection_transform_coefficient_visits,
+                "transform_pair_coefficient_visits": maximum_shape.transform_pair_coefficient_visits,
+                "encode_scalar_centroid_visits": maximum_shape.encode_scalar_centroid_visits,
+                "decode_scalar_centroid_lookups": maximum_shape.decode_scalar_centroid_lookups,
+                "query_lut_allocated_entries": maximum_shape.query_lut_allocated_entries,
+                "query_lut_filled_entries": maximum_shape.query_lut_filled_entries,
+                "scalar_score_lut_lookups": maximum_shape.scalar_score_lut_lookups,
+                "qjl_score_sign_visits": maximum_shape.qjl_score_sign_visits,
+                "packed_score_coefficient_visits": maximum_shape.packed_score_coefficient_visits,
+            },
+            "independently_calculated_planned_upper_bound": maximum_work,
             "receipt": candidate.evaluation.receipt,
         })
     );
@@ -1172,7 +1344,7 @@ fn maximum_dimension_success(root: &Path) -> AnyResult<()> {
         reopened_hits.first().map(|hit| hit.cx_id) == Some(cx_ids[0])
             && reopened_point
                 .as_dense()
-                .is_some_and(|values| values.len() == MAX_SUPPORTED_DIM as usize),
+                .is_some_and(|values| values.len() == maximum_dim_usize),
         "fresh D=4096 reopen failed point/search verification",
     )?;
     println!(
@@ -1236,7 +1408,7 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
             candidate_request_with_k(
                 vec![query],
                 1,
-                exact_work_limits_for(2, OVER_LIMIT_DIM, OVER_LIMIT_DIM, 1)?,
+                refusal_work_limits(2, OVER_LIMIT_DIM, OVER_LIMIT_DIM, 1)?,
                 passing_gates(),
             ),
         )
@@ -1244,8 +1416,11 @@ fn over_limit_dimension_refusal(root: &Path) -> AnyResult<()> {
     let after = slot_state(&vault, registered.slot.slot_id)?;
     let files_after = disk_inventory(&vault_dir)?;
     require(
-        error.code == CALYX_VECTOR_COMPRESSION_INVALID
-            && error.message.contains("1..=4096")
+        error.code == "CALYX_FORGE_QUANT_ERROR"
+            && error.message.contains("op=turboquant_new")
+            && error
+                .message
+                .contains("detail=dimension must be in 1..=4096, got 4097")
             && before == after
             && files_before == files_after,
         "D=4097 refusal did not preserve exact durable state or boundary diagnostic",
@@ -1310,11 +1485,14 @@ fn dimension_input(label: &str, row: usize, slot_id: SlotId, dim: u32) -> AnyRes
 }
 
 fn dimension_row_values(row: usize, dim: u32) -> AnyResult<Vec<f32>> {
-    let mut values = vec![0.0; dim as usize];
-    let value = values.get_mut(row).ok_or_else(|| {
-        format!("dimension fixture row {row} is outside the declared dimension {dim}")
-    })?;
-    *value = 1.0;
+    let dim_usize = usize::try_from(dim)?;
+    if row >= dim_usize {
+        return Err(
+            format!("dimension fixture row {row} is outside the declared dimension {dim}").into(),
+        );
+    }
+    let mut values = vec![0.0; dim_usize];
+    values[row] = 1.0;
     Ok(values)
 }
 
@@ -1324,7 +1502,8 @@ fn dimension_query_values(dim: u32) -> AnyResult<Vec<f32>> {
             "directionally distinct dimension query requires at least two dimensions".into(),
         );
     }
-    let mut values = vec![0.0; dim as usize];
+    let dim_usize = usize::try_from(dim)?;
+    let mut values = vec![0.0; dim_usize];
     values[0] = 4.0;
     values[1] = 1.0;
     Ok(values)
@@ -1534,6 +1713,14 @@ fn production(root: &Path) -> AnyResult<()> {
         query.cx_id != first_corpus_cx_id,
         "production held-out query overlaps corpus identity",
     )?;
+    let production_work = exact_work_plan(
+        &[candidate_work_spec(
+            &registered.slot,
+            PRODUCTION_CORPUS_ROWS,
+            PRODUCTION_DIM,
+        )?],
+        1,
+    )?;
     let before_evaluation = slot_state(&vault, registered.slot.slot_id)?;
     let candidate = registry.build_and_evaluate_compression_candidate(
         &vault,
@@ -1541,7 +1728,7 @@ fn production(root: &Path) -> AnyResult<()> {
         candidate_request_with_k(
             vec![query.clone()],
             1,
-            exact_work_limits_for(PRODUCTION_CORPUS_ROWS, PRODUCTION_DIM, PRODUCTION_DIM, 1)?,
+            production_work.limits.clone(),
             production_gates(),
         ),
     )?;
@@ -1551,6 +1738,7 @@ fn production(root: &Path) -> AnyResult<()> {
         "production ScalarInt8 candidate was substituted",
     )?;
     require_unpublished_candidate(&candidate.evaluation)?;
+    require_v3_work_plan(&candidate.evaluation.receipt, &production_work)?;
     let generation_seq = candidate
         .generation
         .snapshot
@@ -1596,6 +1784,7 @@ fn production(root: &Path) -> AnyResult<()> {
                 "stream_chunk_rows": 256,
                 "registry_build_materialization": "Registry contract materializes one raw corpus and encoded candidate; driver retains no full duplicate corpus",
             },
+            "independently_calculated_planned_upper_bound": production_work,
             "before_ingest": before_ingest,
             "after_ingest": after_ingest,
             "before_evaluation": before_evaluation,
@@ -1857,9 +2046,9 @@ fn production_receipt_summary(receipt: &CompressionAdmissionReceipt) -> Value {
         "latency_p95_ns": receipt.latency_p95_ns,
         "latency_p99_ns": receipt.latency_p99_ns,
         "allocations": receipt.allocations,
-        "resources": receipt.resources,
+        "measured_search_process_resources": receipt.resources,
         "work_limits": receipt.work_limits,
-        "work": receipt.work,
+        "planned_upper_bound_work": receipt.work,
         "gates": receipt.gates,
         "gate_observations": receipt.gate_observations,
         "verdict": receipt.verdict,
@@ -1917,9 +2106,16 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
     )?;
     let cx_ids = corpus_ids(&vault);
     let queries = known_queries(&vault, &cx_ids);
+    let commission_work = exact_work_plan(
+        &[
+            candidate_work_spec(&tq35.slot, ROWS as u32, DIM)?,
+            candidate_work_spec(&int8.slot, ROWS as u32, DIM)?,
+        ],
+        queries.len(),
+    )?;
     let request = candidate_request(
         query_inputs(&queries),
-        exact_work_limits_for(ROWS as u32, DIM, DIM, queries.len())?,
+        commission_work.limits.clone(),
         passing_gates(),
     );
     let request_args = json!({
@@ -1984,6 +2180,7 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
             "request_path": request_path,
             "request_sha256": sha256_hex(&request_bytes),
             "request_arguments": request_readback,
+            "independently_calculated_aggregate_planned_upper_bound": commission_work,
             "source_of_truth": "fresh read-only Aster raw primary/Compression/Ledger reads, read-only query_only _config.db rows, and request-file byte readback",
             "files": disk_inventory(root)?,
         })
@@ -2036,6 +2233,19 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
     let snapshot = vault.latest_seq();
     let cx_ids = corpus_ids(&vault);
     let queries = known_queries(&vault, &cx_ids);
+    let expected_commission_work = exact_work_plan(
+        &[
+            candidate_work_spec(panel_slot(&panel, TQ35_SLOT)?, ROWS as u32, DIM)?,
+            candidate_work_spec(panel_slot(&panel, INT8_SLOT)?, ROWS as u32, DIM)?,
+        ],
+        queries.len(),
+    )?;
+    let persisted_request_limits: CompressionAdmissionWorkLimits =
+        serde_json::from_value(request["candidate_request"]["work_limits"].clone())?;
+    require(
+        persisted_request_limits == expected_commission_work.limits,
+        "readback_mcp persisted request does not contain the exact C=2 aggregate work boundary",
+    )?;
     let mut physical_slots = Vec::new();
     let mut current_receipts = Vec::new();
     for slot_id in [TQ35_SLOT, INT8_SLOT] {
@@ -2053,8 +2263,10 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
                 && latest.active_generation_current,
             format!("MCP-commissioned slot {slot_id} latest receipt is not active/admitted"),
         )?;
+        require_v3_work_plan(&latest.receipt, &expected_commission_work)?;
         if let Some(current) = status.current_admission.as_ref() {
             require_current_status(current)?;
+            require_v3_work_plan(&current.receipt, &expected_commission_work)?;
             current_receipts.push(current.receipt_sha256.clone());
         }
         physical_slots.push(json!({
@@ -2095,6 +2307,7 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
             "config": config,
             "mcp_input": input,
             "request": request,
+            "independently_recalculated_aggregate_planned_upper_bound": expected_commission_work,
             "dispatch_result_path": result_path,
             "dispatch_result_sha256": sha256_hex(&result_bytes),
             "dispatch_result": dispatch_result,
@@ -2320,6 +2533,13 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
         "reopened state does not contain exactly one selected multi-codec winner",
     )?;
     let selected_slot_id = current_slots[0].0;
+    let expected_commission_work = exact_work_plan(
+        &[
+            candidate_work_spec(panel_slot(&state, TQ35_SLOT)?, ROWS as u32, DIM)?,
+            candidate_work_spec(panel_slot(&state, INT8_SLOT)?, ROWS as u32, DIM)?,
+        ],
+        queries.len(),
+    )?;
 
     let mut evidence = Vec::new();
     for (slot_id, codec, expected_verdict) in [
@@ -2472,6 +2692,19 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
                 && decoded_receipt.schema == COMPRESSION_ADMISSION_SCHEMA,
             format!("slot {slot_id} raw receipt differs from validated status receipt"),
         )?;
+        let expected_work = if matches!(slot_id, TQ35_SLOT | INT8_SLOT) {
+            expected_commission_work.clone()
+        } else {
+            exact_work_plan(
+                &[candidate_work_spec(
+                    slot,
+                    ROWS as u32,
+                    decoded_receipt.stored_dim,
+                )?],
+                queries.len(),
+            )?
+        };
+        require_v3_work_plan(&decoded_receipt, &expected_work)?;
         let immutable_verified = verify_immutable_receipt_components(vault_dir, &decoded_receipt)?;
         evidence.push(PersistedSlotEvidence {
             slot_id,
@@ -2486,7 +2719,12 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
             proof_sha256: sha256_hex(&proof),
             current_receipt_sha256: current_pointer.map(|bytes| hex(&bytes)),
             latest_receipt_sha256: latest.receipt_sha256.clone(),
+            receipt_schema: decoded_receipt.schema.clone(),
             verdict: expected_verdict,
+            work_model: decoded_receipt.work.work_model.clone(),
+            candidate_slots: decoded_receipt.work.candidate_slots,
+            candidate_work: decoded_receipt.work.candidate_work.clone(),
+            total_accounted_work_units: decoded_receipt.work.total_accounted_work_units,
             allocation_scope: decoded_receipt.allocations.scope.clone(),
             materialized_primary_rows_per_packed_search: decoded_receipt
                 .allocations
@@ -2506,7 +2744,9 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
                     "provider_observed".to_string()
                 }
             },
-            working_set_bytes_after: decoded_receipt.resources.working_set_bytes_after,
+            working_set_bytes_after_measured_search: decoded_receipt
+                .resources
+                .working_set_bytes_after,
             immutable_physical_components_verified: immutable_verified,
         });
     }
@@ -2541,6 +2781,7 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
             &ledger_rows,
             slot_evidence.slot_id,
             &slot_evidence.latest_receipt_sha256,
+            &slot_evidence.receipt_schema,
             "evaluation",
             slot_evidence.verdict,
         )?;
@@ -2549,6 +2790,7 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
                 &ledger_rows,
                 slot_evidence.slot_id,
                 &slot_evidence.latest_receipt_sha256,
+                &slot_evidence.receipt_schema,
                 "publish",
                 slot_evidence.verdict,
             )?;
@@ -2693,57 +2935,510 @@ fn candidate_request_with_k(
     }
 }
 
-fn exact_work_limits_for(
+fn candidate_work_spec(
+    slot: &Slot,
+    corpus_rows: u32,
+    stored_dim: u32,
+) -> AnyResult<CandidateWorkSpec> {
+    let SlotShape::Dense(raw_dim) = slot.shape else {
+        return Err(format!(
+            "candidate work plan requires dense slot {}, got {:?}",
+            slot.slot_id.get(),
+            slot.shape
+        )
+        .into());
+    };
+    Ok(CandidateWorkSpec {
+        slot_id: slot.slot_id.get(),
+        quant_policy: slot.quant,
+        raw_dim,
+        stored_dim,
+        corpus_rows,
+    })
+}
+
+fn exact_work_plan(
+    candidate_specs: &[CandidateWorkSpec],
+    query_count: usize,
+) -> AnyResult<ExactWorkPlan> {
+    require(
+        !candidate_specs.is_empty(),
+        "exact work plan requires at least one candidate",
+    )?;
+    let held_out_queries = u64::try_from(query_count)?;
+    require(
+        held_out_queries > 0,
+        "exact work plan requires at least one held-out query",
+    )?;
+    let mut canonical = candidate_specs.to_vec();
+    canonical.sort_by_key(|candidate| candidate.slot_id);
+    require(
+        !canonical
+            .windows(2)
+            .any(|pair| pair[0].slot_id == pair[1].slot_id),
+        "exact work plan requires unique candidate slot ids",
+    )?;
+
+    let queries = u128::from(held_out_queries);
+    let warmups = u128::from(WARMUP_RUNS);
+    let measured = u128::from(MEASURED_RUNS);
+    // L = 1 build-recall pass + U warmups + M measured passes.
+    let search_passes = 1_u128 + warmups + measured;
+    let warmup_packed_searches = work_u64(
+        "warmup packed searches",
+        warmups
+            .checked_mul(queries)
+            .ok_or("warmup search overflow")?,
+    )?;
+    let measured_packed_searches = work_u64(
+        "measured packed searches",
+        measured
+            .checked_mul(queries)
+            .ok_or("measured search overflow")?,
+    )?;
+    let evaluation_packed_searches = work_u64(
+        "evaluation packed searches",
+        (warmups + measured)
+            .checked_mul(queries)
+            .ok_or("evaluation packed-search overflow")?,
+    )?;
+    let lifecycle_packed_searches = work_u64(
+        "lifecycle packed searches",
+        search_passes
+            .checked_mul(queries)
+            .ok_or("lifecycle packed-search overflow")?,
+    )?;
+
+    let mut candidate_work = Vec::with_capacity(canonical.len());
+    let mut legacy_by_slot = BTreeMap::new();
+    let mut maximum_corpus_rows = 0_u64;
+    let mut maximum_legacy_pairwise = 0_u64;
+    let mut maximum_legacy_coefficients = 0_u64;
+    let mut peak_geometry = 0_u64;
+    let mut aggregate_retained_and_sample_bound = 0_u128;
+    let mut aggregate_transform = 0_u128;
+    let mut aggregate_auxiliary = 0_u128;
+    let mut aggregate_pairwise = 0_u128;
+    let mut aggregate_registry = 0_u128;
+    let mut aggregate_accounted = 0_u128;
+
+    for spec in canonical {
+        require(
+            spec.corpus_rows > 0 && spec.raw_dim > 0 && spec.stored_dim > 0,
+            format!(
+                "candidate {} exact work shape has a zero row/raw/stored dimension",
+                spec.slot_id
+            ),
+        )?;
+        let rows = u128::from(spec.corpus_rows);
+        let raw_dim = u128::from(spec.raw_dim);
+        let stored_dim = u128::from(spec.stored_dim);
+        let query_prepare_calls_u128 = search_passes
+            .checked_mul(queries)
+            .ok_or("query-prepare call overflow")?;
+        let packed_score_calls_u128 = query_prepare_calls_u128
+            .checked_mul(rows)
+            .ok_or("packed-score call overflow")?;
+        let encode_calls = u64::from(spec.corpus_rows);
+        let decode_calls = encode_calls;
+        let query_prepare_calls = work_u64("query-prepare calls", query_prepare_calls_u128)?;
+        let packed_score_calls = work_u64("packed-score calls", packed_score_calls_u128)?;
+
+        let (geometry_physical_bytes, retained_and_sample_bound, transform, auxiliary) = match spec
+            .quant_policy
+        {
+            QuantPolicy::TurboQuant {
+                bits_per_channel_x2,
+            }
+            | QuantPolicy::TurboQuantHadamard {
+                bits_per_channel_x2,
+            } => {
+                let level = match bits_per_channel_x2 {
+                    5 => QuantLevel::Bits2p5,
+                    7 => QuantLevel::Bits3p5,
+                    other => {
+                        return Err(format!(
+                            "candidate {} has unsupported TurboQuant bits_per_channel_x2 {other}",
+                            spec.slot_id
+                        )
+                        .into());
+                    }
+                };
+                let geometry_kind = match spec.quant_policy {
+                    QuantPolicy::TurboQuant { .. } => TurboQuantGeometryKind::DenseHaarGaussianV2,
+                    QuantPolicy::TurboQuantHadamard { .. } => {
+                        TurboQuantGeometryKind::StructuredHadamardV1
+                    }
+                    _ => unreachable!("TurboQuant match arm checked the policy"),
+                };
+                let shape =
+                    turboquant_work_shape(usize::try_from(spec.stored_dim)?, level, geometry_kind)?;
+                let retained_and_sample_bound = u128::from(shape.geometry_retained_entries)
+                    .checked_add(u128::from(shape.codebook_setup_sample_evaluations))
+                    .ok_or("TurboQuant retained-entry/sample proxy overflow")?;
+                let transform_calls = rows
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(query_prepare_calls_u128))
+                    .ok_or("TurboQuant transform call overflow")?;
+                let transform = transform_calls
+                    .checked_mul(u128::from(shape.transform_pair_coefficient_visits))
+                    .ok_or("TurboQuant transform work overflow")?;
+                let query_lut_visits = u128::from(shape.query_lut_allocated_entries)
+                    .checked_add(u128::from(shape.query_lut_filled_entries))
+                    .ok_or("TurboQuant query LUT work overflow")?;
+                let auxiliary = rows
+                    .checked_mul(u128::from(shape.encode_scalar_centroid_visits))
+                    .and_then(|value| {
+                        rows.checked_mul(u128::from(shape.decode_scalar_centroid_lookups))
+                            .and_then(|decode| value.checked_add(decode))
+                    })
+                    .and_then(|value| {
+                        query_prepare_calls_u128
+                            .checked_mul(query_lut_visits)
+                            .and_then(|query| value.checked_add(query))
+                    })
+                    .and_then(|value| {
+                        packed_score_calls_u128
+                            .checked_mul(u128::from(shape.packed_score_coefficient_visits))
+                            .and_then(|score| value.checked_add(score))
+                    })
+                    .ok_or("TurboQuant auxiliary work overflow")?;
+                (
+                    shape.geometry_physical_bytes,
+                    retained_and_sample_bound,
+                    transform,
+                    auxiliary,
+                )
+            }
+            QuantPolicy::Binary => {
+                let shape = binary_work_shape(usize::try_from(spec.stored_dim)?)?;
+                let transform = rows
+                    .checked_mul(u128::from(shape.encode_transform_coefficient_visits))
+                    .and_then(|value| {
+                        rows.checked_mul(u128::from(shape.decode_transform_coefficient_visits))
+                            .and_then(|decode| value.checked_add(decode))
+                    })
+                    .and_then(|value| {
+                        query_prepare_calls_u128
+                            .checked_mul(u128::from(
+                                shape.query_prepare_transform_coefficient_visits,
+                            ))
+                            .and_then(|query| value.checked_add(query))
+                    })
+                    .ok_or("Binary transform work overflow")?;
+                let auxiliary = packed_score_calls_u128
+                    .checked_mul(u128::from(shape.packed_score_coefficient_visits))
+                    .ok_or("Binary packed-score work overflow")?;
+                (
+                    shape.geometry_physical_bytes,
+                    u128::from(shape.geometry_retained_entries),
+                    transform,
+                    auxiliary,
+                )
+            }
+            QuantPolicy::ScalarInt8 => {
+                let auxiliary = packed_score_calls_u128
+                    .checked_mul(stored_dim)
+                    .and_then(|value| value.checked_mul(3))
+                    .ok_or("ScalarInt8 score-decoded work overflow")?;
+                (0, 0, 0, auxiliary)
+            }
+            QuantPolicy::None | QuantPolicy::MxFp4 | QuantPolicy::Float8 => {
+                let auxiliary = packed_score_calls_u128
+                    .checked_mul(stored_dim)
+                    .ok_or("decoded packed-score work overflow")?;
+                (0, 0, 0, auxiliary)
+            }
+            QuantPolicy::Pq { .. } | QuantPolicy::ColbertResidual2Bit => {
+                return Err(format!(
+                    "candidate {} policy {:?} has no dense Registry compression work contract",
+                    spec.slot_id, spec.quant_policy
+                )
+                .into());
+            }
+        };
+
+        let pairwise = (2_u128 + search_passes)
+            .checked_mul(queries)
+            .and_then(|value| value.checked_mul(rows))
+            .ok_or("candidate pairwise work overflow")?;
+        let registry_coefficients = queries
+            .checked_mul(rows)
+            .and_then(|value| value.checked_mul(raw_dim))
+            .and_then(|value| value.checked_mul(2))
+            .and_then(|value| {
+                rows.checked_mul(raw_dim + stored_dim)
+                    .and_then(|reconstruction| value.checked_add(reconstruction))
+            })
+            .ok_or("candidate Registry coefficient work overflow")?;
+        // Heterogeneous admission accounting covers exactly these enumerated
+        // categories. C/R/Q limits separately bound validation/source passes.
+        let accounted = retained_and_sample_bound
+            .checked_add(transform)
+            .and_then(|value| value.checked_add(auxiliary))
+            .and_then(|value| value.checked_add(pairwise))
+            .and_then(|value| value.checked_add(registry_coefficients))
+            .ok_or("candidate accounted-work sum overflow")?;
+
+        let exact_truth_pairwise_scores = rows
+            .checked_mul(queries)
+            .ok_or("legacy exact pairwise work overflow")?;
+        let packed_pairwise_scores = rows
+            .checked_mul(u128::from(evaluation_packed_searches))
+            .ok_or("legacy packed pairwise work overflow")?;
+        let legacy_pairwise = exact_truth_pairwise_scores
+            .checked_add(packed_pairwise_scores)
+            .and_then(|value| value.checked_add(rows))
+            .ok_or("legacy total pairwise work overflow")?;
+        let legacy_coefficients = exact_truth_pairwise_scores
+            .checked_mul(raw_dim)
+            .and_then(|value| {
+                packed_pairwise_scores
+                    .checked_mul(stored_dim)
+                    .and_then(|packed| value.checked_add(packed))
+            })
+            .and_then(|value| {
+                rows.checked_mul(raw_dim + stored_dim)
+                    .and_then(|reconstruction| value.checked_add(reconstruction))
+            })
+            .ok_or("legacy coefficient work overflow")?;
+
+        let retained_and_sample_bound = work_u64(
+            "candidate retained-entry/sample proxy",
+            retained_and_sample_bound,
+        )?;
+        let transform = work_u64("candidate transform work", transform)?;
+        let auxiliary = work_u64("candidate auxiliary work", auxiliary)?;
+        let pairwise = work_u64("candidate pairwise work", pairwise)?;
+        let registry_coefficients =
+            work_u64("candidate Registry coefficient work", registry_coefficients)?;
+        let accounted = work_u64("candidate accounted-work sum", accounted)?;
+        let legacy_pairwise = work_u64("legacy total pairwise work", legacy_pairwise)?;
+        let legacy_coefficients = work_u64("legacy coefficient work", legacy_coefficients)?;
+
+        maximum_corpus_rows = maximum_corpus_rows.max(u64::from(spec.corpus_rows));
+        maximum_legacy_pairwise = maximum_legacy_pairwise.max(legacy_pairwise);
+        maximum_legacy_coefficients = maximum_legacy_coefficients.max(legacy_coefficients);
+        peak_geometry = peak_geometry.max(geometry_physical_bytes);
+        aggregate_retained_and_sample_bound = aggregate_retained_and_sample_bound
+            .checked_add(u128::from(retained_and_sample_bound))
+            .ok_or("aggregate retained-entry/sample proxy overflow")?;
+        aggregate_transform = aggregate_transform
+            .checked_add(u128::from(transform))
+            .ok_or("aggregate transform work overflow")?;
+        aggregate_auxiliary = aggregate_auxiliary
+            .checked_add(u128::from(auxiliary))
+            .ok_or("aggregate auxiliary work overflow")?;
+        aggregate_pairwise = aggregate_pairwise
+            .checked_add(u128::from(pairwise))
+            .ok_or("aggregate pairwise work overflow")?;
+        aggregate_registry = aggregate_registry
+            .checked_add(u128::from(registry_coefficients))
+            .ok_or("aggregate Registry work overflow")?;
+        aggregate_accounted = aggregate_accounted
+            .checked_add(u128::from(accounted))
+            .ok_or("aggregate accounted-work sum overflow")?;
+
+        candidate_work.push(CompressionCandidateWorkObservation {
+            slot_id: spec.slot_id,
+            quant_policy: spec.quant_policy,
+            raw_dim: spec.raw_dim,
+            stored_dim: spec.stored_dim,
+            corpus_rows: u64::from(spec.corpus_rows),
+            geometry_physical_bytes,
+            codec_retained_entry_and_sample_bound: retained_and_sample_bound,
+            encode_calls,
+            decode_calls,
+            query_prepare_calls,
+            packed_score_calls,
+            codec_transform_coefficient_visits: transform,
+            codec_auxiliary_work_units: auxiliary,
+            pairwise_score_evaluations: pairwise,
+            registry_coefficient_evaluations: registry_coefficients,
+            accounted_work_units: accounted,
+        });
+        legacy_by_slot.insert(
+            spec.slot_id,
+            ExpectedLegacyWork {
+                corpus_rows: u64::from(spec.corpus_rows),
+                held_out_queries,
+                warmup_packed_searches,
+                measured_packed_searches,
+                exact_truth_pairwise_scores: work_u64(
+                    "legacy exact pairwise work",
+                    exact_truth_pairwise_scores,
+                )?,
+                packed_pairwise_scores: work_u64(
+                    "legacy packed pairwise work",
+                    packed_pairwise_scores,
+                )?,
+                reconstruction_rows: u64::from(spec.corpus_rows),
+                coefficient_evaluations: legacy_coefficients,
+            },
+        );
+    }
+
+    let aggregate_retained_and_sample_bound = work_u64(
+        "aggregate retained-entry/sample proxy",
+        aggregate_retained_and_sample_bound,
+    )?;
+    let aggregate_transform = work_u64("aggregate transform work", aggregate_transform)?;
+    let aggregate_auxiliary = work_u64("aggregate auxiliary work", aggregate_auxiliary)?;
+    let aggregate_pairwise = work_u64("aggregate pairwise work", aggregate_pairwise)?;
+    let aggregate_registry = work_u64("aggregate Registry work", aggregate_registry)?;
+    let aggregate_accounted = work_u64("aggregate accounted-work sum", aggregate_accounted)?;
+    let candidate_slots = u64::try_from(candidate_work.len())?;
+    let limits = CompressionAdmissionWorkLimits {
+        maximum_corpus_rows,
+        maximum_held_out_queries: held_out_queries,
+        maximum_total_packed_searches: lifecycle_packed_searches,
+        maximum_pairwise_score_evaluations: maximum_legacy_pairwise,
+        maximum_coefficient_evaluations: maximum_legacy_coefficients,
+        maximum_candidate_slots: candidate_slots,
+        // V3 rejects zero declarations. One is the tightest representable
+        // ceiling when a real codec observation is exactly zero.
+        maximum_peak_codec_geometry_bytes: peak_geometry.max(1),
+        maximum_aggregate_codec_retained_entry_and_sample_bound:
+            aggregate_retained_and_sample_bound.max(1),
+        maximum_aggregate_codec_transform_coefficient_visits: aggregate_transform.max(1),
+        maximum_aggregate_pairwise_score_evaluations: aggregate_pairwise.max(1),
+        maximum_total_accounted_work_units: aggregate_accounted.max(1),
+    };
+    Ok(ExactWorkPlan {
+        limits,
+        candidate_work,
+        legacy_by_slot,
+        peak_codec_geometry_bytes: peak_geometry,
+        aggregate_codec_retained_entry_and_sample_bound: aggregate_retained_and_sample_bound,
+        aggregate_codec_transform_coefficient_visits: aggregate_transform,
+        aggregate_codec_auxiliary_work_units: aggregate_auxiliary,
+        aggregate_pairwise_score_evaluations: aggregate_pairwise,
+        aggregate_registry_coefficient_evaluations: aggregate_registry,
+        total_accounted_work_units: aggregate_accounted,
+    })
+}
+
+fn refusal_work_limits(
     rows: u32,
     raw_dim: u32,
     stored_dim: u32,
     query_count: usize,
 ) -> AnyResult<CompressionAdmissionWorkLimits> {
-    let rows = u64::from(rows);
-    let queries = u64::try_from(query_count)?;
-    let packed_searches = u64::from(WARMUP_RUNS + MEASURED_RUNS)
+    // No codec work shape exists for these deliberately invalid/empty inputs.
+    // The legacy scan bounds reflect the declared R/Q/D shape, while every
+    // v3 codec-accounting limit is the minimum positive canary. The intended
+    // validation must refuse before codec accounting; an ordering regression
+    // therefore produces the wrong diagnostic and makes the FSV fail loudly.
+    let rows = u128::from(rows);
+    let raw_dim = u128::from(raw_dim);
+    let stored_dim = u128::from(stored_dim);
+    let queries = u128::try_from(query_count)?;
+    let evaluation_searches = u128::from(WARMUP_RUNS + MEASURED_RUNS)
         .checked_mul(queries)
-        .ok_or("packed-search boundary overflow")?;
+        .ok_or("refusal evaluation-search bound overflow")?;
+    let lifecycle_searches = u128::from(1 + WARMUP_RUNS + MEASURED_RUNS)
+        .checked_mul(queries)
+        .ok_or("refusal lifecycle-search bound overflow")?;
     let exact_pairs = rows
         .checked_mul(queries)
-        .ok_or("exact-pair boundary overflow")?;
+        .ok_or("refusal exact-pair bound overflow")?;
     let packed_pairs = rows
-        .checked_mul(packed_searches)
-        .ok_or("packed-pair boundary overflow")?;
+        .checked_mul(evaluation_searches)
+        .ok_or("refusal packed-pair bound overflow")?;
     let pairwise = exact_pairs
         .checked_add(packed_pairs)
         .and_then(|value| value.checked_add(rows))
-        .ok_or("pairwise boundary overflow")?;
+        .ok_or("refusal pairwise bound overflow")?;
     let coefficients = exact_pairs
-        .checked_mul(u64::from(raw_dim))
+        .checked_mul(raw_dim)
         .and_then(|value| {
             packed_pairs
-                .checked_mul(u64::from(stored_dim))
+                .checked_mul(stored_dim)
                 .and_then(|packed| value.checked_add(packed))
         })
         .and_then(|value| {
-            rows.checked_mul(u64::from(raw_dim) + u64::from(stored_dim))
+            rows.checked_mul(raw_dim + stored_dim)
                 .and_then(|reconstruction| value.checked_add(reconstruction))
         })
-        .ok_or("coefficient boundary overflow")?;
+        .ok_or("refusal coefficient bound overflow")?;
     Ok(CompressionAdmissionWorkLimits {
-        maximum_corpus_rows: rows,
-        maximum_held_out_queries: queries,
-        maximum_total_packed_searches: packed_searches,
-        maximum_pairwise_score_evaluations: pairwise,
-        maximum_coefficient_evaluations: coefficients,
+        maximum_corpus_rows: work_u64("refusal corpus rows", rows)?,
+        maximum_held_out_queries: work_u64("refusal held-out queries", queries)?,
+        maximum_total_packed_searches: work_u64(
+            "refusal lifecycle packed searches",
+            lifecycle_searches,
+        )?,
+        maximum_pairwise_score_evaluations: work_u64("refusal pairwise scores", pairwise)?,
+        maximum_coefficient_evaluations: work_u64("refusal coefficient evaluations", coefficients)?,
+        maximum_candidate_slots: 1,
+        maximum_peak_codec_geometry_bytes: 1,
+        maximum_aggregate_codec_retained_entry_and_sample_bound: 1,
+        maximum_aggregate_codec_transform_coefficient_visits: 1,
+        maximum_aggregate_pairwise_score_evaluations: 1,
+        maximum_total_accounted_work_units: 1,
     })
 }
 
-fn exact_work_limits(
-    generation: &calyx_registry::CompressedGenerationIdentity,
-    query_count: usize,
-) -> AnyResult<CompressionAdmissionWorkLimits> {
-    exact_work_limits_for(
-        generation.row_count,
-        generation.raw_dim,
-        generation.stored_dim,
-        query_count,
+fn work_u64(label: &str, value: u128) -> AnyResult<u64> {
+    u64::try_from(value).map_err(|_| format!("{label} exceeds u64").into())
+}
+
+fn require_v3_work_plan(
+    receipt: &CompressionAdmissionReceipt,
+    expected: &ExactWorkPlan,
+) -> AnyResult<()> {
+    let legacy = expected
+        .legacy_by_slot
+        .get(&receipt.slot_id)
+        .ok_or_else(|| format!("work plan omitted receipt slot {}", receipt.slot_id))?;
+    let expected_candidate_slots = u64::try_from(expected.candidate_work.len())?;
+    let persisted = &receipt.work;
+    require(
+        receipt.schema == COMPRESSION_ADMISSION_SCHEMA
+            && persisted.work_model == COMPRESSION_WORK_MODEL
+            && persisted.candidate_slots == expected_candidate_slots
+            && persisted.candidate_work == expected.candidate_work
+            && persisted.peak_codec_geometry_bytes == expected.peak_codec_geometry_bytes
+            && persisted.aggregate_codec_retained_entry_and_sample_bound
+                == expected.aggregate_codec_retained_entry_and_sample_bound
+            && persisted.aggregate_codec_transform_coefficient_visits
+                == expected.aggregate_codec_transform_coefficient_visits
+            && persisted.aggregate_codec_auxiliary_work_units
+                == expected.aggregate_codec_auxiliary_work_units
+            && persisted.aggregate_pairwise_score_evaluations
+                == expected.aggregate_pairwise_score_evaluations
+            && persisted.aggregate_registry_coefficient_evaluations
+                == expected.aggregate_registry_coefficient_evaluations
+            && persisted.total_accounted_work_units == expected.total_accounted_work_units
+            && persisted.corpus_rows == legacy.corpus_rows
+            && persisted.held_out_queries == legacy.held_out_queries
+            && persisted.warmup_packed_searches == legacy.warmup_packed_searches
+            && persisted.measured_packed_searches == legacy.measured_packed_searches
+            && persisted.exact_truth_pairwise_scores == legacy.exact_truth_pairwise_scores
+            && persisted.packed_pairwise_scores == legacy.packed_pairwise_scores
+            && persisted.reconstruction_rows == legacy.reconstruction_rows
+            && persisted.coefficient_evaluations == legacy.coefficient_evaluations
+            && receipt.work_limits == expected.limits,
+        format!(
+            "slot {} v3 persisted planned upper bound differs from independent exact calculation: expected={} persisted={}",
+            receipt.slot_id,
+            serde_json::to_string(expected)?,
+            serde_json::to_string(persisted)?,
+        ),
+    )?;
+    require(
+        receipt
+            .gate_observations
+            .iter()
+            .any(|gate| gate.gate == "maximum_working_set_bytes_after_measured_search")
+            && receipt
+                .gate_observations
+                .iter()
+                .all(|gate| gate.gate != "maximum_working_set_bytes"),
+        format!(
+            "slot {} v3 receipt did not label endpoint RSS separately from transient peak/legacy v2 semantics",
+            receipt.slot_id
+        ),
     )
 }
 
@@ -2797,6 +3492,81 @@ fn require_unpublished_candidate(readback: &CompressionAdmissionReadback) -> Any
             && readback.pointer_ledger.is_none()
             && readback.receipt.candidate_selection.is_none(),
         "passing candidate evaluation was published before selection",
+    )
+}
+
+fn require_historical_candidate_receipt(readback: &CompressionAdmissionReadback) -> AnyResult<()> {
+    require(
+        readback.receipt.schema == COMPRESSION_ADMISSION_SCHEMA
+            && readback.receipt.verdict == CompressionAdmissionVerdict::Admitted
+            && readback.receipt.candidate_selection.is_none()
+            && !readback.current
+            && readback.active_generation_current
+            && readback.receipt_commit_seq.is_none()
+            && readback.receipt_ledger.is_none()
+            && readback.pointer_commit_seq.is_none()
+            && readback.pointer_ledger.is_none()
+            && readback.trust == "verified_historical_hash_and_active_generation",
+        "exact hash-addressed candidate receipt did not reopen as canonical immutable historical bytes bound to the active manifested generation",
+    )
+}
+
+fn require_compact_commission_candidate(
+    candidate: &CompressionCandidateCommissionEntry,
+    readback: &CompressionAdmissionReadback,
+) -> AnyResult<()> {
+    let receipt = &readback.receipt;
+    require(
+        candidate.schema == COMPRESSION_ADMISSION_SCHEMA
+            && candidate.schema == receipt.schema
+            && candidate.receipt_sha256 == readback.receipt_sha256
+            && candidate.receipt_commit_seq > candidate.generation.generation_seq
+            && candidate.generation.slot_id == receipt.slot_id
+            && candidate.generation.slot_key == receipt.slot_key
+            && candidate.generation.stored_codec == receipt.codec
+            && candidate.generation.corpus_rows == receipt.corpus_rows
+            && candidate.generation.generation_seq == receipt.generation_seq
+            && candidate.codec_context_sha256 == receipt.codec_context_sha256
+            && candidate.generation_sha256 == receipt.generation_sha256
+            && candidate.raw_generation_sha256 == receipt.raw_generation_sha256
+            && candidate.membership_sha256 == receipt.membership_sha256
+            && candidate.level == receipt.level
+            && candidate.raw_dim == receipt.raw_dim
+            && candidate.stored_dim == receipt.stored_dim
+            && candidate.verdict == receipt.verdict
+            && candidate.total_physical_bytes == receipt.total_physical_bytes
+            && candidate.effective_bits_per_value == receipt.effective_bits_per_value
+            && candidate.build_elapsed_ns == receipt.build.elapsed_ns
+            && candidate
+                .trust
+                .starts_with("verified_candidate_evaluation_physical_bytes=")
+            && candidate.trust.ends_with(";current_pointer_unchanged=true"),
+        format!(
+            "slot {} compact commission identity differs from its exact persisted receipt",
+            candidate.generation.slot_id
+        ),
+    )
+}
+
+fn require_receipt_matches_generation(
+    receipt: &CompressionAdmissionReceipt,
+    generation: &calyx_registry::CompressedGenerationIdentity,
+) -> AnyResult<()> {
+    require(
+        receipt.slot_id == generation.slot_id
+            && receipt.codec == generation.codec
+            && receipt.level == generation.level
+            && receipt.raw_dim == generation.raw_dim
+            && receipt.stored_dim == generation.stored_dim
+            && receipt.corpus_rows == generation.row_count
+            && receipt.codec_context_sha256 == generation.codec_context_sha256
+            && receipt.generation_sha256 == generation.generation_sha256
+            && receipt.raw_generation_sha256 == generation.raw_generation_sha256
+            && receipt.membership_sha256 == generation.membership_sha256,
+        format!(
+            "slot {} exact candidate receipt differs from its independently reopened manifested generation",
+            receipt.slot_id
+        ),
     )
 }
 
@@ -3125,6 +3895,7 @@ fn require_admission_ledger_binding(
     rows: &[(Vec<u8>, Vec<u8>)],
     slot_id: u16,
     receipt_sha256: &str,
+    receipt_schema: &str,
     phase: &str,
     verdict: CompressionAdmissionVerdict,
 ) -> AnyResult<()> {
@@ -3140,7 +3911,7 @@ fn require_admission_ledger_binding(
             continue;
         }
         let payload: Value = serde_json::from_slice(&entry.payload)?;
-        if payload.get("marker") == Some(&Value::String(ADMISSION_MARKER.to_string()))
+        if payload.get("marker") == Some(&Value::String(receipt_schema.to_string()))
             && payload.get("slot_id").and_then(Value::as_u64) == Some(u64::from(slot_id))
             && payload.get("receipt_sha256").and_then(Value::as_str) == Some(receipt_sha256)
             && payload.get("phase").and_then(Value::as_str) == Some(phase)
@@ -3153,6 +3924,67 @@ fn require_admission_ledger_binding(
         matches == 1,
         format!(
             "expected exactly one Admission Ledger binding for slot={slot_id} receipt={receipt_sha256} phase={phase}, found {matches}"
+        ),
+    )
+}
+
+fn require_ledger_ref(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    reference: &calyx_core::LedgerRef,
+    label: &str,
+) -> AnyResult<()> {
+    let expected_key = reference.seq.to_be_bytes();
+    let matches = rows
+        .iter()
+        .filter(|(key, _)| key.as_slice() == expected_key.as_slice())
+        .collect::<Vec<_>>();
+    require(
+        matches.len() == 1,
+        format!(
+            "{label} LedgerRef sequence {} resolved to {} physical rows",
+            reference.seq,
+            matches.len()
+        ),
+    )?;
+    let entry = calyx_ledger::decode(&matches[0].1)?;
+    require(
+        entry.seq == reference.seq && entry.entry_hash == reference.hash,
+        format!(
+            "{label} LedgerRef sequence/hash differs from its independently read Ledger CF row"
+        ),
+    )
+}
+
+fn require_admission_ledger_binding_ref(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    candidate: &CompressionCandidateCommissionEntry,
+    receipt: &CompressionAdmissionReceipt,
+) -> AnyResult<()> {
+    require_ledger_ref(
+        rows,
+        &candidate.receipt_ledger,
+        "candidate admission receipt",
+    )?;
+    let expected_key = candidate.receipt_ledger.seq.to_be_bytes();
+    let (_, bytes) = rows
+        .iter()
+        .find(|(key, _)| key.as_slice() == expected_key.as_slice())
+        .ok_or("candidate admission LedgerRef row disappeared after exact reference readback")?;
+    let entry = calyx_ledger::decode(bytes)?;
+    let payload: Value = serde_json::from_slice(&entry.payload)?;
+    let expected_verdict = serde_json::to_value(receipt.verdict)?;
+    require(
+        entry.kind == EntryKind::Admission
+            && payload.get("marker") == Some(&Value::String(candidate.schema.clone()))
+            && payload.get("slot_id").and_then(Value::as_u64)
+                == Some(u64::from(candidate.generation.slot_id))
+            && payload.get("receipt_sha256").and_then(Value::as_str)
+                == Some(candidate.receipt_sha256.as_str())
+            && payload.get("phase").and_then(Value::as_str) == Some("evaluation")
+            && payload.get("verdict") == Some(&expected_verdict),
+        format!(
+            "slot {} compact receipt LedgerRef does not bind its exact schema/hash/verdict evaluation payload",
+            candidate.generation.slot_id
         ),
     )
 }

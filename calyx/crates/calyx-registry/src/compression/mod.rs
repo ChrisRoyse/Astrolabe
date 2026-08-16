@@ -8,12 +8,12 @@ mod recall;
 
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, MiEstimate, TrustTag};
 use calyx_aster::cf::{
-    COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key,
+    COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, KeyRange, base_key, compression_manifest_key,
     compression_membership_proof_key, slot_key,
 };
 pub use calyx_aster::compression_lifecycle::COMPRESSION_GENERATION_MARKER;
 use calyx_aster::compression_lifecycle::{GenerationTransition, compression_generation_subject};
-use calyx_aster::vault::{AsterVault, encode};
+use calyx_aster::vault::{AsterVault, RetainedSnapshot, encode};
 use calyx_core::{Clock, CxId, LedgerRef, LensId, QuantPolicy, Result, Seq, Slot, SlotVector};
 use calyx_forge::AssayQuantSafety;
 use calyx_ledger::{ActorId, EntryKind};
@@ -23,7 +23,9 @@ use std::collections::BTreeSet;
 
 use crate::spec::LensSpec;
 pub use codec::inspect_unbound_stored_slot_envelope;
-use codec::{EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows, parse_compression_manifest};
+use codec::{
+    CodecContext, EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows, parse_compression_manifest,
+};
 pub use index::{
     CompressedGenerationIdentity, CompressedSlotHit, CompressedSlotIndex,
     CompressionReconstructionObservation,
@@ -38,13 +40,15 @@ pub use measurement::{
     CompressionAdmissionReadback, CompressionAdmissionReceipt, CompressionAdmissionRequest,
     CompressionAdmissionStatus, CompressionAdmissionVerdict, CompressionAdmissionWorkLimits,
     CompressionAllocationObservation, CompressionBuildObservation,
-    CompressionCandidateCommissionReadback, CompressionCandidateEvaluationReadback,
-    CompressionCandidateEvaluationRequest, CompressionCandidateReference,
+    CompressionCandidateCommissionEntry, CompressionCandidateCommissionReadback,
+    CompressionCandidateEvaluationReadback, CompressionCandidateEvaluationRequest,
+    CompressionCandidateGenerationSummary, CompressionCandidateReference,
     CompressionCandidateSelectionEntry, CompressionCandidateSelectionReceipt,
-    CompressionGateComparison, CompressionGateObservation, CompressionPhysicalComponent,
-    CompressionPlacementObservation, CompressionQueryObservation,
+    CompressionCandidateWorkObservation, CompressionGateComparison, CompressionGateObservation,
+    CompressionPhysicalComponent, CompressionPlacementObservation, CompressionQueryObservation,
     CompressionReconstructionEvidence, CompressionResourceObservation, CompressionScoredHit,
     CompressionVramObservation, CompressionWorkObservation,
+    preflight_compression_candidate_operation,
 };
 pub(crate) use measurement::{
     admission_status, build_and_evaluate_candidate, commission_and_select_candidates,
@@ -162,6 +166,16 @@ pub struct SlotCompressionReport {
     pub ledger: Option<LedgerRef>,
 }
 
+/// Internal build product that keeps the exact codec context alive through
+/// durable generation commit and admission evaluation (#1064 PC-04/13).
+pub(super) struct CompressionBuildProduct {
+    pub(super) report: SlotCompressionReport,
+    pub(super) codec: CodecContext,
+    /// Exact sequence guarded by the durable full-column rewrite. Pure
+    /// compression products carry `None`; persisted products carry `Some`.
+    pub(super) source_seq: Option<Seq>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredSlotEnvelope {
     pub format_version: u8,
@@ -188,6 +202,7 @@ const MXFP4_SOURCE_DOMAIN: &[u8] = b"calyx-registry-mxfp4-source-column-v1";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MxFp4AssayEvidence {
+    cache_key: AssayCacheKey,
     slot_id: u16,
     slot_key: String,
     lens_id: LensId,
@@ -245,9 +260,9 @@ impl MxFp4AssayEvidence {
                 self.dim
             )));
         }
-        if self.written_at_seq != self.current_seq {
+        if self.written_at_seq > self.current_seq {
             return Err(mxfp4_evidence_error(format!(
-                "stale assay evidence: written_at_seq={} current_seq={}",
+                "future-dated assay evidence: written_at_seq={} current_seq={}",
                 self.written_at_seq, self.current_seq
             )));
         }
@@ -265,6 +280,22 @@ impl MxFp4AssayEvidence {
         hasher.update(self.assay_row_sha256);
         hasher.update(self.source_column_sha256);
         hasher.finalize().into()
+    }
+
+    /// Compares every immutable Assay/source binding while deliberately
+    /// excluding only the operation snapshot at which the same row was
+    /// revalidated. Commission-owned commits may advance the vault sequence
+    /// without changing this candidate's source column (#1064 PC-03/43).
+    pub(super) fn has_same_immutable_identity(&self, other: &Self) -> bool {
+        self.cache_key == other.cache_key
+            && self.slot_id == other.slot_id
+            && self.slot_key == other.slot_key
+            && self.lens_id == other.lens_id
+            && self.dim == other.dim
+            && self.written_at_seq == other.written_at_seq
+            && self.source_column_sha256 == other.source_column_sha256
+            && self.assay_row_sha256 == other.assay_row_sha256
+            && self.safety == other.safety
     }
 }
 
@@ -360,6 +391,15 @@ pub fn load_mxfp4_assay_evidence<C: Clock>(
     lens: &LensSpec,
 ) -> Result<MxFp4AssayEvidence> {
     let current_seq = vault.latest_seq();
+    load_mxfp4_assay_evidence_at(vault, slot, lens, current_seq)
+}
+
+pub(super) fn load_mxfp4_assay_evidence_at<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    current_seq: Seq,
+) -> Result<MxFp4AssayEvidence> {
     let (source_column_sha256, source_rows) =
         source_slot_column_attestation(vault, slot, ColumnFamily::slot(slot.slot_id), current_seq)?;
     let expected_dim = match slot.shape {
@@ -385,13 +425,13 @@ pub fn load_mxfp4_assay_evidence<C: Clock>(
             continue;
         }
         if row.provenance != MXFP4_ASSAY_PROVENANCE
-            || row.written_at_seq != current_seq
+            || row.written_at_seq > current_seq
             || row.estimate.trust != TrustTag::Trusted
             || row.estimate.n_samples < calyx_assay::MIN_ASSAY_SAMPLES
             || row.estimate.bits.to_bits() != payload.safety.quantized_bits.to_bits()
         {
             return Err(mxfp4_evidence_error(format!(
-                "MXFP4 Assay row is stale, provisional, under-sampled, or internally inconsistent: written_at_seq={} current_seq={current_seq} trust={:?} n_samples={} estimate_bits={} payload_bits={}",
+                "MXFP4 Assay row is future-dated, provisional, under-sampled, or internally inconsistent: written_at_seq={} current_seq={current_seq} trust={:?} n_samples={} estimate_bits={} payload_bits={}",
                 row.written_at_seq,
                 row.estimate.trust,
                 row.estimate.n_samples,
@@ -416,6 +456,7 @@ pub fn load_mxfp4_assay_evidence<C: Clock>(
             ))
         })?;
         matches.push(MxFp4AssayEvidence {
+            cache_key: row.cache_key.clone(),
             slot_id: slot.slot_id.get(),
             slot_key: slot.slot_key.key().to_string(),
             lens_id: lens.lens_id(),
@@ -434,6 +475,80 @@ pub fn load_mxfp4_assay_evidence<C: Clock>(
         )));
     }
     Ok(matches.remove(0))
+}
+
+/// Reopens exactly the Assay row selected during preflight, rebinds it to the
+/// candidate's source column at `current_seq`, and requires every immutable
+/// identity field to remain equal. This point read avoids repeating the shared
+/// Assay-column materialization between preflight and write (#1064 PC-03/43).
+pub(super) fn reload_mxfp4_assay_evidence_at<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    preflight: &MxFp4AssayEvidence,
+    current_seq: Seq,
+) -> Result<MxFp4AssayEvidence> {
+    let subject = AssaySubject::Lens { slot: slot.slot_id };
+    let row =
+        AssayStore::read_row_from_vault_at(vault, current_seq, &preflight.cache_key, &subject)?
+            .ok_or_else(|| mxfp4_evidence_error("preflight-bound MXFP4 Assay row is missing"))?;
+    let payload_value = row
+        .payload
+        .as_ref()
+        .ok_or_else(|| mxfp4_evidence_error("preflight-bound MXFP4 Assay row has no payload"))?;
+    let payload: MxFp4AssayPayload =
+        serde_json::from_value(payload_value.clone()).map_err(|error| {
+            mxfp4_evidence_error(format!(
+                "preflight-bound MXFP4 Assay payload is invalid: {error}"
+            ))
+        })?;
+    let expected_dim = match slot.shape {
+        calyx_core::SlotShape::Dense(raw_dim) => lens.truncate_dim.unwrap_or(raw_dim),
+        _ => return Err(mxfp4_evidence_error("MXFP4 evidence requires a dense slot")),
+    };
+    let (source_column_sha256, source_rows) =
+        source_slot_column_attestation(vault, slot, ColumnFamily::slot(slot.slot_id), current_seq)?;
+    if row.cache_key != preflight.cache_key
+        || row.provenance != MXFP4_ASSAY_PROVENANCE
+        || row.written_at_seq > current_seq
+        || row.estimate.trust != TrustTag::Trusted
+        || row.estimate.n_samples < calyx_assay::MIN_ASSAY_SAMPLES
+        || row.estimate.bits.to_bits() != payload.safety.quantized_bits.to_bits()
+        || payload.schema != MXFP4_ASSAY_SCHEMA
+        || payload.slot_key != slot.slot_key.key()
+        || payload.lens_id != lens.lens_id().to_string()
+        || payload.dim != expected_dim
+        || payload.source_rows != source_rows
+        || decode_sha256(&payload.source_slot_column_sha256)? != source_column_sha256
+        || !payload.safety.passes()
+    {
+        return Err(mxfp4_evidence_error(
+            "preflight-bound MXFP4 Assay row no longer binds the exact source/lens context",
+        ));
+    }
+    let row_bytes = serde_json::to_vec(&row).map_err(|error| {
+        mxfp4_evidence_error(format!(
+            "failed to canonicalize preflight-bound MXFP4 Assay row: {error}"
+        ))
+    })?;
+    let refreshed = MxFp4AssayEvidence {
+        cache_key: row.cache_key,
+        slot_id: slot.slot_id.get(),
+        slot_key: slot.slot_key.key().to_string(),
+        lens_id: lens.lens_id(),
+        dim: expected_dim,
+        written_at_seq: row.written_at_seq,
+        current_seq,
+        source_column_sha256,
+        assay_row_sha256: Sha256::digest(row_bytes).into(),
+        safety: payload.safety,
+    };
+    if !preflight.has_same_immutable_identity(&refreshed) {
+        return Err(mxfp4_evidence_error(
+            "MXFP4 Assay/source immutable identity changed after commission preflight",
+        ));
+    }
+    Ok(refreshed)
 }
 
 pub(super) fn verify_mxfp4_assay_attestation_at<C: Clock>(
@@ -516,12 +631,24 @@ pub(crate) fn write_compressed_slot_batch<C: Clock>(
     queries: &[CompressionQuery],
     k: usize,
 ) -> Result<SlotCompressionReport> {
+    write_compressed_slot_batch_with_context(vault, slot, lens, rows, queries, k)
+        .map(|product| product.report)
+}
+
+pub(super) fn write_compressed_slot_batch_with_context<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    rows: &[(CxId, Vec<f32>)],
+    queries: &[CompressionQuery],
+    k: usize,
+) -> Result<CompressionBuildProduct> {
     let evidence = if lens.quant_default == QuantPolicy::MxFp4 {
         Some(load_mxfp4_assay_evidence(vault, slot, lens)?)
     } else {
         None
     };
-    write_compressed_slot_batch_with_assay_evidence(
+    write_compressed_slot_batch_with_context_and_assay_evidence(
         vault,
         slot,
         lens,
@@ -541,8 +668,78 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
     k: usize,
     mxfp4_evidence: Option<&MxFp4AssayEvidence>,
 ) -> Result<SlotCompressionReport> {
+    write_compressed_slot_batch_with_context_and_assay_evidence(
+        vault,
+        slot,
+        lens,
+        rows,
+        queries,
+        k,
+        mxfp4_evidence,
+    )
+    .map(|product| product.report)
+}
+
+fn write_compressed_slot_batch_with_context_and_assay_evidence<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    rows: &[(CxId, Vec<f32>)],
+    queries: &[CompressionQuery],
+    k: usize,
+    mxfp4_evidence: Option<&MxFp4AssayEvidence>,
+) -> Result<CompressionBuildProduct> {
+    write_compressed_slot_batch_with_context_and_assay_evidence_inner(
+        vault,
+        slot,
+        lens,
+        rows,
+        queries,
+        k,
+        mxfp4_evidence,
+        false,
+    )
+}
+
+pub(super) fn write_fresh_compressed_slot_batch_with_context_and_assay_evidence<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    rows: &[(CxId, Vec<f32>)],
+    queries: &[CompressionQuery],
+    k: usize,
+    mxfp4_evidence: Option<&MxFp4AssayEvidence>,
+) -> Result<CompressionBuildProduct> {
+    write_compressed_slot_batch_with_context_and_assay_evidence_inner(
+        vault,
+        slot,
+        lens,
+        rows,
+        queries,
+        k,
+        mxfp4_evidence,
+        true,
+    )
+}
+
+fn write_compressed_slot_batch_with_context_and_assay_evidence_inner<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    rows: &[(CxId, Vec<f32>)],
+    queries: &[CompressionQuery],
+    k: usize,
+    mxfp4_evidence: Option<&MxFp4AssayEvidence>,
+    require_fresh_create: bool,
+) -> Result<CompressionBuildProduct> {
     reject_dense_codec_for_multivector(slot.shape, lens.quant_default)?;
     let (expected_seq, transition) = validate_full_column_rewrite(vault, slot, lens, rows)?;
+    if require_fresh_create && transition != GenerationTransition::Create {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "commission candidate changed from its preflight fresh raw Create source before guarded build",
+        ));
+    }
     if lens.quant_default == QuantPolicy::MxFp4
         && let Some(evidence) = mxfp4_evidence
         && evidence.current_seq != expected_seq
@@ -552,8 +749,15 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
             evidence.current_seq
         )));
     }
-    let mut report =
-        compress_slot_batch_with_assay_evidence(slot, lens, rows, queries, k, mxfp4_evidence)?;
+    let mut product = compress_slot_batch_product_with_assay_evidence(
+        slot,
+        lens,
+        rows,
+        queries,
+        k,
+        mxfp4_evidence,
+    )?;
+    let report = &mut product.report;
     let write_capacity = report
         .rows
         .len()
@@ -598,10 +802,10 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
         transition,
         slot,
         expected_seq,
-        &report,
+        report,
         &affected,
     )?);
-    let ledger_payload = generation_ledger_payload(&report, transition, &affected)?;
+    let ledger_payload = generation_ledger_payload(report, transition, &affected)?;
     let (snapshot, ledger_ref) = vault.write_cf_batch_with_ledger_entry_if_seq(
         expected_seq,
         writes,
@@ -610,9 +814,24 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
         ledger_payload,
         ActorId::Service("calyx-registry".to_string()),
     )?;
+    let direct_successor = expected_seq.checked_add(1).ok_or_else(|| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "vault sequence overflow while validating compressed generation provenance",
+        )
+    })?;
+    if snapshot != direct_successor {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!(
+                "compressed generation sequence is not the direct successor of its guarded source: source_seq={expected_seq} generation_seq={snapshot}"
+            ),
+        ));
+    }
     report.snapshot = Some(snapshot);
     report.ledger = Some(ledger_ref);
-    Ok(report)
+    product.source_seq = Some(expected_seq);
+    Ok(product)
 }
 
 fn generation_ledger_payload(
@@ -721,13 +940,83 @@ pub(crate) fn compress_streamed_column<C: Clock>(
 /// truth and classifies which lifecycle transition it is (issue #562):
 /// `Create` for a fresh raw column, `Migrate` for a legacy unmanifested
 /// compressed column, `Reseal` for an already-manifested generation.
+fn scan_rewrite_column_bounded_at<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot_lease: &RetainedSnapshot<'_>,
+    column_family: ColumnFamily,
+    maximum_rows: usize,
+    label: &str,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    const PAGE_ROWS: usize = 1_024;
+    let snapshot = snapshot_lease.seq();
+    let range = KeyRange {
+        start: Vec::new(),
+        end: None,
+    };
+    let mut after_key: Option<Vec<u8>> = None;
+    let mut rows = Vec::new();
+    loop {
+        let remaining = maximum_rows.saturating_sub(rows.len());
+        let page_limit = remaining.saturating_add(1).min(PAGE_ROWS);
+        let page = vault.scan_cf_range_page_at(
+            snapshot,
+            column_family,
+            &range,
+            after_key.as_deref(),
+            page_limit,
+        )?;
+        snapshot_lease.record_progress();
+        if page.is_empty() {
+            break;
+        }
+        let next_after = page.last().map(|(key, _)| key.clone()).ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!("nonempty {label} rewrite page has no final key"),
+            )
+        })?;
+        if after_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &next_after)
+        {
+            return Err(compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!("{label} rewrite scan did not advance"),
+            ));
+        }
+        rows.extend(page);
+        if rows.len() > maximum_rows {
+            return Err(compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!(
+                    "{label} rewrite column exceeds incoming row cardinality: observed_at_least={} incoming_rows={maximum_rows}",
+                    rows.len()
+                ),
+            ));
+        }
+        after_key = Some(next_after);
+    }
+    Ok(rows)
+}
+
 fn validate_full_column_rewrite<C: Clock>(
     vault: &AsterVault<C>,
     slot: &Slot,
     lens: &LensSpec,
     rows: &[(CxId, Vec<f32>)],
 ) -> Result<(Seq, GenerationTransition)> {
-    let snapshot = vault.latest_seq();
+    let snapshot_lease = vault.retain_latest_snapshot();
+    validate_full_column_rewrite_at(vault, slot, lens, rows, &snapshot_lease)
+}
+
+fn validate_full_column_rewrite_at<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    rows: &[(CxId, Vec<f32>)],
+    snapshot_lease: &RetainedSnapshot<'_>,
+) -> Result<(Seq, GenerationTransition)> {
+    let snapshot = snapshot_lease.seq();
     let mut incoming = std::collections::BTreeMap::new();
     let mut incoming_values = std::collections::BTreeMap::new();
     for (cx_id, values) in rows {
@@ -793,6 +1082,7 @@ fn validate_full_column_rewrite<C: Clock>(
                 ),
             ));
         }
+        snapshot_lease.record_progress();
     }
     if incoming.is_empty() {
         return Err(compression_error(
@@ -800,7 +1090,13 @@ fn validate_full_column_rewrite<C: Clock>(
             "compressed full-column rewrite requires persisted source rows",
         ));
     }
-    let stored_rows = vault.scan_cf_at(snapshot, ColumnFamily::slot(slot.slot_id))?;
+    let stored_rows = scan_rewrite_column_bounded_at(
+        vault,
+        snapshot_lease,
+        ColumnFamily::slot(slot.slot_id),
+        incoming.len(),
+        "primary slot",
+    )?;
     if stored_rows.is_empty() {
         return Err(compression_error(
             CALYX_VECTOR_COMPRESSION_EMPTY,
@@ -827,7 +1123,14 @@ fn validate_full_column_rewrite<C: Clock>(
         ColumnFamily::Compression,
         &compression_manifest_key(slot.slot_id),
     )?;
-    let raw_rows = vault.scan_cf_at(snapshot, ColumnFamily::slot_raw(slot.slot_id))?;
+    snapshot_lease.record_progress();
+    let raw_rows = scan_rewrite_column_bounded_at(
+        vault,
+        snapshot_lease,
+        ColumnFamily::slot_raw(slot.slot_id),
+        incoming.len(),
+        "raw sidecar",
+    )?;
     if manifest.is_none() {
         if !raw_rows.is_empty() {
             let legacy_raw = raw_rows
@@ -846,6 +1149,7 @@ fn validate_full_column_rewrite<C: Clock>(
                         "legacy raw sidecar does not exactly match the requested full-column source vectors",
                     ));
                 }
+                snapshot_lease.record_progress();
             }
             let verifier = LegacyV2EnvelopeVerifier::new(slot, lens)?;
             for (key, stored_value) in &stored_rows {
@@ -856,6 +1160,7 @@ fn validate_full_column_rewrite<C: Clock>(
                     )
                 })?;
                 verifier.verify(stored_value, raw)?;
+                snapshot_lease.record_progress();
             }
             return Ok((snapshot, GenerationTransition::Migrate));
         }
@@ -872,6 +1177,7 @@ fn validate_full_column_rewrite<C: Clock>(
                     "incoming vector bytes do not match the persisted source SlotVector",
                 ));
             }
+            snapshot_lease.record_progress();
         }
         return Ok((snapshot, GenerationTransition::Create));
     }
@@ -892,8 +1198,11 @@ fn validate_full_column_rewrite<C: Clock>(
                 "incoming vector bytes do not match the persisted raw sidecar source of truth",
             ));
         }
+        snapshot_lease.record_progress();
     }
+    snapshot_lease.record_progress();
     CompressedSlotIndex::open(vault, slot, lens)?.verify_at(snapshot)?;
+    snapshot_lease.record_progress();
     Ok((snapshot, GenerationTransition::Reseal))
 }
 
@@ -978,12 +1287,24 @@ pub fn compress_slot_batch_with_assay_evidence(
     k: usize,
     mxfp4_evidence: Option<&MxFp4AssayEvidence>,
 ) -> Result<SlotCompressionReport> {
+    compress_slot_batch_product_with_assay_evidence(slot, lens, rows, queries, k, mxfp4_evidence)
+        .map(|product| product.report)
+}
+
+fn compress_slot_batch_product_with_assay_evidence(
+    slot: &Slot,
+    lens: &LensSpec,
+    rows: &[(CxId, Vec<f32>)],
+    queries: &[CompressionQuery],
+    k: usize,
+    mxfp4_evidence: Option<&MxFp4AssayEvidence>,
+) -> Result<CompressionBuildProduct> {
     reject_dense_codec_for_multivector(slot.shape, lens.quant_default)?;
     validate_batch(slot, lens, rows, queries, k)?;
     let initial = encode_rows(slot, lens, rows, lens.quant_default, mxfp4_evidence)?;
-    let report = build_report(slot, lens, rows, queries, k, initial, None)?;
-    if recall_drop(&report) <= lens.recall_delta {
-        return Ok(report);
+    let product = build_report(slot, lens, rows, queries, k, initial, None)?;
+    if recall_drop(&product.report) <= lens.recall_delta {
+        return Ok(product);
     }
 
     Err(compression_error(
@@ -991,7 +1312,7 @@ pub fn compress_slot_batch_with_assay_evidence(
         format!(
             "requested quant policy {:?} failed recall contract: recall drop {:.6} exceeded declared delta {:.6}; no fallback codec was written",
             lens.quant_default,
-            recall_drop(&report),
+            recall_drop(&product.report),
             lens.recall_delta
         ),
     ))
@@ -1005,7 +1326,7 @@ fn build_report(
     k: usize,
     encoded: EncodedBatch,
     fallback_reason: Option<String>,
-) -> Result<SlotCompressionReport> {
+) -> Result<CompressionBuildProduct> {
     let raw_bytes_total = encoded.rows.iter().try_fold(0_usize, |sum, row| {
         sum.checked_add(row.raw_bytes.len()).ok_or_else(|| {
             compression_error(
@@ -1121,7 +1442,7 @@ fn build_report(
             "compression report has no physically encoded row from which to read the stored codec",
         )
     })?;
-    Ok(SlotCompressionReport {
+    let report = SlotCompressionReport {
         slot_id: slot.slot_id.get(),
         slot_key: slot.slot_key.key().to_string(),
         requested_quant: lens.quant_default,
@@ -1159,6 +1480,11 @@ fn build_report(
         generation_manifest_bytes: encoded.manifest_bytes,
         snapshot: None,
         ledger: None,
+    };
+    Ok(CompressionBuildProduct {
+        report,
+        codec: encoded.codec,
+        source_seq: None,
     })
 }
 

@@ -4,8 +4,8 @@ use std::sync::{OnceLock, RwLock};
 use crate::quant::QuantLevel;
 use crate::{ForgeError, Result};
 
-const QUADRATURE_POINTS: usize = 32_768;
-const MAX_LLOYD_ITERATIONS: usize = 256;
+pub(crate) const QUADRATURE_POINTS: usize = 32_768;
+pub(crate) const MAX_LLOYD_ITERATIONS: usize = 256;
 const CONVERGENCE: f64 = 1.0e-13;
 type CodebookCacheKey = (usize, usize);
 type CodebookCache = RwLock<BTreeMap<CodebookCacheKey, Vec<f32>>>;

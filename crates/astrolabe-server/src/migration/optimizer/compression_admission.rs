@@ -357,6 +357,63 @@ pub(crate) fn commission_optimizer_compression_candidates_json_at(
     candidate_slot_ids: &[SlotId],
     request: CompressionCandidateEvaluationRequest,
 ) -> Result<Value, DynError> {
+    const MAX_CANDIDATE_SLOTS: usize = u16::MAX as usize + 1;
+    const OPERATION_PREFLIGHT_STAGE: &str =
+        "pure operation-shape preflight before vault/manifest/Ledger open";
+    if !(2..=MAX_CANDIDATE_SLOTS).contains(&candidate_slot_ids.len()) {
+        return Err(ToolFault::new(
+            ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
+            format!(
+                "compression commission requires 2..={MAX_CANDIDATE_SLOTS} candidate_slot_ids, got {}",
+                candidate_slot_ids.len()
+            ),
+            "Pass a bounded roster of at least two unique registered dense raw candidate slots.",
+        )
+        .with_detail("minimum_items", 2_u64)
+        .with_detail("maximum_items", MAX_CANDIDATE_SLOTS as u64)
+        .with_detail("observed_items", candidate_slot_ids.len() as u64)
+        .with_detail("stage", OPERATION_PREFLIGHT_STAGE)
+        .with_detail("vault_or_manifest_opened", false)
+        .with_detail("ledger_chain_scanned", false)
+        .into());
+    }
+    let mut unique_candidate_slots = BTreeSet::new();
+    if candidate_slot_ids
+        .iter()
+        .any(|slot_id| !unique_candidate_slots.insert(slot_id.get()))
+    {
+        return Err(ToolFault::new(
+            ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
+            "compression commission candidate_slot_ids must be unique",
+            "Pass each exact registered candidate slot id once.",
+        )
+        .with_detail("stage", OPERATION_PREFLIGHT_STAGE)
+        .with_detail("vault_or_manifest_opened", false)
+        .with_detail("ledger_chain_scanned", false)
+        .into());
+    }
+    let candidate_slot_values = candidate_slot_ids
+        .iter()
+        .map(|slot_id| slot_id.get())
+        .collect::<Vec<_>>();
+    calyx_registry::preflight_compression_candidate_operation(&candidate_slot_values, &request)
+        .map_err(|error| -> DynError {
+            ToolFault::new(
+                error.code.clone(),
+                format!(
+                    "project {project:?} compression-admission {OPERATION_PREFLIGHT_STAGE} failed: {}",
+                    error.message
+                ),
+                error.remediation,
+            )
+            .with_detail("project", project)
+            .with_detail("stage", OPERATION_PREFLIGHT_STAGE)
+            .with_detail("source_code", error.code)
+            .with_detail("vault_or_manifest_opened", false)
+            .with_detail("ledger_chain_scanned", false)
+            .into()
+        })?;
+
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
     if !vault_dir.exists() {
         return Err(ToolFault::new(
@@ -381,41 +438,21 @@ pub(crate) fn commission_optimizer_compression_candidates_json_at(
         .with_detail("project", project)
         .into());
     }
-    if candidate_slot_ids.len() < 2 {
-        return Err(ToolFault::new(
-            ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
-            "compression commission requires at least two candidate_slot_ids",
-            "Pass at least two unique registered dense raw candidate slots.",
-        )
-        .into());
-    }
     let (manifest_store, manifest_before, panel_state) =
         load_manifest_bound_panel_state(&vault_dir, project, "commission")?;
+    let panel_slots = unique_panel_slot_index(project, "commission", &panel_state.panel.slots)?;
     let mut slots = Vec::with_capacity(candidate_slot_ids.len());
     for slot_id in candidate_slot_ids {
-        let matches = panel_state
-            .panel
-            .slots
-            .iter()
-            .filter(|slot| slot.slot_id == *slot_id)
-            .collect::<Vec<_>>();
-        if matches.len() != 1
-            || slots
-                .iter()
-                .any(|slot: &&calyx_core::Slot| slot.slot_id == *slot_id)
-        {
+        let Some(slot) = panel_slots.get(slot_id).copied() else {
             return Err(ToolFault::new(
                 ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
-                format!(
-                    "candidate slot {} is missing, duplicated, or repeated",
-                    slot_id.get()
-                ),
+                format!("candidate slot {} is not registered", slot_id.get()),
                 "Pass each exact registered candidate slot id once.",
             )
             .with_detail("slot_id", u64::from(slot_id.get()))
             .into());
-        }
-        slots.push(matches[0]);
+        };
+        slots.push(slot);
     }
     let vault = open_shadow_vault_writable(
         &vault_dir,
@@ -520,11 +557,19 @@ pub(crate) fn commission_optimizer_compression_candidates_json_at(
         "candidate_evaluations": result.candidates,
         "selected_configuration": selected_configuration,
         "publication": publication,
+        "cost_scope": {
+            "mode": "commission_compression_candidates",
+            "bounded_path": "Registry compression core candidate preflight/build/evaluate/select",
+            "work_limits": "candidate_request.work_limits",
+            "bounded_dimensions": "canonical candidate count C, corpus rows R, held-out queries Q, dimensions D, and the receipt's enumerated codec/Registry accounting categories",
+            "end_to_end_mcp_bounded": false,
+        },
+        "known_cost_gap": optimizer_compression_known_cost_gap(),
         "source_state": {
             "vault_dir": vault_dir,
             "ledger_chain_before": chain.status,
             "ledger_chain_after": chain_after.status,
-            "preflight": "all candidate raw columns, contexts, manifests, work, query disjointness, and backend before first mutation",
+            "preflight": "allocation-free slot/lens descriptors; raw/Base identity bindings; absent fresh compressed manifest, admission pointers, and raw sidecar; canonical corpus equality; work/limits; query disjointness; CPU backend. Codec-context creation begins during build after preflight",
             "partial_fault_contract": "mid-run physical faults retain the explicit persisted evaluation prefix; atomic commission is not claimed",
             "manifest_context": {
                 "before_manifest_seq": manifest_before.manifest_seq,
@@ -548,45 +593,64 @@ pub(crate) fn select_optimizer_compression_candidates_json_at(
     project: &str,
     candidate_receipts: &[(SlotId, [u8; 32])],
 ) -> Result<Value, DynError> {
-    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
-    let chain = astrolabe_ingest::verify_chain_vault_path(&vault_dir)?;
-    if chain.status != "intact" || candidate_receipts.len() < 2 {
+    const MAX_CANDIDATE_RECEIPTS: usize = u16::MAX as usize + 1;
+    const REPLAY_PREFLIGHT_STAGE: &str =
+        "selection-replay roster preflight before vault/manifest/Ledger open";
+    if !(2..=MAX_CANDIDATE_RECEIPTS).contains(&candidate_receipts.len()) {
         return Err(ToolFault::new(
             ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
-            "selection replay requires an intact Ledger and at least two candidate receipts",
-            "Pass the exact slot_id and original receipt_sha256 entries from the pending selection receipt.",
+            format!(
+                "selection replay requires 2..={MAX_CANDIDATE_RECEIPTS} candidate receipts, got {}",
+                candidate_receipts.len()
+            ),
+            "Pass the exact bounded slot_id and original receipt_sha256 roster from the pending selection receipt.",
+        )
+        .with_detail("stage", REPLAY_PREFLIGHT_STAGE)
+        .with_detail("vault_or_manifest_opened", false)
+        .with_detail("ledger_chain_scanned", false)
+        .into());
+    }
+    let mut unique_slot_ids = BTreeSet::new();
+    if candidate_receipts
+        .iter()
+        .any(|(slot_id, _)| !unique_slot_ids.insert(slot_id.get()))
+    {
+        return Err(ToolFault::new(
+            ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
+            "selection replay candidate receipts repeat a slot id",
+            "Pass every exact source candidate slot once.",
+        )
+        .with_detail("stage", REPLAY_PREFLIGHT_STAGE)
+        .with_detail("vault_or_manifest_opened", false)
+        .with_detail("ledger_chain_scanned", false)
+        .into());
+    }
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    let chain = astrolabe_ingest::verify_chain_vault_path(&vault_dir)?;
+    if chain.status != "intact" {
+        return Err(ToolFault::new(
+            ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
+            "selection replay requires an intact Ledger",
+            "Repair or rebuild the exact shadow vault before replaying the immutable candidate roster.",
         )
         .into());
     }
     let (manifest_store, manifest_before, panel_state) =
         load_manifest_bound_panel_state(&vault_dir, project, "selection replay")?;
+    let panel_slots =
+        unique_panel_slot_index(project, "selection replay", &panel_state.panel.slots)?;
     let mut references = Vec::with_capacity(candidate_receipts.len());
     for (slot_id, receipt_sha256) in candidate_receipts {
-        let matches = panel_state
-            .panel
-            .slots
-            .iter()
-            .filter(|slot| slot.slot_id == *slot_id)
-            .collect::<Vec<_>>();
-        if matches.len() != 1
-            || references.iter().any(
-                |reference: &calyx_registry::CompressionCandidateReference| {
-                    reference.slot.slot_id == *slot_id
-                },
-            )
-        {
+        let Some(slot) = panel_slots.get(slot_id).copied() else {
             return Err(ToolFault::new(
                 ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
-                format!(
-                    "candidate slot {} is missing, duplicated, or repeated",
-                    slot_id.get()
-                ),
+                format!("candidate slot {} is not registered", slot_id.get()),
                 "Pass every exact source candidate once.",
             )
             .into());
-        }
+        };
         references.push(calyx_registry::CompressionCandidateReference {
-            slot: matches[0].clone(),
+            slot: slot.clone(),
             receipt_sha256: *receipt_sha256,
         });
     }
@@ -673,6 +737,14 @@ pub(crate) fn select_optimizer_compression_candidates_json_at(
         "after_vault_seq": after_seq,
         "selected_configuration": selected_json,
         "publication": publication,
+        "cost_scope": {
+            "mode": "select_compression_candidates",
+            "bounded_path": "Registry exact-receipt streaming, canonical roster recomputation, and deterministic selection",
+            "work_limits": "canonical work/limits persisted in the exact source receipts",
+            "bounded_dimensions": "exact candidate receipt roster C and its persisted canonical C/R/Q/D accounting",
+            "end_to_end_mcp_bounded": false,
+        },
+        "known_cost_gap": optimizer_compression_known_cost_gap(),
         "ledger_chain_before": chain.status,
         "ledger_chain_after": chain_after.status,
         "manifest_context": {
@@ -685,6 +757,60 @@ pub(crate) fn select_optimizer_compression_candidates_json_at(
         },
         "trust": "verified_candidate_source_recompute_current_readback_and_post_ledger_chain",
     }))
+}
+
+fn optimizer_compression_known_cost_gap() -> Value {
+    json!({
+        "mcp_ledger_verification": {
+            "issue": 1137,
+            "defect_classes": ["PC-40", "PC-43"],
+            "operation": "MCP commission/selection-replay pre/post full Ledger-chain verification plus repeated store opens",
+            "asymptotic_cost": "Theta(M) for each full-chain verification over Ledger entry count M",
+            "production_ledger_entries_m": "unknown",
+            "production_store_open_count": "unknown",
+            "bounded_by_candidate_request_work_limits": false,
+        },
+        "mcp_panel_roster_resolution": {
+            "issue": 1137,
+            "defect_classes": ["PC-05", "PC-43"],
+            "operation": "one duplicate-detecting BTreeMap index over panel slots plus candidate lookups",
+            "asymptotic_cost": "Theta(P log P + C log P) for panel slot count P and candidate count C",
+            "production_panel_slots_p": "unknown",
+            "bounded_by_candidate_request_work_limits": false,
+        },
+        "mxfp4_commission_evidence": {
+            "issue": 1136,
+            "defect_classes": ["PC-03", "PC-43"],
+            "current_behavior": "multi-candidate commission preflight-refuses MXFP4 before candidate scan/write",
+            "required_bounded_primitive": "exact-key bounded initial Assay evidence lookup",
+            "single_candidate_diagnostic_behavior": "unchanged",
+        },
+    })
+}
+
+fn unique_panel_slot_index<'a>(
+    project: &str,
+    operation: &str,
+    slots: &'a [calyx_core::Slot],
+) -> Result<BTreeMap<SlotId, &'a calyx_core::Slot>, DynError> {
+    let mut by_id = BTreeMap::new();
+    for slot in slots {
+        if by_id.insert(slot.slot_id, slot).is_some() {
+            return Err(ToolFault::new(
+                ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID,
+                format!(
+                    "project {project:?} panel repeats slot id {} during {operation}",
+                    slot.slot_id.get()
+                ),
+                "Preserve the immutable Panel and repair the duplicate slot identity before retrying.",
+            )
+            .with_detail("project", project)
+            .with_detail("operation", operation)
+            .with_detail("slot_id", u64::from(slot.slot_id.get()))
+            .into());
+        }
+    }
+    Ok(by_id)
 }
 
 fn load_manifest_bound_panel_state(

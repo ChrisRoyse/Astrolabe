@@ -1039,7 +1039,7 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
     json!({
         "name": "optimizer_status",
         "title": "Optimizer Status",
-        "description": "Return labeled optimizer readiness, acknowledge Loom trigger events, generate measured proposals, commission real registered compression candidates through all-slot preflight/build/evaluate/select, or replay selection from exact immutable candidate receipts after an interrupted publication.",
+        "description": "Return labeled optimizer readiness, acknowledge Loom trigger events, generate measured proposals, commission real registered compression candidates through all-slot preflight/build/evaluate/select, or replay selection from exact immutable candidate receipts after an interrupted publication. Candidate work limits bound the Registry compression core only; MCP commission and selection-replay orchestration also perform pre/post full Ledger-chain verification at Theta(M), repeated store opens, and one panel-roster index at Theta(P log P) plus C lookups, whose production M/P/open counts are currently unknown and are not bounded by candidate_request.work_limits (#1137, PC-05/PC-40/PC-43). MXFP4 multi-candidate commission is preflight-refused before candidate scan/write until initial Assay evidence has an exact-key bounded lookup (#1136, PC-03/PC-43); the single-candidate diagnostic path is unchanged.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1059,9 +1059,10 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
                 "candidate_slot_ids": {
                     "type": "array",
                     "minItems": 2,
+                    "maxItems": 65536,
                     "uniqueItems": true,
                     "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
-                    "description": "Required for commission_compression_candidates: unique registered dense raw candidate slots sharing identical source rows."
+                    "description": "Required for commission_compression_candidates: unique registered dense raw candidate slots sharing identical source rows. MXFP4 commission is currently preflight-refused before candidate scan/write because its initial Assay evidence discovery has no exact-key bounded lookup (#1136); single-candidate diagnostics remain available."
                 },
                 "candidate_request": {
                     "type": "object",
@@ -1087,11 +1088,17 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
                             "properties": {
                                 "maximum_corpus_rows": { "type": "integer", "minimum": 1 },
                                 "maximum_held_out_queries": { "type": "integer", "minimum": 1 },
-                                "maximum_total_packed_searches": { "type": "integer", "minimum": 1 },
+                                "maximum_total_packed_searches": { "type": "integer", "minimum": 1, "description": "Maximum lifecycle packed searches (1 + warmup_runs + measured_runs) * Q, including the build-recall pass." },
                                 "maximum_pairwise_score_evaluations": { "type": "integer", "minimum": 1 },
-                                "maximum_coefficient_evaluations": { "type": "integer", "minimum": 1 }
+                                "maximum_coefficient_evaluations": { "type": "integer", "minimum": 1 },
+                                "maximum_candidate_slots": { "type": "integer", "minimum": 1, "description": "Maximum canonical candidate count C." },
+                                "maximum_peak_codec_geometry_bytes": { "type": "integer", "minimum": 1, "description": "Maximum planned retained codec-geometry bytes across sequential candidates." },
+                                "maximum_aggregate_codec_retained_entry_and_sample_bound": { "type": "integer", "minimum": 1, "description": "Maximum aggregate deterministic retained-entry plus cold codebook-sample admission proxy; this is not measured or complete codec setup work." },
+                                "maximum_aggregate_codec_transform_coefficient_visits": { "type": "integer", "minimum": 1, "description": "Maximum aggregate planned codec transform coefficient visits." },
+                                "maximum_aggregate_pairwise_score_evaluations": { "type": "integer", "minimum": 1, "description": "Maximum aggregate planned pairwise score evaluations." },
+                                "maximum_total_accounted_work_units": { "type": "integer", "minimum": 1, "description": "Maximum checked sum of the enumerated admission categories only; independent C/R/Q limits bound other Registry-core validation/source passes, and this is not end-to-end MCP work, total execution, bytes, elapsed time, or CPU instructions." }
                             },
-                            "required": ["maximum_corpus_rows", "maximum_held_out_queries", "maximum_total_packed_searches", "maximum_pairwise_score_evaluations", "maximum_coefficient_evaluations"],
+                            "required": ["maximum_corpus_rows", "maximum_held_out_queries", "maximum_total_packed_searches", "maximum_pairwise_score_evaluations", "maximum_coefficient_evaluations", "maximum_candidate_slots", "maximum_peak_codec_geometry_bytes", "maximum_aggregate_codec_retained_entry_and_sample_bound", "maximum_aggregate_codec_transform_coefficient_visits", "maximum_aggregate_pairwise_score_evaluations", "maximum_total_accounted_work_units"],
                             "additionalProperties": false
                         },
                         "gates": {
@@ -1102,7 +1109,7 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
                                 "maximum_cosine_error": { "type": "number", "minimum": 0 },
                                 "maximum_p99_latency_ns": { "type": "integer", "minimum": 1 },
                                 "maximum_total_physical_bytes": { "type": "integer", "minimum": 1 },
-                                "maximum_working_set_bytes": { "type": "integer", "minimum": 1 },
+                                "maximum_working_set_bytes": { "type": "integer", "minimum": 1, "description": "Maximum process working-set endpoint immediately after measured packed search; this is not the transient process peak." },
                                 "maximum_materialized_primary_bytes_per_query": { "type": "integer", "minimum": 1 }
                             },
                             "required": ["minimum_recall_at_k", "maximum_mean_cosine_error", "maximum_cosine_error", "maximum_p99_latency_ns", "maximum_total_physical_bytes", "maximum_working_set_bytes", "maximum_materialized_primary_bytes_per_query"],
@@ -1115,6 +1122,7 @@ pub(crate) fn optimizer_status_tool_definition() -> Value {
                 "candidate_receipts": {
                     "type": "array",
                     "minItems": 2,
+                    "maxItems": 65536,
                     "items": {
                         "type": "object",
                         "properties": {

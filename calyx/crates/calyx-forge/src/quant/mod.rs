@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-pub use binary::{BinaryCodec, binary_prefilter, hamming_dot_estimate};
+pub use binary::{
+    BinaryCodec, BinaryPreparedQuery, BinaryWorkShape, binary_prefilter, binary_work_shape,
+    hamming_dot_estimate,
+};
 pub use int8::ScalarInt8Codec;
 pub use mxfp4_codec::{
     AssayQuantSafety, MXFP_BODY_ALIGNMENT_BYTES, MXFP_FORMAT_HEADER_BYTES, MXFP_FORMAT_VERSION,
@@ -27,7 +30,8 @@ pub use rotation::{
 pub use turboquant::{
     TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec,
     TurboQuantGeometryKind, TurboQuantOwnedCandidate, TurboQuantPreparedQuery, TurboQuantStorage,
-    TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate, turboquant_payload_len,
+    TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate, TurboQuantWorkShape,
+    turboquant_payload_len, turboquant_work_shape,
 };
 
 pub type SeedId = [u8; 32];

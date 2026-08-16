@@ -9,7 +9,7 @@ use crate::{ForgeError, Result};
 
 /// Frozen identity of the arbitrary-dimension structured Hadamard transform.
 pub(crate) const STRUCTURED_HADAMARD_VERSION: u8 = 1;
-const MIXING_ROUNDS: usize = 2;
+pub(crate) const MIXING_ROUNDS: usize = 2;
 
 #[derive(Clone)]
 struct HadamardRound {

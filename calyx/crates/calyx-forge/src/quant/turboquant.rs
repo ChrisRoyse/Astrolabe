@@ -6,12 +6,14 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use sha2::{Digest, Sha256};
 use wide::f64x4;
 
-use crate::quant::codebook::{LloydMaxCodebook, stable_inv_sqrt};
-use crate::quant::hadamard::StructuredHadamard;
+use crate::quant::codebook::{
+    LloydMaxCodebook, MAX_LLOYD_ITERATIONS, QUADRATURE_POINTS, stable_inv_sqrt,
+};
+use crate::quant::hadamard::{MIXING_ROUNDS, StructuredHadamard};
 use crate::quant::qjl::{
     GaussianProjection, QJL_FACTOR, QjlResidual, bitstream_len, has_nonzero_padding, sign_dot,
 };
-use crate::quant::rotation::HaarRotation;
+use crate::quant::rotation::{HaarRotation, haar_work_shape};
 use crate::quant::{QuantLevel, QuantizedVec, Quantizer, RotationSeed, SeedId};
 use crate::{ForgeError, Result};
 
@@ -54,6 +56,197 @@ impl TurboQuantGeometryKind {
             Self::StructuredHadamardV1 => 2,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+/// Cache-independent admission cardinalities for one TurboQuant codec policy.
+///
+/// `(dim, level, geometry_kind)` is invariant across the plan. The fields are
+/// checked structural counts and conservative nonzero-operation bounds; they
+/// do not report elapsed work, cache state, allocator usage, or RSS. Runtime
+/// observations remain a separate receipt concern.
+pub struct TurboQuantWorkShape {
+    /// Source dimension.
+    pub dim: u64,
+    /// Fractional scalar policy.
+    pub level: QuantLevel,
+    /// Frozen transform family.
+    pub geometry_kind: TurboQuantGeometryKind,
+    /// Retained `Vec` content bytes reported by codec geometry accounting.
+    pub geometry_physical_bytes: u64,
+    /// Sum of retained transform entries, packed sign bytes, and centroids.
+    pub geometry_retained_entries: u64,
+    /// Cache-independent Lloyd assignment bound: `0` at `D=1`, else
+    /// `2 * QUADRATURE_POINTS * MAX_LLOYD_ITERATIONS`.
+    pub codebook_setup_sample_evaluations: u64,
+    /// Planned arithmetic coefficient-visit bound for one nonzero rotation.
+    pub rotation_transform_coefficient_visits: u64,
+    /// Planned arithmetic coefficient-visit bound for one nonzero projection.
+    pub projection_transform_coefficient_visits: u64,
+    /// Planned rotation-plus-projection bound for one nonzero transform pair.
+    pub transform_pair_coefficient_visits: u64,
+    /// Centroid accesses planned while encoding one nonzero vector.
+    pub encode_scalar_centroid_visits: u64,
+    /// Scalar centroid lookups while decoding one nonzero vector.
+    pub decode_scalar_centroid_lookups: u64,
+    /// Allocated `f64` entries in one prepared-query scalar LUT.
+    pub query_lut_allocated_entries: u64,
+    /// Initialized entries in one prepared-query scalar LUT.
+    pub query_lut_filled_entries: u64,
+    /// Scalar LUT lookups while scoring one nonzero packed candidate.
+    pub scalar_score_lut_lookups: u64,
+    /// Projected-query sign visits while scoring one nonzero packed candidate.
+    pub qjl_score_sign_visits: u64,
+    /// Scalar plus QJL visits while scoring one nonzero packed candidate.
+    pub packed_score_coefficient_visits: u64,
+}
+
+/// Derives a TurboQuant admission plan without constructing or caching geometry.
+///
+/// The valid-input path performs checked arithmetic and does not consult the
+/// geometry or codebook caches.
+pub fn turboquant_work_shape(
+    dim: usize,
+    level: QuantLevel,
+    geometry_kind: TurboQuantGeometryKind,
+) -> Result<TurboQuantWorkShape> {
+    validate_level(level, "work_shape")?;
+    if dim == 0 || dim > TURBOQUANT_MAX_DIM {
+        return Err(quant_error(
+            "work_shape",
+            level,
+            format!("dimension {dim} is outside 1..={TURBOQUANT_MAX_DIM}"),
+        ));
+    }
+    let dim_u64 = u64::try_from(dim)
+        .map_err(|_| quant_error("work_shape", level, "dimension exceeds u64"))?;
+    let (low_bits, high_bits) = scalar_widths(level)?;
+    let low_levels = checked_level_count(low_bits, level)?;
+    let high_levels = checked_level_count(high_bits, level)?;
+    let codebook_centroids = work_add(low_levels, high_levels, level)?;
+    let high_coordinates = work_add(dim_u64, 1, level)? / 2;
+    let low_coordinates = dim_u64 / 2;
+    let query_lut_allocated_entries = work_mul(dim_u64, high_levels, level)?;
+    let query_lut_filled_entries = work_add(
+        work_mul(high_coordinates, high_levels, level)?,
+        work_mul(low_coordinates, low_levels, level)?,
+        level,
+    )?;
+    let f32_bytes = u64::try_from(std::mem::size_of::<f32>())
+        .map_err(|_| quant_error("work_shape", level, "f32 byte width exceeds u64"))?;
+    let u32_bytes = u64::try_from(std::mem::size_of::<u32>())
+        .map_err(|_| quant_error("work_shape", level, "u32 byte width exceeds u64"))?;
+
+    let (
+        geometry_physical_bytes,
+        geometry_retained_entries,
+        codebook_setup_sample_evaluations,
+        rotation_transform_coefficient_visits,
+        projection_transform_coefficient_visits,
+    ) = match geometry_kind {
+        TurboQuantGeometryKind::DenseHaarGaussianV2 => {
+            let haar = haar_work_shape(dim)?;
+            let projection_coefficients = work_mul(dim_u64, dim_u64, level)?;
+            let retained = work_add(
+                work_add(
+                    haar.geometry_retained_entries,
+                    projection_coefficients,
+                    level,
+                )?,
+                codebook_centroids,
+                level,
+            )?;
+            let bytes = work_add(
+                haar.geometry_physical_bytes,
+                work_mul(
+                    work_add(projection_coefficients, codebook_centroids, level)?,
+                    f32_bytes,
+                    level,
+                )?,
+                level,
+            )?;
+            let codebook_samples = if dim == 1 {
+                0
+            } else {
+                work_mul(
+                    2,
+                    work_mul(
+                        u64::try_from(QUADRATURE_POINTS).map_err(|_| {
+                            quant_error("work_shape", level, "quadrature count exceeds u64")
+                        })?,
+                        u64::try_from(MAX_LLOYD_ITERATIONS).map_err(|_| {
+                            quant_error("work_shape", level, "Lloyd iteration count exceeds u64")
+                        })?,
+                        level,
+                    )?,
+                    level,
+                )?
+            };
+            (
+                bytes,
+                retained,
+                codebook_samples,
+                haar.transform_coefficient_visits,
+                projection_coefficients,
+            )
+        }
+        TurboQuantGeometryKind::StructuredHadamardV1 => {
+            let rounds = u64::try_from(MIXING_ROUNDS)
+                .map_err(|_| quant_error("work_shape", level, "mixing round count exceeds u64"))?;
+            let sign_bytes = work_add(dim_u64, 7, level)? / 8;
+            let entries_per_round = work_add(dim_u64, sign_bytes, level)?;
+            let bytes_per_round =
+                work_add(work_mul(dim_u64, u32_bytes, level)?, sign_bytes, level)?;
+            let transform_count = 2_u64;
+            let retained = work_add(
+                work_mul(
+                    transform_count,
+                    work_mul(rounds, entries_per_round, level)?,
+                    level,
+                )?,
+                codebook_centroids,
+                level,
+            )?;
+            let bytes = work_add(
+                work_mul(
+                    transform_count,
+                    work_mul(rounds, bytes_per_round, level)?,
+                    level,
+                )?,
+                work_mul(codebook_centroids, f32_bytes, level)?,
+                level,
+            )?;
+            let fwht_visits = structured_fwht_coefficient_visits(dim_u64, level)?;
+            let visits_per_round = work_add(fwht_visits, work_mul(dim_u64, 2, level)?, level)?;
+            let transform_visits = work_mul(rounds, visits_per_round, level)?;
+            (bytes, retained, 0, transform_visits, transform_visits)
+        }
+    };
+    let transform_pair_coefficient_visits = work_add(
+        rotation_transform_coefficient_visits,
+        projection_transform_coefficient_visits,
+        level,
+    )?;
+    let encode_scalar_centroid_visits = work_add(query_lut_filled_entries, dim_u64, level)?;
+    let packed_score_coefficient_visits = work_mul(dim_u64, 2, level)?;
+    Ok(TurboQuantWorkShape {
+        dim: dim_u64,
+        level,
+        geometry_kind,
+        geometry_physical_bytes,
+        geometry_retained_entries,
+        codebook_setup_sample_evaluations,
+        rotation_transform_coefficient_visits,
+        projection_transform_coefficient_visits,
+        transform_pair_coefficient_visits,
+        encode_scalar_centroid_visits,
+        decode_scalar_centroid_lookups: dim_u64,
+        query_lut_allocated_entries,
+        query_lut_filled_entries,
+        scalar_score_lut_lookups: dim_u64,
+        qjl_score_sign_visits: dim_u64,
+        packed_score_coefficient_visits,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1695,6 +1888,45 @@ fn scalar_widths(level: QuantLevel) -> Result<(usize, usize)> {
             "TurboQuant supports only Bits2p5 and Bits3p5",
         )),
     }
+}
+
+fn checked_level_count(bits: usize, level: QuantLevel) -> Result<u64> {
+    let shift = u32::try_from(bits)
+        .map_err(|_| quant_error("work_shape", level, "scalar bit width exceeds u32"))?;
+    1_u64
+        .checked_shl(shift)
+        .ok_or_else(|| quant_error("work_shape", level, "scalar level count overflow"))
+}
+
+fn work_add(left: u64, right: u64, level: QuantLevel) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| quant_error("work_shape", level, "work cardinality addition overflow"))
+}
+
+fn work_mul(left: u64, right: u64, level: QuantLevel) -> Result<u64> {
+    left.checked_mul(right).ok_or_else(|| {
+        quant_error(
+            "work_shape",
+            level,
+            "work cardinality multiplication overflow",
+        )
+    })
+}
+
+fn structured_fwht_coefficient_visits(dim: u64, level: QuantLevel) -> Result<u64> {
+    let mut remaining = dim;
+    let mut visits = 0_u64;
+    while remaining != 0 {
+        let exponent = u64::BITS - 1 - remaining.leading_zeros();
+        let block = 1_u64
+            .checked_shl(exponent)
+            .ok_or_else(|| quant_error("work_shape", level, "Hadamard block overflow"))?;
+        visits = work_add(visits, work_mul(block, u64::from(exponent), level)?, level)?;
+        remaining = remaining
+            .checked_sub(block)
+            .ok_or_else(|| quant_error("work_shape", level, "Hadamard remainder underflow"))?;
+    }
+    Ok(visits)
 }
 
 fn scalar_bits(dim: usize, level: QuantLevel) -> Result<usize> {

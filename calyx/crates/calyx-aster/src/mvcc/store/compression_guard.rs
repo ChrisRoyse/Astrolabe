@@ -22,8 +22,18 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-const COMPRESSION_ADMISSION_SCHEMA: &str = "calyx.registry.compression_admission.v2";
+const COMPRESSION_ADMISSION_SCHEMA_V2: &str = "calyx.registry.compression_admission.v2";
+const COMPRESSION_ADMISSION_SCHEMA_V3: &str = "calyx.registry.compression_admission.v3";
 const COMPRESSION_ADMISSION_SUBJECT_PREFIX: &str = "compression-admission:slot:";
+
+// Aster validates both supported immutable wire generations without rewriting
+// either one. Every paired Ledger marker must equal the referenced receipt's
+// exact schema, so a v2 receipt can never be relabeled as v3 during publication.
+#[derive(Clone)]
+struct CompressionAdmissionReceiptMetadata {
+    schema: String,
+    verdict: String,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +70,8 @@ pub(super) fn validate_compression_writes(
     let mut proof_mutation_slots: BTreeSet<u16> = BTreeSet::new();
     let mut lifecycle_by_slot: BTreeMap<u16, Vec<GenerationLifecycleRecord>> = BTreeMap::new();
     let mut ledger_rows: Vec<(&[u8], &[u8])> = Vec::new();
-    let mut admission_receipts: BTreeMap<(u16, [u8; 32]), String> = BTreeMap::new();
+    let mut admission_receipts: BTreeMap<(u16, [u8; 32]), CompressionAdmissionReceiptMetadata> =
+        BTreeMap::new();
     let mut evaluation_pointer_puts: Vec<(u16, [u8; 32])> = Vec::new();
     let mut evaluation_pointer_tombstones: BTreeSet<u16> = BTreeSet::new();
     let mut admission_pointer_puts: Vec<(u16, [u8; 32])> = Vec::new();
@@ -157,17 +168,34 @@ pub(super) fn validate_compression_writes(
                                 slot_id.get()
                             ))
                         })?;
-                    if receipt_schema != Some(COMPRESSION_ADMISSION_SCHEMA)
-                        || receipt_slot != Some(u64::from(slot_id.get()))
-                    {
+                    let Some(receipt_schema) =
+                        receipt_schema.filter(|schema| is_supported_admission_schema(schema))
+                    else {
                         return Err(compression_write_error(format!(
-                            "compression admission receipt {} key does not match its schema/slot identity for slot {}",
+                            "compression admission receipt {} for slot {} has unsupported schema {:?}; expected {} or {}",
                             hex(&receipt_sha256),
-                            slot_id.get()
+                            slot_id.get(),
+                            receipt_value.get("schema"),
+                            COMPRESSION_ADMISSION_SCHEMA_V2,
+                            COMPRESSION_ADMISSION_SCHEMA_V3,
+                        )));
+                    };
+                    if receipt_slot != Some(u64::from(slot_id.get())) {
+                        return Err(compression_write_error(format!(
+                            "compression admission receipt {} key slot {} differs from payload slot {:?} under schema {receipt_schema}",
+                            hex(&receipt_sha256),
+                            slot_id.get(),
+                            receipt_value.get("slot_id"),
                         )));
                     }
                     if admission_receipts
-                        .insert((slot_id.get(), receipt_sha256), receipt_verdict.to_string())
+                        .insert(
+                            (slot_id.get(), receipt_sha256),
+                            CompressionAdmissionReceiptMetadata {
+                                schema: receipt_schema.to_string(),
+                                verdict: receipt_verdict.to_string(),
+                            },
+                        )
                         .is_some()
                     {
                         return Err(compression_write_error(format!(
@@ -501,18 +529,18 @@ pub(super) fn validate_compression_writes(
 fn validate_admission_publication(
     table: &RowTable,
     current: Seq,
-    receipts: &BTreeMap<(u16, [u8; 32]), String>,
+    receipts: &BTreeMap<(u16, [u8; 32]), CompressionAdmissionReceiptMetadata>,
     evaluation_pointers: &[(u16, [u8; 32])],
     admission_pointers: &[(u16, [u8; 32])],
     ledger: &LedgerEntry,
 ) -> Result<()> {
-    let (slot, receipt_sha256, phase, verdict) = match (
+    let (slot, receipt_sha256, phase, receipt_metadata) = match (
         receipts.len(),
         evaluation_pointers,
         admission_pointers,
     ) {
         (1, [(pointer_slot, pointer_digest)], []) => {
-            let (&(receipt_slot, receipt_digest), receipt_verdict) = receipts
+            let (&(receipt_slot, receipt_digest), receipt_metadata) = receipts
                 .first_key_value()
                 .expect("receipt length was checked");
             if receipt_slot != *pointer_slot || receipt_digest != *pointer_digest {
@@ -525,19 +553,20 @@ fn validate_admission_publication(
                 receipt_slot,
                 receipt_digest,
                 "evaluation",
-                receipt_verdict.as_str(),
+                receipt_metadata.clone(),
             )
         }
         (0, [], [(pointer_slot, pointer_digest)]) => {
-            let receipt_verdict = persisted_admission_receipt_verdict(
+            let receipt_metadata = persisted_admission_receipt_metadata(
                 table,
                 current,
                 *pointer_slot,
                 *pointer_digest,
             )?;
-            if receipt_verdict != "admitted" {
+            if receipt_metadata.verdict != "admitted" {
                 return Err(compression_write_error(format!(
-                    "current compression-admission pointer for slot {pointer_slot} references a {receipt_verdict} receipt"
+                    "current compression-admission pointer for slot {pointer_slot} references a {} receipt",
+                    receipt_metadata.verdict
                 )));
             }
             let latest_key = compression_admission_evaluation_pointer_key(calyx_core::SlotId::new(
@@ -556,7 +585,7 @@ fn validate_admission_publication(
                     hex(pointer_digest)
                 )));
             }
-            (*pointer_slot, *pointer_digest, "publish", "admitted")
+            (*pointer_slot, *pointer_digest, "publish", receipt_metadata)
         }
         _ => {
             return Err(compression_write_error(format!(
@@ -567,6 +596,7 @@ fn validate_admission_publication(
             )));
         }
     };
+    let verdict = receipt_metadata.verdict.as_str();
 
     let expected_subject = format!("{COMPRESSION_ADMISSION_SUBJECT_PREFIX}{slot}").into_bytes();
     if ledger.kind != EntryKind::Admission
@@ -582,26 +612,28 @@ fn validate_admission_publication(
                 "compression admission {phase} ledger payload for slot {slot} is malformed: {error}"
             ))
         })?;
-    if payload.marker != COMPRESSION_ADMISSION_SCHEMA
+    if payload.marker != receipt_metadata.schema
         || payload.slot_id != slot
         || payload.receipt_sha256 != hex(&receipt_sha256)
         || payload.phase != phase
         || payload.verdict != verdict
     {
         return Err(compression_write_error(format!(
-            "compression admission {phase} ledger payload does not bind slot {slot}, receipt {}, and verdict {verdict}",
-            hex(&receipt_sha256)
+            "compression admission {phase} ledger payload does not bind slot {slot}, receipt {}, receipt schema {}, and verdict {verdict}: marker={}",
+            hex(&receipt_sha256),
+            receipt_metadata.schema,
+            payload.marker,
         )));
     }
     Ok(())
 }
 
-fn persisted_admission_receipt_verdict(
+fn persisted_admission_receipt_metadata(
     table: &RowTable,
     current: Seq,
     slot: u16,
     receipt_sha256: [u8; 32],
-) -> Result<String> {
+) -> Result<CompressionAdmissionReceiptMetadata> {
     let receipt_key =
         compression_admission_receipt_key(calyx_core::SlotId::new(slot), receipt_sha256);
     let receipt = visible_value(table, current, ColumnFamily::Compression, &receipt_key)
@@ -625,14 +657,22 @@ fn persisted_admission_receipt_verdict(
             "persisted compression admission receipt for slot {slot} is malformed: {error}"
         ))
     })?;
-    if value.get("schema").and_then(|field| field.as_str()) != Some(COMPRESSION_ADMISSION_SCHEMA)
-        || value.get("slot_id").and_then(|field| field.as_u64()) != Some(u64::from(slot))
-    {
+    let schema = value.get("schema").and_then(|field| field.as_str());
+    let Some(schema) = schema.filter(|schema| is_supported_admission_schema(schema)) else {
         return Err(compression_write_error(format!(
-            "persisted compression admission receipt for slot {slot} has mismatched schema/slot identity"
+            "persisted compression admission receipt for slot {slot} has unsupported schema {:?}; expected {} or {}",
+            value.get("schema"),
+            COMPRESSION_ADMISSION_SCHEMA_V2,
+            COMPRESSION_ADMISSION_SCHEMA_V3,
+        )));
+    };
+    if value.get("slot_id").and_then(|field| field.as_u64()) != Some(u64::from(slot)) {
+        return Err(compression_write_error(format!(
+            "persisted compression admission receipt key slot {slot} differs from payload slot {:?} under schema {schema}",
+            value.get("slot_id"),
         )));
     }
-    value
+    let verdict = value
         .get("verdict")
         .and_then(|field| field.as_str())
         .filter(|value| matches!(*value, "admitted" | "refused"))
@@ -641,7 +681,18 @@ fn persisted_admission_receipt_verdict(
             compression_write_error(format!(
                 "persisted compression admission receipt for slot {slot} has no supported verdict"
             ))
-        })
+        })?;
+    Ok(CompressionAdmissionReceiptMetadata {
+        schema: schema.to_string(),
+        verdict,
+    })
+}
+
+fn is_supported_admission_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        COMPRESSION_ADMISSION_SCHEMA_V2 | COMPRESSION_ADMISSION_SCHEMA_V3
+    )
 }
 
 #[derive(Default)]

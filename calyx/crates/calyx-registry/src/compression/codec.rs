@@ -2,6 +2,7 @@ use calyx_aster::vault::encode;
 use calyx_core::{
     Asymmetry, CalyxError, Modality, QuantPolicy, Result, Slot, SlotShape, SlotVector,
 };
+use calyx_forge::quant::BinaryPreparedQuery;
 use calyx_forge::{
     BinaryCodec, MXFP_FORMAT_HEADER_BYTES, MxFp4Codec, MxFp8Codec, QuantLevel, QuantizedVec,
     Quantizer, ScalarInt8Codec, TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_MAX_DIM,
@@ -91,6 +92,40 @@ pub(super) struct CompressionManifest {
     pub(super) assay_attestation_id: [u8; 32],
 }
 
+/// Pure frozen codec identity. Constructing this descriptor validates the
+/// slot/lens/policy contract but never materializes codec geometry (issue #1064
+/// PC-03/04/43).
+#[derive(Clone, Copy)]
+pub(super) struct CodecDescriptor {
+    dim: usize,
+    stored_codec: StoredSlotCodec,
+    level: QuantLevel,
+}
+
+impl CodecDescriptor {
+    pub(super) fn for_read(slot: &Slot, lens: &LensSpec) -> Result<Self> {
+        let dim = validate_context(slot, lens, lens.quant_default)?;
+        let (stored_codec, level) = current_policy_identity(lens.quant_default)?;
+        Ok(Self {
+            dim,
+            stored_codec,
+            level,
+        })
+    }
+
+    pub(super) fn dim(self) -> usize {
+        self.dim
+    }
+
+    pub(super) fn stored_codec(self) -> StoredSlotCodec {
+        self.stored_codec
+    }
+
+    pub(super) fn level(self) -> QuantLevel {
+        self.level
+    }
+}
+
 pub(super) struct LegacyV2EnvelopeVerifier {
     slot: Slot,
     lens: LensSpec,
@@ -147,6 +182,10 @@ pub(super) enum CodecContext {
 pub(super) enum PreparedSlotQuery {
     TurboQuant {
         query: TurboQuantPreparedQuery,
+        norm: f64,
+    },
+    Binary {
+        query: BinaryPreparedQuery,
         norm: f64,
     },
     Dense {
@@ -951,6 +990,38 @@ impl CodecContext {
         }
     }
 
+    /// Recounts retained codec geometry from the live slice lengths. This is
+    /// independent runtime readback for the allocation-free admission planner
+    /// and does not include enum/`Arc`/allocator bookkeeping (#1064 PC-37).
+    pub(super) fn geometry_physical_bytes(&self) -> Result<u64> {
+        let bytes = match self {
+            Self::TurboQuant(codec) => codec.geometry_physical_bytes(),
+            Self::Binary(codec) => codec.geometry_physical_bytes(),
+            Self::RawF32 { .. } | Self::ScalarInt8(_) | Self::MxFp4 { .. } | Self::MxFp8(_) => {
+                return Ok(0);
+            }
+        };
+        u64::try_from(bytes).map_err(|_| invalid("live codec geometry byte count exceeds u64"))
+    }
+
+    pub(super) fn validate_descriptor(&self, descriptor: CodecDescriptor) -> Result<()> {
+        if self.dim() != descriptor.dim()
+            || self.stored_codec() != descriptor.stored_codec()
+            || self.level() != descriptor.level()
+        {
+            return Err(invalid(format!(
+                "materialized codec does not match pure frozen descriptor: actual codec={:?} level={:?} dim={} descriptor codec={:?} level={:?} dim={}",
+                self.stored_codec(),
+                self.level(),
+                self.dim(),
+                descriptor.stored_codec(),
+                descriptor.level(),
+                descriptor.dim()
+            )));
+        }
+        Ok(())
+    }
+
     fn encode(&self, prepared: &[f32]) -> Result<QuantizedVec> {
         match self {
             Self::RawF32 { dim } => {
@@ -1014,6 +1085,10 @@ impl CodecContext {
                 query: codec.prepare_query(query).map_err(forge_error)?,
                 norm,
             }),
+            Self::Binary(codec) => Ok(PreparedSlotQuery::Binary {
+                query: codec.prepare_query(query).map_err(forge_error)?,
+                norm,
+            }),
             _ => Ok(PreparedSlotQuery::Dense {
                 values: query.to_vec(),
                 norm,
@@ -1054,14 +1129,14 @@ impl CodecContext {
             (Self::MxFp8(codec), PreparedSlotQuery::Dense { values, norm }) => {
                 score_mxfp(codec.dot_and_norm(values, &parsed.qv), *norm)
             }
-            (Self::Binary(codec), PreparedSlotQuery::Dense { values, norm }) => {
+            (Self::Binary(codec), PreparedSlotQuery::Binary { query, norm }) => {
                 if *norm == 0.0 {
                     return Ok(0.0);
                 }
                 finite_score(
                     f64::from(
                         codec
-                            .dot_estimate(values, &parsed.qv)
+                            .score_prepared(query, &parsed.qv)
                             .map_err(forge_error)?,
                     ) / *norm,
                     "binary cosine score",
@@ -1332,16 +1407,19 @@ pub(super) fn codec_context_id(
     lens: &LensSpec,
     codec: &CodecContext,
 ) -> Result<[u8; 32]> {
+    let descriptor = CodecDescriptor::for_read(slot, lens)?;
+    codec.validate_descriptor(descriptor)?;
+    codec_context_id_for_descriptor(slot, lens, descriptor)
+}
+
+pub(super) fn codec_context_id_for_descriptor(
+    slot: &Slot,
+    lens: &LensSpec,
+    descriptor: CodecDescriptor,
+) -> Result<[u8; 32]> {
     let SlotShape::Dense(raw_dim) = slot.shape else {
         return Err(invalid("codec context requires a dense slot"));
     };
-    let stored_dim = validate_context(slot, lens, slot.quant)?;
-    if stored_dim != codec.dim() {
-        return Err(invalid(format!(
-            "codec dimension {} does not match validated frozen context dimension {stored_dim}",
-            codec.dim()
-        )));
-    }
     let mut hasher = Sha256::new();
     hasher.update(CODEC_CONTEXT_DOMAIN);
     hasher.update([COMPRESSED_SLOT_VERSION]);
@@ -1351,8 +1429,11 @@ pub(super) fn codec_context_id(
     hasher.update((slot.slot_key.key().len() as u64).to_be_bytes());
     hasher.update(slot.slot_key.key().as_bytes());
     hasher.update(raw_dim.to_be_bytes());
-    hasher.update((codec.dim() as u64).to_be_bytes());
-    hasher.update([codec_code(codec.stored_codec()), level_code(codec.level())]);
+    hasher.update((descriptor.dim() as u64).to_be_bytes());
+    hasher.update([
+        codec_code(descriptor.stored_codec()),
+        level_code(descriptor.level()),
+    ]);
     hasher.update([modality_code(slot.modality)]);
     match slot.asymmetry {
         Asymmetry::None => {
@@ -1387,6 +1468,49 @@ pub(super) fn codec_context_id(
     };
     hasher.update(lens.recall_delta.to_bits().to_be_bytes());
     Ok(hasher.finalize().into())
+}
+
+fn current_policy_identity(policy: QuantPolicy) -> Result<(StoredSlotCodec, QuantLevel)> {
+    match policy {
+        QuantPolicy::None => Ok((StoredSlotCodec::RawF32, QuantLevel::F32)),
+        QuantPolicy::ScalarInt8 => Ok((StoredSlotCodec::ScalarInt8, QuantLevel::Bits8)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 7,
+        }
+        | QuantPolicy::TurboQuantHadamard {
+            bits_per_channel_x2: 7,
+        } => Ok((StoredSlotCodec::TurboQuantBits3p5, QuantLevel::Bits3p5)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 5,
+        }
+        | QuantPolicy::TurboQuantHadamard {
+            bits_per_channel_x2: 5,
+        } => Ok((StoredSlotCodec::TurboQuantBits2p5, QuantLevel::Bits2p5)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 16,
+        } => Err(invalid(
+            "TurboQuant bits_per_channel_x2=16 was a removed policy substitution; request ScalarInt8 or a real TurboQuant operating point",
+        )),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2,
+        } => Err(invalid(format!(
+            "unsupported TurboQuant bits_per_channel_x2 {bits_per_channel_x2}; expected 5 or 7"
+        ))),
+        QuantPolicy::TurboQuantHadamard {
+            bits_per_channel_x2,
+        } => Err(invalid(format!(
+            "unsupported structured-Hadamard TurboQuant bits_per_channel_x2 {bits_per_channel_x2}; expected 5 or 7"
+        ))),
+        QuantPolicy::MxFp4 => Ok((StoredSlotCodec::MxFp4, QuantLevel::Bits4Fp)),
+        QuantPolicy::Float8 => Ok((StoredSlotCodec::MxFp8, QuantLevel::Bits8Fp)),
+        QuantPolicy::Binary => Ok((StoredSlotCodec::Binary, QuantLevel::Bits1)),
+        QuantPolicy::Pq { m, nbits } => Err(invalid(format!(
+            "PQ codec is not implemented for m={m} nbits={nbits}; refusing codec substitution"
+        ))),
+        QuantPolicy::ColbertResidual2Bit => Err(invalid(
+            "ColbertResidual2Bit is a Multi-only codec; route it through the packed multi-vector generation API",
+        )),
+    }
 }
 
 const fn modality_code(modality: Modality) -> u8 {

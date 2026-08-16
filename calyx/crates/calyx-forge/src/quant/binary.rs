@@ -1,11 +1,96 @@
 use crate::cpu::check_finite;
-use crate::quant::rotation::HaarRotation;
-use crate::quant::{QuantLevel, QuantizedVec, Quantizer, RotationSeed};
+use crate::quant::rotation::{HaarRotation, haar_work_shape};
+use crate::quant::{QuantLevel, QuantizedVec, Quantizer, RotationSeed, SeedId};
 use crate::{ForgeError, Result};
 
 const BINARY_LEVEL_DETAIL: &str = "BinaryCodec only supports Bits1";
 const BINARY_REMEDIATION: &str =
     "Use finite vectors, matching seeds, and Bits1 binary quantized vectors";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Cache-independent admission cardinalities for one Binary codec dimension.
+///
+/// `dim` is invariant across the plan. The fields describe retained buffer
+/// contents and conservative operation bounds; they are not elapsed-work,
+/// allocator, or RSS measurements.
+pub struct BinaryWorkShape {
+    /// Source dimension.
+    pub dim: u64,
+    /// Retained Haar `Vec` content bytes.
+    pub geometry_physical_bytes: u64,
+    /// Retained Haar offsets, factors, and column signs.
+    pub geometry_retained_entries: u64,
+    /// Retained Householder factor coefficients.
+    pub haar_factor_coefficients: u64,
+    /// Coefficients retained by one prepared query.
+    pub prepared_query_coefficients: u64,
+    /// Retained `f32` bytes in one prepared query.
+    pub prepared_query_physical_bytes: u64,
+    /// Planned arithmetic coefficient-visit bound for one encode rotation.
+    pub encode_transform_coefficient_visits: u64,
+    /// Planned arithmetic coefficient-visit bound for one decode rotation.
+    pub decode_transform_coefficient_visits: u64,
+    /// Planned arithmetic coefficient-visit bound for one query rotation.
+    pub query_prepare_transform_coefficient_visits: u64,
+    /// Planned sign-visit bound for one prepared packed-candidate score.
+    pub packed_score_coefficient_visits: u64,
+}
+
+/// Derives a Binary admission plan without constructing or caching geometry.
+///
+/// The valid-input path performs checked arithmetic and does not consult a
+/// geometry cache.
+pub fn binary_work_shape(dim: usize) -> Result<BinaryWorkShape> {
+    let haar = haar_work_shape(dim)?;
+    let dim = u64::try_from(dim)
+        .map_err(|_| binary_error("work_shape", QuantLevel::Bits1, "dimension exceeds u64"))?;
+    let f32_bytes = u64::try_from(std::mem::size_of::<f32>()).map_err(|_| {
+        binary_error(
+            "work_shape",
+            QuantLevel::Bits1,
+            "f32 byte width exceeds u64",
+        )
+    })?;
+    let prepared_query_physical_bytes = dim.checked_mul(f32_bytes).ok_or_else(|| {
+        binary_error(
+            "work_shape",
+            QuantLevel::Bits1,
+            "prepared query byte count overflow",
+        )
+    })?;
+    Ok(BinaryWorkShape {
+        dim,
+        geometry_physical_bytes: haar.geometry_physical_bytes,
+        geometry_retained_entries: haar.geometry_retained_entries,
+        haar_factor_coefficients: haar.factor_coefficients,
+        prepared_query_coefficients: dim,
+        prepared_query_physical_bytes,
+        encode_transform_coefficient_visits: haar.transform_coefficient_visits,
+        decode_transform_coefficient_visits: haar.transform_coefficient_visits,
+        query_prepare_transform_coefficient_visits: haar.transform_coefficient_visits,
+        packed_score_coefficient_visits: dim,
+    })
+}
+
+#[derive(Clone, Debug)]
+/// Query rotated once for repeated Binary packed-candidate scans.
+pub struct BinaryPreparedQuery {
+    dim: usize,
+    seed_id: SeedId,
+    rotated: Vec<f32>,
+}
+
+impl BinaryPreparedQuery {
+    /// Prepared query dimension.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Rotation identity used to prepare this query.
+    pub fn seed_id(&self) -> SeedId {
+        self.seed_id
+    }
+}
 
 pub struct BinaryCodec {
     seed: RotationSeed,
@@ -31,6 +116,129 @@ impl BinaryCodec {
 
     pub fn seed(&self) -> &RotationSeed {
         &self.seed
+    }
+
+    /// Retained Haar buffer-content bytes in this live codec geometry.
+    ///
+    /// This reads the constructed buffers directly and performs no allocation.
+    pub fn geometry_physical_bytes(&self) -> usize {
+        let (starts, factors, signs) = self.rotation.geometry_parts();
+        std::mem::size_of_val(starts)
+            + std::mem::size_of_val(factors)
+            + std::mem::size_of_val(signs)
+    }
+
+    /// Rotates one finite raw query for reuse across a candidate scan.
+    pub fn prepare_query(&self, query: &[f32]) -> Result<BinaryPreparedQuery> {
+        self.prepare_query_with_op(query, "binary_prepare_query")
+    }
+
+    /// Scores one packed candidate without repeating the query rotation.
+    pub fn score_prepared(
+        &self,
+        query: &BinaryPreparedQuery,
+        candidate: &QuantizedVec,
+    ) -> Result<f32> {
+        self.score_prepared_with_op(query, candidate, "score_prepared")
+    }
+
+    fn prepare_query_with_op(&self, query: &[f32], op: &str) -> Result<BinaryPreparedQuery> {
+        self.validate_raw_query(query, op)?;
+        self.prepare_validated_query(query)
+    }
+
+    fn validate_raw_query(&self, query: &[f32], op: &str) -> Result<()> {
+        self.seed.verify_current_version()?;
+        if query.len() != self.seed.dim {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![self.seed.dim],
+                got: vec![query.len()],
+                remediation: "Score binary vectors with a raw query of the codec dimension"
+                    .to_string(),
+            });
+        }
+        check_finite(query, op)?;
+        Ok(())
+    }
+
+    fn prepare_validated_query(&self, query: &[f32]) -> Result<BinaryPreparedQuery> {
+        let mut rotated = query.to_vec();
+        self.rotation.apply(&mut rotated)?;
+        Ok(BinaryPreparedQuery {
+            dim: self.seed.dim,
+            seed_id: self.seed.id,
+            rotated,
+        })
+    }
+
+    fn score_prepared_with_op(
+        &self,
+        query: &BinaryPreparedQuery,
+        candidate: &QuantizedVec,
+        op: &str,
+    ) -> Result<f32> {
+        self.validate_prepared_query(query, op)?;
+        self.validate_scoring_candidate(candidate, op)?;
+        self.score_validated(query, candidate, op)
+    }
+
+    fn validate_prepared_query(&self, query: &BinaryPreparedQuery, op: &str) -> Result<()> {
+        if query.dim != self.seed.dim {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![self.seed.dim],
+                got: vec![query.dim],
+                remediation: "Score with a binary query prepared by this codec".to_string(),
+            });
+        }
+        if query.seed_id != self.seed.id {
+            return Err(binary_error(
+                op,
+                QuantLevel::Bits1,
+                "prepared query geometry does not match the binary codec",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_scoring_candidate(&self, candidate: &QuantizedVec, op: &str) -> Result<()> {
+        validate_quantized(candidate, op)?;
+        if candidate.dim != self.seed.dim || candidate.seed_id != self.seed.id {
+            return Err(binary_error(
+                op,
+                candidate.level,
+                "packed candidate geometry does not match the binary codec",
+            ));
+        }
+        Ok(())
+    }
+
+    fn score_validated(
+        &self,
+        query: &BinaryPreparedQuery,
+        candidate: &QuantizedVec,
+        op: &str,
+    ) -> Result<f32> {
+        let sum = query
+            .rotated
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if read_bit(&candidate.bytes, index) {
+                    f64::from(*value)
+                } else {
+                    -f64::from(*value)
+                }
+            })
+            .sum::<f64>()
+            * f64::from(candidate.scale);
+        if !sum.is_finite() || sum.abs() > f64::from(f32::MAX) {
+            return Err(binary_error(
+                op,
+                candidate.level,
+                "dot estimate cannot be represented as finite f32",
+            ));
+        }
+        Ok(sum as f32)
     }
 }
 
@@ -83,45 +291,10 @@ impl Quantizer for BinaryCodec {
     }
 
     fn dot_estimate(&self, query: &[f32], candidate: &QuantizedVec) -> Result<f32> {
-        if query.len() != self.seed.dim {
-            return Err(ForgeError::ShapeMismatch {
-                expected: vec![self.seed.dim],
-                got: vec![query.len()],
-                remediation: "Score binary vectors with a raw query of the codec dimension"
-                    .to_string(),
-            });
-        }
-        check_finite(query, "binary_dot_estimate")?;
-        validate_quantized(candidate, "dot_estimate")?;
-        if candidate.dim != self.seed.dim || candidate.seed_id != self.seed.id {
-            return Err(binary_error(
-                "dot_estimate",
-                candidate.level,
-                "packed candidate geometry does not match the binary codec",
-            ));
-        }
-        let mut rotated = query.to_vec();
-        self.rotation.apply(&mut rotated)?;
-        let sum = rotated
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                if read_bit(&candidate.bytes, index) {
-                    f64::from(*value)
-                } else {
-                    -f64::from(*value)
-                }
-            })
-            .sum::<f64>()
-            * f64::from(candidate.scale);
-        if !sum.is_finite() || sum.abs() > f64::from(f32::MAX) {
-            return Err(binary_error(
-                "dot_estimate",
-                candidate.level,
-                "dot estimate cannot be represented as finite f32",
-            ));
-        }
-        Ok(sum as f32)
+        self.validate_raw_query(query, "binary_dot_estimate")?;
+        self.validate_scoring_candidate(candidate, "dot_estimate")?;
+        let prepared = self.prepare_validated_query(query)?;
+        self.score_validated(&prepared, candidate, "dot_estimate")
     }
 
     fn level(&self) -> QuantLevel {

@@ -29,6 +29,13 @@ const ROOT_ENV: &str = "ASTROLABE_COMPRESSION_FSV_ROOT";
 const PROJECT: &str = "issues-557-564-compression-admission-fsv";
 const INPUT_FILE: &str = "mcp-input.json";
 const OUTPUT_FILE: &str = "mcp-dispatch-result.json";
+const OPERATION_PREFLIGHT_STAGE: &str =
+    "pure operation-shape preflight before vault/manifest/Ledger open";
+const SLOT_COUNT_PREFLIGHT_STAGE: &str =
+    "candidate slot count validation before slot Vec allocation";
+const SLOT_PARSE_PREFLIGHT_STAGE: &str = "candidate slot parse before vault/manifest/Ledger open";
+const RECEIPT_PARSE_PREFLIGHT_STAGE: &str =
+    "candidate receipt parse before vault/manifest/Ledger open";
 
 type AnyResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
@@ -586,6 +593,112 @@ fn tools_list(runner: &CbmToolRunner) -> AnyResult<Value> {
             required_property,
         )?;
     }
+    require(
+        schema["properties"]["candidate_slot_ids"]["minItems"] == 2
+            && schema["properties"]["candidate_slot_ids"]["maxItems"] == 65_536
+            && schema["properties"]["candidate_slot_ids"]["uniqueItems"] == Value::Bool(true)
+            && schema["properties"]["candidate_receipts"]["minItems"] == 2
+            && schema["properties"]["candidate_receipts"]["maxItems"] == 65_536,
+        "ISSUE_557_564_FSV_OPTIMIZER_CANDIDATE_ROSTER_BOUNDS_MISSING",
+        schema,
+    )?;
+    let work_limits = &schema["properties"]["candidate_request"]["properties"]["work_limits"];
+    let required_work_limits = work_limits["required"]
+        .as_array()
+        .ok_or("optimizer work-limit required list is absent")?;
+    require(
+        work_limits["properties"]
+            .as_object()
+            .map(|fields| fields.len())
+            == Some(11)
+            && required_work_limits.len() == 11,
+        "ISSUE_557_564_FSV_OPTIMIZER_WORK_LIMIT_SCHEMA_CARDINALITY",
+        work_limits,
+    )?;
+    for required_limit in [
+        "maximum_corpus_rows",
+        "maximum_held_out_queries",
+        "maximum_total_packed_searches",
+        "maximum_pairwise_score_evaluations",
+        "maximum_coefficient_evaluations",
+        "maximum_candidate_slots",
+        "maximum_peak_codec_geometry_bytes",
+        "maximum_aggregate_codec_retained_entry_and_sample_bound",
+        "maximum_aggregate_codec_transform_coefficient_visits",
+        "maximum_aggregate_pairwise_score_evaluations",
+        "maximum_total_accounted_work_units",
+    ] {
+        require(
+            work_limits["properties"].get(required_limit).is_some()
+                && required_work_limits
+                    .iter()
+                    .any(|field| field.as_str() == Some(required_limit)),
+            "ISSUE_557_564_FSV_OPTIMIZER_WORK_LIMIT_MISSING",
+            required_limit,
+        )?;
+    }
+    require(
+        work_limits["additionalProperties"] == Value::Bool(false),
+        "ISSUE_557_564_FSV_OPTIMIZER_WORK_LIMIT_SCHEMA_OPEN",
+        work_limits,
+    )?;
+    require(
+        optimizer[0]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("Registry compression core only")
+                    && description.contains("commission and selection-replay orchestration")
+                    && description.contains("Theta(M)")
+                    && description.contains("Theta(P log P)")
+                    && description.contains("production M/P/open counts are currently unknown")
+                    && description.contains("#1137")
+                    && description.contains("PC-05/PC-40/PC-43")
+                    && description.contains("MXFP4 multi-candidate commission is preflight-refused")
+                    && description.contains("exact-key bounded lookup")
+                    && description.contains("#1136")
+                    && description.contains("PC-03/PC-43")
+            }),
+        "ISSUE_557_564_FSV_OPTIMIZER_END_TO_END_COST_SCOPE_AMBIGUOUS",
+        &optimizer[0],
+    )?;
+    require(
+        schema["properties"]["candidate_slot_ids"]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("MXFP4 commission is currently preflight-refused")
+                    && description.contains("before candidate scan/write")
+                    && description.contains("exact-key bounded lookup")
+                    && description.contains("#1136")
+                    && description.contains("single-candidate diagnostics remain available")
+            }),
+        "ISSUE_557_564_FSV_OPTIMIZER_MXFP4_COMMISSION_SCOPE_AMBIGUOUS",
+        &schema["properties"]["candidate_slot_ids"],
+    )?;
+    require(
+        work_limits["properties"]["maximum_total_packed_searches"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("build-recall"))
+            && work_limits["properties"]["maximum_aggregate_codec_retained_entry_and_sample_bound"]
+                ["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("not measured or complete"))
+            && work_limits["properties"]["maximum_total_accounted_work_units"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("other Registry-core validation/source passes")
+                        && description.contains("not end-to-end MCP work")
+                }),
+        "ISSUE_557_564_FSV_OPTIMIZER_WORK_LIMIT_SEMANTICS_AMBIGUOUS",
+        work_limits,
+    )?;
+    let gates = &schema["properties"]["candidate_request"]["properties"]["gates"];
+    require(
+        gates["properties"]["maximum_working_set_bytes"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("not the transient process peak")),
+        "ISSUE_557_564_FSV_OPTIMIZER_RSS_GATE_SEMANTICS_AMBIGUOUS",
+        gates,
+    )?;
     Ok(json!({
         "exchange": exchange.evidence(),
         "optimizer_definition": optimizer[0],
@@ -672,6 +785,146 @@ fn verify_commission_payload(payload: &Value, selected_receipt: &str) -> AnyResu
                 .is_some_and(|candidates| candidates.len() == 2),
         "ISSUE_557_564_FSV_COMMISSION_PAYLOAD_INVALID",
         payload,
+    )?;
+    let compact_candidates = payload["candidate_evaluations"]
+        .as_array()
+        .filter(|candidates| candidates.len() == 2)
+        .ok_or("commission response has no exact compact candidate roster")?;
+    let selected_candidates = selected["measurement"]["candidate_selection"]["candidates"]
+        .as_array()
+        .ok_or("selected receipt has no candidate roster")?;
+    for candidate in compact_candidates {
+        let slot_id = candidate["generation"]["slot_id"]
+            .as_u64()
+            .ok_or("compact commission candidate has no generation slot id")?;
+        let receipt_sha256 = candidate["receipt_sha256"]
+            .as_str()
+            .filter(|digest| digest.len() == 64)
+            .ok_or("compact commission candidate has no receipt SHA-256")?;
+        let matches_selection = selected_candidates.iter().any(|selected_candidate| {
+            selected_candidate["slot_id"].as_u64() == Some(slot_id)
+                && selected_candidate["receipt_sha256"].as_str() == Some(receipt_sha256)
+        });
+        let encoded = serde_json::to_string(candidate)?;
+        require(
+            matches_selection
+                && candidate.get("evaluation").is_none()
+                && candidate.get("receipt").is_none()
+                && candidate["generation"].get("rows").is_none()
+                && candidate["generation"].get("ledger").is_none()
+                && !encoded.contains("\"held_out_queries\"")
+                && !encoded.contains("\"queries\"")
+                && !encoded.contains("\"reconstruction\"")
+                && !encoded.contains("\"physical_components\"")
+                && !encoded.contains("\"membership_proofs\""),
+            "ISSUE_557_564_FSV_COMMISSION_CANDIDATE_PAYLOAD_NOT_COMPACT",
+            candidate,
+        )?;
+    }
+    require(
+        payload["cost_scope"]["mode"] == "commission_compression_candidates"
+            && payload["cost_scope"]["work_limits"] == "candidate_request.work_limits"
+            && payload["cost_scope"]["end_to_end_mcp_bounded"] == Value::Bool(false)
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["issue"] == 1137
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["defect_classes"]
+                == json!(["PC-40", "PC-43"])
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["operation"]
+                .as_str()
+                .is_some_and(|operation| operation.contains("pre/post full Ledger-chain"))
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["asymptotic_cost"]
+                .as_str()
+                .is_some_and(|cost| cost.contains("Theta(M)"))
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["production_ledger_entries_m"]
+                == "unknown"
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["production_store_open_count"]
+                == "unknown"
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["bounded_by_candidate_request_work_limits"]
+                == Value::Bool(false)
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["issue"] == 1137
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["defect_classes"]
+                == json!(["PC-05", "PC-43"])
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["asymptotic_cost"]
+                .as_str()
+                .is_some_and(|cost| cost.contains("Theta(P log P + C log P)"))
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["production_panel_slots_p"]
+                == "unknown"
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["bounded_by_candidate_request_work_limits"]
+                == Value::Bool(false),
+        "ISSUE_557_564_FSV_COMMISSION_END_TO_END_COST_GAP_MISSING",
+        payload,
+    )?;
+    require(
+        payload["known_cost_gap"]["mxfp4_commission_evidence"]["issue"] == 1136
+            && payload["known_cost_gap"]["mxfp4_commission_evidence"]["defect_classes"]
+                == json!(["PC-03", "PC-43"])
+            && payload["known_cost_gap"]["mxfp4_commission_evidence"]["current_behavior"]
+                .as_str()
+                .is_some_and(|behavior| {
+                    behavior.contains("preflight-refuses MXFP4 before candidate scan/write")
+                })
+            && payload["known_cost_gap"]["mxfp4_commission_evidence"]["required_bounded_primitive"]
+                == "exact-key bounded initial Assay evidence lookup"
+            && payload["known_cost_gap"]["mxfp4_commission_evidence"]["single_candidate_diagnostic_behavior"]
+                == "unchanged",
+        "ISSUE_557_564_FSV_COMMISSION_MXFP4_LIMITATION_MISSING",
+        payload,
+    )?;
+    require(
+        payload["source_state"]["preflight"]
+            .as_str()
+            .is_some_and(|preflight| {
+                preflight.contains("allocation-free slot/lens descriptors")
+                    && preflight.contains("raw/Base identity bindings")
+                    && preflight.contains("absent fresh compressed manifest")
+                    && preflight.contains("canonical corpus equality")
+                    && preflight.contains("work/limits")
+                    && preflight.contains("query disjointness")
+                    && preflight.contains("CPU backend")
+                    && preflight.contains("Codec-context creation begins during build")
+            }),
+        "ISSUE_557_564_FSV_COMMISSION_PREFLIGHT_SCOPE_INACCURATE",
+        payload,
+    )
+}
+
+fn verify_selection_replay_cost_payload(payload: &Value) -> AnyResult<()> {
+    require(
+        payload["cost_scope"]["mode"] == "select_compression_candidates"
+            && payload["cost_scope"]["bounded_path"]
+                .as_str()
+                .is_some_and(|path| path.contains("exact-receipt streaming"))
+            && payload["cost_scope"]["work_limits"]
+                == "canonical work/limits persisted in the exact source receipts"
+            && payload["cost_scope"]["end_to_end_mcp_bounded"] == Value::Bool(false)
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["issue"] == 1137
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["defect_classes"]
+                == json!(["PC-40", "PC-43"])
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["operation"]
+                .as_str()
+                .is_some_and(|operation| {
+                    operation.contains("commission/selection-replay pre/post full Ledger-chain")
+                })
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["asymptotic_cost"]
+                .as_str()
+                .is_some_and(|cost| cost.contains("Theta(M)"))
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["production_ledger_entries_m"]
+                == "unknown"
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["production_store_open_count"]
+                == "unknown"
+            && payload["known_cost_gap"]["mcp_ledger_verification"]["bounded_by_candidate_request_work_limits"]
+                == Value::Bool(false)
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["issue"] == 1137
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["defect_classes"]
+                == json!(["PC-05", "PC-43"])
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["asymptotic_cost"]
+                .as_str()
+                .is_some_and(|cost| cost.contains("Theta(P log P + C log P)"))
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["production_panel_slots_p"]
+                == "unknown"
+            && payload["known_cost_gap"]["mcp_panel_roster_resolution"]["bounded_by_candidate_request_work_limits"]
+                == Value::Bool(false),
+        "ISSUE_557_564_FSV_SELECTION_REPLAY_COST_GAP_MISSING",
+        payload,
     )
 }
 
@@ -733,6 +986,7 @@ fn expect_refusal(
     case: &str,
     arguments: &Value,
     expected_code: &str,
+    expected_preflight_stage: Option<&str>,
     cache_dir: &Path,
     project: &str,
     slot_ids: &[u16],
@@ -755,6 +1009,15 @@ fn expect_refusal(
         "ISSUE_557_564_FSV_REFUSAL_CONTRACT_MISMATCH",
         format!("case={case} payload={payload}"),
     )?;
+    if let Some(expected_stage) = expected_preflight_stage {
+        require(
+            payload["stage"] == expected_stage
+                && payload["vault_or_manifest_opened"] == Value::Bool(false)
+                && payload["ledger_chain_scanned"] == Value::Bool(false),
+            "ISSUE_557_564_FSV_REFUSAL_PAID_STATE_IO_BEFORE_PREFLIGHT",
+            format!("case={case} payload={payload}"),
+        )?;
+    }
     let after = physical_state(cache_dir, project, slot_ids, layout)?;
     println!(
         "{}",
@@ -776,6 +1039,7 @@ fn expect_refusal(
         "before": before,
         "after": after,
         "byte_stable": true,
+        "preflight_before_vault_manifest_or_ledger_io": expected_preflight_stage,
     }))
 }
 
@@ -905,6 +1169,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
         "ISSUE_557_564_FSV_REPLAY_INVALID",
         replay_payload,
     )?;
+    verify_selection_replay_cost_payload(replay_payload)?;
     let replay_after = physical_state(
         &input.cache_dir,
         &input.project,
@@ -933,6 +1198,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
         "ISSUE_557_564_FSV_IDEMPOTENT_REPEAT_INVALID",
         repeat_payload,
     )?;
+    verify_selection_replay_cost_payload(repeat_payload)?;
     let repeat_after = physical_state(
         &input.cache_dir,
         &input.project,
@@ -943,6 +1209,29 @@ fn run(root: PathBuf) -> AnyResult<()> {
         repeat_before["fingerprint"] == repeat_after["fingerprint"],
         "ISSUE_557_564_FSV_IDEMPOTENT_REPEAT_MUTATED_STATE",
         "idempotent selector repeat changed physical state",
+    )?;
+
+    let mut duplicate_replay = replay_args.clone();
+    let replay_receipts = duplicate_replay["candidate_receipts"]
+        .as_array_mut()
+        .ok_or("selection replay candidate_receipts are not an array")?;
+    require(
+        replay_receipts.len() >= 2,
+        "ISSUE_557_564_FSV_REPLAY_FIXTURE_TOO_SMALL",
+        replay_receipts.len(),
+    )?;
+    replay_receipts[1]["slot_id"] = replay_receipts[0]["slot_id"].clone();
+    let duplicate_replay_edge = expect_refusal(
+        &runner,
+        55_756_405,
+        "duplicate_selection_replay_slot",
+        &duplicate_replay,
+        "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_DUPLICATE_SLOT",
+        Some(RECEIPT_PARSE_PREFLIGHT_STAGE),
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
     )?;
 
     let mut duplicate_query = commission_args.clone();
@@ -961,6 +1250,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
         "duplicate_query_cx_id",
         &duplicate_query,
         "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        Some(OPERATION_PREFLIGHT_STAGE),
         &input.cache_dir,
         &input.project,
         &input.slot_ids,
@@ -974,7 +1264,84 @@ fn run(root: PathBuf) -> AnyResult<()> {
         55_756_411,
         "duplicate_candidate_slot",
         &duplicate_slot,
-        "ASTRO_OPTIMIZER_COMPRESSION_STATUS_INVALID",
+        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_DUPLICATE",
+        Some(SLOT_PARSE_PREFLIGHT_STAGE),
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
+
+    let mut single_candidate = commission_args.clone();
+    single_candidate["candidate_slot_ids"] = json!([input.slot_ids[0]]);
+    let single_candidate_edge = expect_refusal(
+        &runner,
+        55_756_412,
+        "single_candidate_commission",
+        &single_candidate,
+        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_COUNT_INVALID",
+        Some(SLOT_COUNT_PREFLIGHT_STAGE),
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
+
+    let mut query_limit = commission_args.clone();
+    let query_count = query_limit["candidate_request"]["queries"]
+        .as_array()
+        .map(Vec::len)
+        .ok_or("candidate queries are not an array")?;
+    require(
+        query_count > 1,
+        "ISSUE_557_564_FSV_QUERY_FIXTURE_TOO_SMALL",
+        query_count,
+    )?;
+    query_limit["candidate_request"]["work_limits"]["maximum_held_out_queries"] =
+        json!(query_count - 1);
+    let query_limit_edge = expect_refusal(
+        &runner,
+        55_756_413,
+        "held_out_query_exact_minus_one_limit",
+        &query_limit,
+        "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        Some(OPERATION_PREFLIGHT_STAGE),
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
+
+    let mut lifecycle_limit = commission_args.clone();
+    let lifecycle_searches =
+        lifecycle_limit["candidate_request"]["work_limits"]["maximum_total_packed_searches"]
+            .as_u64()
+            .filter(|value| *value > 1)
+            .ok_or("lifecycle packed-search fixture limit is not positive")?;
+    lifecycle_limit["candidate_request"]["work_limits"]["maximum_total_packed_searches"] =
+        json!(lifecycle_searches - 1);
+    let lifecycle_limit_edge = expect_refusal(
+        &runner,
+        55_756_414,
+        "lifecycle_packed_search_exact_minus_one_limit",
+        &lifecycle_limit,
+        "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        Some(OPERATION_PREFLIGHT_STAGE),
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
+
+    let mut invalid_runs = commission_args.clone();
+    invalid_runs["candidate_request"]["measured_runs"] = json!(2);
+    let invalid_runs_edge = expect_refusal(
+        &runner,
+        55_756_415,
+        "measured_runs_below_schema_minimum",
+        &invalid_runs,
+        "ASTRO_MCP_ARGUMENT_BOUND_INVALID",
+        None,
         &input.cache_dir,
         &input.project,
         &input.slot_ids,
@@ -982,13 +1349,30 @@ fn run(root: PathBuf) -> AnyResult<()> {
     )?;
 
     let mut invalid_backend = commission_args.clone();
-    invalid_backend["candidate_request"]["requested_backend"] = json!("invalid-provider");
+    invalid_backend["candidate_request"]["requested_backend"] = json!("cuda");
     let invalid_backend_edge = expect_refusal(
         &runner,
-        55_756_412,
-        "invalid_backend",
+        55_756_416,
+        "unsupported_cuda_backend",
         &invalid_backend,
-        "ASTRO_MCP_ARGUMENT_ENUM_INVALID",
+        "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        Some(OPERATION_PREFLIGHT_STAGE),
+        &input.cache_dir,
+        &input.project,
+        &input.slot_ids,
+        CandidateLayout::CompressedWithRawSidecar,
+    )?;
+
+    let mut invalid_gates = commission_args.clone();
+    invalid_gates["candidate_request"]["gates"]["maximum_mean_cosine_error"] = json!(0.75);
+    invalid_gates["candidate_request"]["gates"]["maximum_cosine_error"] = json!(0.5);
+    let invalid_gates_edge = expect_refusal(
+        &runner,
+        55_756_417,
+        "incoherent_cosine_error_gates",
+        &invalid_gates,
+        "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        Some(OPERATION_PREFLIGHT_STAGE),
         &input.cache_dir,
         &input.project,
         &input.slot_ids,
@@ -1047,7 +1431,17 @@ fn run(root: PathBuf) -> AnyResult<()> {
             "after": repeat_after,
             "byte_stable": true,
         },
-        "malformed_calls": [duplicate_query_edge, duplicate_slot_edge, invalid_backend_edge],
+        "malformed_calls": [
+            duplicate_query_edge,
+            duplicate_slot_edge,
+            duplicate_replay_edge,
+            single_candidate_edge,
+            query_limit_edge,
+            lifecycle_limit_edge,
+            invalid_runs_edge,
+            invalid_backend_edge,
+            invalid_gates_edge,
+        ],
         "selected_current_receipt_sha256": selected_receipt,
         "final_state": final_state,
     });
