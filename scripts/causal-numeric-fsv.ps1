@@ -13,6 +13,7 @@ param(
     [Parameter(Mandatory)][string]$SourcePath,
     [Parameter(Mandatory)][string]$TreeSha,
     [Parameter(Mandatory)][string]$SessionId,
+    [Parameter(Mandatory)][string]$NomicDir,
     [int]$Issue = 1134
 )
 
@@ -42,11 +43,22 @@ Assert-Astro ($Issue -eq 1134) 'ISSUE_1134_FSV_ISSUE_MISMATCH' `
     "expected issue 1134, observed $Issue"
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $source = [IO.Path]::GetFullPath($SourcePath)
+$nomicRoot = [IO.Path]::GetFullPath($NomicDir)
+$nomicVectors = Join-Path $nomicRoot 'code_vectors.bin'
+$nomicTokens = Join-Path $nomicRoot 'code_tokens.txt'
 $head = (& 'C:\Program Files\Git\bin\git.exe' -C $workspace rev-parse HEAD).Trim()
 Assert-Astro ($LASTEXITCODE -eq 0 -and $head -ceq $TreeSha) `
     'ISSUE_1134_FSV_TREE_MISMATCH' "expected committed tree $TreeSha, observed $head"
 Assert-Astro (Test-Path -LiteralPath $source -PathType Leaf) `
     'ISSUE_1134_FSV_ARTIFACT_MISSING' "native artifact is absent: $source"
+Assert-Astro (
+    (Test-Path -LiteralPath $nomicVectors -PathType Leaf) -and
+    (Test-Path -LiteralPath $nomicTokens -PathType Leaf)
+) 'ISSUE_1134_FSV_NOMIC_DATA_MISSING' `
+    "required Nomic runtime-data pair is absent below $nomicRoot"
+$nomicVectorsHash = Get-Sha256 $nomicVectors
+$nomicTokensHash = Get-Sha256 $nomicTokens
+$env:ASTRO_NOMIC_DIR = $nomicRoot
 
 $sourceHash = Get-Sha256 $source
 $session = Join-Path (
@@ -125,6 +137,11 @@ $report = $reportRaw | ConvertFrom-Json
 $reportAgain = Get-Content -LiteralPath $reportPath -Raw
 Assert-Astro ($reportRaw -ceq $reportAgain) 'ISSUE_1134_FSV_REPORT_UNSTABLE' `
     'the persisted report changed across two independent reads'
+Assert-Astro (
+    (Get-Sha256 $nomicVectors) -ceq $nomicVectorsHash -and
+    (Get-Sha256 $nomicTokens) -ceq $nomicTokensHash
+) 'ISSUE_1134_FSV_NOMIC_DATA_DRIFT' `
+    'the exact Nomic runtime-data pair changed across the native artifact run'
 Assert-Astro ([string]$report.schema -ceq 'astrolabe.issue-1134.causal-numeric-fsv.v1') `
     'ISSUE_1134_FSV_REPORT_INVALID' 'report schema does not identify the issue-1134 contract'
 Assert-Astro (
@@ -194,6 +211,11 @@ $readback = [ordered]@{
     artifact_sha256 = $sourceHash
     run_record_sha256 = Get-Sha256 $runRecordPath
     report_sha256 = Get-Sha256 $reportPath
+    nomic_runtime = [ordered]@{
+        directory = $nomicRoot
+        code_vectors_sha256 = $nomicVectorsHash
+        code_tokens_sha256 = $nomicTokensHash
+    }
     project = [string]$report.project
     artifact_generation = [string]$happyAfter.state.causal.artifact_sha256
     snapshot_seq = [uint64]$happyAfter.state.snapshot_seq
