@@ -1683,7 +1683,7 @@ fn scan_preflight_candidate_rows<C: Clock>(
         end: None,
     };
     let mut after_key: Option<Vec<u8>> = None;
-    let mut rows = Vec::new();
+    let mut rows: Vec<(CxId, Vec<f32>)> = Vec::new();
     loop {
         let seen = u64::try_from(rows.len())
             .map_err(|_| admission_error("candidate preflight row count exceeds u64"))?;
