@@ -29,6 +29,7 @@ const ROOT_ENV: &str = "ASTROLABE_COMPRESSION_FSV_ROOT";
 const PROJECT: &str = "issues-557-564-compression-admission-fsv";
 const INPUT_FILE: &str = "mcp-input.json";
 const OUTPUT_FILE: &str = "mcp-dispatch-result.json";
+const SHADOW_LEDGER_CHECKPOINT_KEY: &str = "shadow_ledger_checkpoint_json";
 const OPERATION_PREFLIGHT_STAGE: &str =
     "pure operation-shape preflight before vault/manifest/Ledger open";
 const SLOT_COUNT_PREFLIGHT_STAGE: &str =
@@ -932,6 +933,7 @@ fn verify_status_payload(
     payload: &Value,
     slot_ids: &[u16],
     selected_receipt: &str,
+    expected_shadow_ledger_checkpoint: &Value,
 ) -> AnyResult<Value> {
     let admission = &payload["compression_admission"];
     let slots = admission["slots"]
@@ -971,6 +973,11 @@ fn verify_status_payload(
             && current_receipts[0] == selected_receipt,
         "ISSUE_557_564_FSV_STATUS_STATE_MISMATCH",
         format!("latest={latest_states:?} current={current_receipts:?}"),
+    )?;
+    require(
+        payload["source_state"]["shadow_ledger_checkpoint"] == *expected_shadow_ledger_checkpoint,
+        "ISSUE_557_564_FSV_STATUS_LEDGER_CHECKPOINT_MISMATCH",
+        &payload["source_state"]["shadow_ledger_checkpoint"],
     )?;
     Ok(json!({
         "relevant_slots": relevant,
@@ -1132,6 +1139,16 @@ fn run(root: PathBuf) -> AnyResult<()> {
         &input.slot_ids,
         CandidateLayout::CompressedWithRawSidecar,
     )?;
+    let checkpoint_key = format!(
+        "astrolabe.calyx.{}.{SHADOW_LEDGER_CHECKPOINT_KEY}",
+        input.project
+    );
+    let expected_shadow_ledger_checkpoint = serde_json::from_str::<Value>(
+        status_before["state"]["config"]["rows"]
+            .get(&checkpoint_key)
+            .and_then(Value::as_str)
+            .ok_or("prepared MCP config has no shadow Ledger checkpoint row")?,
+    )?;
     let status_exchange = call_optimizer(&runner, 55_756_402, &status_args)?;
     let (status_payload, status_error) = status_exchange.tool_result()?;
     require(
@@ -1139,8 +1156,12 @@ fn run(root: PathBuf) -> AnyResult<()> {
         "ISSUE_557_564_FSV_STATUS_FAILED",
         status_payload,
     )?;
-    let status_evidence =
-        verify_status_payload(status_payload, &input.slot_ids, &selected_receipt)?;
+    let status_evidence = verify_status_payload(
+        status_payload,
+        &input.slot_ids,
+        &selected_receipt,
+        &expected_shadow_ledger_checkpoint,
+    )?;
     let status_after = physical_state(
         &input.cache_dir,
         &input.project,

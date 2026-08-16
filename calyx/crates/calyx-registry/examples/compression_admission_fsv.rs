@@ -76,7 +76,10 @@ use calyx_core::{
 };
 use calyx_forge::quant::{binary_work_shape, turboquant_work_shape};
 use calyx_forge::{BackendKind, QuantLevel, TurboQuantGeometryKind};
-use calyx_ledger::{EntryKind, LedgerCfStore, VerifyResult, verify_chain};
+use calyx_ledger::{
+    EntryKind, LedgerCfStore, LedgerHeadAnchor, LedgerRow, StreamingChainVerifier, StreamingStart,
+    VerifyResult, verify_chain,
+};
 use calyx_registry::{
     AlgorithmicLens, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
     COMPRESSION_ADMISSION_SCHEMA, CompressionAdmissionGates, CompressionAdmissionReadback,
@@ -114,6 +117,9 @@ const PRODUCTION_DB: &str = r"C:\Users\hotra\.cache\codebase-memory-mcp\C-code-p
 const MCP_PROJECT: &str = "issues-557-564-compression-admission-fsv";
 const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SALT: &[u8] = b"issues-557-564-compression-admission-fsv";
+const SHADOW_LEDGER_CHECKPOINT_KEY: &str = "shadow_ledger_checkpoint_json";
+const SHADOW_LEDGER_CHECKPOINT_SCHEMA: &str = "astrolabe.shadow-ledger-checkpoint.v1";
+const SHADOW_LEDGER_TIP_HASH_ALGORITHM: &str = "blake3-256";
 const ROOT_ENV: &str = "ASTROLABE_COMPRESSION_FSV_ROOT";
 const MODE_ENV: &str = "ASTROLABE_COMPRESSION_FSV_MODE";
 const COMPRESSION_WORK_MODEL: &str = "calyx.registry.compression_work.v3";
@@ -2064,8 +2070,139 @@ fn production_receipt_summary(receipt: &CompressionAdmissionReceipt) -> Value {
 struct McpConfigReadback {
     query_only: i64,
     rows: BTreeMap<String, String>,
+    shadow_ledger_checkpoint: McpShadowLedgerCheckpoint,
     database_bytes: u64,
     database_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpShadowLedgerCheckpoint {
+    schema: String,
+    mvcc_commit_seq: u64,
+    ledger_height: u64,
+    tip_hash_algorithm: String,
+    tip_hash_hex: String,
+}
+
+fn validate_mcp_shadow_ledger_checkpoint(checkpoint: &McpShadowLedgerCheckpoint) -> AnyResult<()> {
+    let valid_hash = checkpoint.tip_hash_hex.len() == 64
+        && checkpoint
+            .tip_hash_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && checkpoint.tip_hash_hex == checkpoint.tip_hash_hex.to_ascii_lowercase();
+    require(
+        checkpoint.schema == SHADOW_LEDGER_CHECKPOINT_SCHEMA
+            && checkpoint.tip_hash_algorithm == SHADOW_LEDGER_TIP_HASH_ALGORITHM
+            && valid_hash
+            && ((checkpoint.ledger_height == 0 && checkpoint.tip_hash_hex == "0".repeat(64))
+                || (checkpoint.ledger_height != 0 && checkpoint.tip_hash_hex != "0".repeat(64))),
+        "MCP shadow Ledger checkpoint contract is invalid",
+    )
+}
+
+fn verify_mcp_shadow_ledger_checkpoint(
+    checkpoint: &McpShadowLedgerCheckpoint,
+    current_mvcc_seq: u64,
+    ledger_rows: &[LedgerRow],
+    ledger_head: &LedgerHeadAnchor,
+) -> AnyResult<()> {
+    validate_mcp_shadow_ledger_checkpoint(checkpoint)?;
+    let current_height = u64::try_from(ledger_rows.len())?;
+    require(
+        ledger_head.height == current_height,
+        format!(
+            "MCP physical Ledger row count {} differs from external head height {}",
+            current_height, ledger_head.height
+        ),
+    )?;
+    let current_tip_hash = ledger_rows
+        .last()
+        .map(|row| calyx_ledger::decode(&row.bytes).map(|entry| entry.entry_hash))
+        .transpose()?
+        .unwrap_or([0_u8; 32]);
+    require(
+        ledger_head.tip_hash == current_tip_hash,
+        "MCP physical Ledger tip differs from its external head anchor",
+    )?;
+    require(
+        current_mvcc_seq >= checkpoint.mvcc_commit_seq
+            && current_height >= checkpoint.ledger_height
+            && ((current_mvcc_seq == checkpoint.mvcc_commit_seq
+                && current_height == checkpoint.ledger_height)
+                || (current_mvcc_seq > checkpoint.mvcc_commit_seq
+                    && current_height > checkpoint.ledger_height)),
+        format!(
+            "MCP shadow Ledger checkpoint is not a strict retained prefix: checkpoint mvcc/height={}/{} current={}/{}",
+            checkpoint.mvcc_commit_seq, checkpoint.ledger_height, current_mvcc_seq, current_height
+        ),
+    )?;
+    let checkpoint_tip_hash = match checkpoint.ledger_height.checked_sub(1) {
+        Some(tip_seq) => {
+            let index = usize::try_from(tip_seq)?;
+            let row = ledger_rows
+                .get(index)
+                .ok_or("MCP shadow Ledger checkpoint tip row is absent")?;
+            let entry = calyx_ledger::decode(&row.bytes)?;
+            require(
+                row.seq == tip_seq && entry.seq == tip_seq && entry.verify(),
+                "MCP shadow Ledger checkpoint tip row is not canonical",
+            )?;
+            entry.entry_hash
+        }
+        None => [0_u8; 32],
+    };
+    require(
+        hex(&checkpoint_tip_hash) == checkpoint.tip_hash_hex,
+        "MCP shadow Ledger checkpoint tip hash differs from the retained physical prefix",
+    )
+}
+
+fn capture_mcp_shadow_ledger_checkpoint(
+    vault_dir: &Path,
+    vault: &AsterVault<SystemClock>,
+) -> AnyResult<McpShadowLedgerCheckpoint> {
+    let snapshot = vault.latest_seq();
+    let physical = AsterLedgerCfStore::open(vault_dir)?;
+    let ledger_rows = physical.scan()?;
+    let ledger_head = physical
+        .head_anchor()?
+        .ok_or("prepare_mcp physical Ledger has no external head anchor")?;
+    let tip_hash = ledger_rows
+        .last()
+        .map(|row| calyx_ledger::decode(&row.bytes).map(|entry| entry.entry_hash))
+        .transpose()?
+        .unwrap_or([0_u8; 32]);
+    let checkpoint = McpShadowLedgerCheckpoint {
+        schema: SHADOW_LEDGER_CHECKPOINT_SCHEMA.to_string(),
+        mvcc_commit_seq: snapshot,
+        ledger_height: u64::try_from(ledger_rows.len())?,
+        tip_hash_algorithm: SHADOW_LEDGER_TIP_HASH_ALGORITHM.to_string(),
+        tip_hash_hex: hex(&tip_hash),
+    };
+    verify_mcp_shadow_ledger_checkpoint(&checkpoint, snapshot, &ledger_rows, &ledger_head)?;
+    let ledger_height = u64::try_from(ledger_rows.len())?;
+    let verified = match StreamingChainVerifier::start(0..ledger_height, Some(ledger_head), None)? {
+        StreamingStart::Complete(result) => result,
+        StreamingStart::Ready(mut verifier) => {
+            let mut terminal = None;
+            for row in ledger_rows {
+                if let Some(result) = verifier.verify_next(Some(row))? {
+                    terminal = Some(result);
+                    break;
+                }
+            }
+            terminal.unwrap_or(VerifyResult::Intact {
+                count: verifier.count(),
+            })
+        }
+    };
+    require(
+        matches!(verified, VerifyResult::Intact { count } if count == ledger_height),
+        format!("prepare_mcp physical Ledger chain is not intact: {verified:?}"),
+    )?;
+    Ok(checkpoint)
 }
 
 fn prepare_mcp(root: &Path) -> AnyResult<()> {
@@ -2152,9 +2289,14 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
         "canonical MCP dispatcher input readback differs from written input",
     )?;
 
+    let shadow_ledger_checkpoint = capture_mcp_shadow_ledger_checkpoint(&vault_dir, &vault)?;
     let config_path = cache_dir.join("_config.db");
-    write_mcp_config(&config_path, &vault_dir)?;
+    write_mcp_config(&config_path, &vault_dir, &shadow_ledger_checkpoint)?;
     let config = read_mcp_config(&config_path, &vault_dir)?;
+    require(
+        config.shadow_ledger_checkpoint == shadow_ledger_checkpoint,
+        "prepare_mcp shadow Ledger checkpoint readback differs",
+    )?;
     drop(vault);
     let reopened = open_read_vault_for_primary_slots(
         &vault_dir,
@@ -2186,7 +2328,7 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
             "request_sha256": sha256_hex(&request_bytes),
             "request_arguments": request_readback,
             "independently_calculated_aggregate_planned_upper_bound": commission_work,
-            "source_of_truth": "fresh read-only Aster raw primary/Compression/Ledger reads, read-only query_only _config.db rows, and request-file byte readback",
+            "source_of_truth": "fresh read-only Aster raw primary/Compression/Ledger reads, external Ledger-head and retained-prefix checkpoint validation, read-only query_only _config.db rows, and request-file byte readback",
             "files": disk_inventory(root)?,
         })
     );
@@ -2296,6 +2438,15 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
         matches!(chain, VerifyResult::Intact { count } if count == ledger_rows.len() as u64),
         format!("readback_mcp physical Ledger is not intact: {chain:?}"),
     )?;
+    let ledger_head = ledger_store
+        .head_anchor()?
+        .ok_or("readback_mcp physical Ledger has no external head anchor")?;
+    verify_mcp_shadow_ledger_checkpoint(
+        &config.shadow_ledger_checkpoint,
+        snapshot,
+        &ledger_rows,
+        &ledger_head,
+    )?;
     drop(ledger_store);
     drop(vault);
     let files_after = disk_inventory(root)?;
@@ -2308,7 +2459,7 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
         json!({
             "event": "mcp_readback_complete",
             "project": MCP_PROJECT,
-            "source_of_truth": "independent read-only Aster primary/raw/manifest/proof/receipt/pointer/Ledger reads and query_only SQLite config reads; dispatcher JSON is comparison-only",
+            "source_of_truth": "independent read-only Aster primary/raw/manifest/proof/receipt/pointer/Ledger reads, external Ledger-head and retained-prefix checkpoint validation, and query_only SQLite config reads; dispatcher JSON is comparison-only",
             "config": config,
             "mcp_input": input,
             "request": request,
@@ -2322,6 +2473,8 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
             "physical_ledger": format!("{chain:?}"),
             "physical_ledger_rows": ledger_rows.len(),
             "physical_ledger_sha256": ledger_rows_sha256(&ledger_rows),
+            "shadow_ledger_checkpoint": config.shadow_ledger_checkpoint,
+            "shadow_ledger_checkpoint_verified": true,
             "files_before": files_before,
             "files_after": files_after,
             "disk_unchanged_during_readback": true,
@@ -2360,7 +2513,11 @@ fn require_mcp_raw_candidate(
     Ok(())
 }
 
-fn write_mcp_config(path: &Path, vault_dir: &Path) -> AnyResult<()> {
+fn write_mcp_config(
+    path: &Path,
+    vault_dir: &Path,
+    shadow_ledger_checkpoint: &McpShadowLedgerCheckpoint,
+) -> AnyResult<()> {
     require(!path.exists(), "prepare_mcp config database already exists")?;
     let mut connection = Connection::open(path)?;
     let transaction = connection.transaction()?;
@@ -2377,6 +2534,10 @@ fn write_mcp_config(path: &Path, vault_dir: &Path) -> AnyResult<()> {
         (
             format!("{prefix}.vault_salt"),
             std::str::from_utf8(VAULT_SALT)?.to_string(),
+        ),
+        (
+            format!("{prefix}.{SHADOW_LEDGER_CHECKPOINT_KEY}"),
+            serde_json::to_string(shadow_ledger_checkpoint)?,
         ),
     ] {
         transaction.execute(
@@ -2398,7 +2559,7 @@ fn read_mcp_config(path: &Path, vault_dir: &Path) -> AnyResult<McpConfigReadback
     let query_only: i64 = connection.pragma_query_value(None, "query_only", |row| row.get(0))?;
     require(query_only == 1, "MCP config readback is not query_only")?;
     let prefix = format!("astrolabe.calyx.{MCP_PROJECT}");
-    let expected = BTreeMap::from([
+    let expected_base = BTreeMap::from([
         (prefix.clone(), "shadow".to_string()),
         (
             format!("{prefix}.vault_dir"),
@@ -2418,14 +2579,29 @@ fn read_mcp_config(path: &Path, vault_dir: &Path) -> AnyResult<McpConfigReadback
         })?
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     require(
-        rows == expected,
-        "MCP config persisted rows differ from exact expected values",
+        rows.len() == expected_base.len() + 1
+            && expected_base
+                .iter()
+                .all(|(key, value)| rows.get(key) == Some(value)),
+        "MCP config persisted base rows differ from exact expected values",
+    )?;
+    let checkpoint_key = format!("{prefix}.{SHADOW_LEDGER_CHECKPOINT_KEY}");
+    let checkpoint_raw = rows
+        .get(&checkpoint_key)
+        .ok_or("MCP config has no shadow Ledger checkpoint row")?;
+    let shadow_ledger_checkpoint =
+        serde_json::from_str::<McpShadowLedgerCheckpoint>(checkpoint_raw)?;
+    validate_mcp_shadow_ledger_checkpoint(&shadow_ledger_checkpoint)?;
+    require(
+        serde_json::to_string(&shadow_ledger_checkpoint)? == *checkpoint_raw,
+        "MCP config shadow Ledger checkpoint is not canonical JSON",
     )?;
     drop(statement);
     drop(connection);
     Ok(McpConfigReadback {
         query_only,
         rows,
+        shadow_ledger_checkpoint,
         database_bytes: fs::metadata(path)?.len(),
         database_sha256: sha256_file(path)?,
     })
