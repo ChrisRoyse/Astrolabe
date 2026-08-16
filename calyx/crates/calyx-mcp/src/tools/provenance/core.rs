@@ -1,17 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::ledger_view::AsterLedgerCfStore;
-use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{Anchor, AnchorKind, CalyxError, CxId, SlotId, SlotVector};
+use calyx_aster::manifest::ManifestStore;
+use calyx_aster::vault::encode::BaseRecord;
+use calyx_aster::vault::{AsterVault, SlotVectorResolver, VaultOptions};
+use calyx_core::{Anchor, AnchorKind, CalyxError, CxId};
 use calyx_ledger::{
     EntryKind, LedgerCfStore, LedgerEntry, REPRODUCE_PAYLOAD_TAG, SubjectId, VerifyResult, decode,
     get_answer_trace, get_provenance, verify_chain,
 };
-use calyx_registry::{load_vault_panel_state, resolved_constellation_read_cfs};
+use calyx_registry::load_vault_panel_state;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -142,13 +144,58 @@ pub(super) fn lineage_for_resolved(
     resolved: &ResolvedVault,
     cx_id: CxId,
 ) -> ToolResult<LineageOut> {
+    let salt = vault_salt(resolved.vault_id, &resolved.name);
+    // The Base-only reader discovers this constellation's exact slot set while
+    // retaining the shared commit generation. The second shared reader is
+    // acquired before that guard can drop, so slot and physical Ledger evidence
+    // cannot cross a writer boundary and unrelated panel slots are never opened.
+    let base_vault = AsterVault::open(
+        &resolved.path,
+        resolved.vault_id,
+        salt.clone(),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(vec![ColumnFamily::Base]),
+            ..VaultOptions::default()
+        },
+    )?;
+    let snapshot = base_vault.latest_seq();
+    let manifest_store = ManifestStore::open(&resolved.path);
+    let manifest = manifest_store.load_current()?;
     let state = load_vault_panel_state(&resolved.path)?;
-    let mut selected_cfs = resolved_constellation_read_cfs(&state.panel);
+    if manifest_store.load_current()? != manifest {
+        return Err(CalyxError::stale_derived(
+            "vault panel/registry manifest changed while binding lineage state",
+        )
+        .into());
+    }
+    let base_bytes = base_vault
+        .read_cf_at(snapshot, ColumnFamily::Base, &base_key(cx_id))?
+        .ok_or_else(|| {
+            CalyxError::vault_access_denied(format!("cx_id {cx_id} does not exist in vault"))
+        })?;
+    let base = BaseRecord::decode_for_key(cx_id, &base_bytes)?;
+    if base.vault_id() != resolved.vault_id {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "Base row for {cx_id} belongs to vault {} instead of {}",
+            base.vault_id(),
+            resolved.vault_id
+        ))
+        .into());
+    }
+    let slot_ids = base.slot_hashes().keys().copied().collect::<BTreeSet<_>>();
+    let mut selected_cfs = Vec::with_capacity(1_usize.saturating_add(slot_ids.len()));
+    if !slot_ids.is_empty() {
+        selected_cfs.push(ColumnFamily::Compression);
+    }
     selected_cfs.push(ColumnFamily::Ledger);
+    selected_cfs.extend(slot_ids.iter().copied().map(ColumnFamily::slot));
     let vault = AsterVault::open(
         &resolved.path,
         resolved.vault_id,
-        vault_salt(resolved.vault_id, &resolved.name),
+        salt,
         VaultOptions {
             restore_mvcc_rows: false,
             restore_ledger_hook: false,
@@ -157,15 +204,28 @@ pub(super) fn lineage_for_resolved(
             ..VaultOptions::default()
         },
     )?;
-    let stored = vault
-        .get_resolved_at(cx_id, vault.latest_seq(), &state)
-        .map_err(|error| {
-            if error.code == "CALYX_STALE_DERIVED" {
-                CalyxError::vault_access_denied(format!("cx_id {cx_id} does not exist in vault"))
-            } else {
-                error
-            }
-        })?;
+    if vault.latest_seq() != snapshot {
+        return Err(CalyxError::stale_derived(format!(
+            "lineage snapshot changed from {snapshot} to {} while the retained Base reader was held",
+            vault.latest_seq()
+        ))
+        .into());
+    }
+    let mut measured_slots = BTreeSet::new();
+    for slot_id in &slot_ids {
+        let vector = state
+            .resolve_slot_vector_at(&vault, snapshot, cx_id, *slot_id)?
+            .ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "slot {} Base declaration has no physical row for {cx_id}",
+                    slot_id.get()
+                ))
+            })?;
+        if !vector.is_absent() {
+            measured_slots.insert(*slot_id);
+        }
+    }
+    let stored = base.constellation();
     let store = vault.retained_read_only_ledger_store()?;
     let entries = get_provenance(&store, &NoQuarantine, cx_id)?;
     verify_current_base_ref(
@@ -180,14 +240,22 @@ pub(super) fn lineage_for_resolved(
         .slots
         .iter()
         .filter_map(|slot| {
-            measured_slot(&stored.slots, slot.slot_id).map(|_| LensMeasureOut {
-                slot: slot.slot_id.get(),
-                lens_id: slot.lens_id.to_string(),
-                measured_at: stored.created_at,
-            })
+            measured_slots
+                .contains(&slot.slot_id)
+                .then(|| LensMeasureOut {
+                    slot: slot.slot_id.get(),
+                    lens_id: slot.lens_id.to_string(),
+                    measured_at: stored.created_at,
+                })
         })
         .collect();
     let anchors = anchor_outputs(cx_id, ingest.seq, &stored.anchors, &entries)?;
+    if manifest_store.load_current()? != manifest {
+        return Err(CalyxError::stale_derived(
+            "vault panel/registry manifest changed during lineage readback",
+        )
+        .into());
+    }
     Ok(LineageOut {
         cx_id: cx_id.to_string(),
         ingest_seq: ingest.seq,
@@ -466,13 +534,6 @@ fn vault_paths() -> ToolResult<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
-}
-
-fn measured_slot(slots: &BTreeMap<SlotId, SlotVector>, slot: SlotId) -> Option<()> {
-    slots
-        .get(&slot)
-        .filter(|vector| !vector.is_absent())
-        .map(|_| ())
 }
 
 fn json_payload(entry: &LedgerEntry) -> Value {

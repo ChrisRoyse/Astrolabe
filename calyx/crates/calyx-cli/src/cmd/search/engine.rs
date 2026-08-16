@@ -8,15 +8,18 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Instant;
 
+use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::vault::AsterVault;
+use calyx_aster::vault::encode::BaseRecord;
 use calyx_core::{
     AnchorKind, CalyxError, Constellation, CxId, Input, LensId, Modality, Placement, SlotId,
     SlotState, SlotVector,
 };
 use calyx_registry::{VaultPanelState, load_vault_panel_state, require_vault_registry_contracts};
 use calyx_search::{
-    FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchTraceEvent, load_docs_resolved,
+    FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchTraceEvent,
     search_outcome_with_freshness, search_outcome_with_query_vectors_freshness_resolved,
+    search_outcome_with_slots_traced,
 };
 use calyx_sextant::Hit;
 
@@ -73,7 +76,11 @@ fn search_command(args: SearchArgs) -> CliResult {
         None => {
             require_resident_for_gpu_text_search(&state)?;
             let vault = open_vault(&resolved, search_read_cfs(&state, guard))?;
-            search_outcome_with_freshness(
+            let mut trace_sink = emit_search_trace;
+            let trace_sink = args
+                .explain
+                .then_some(&mut trace_sink as &mut dyn FnMut(SearchTraceEvent));
+            search_outcome_with_slots_traced(
                 &vault,
                 &state,
                 &resolved.path,
@@ -83,7 +90,9 @@ fn search_command(args: SearchArgs) -> CliResult {
                 guard,
                 args.filter.as_deref(),
                 args.explain,
+                None,
                 freshness,
+                trace_sink,
             )?
         }
     };
@@ -307,11 +316,8 @@ fn kernel_answer_command(args: KernelAnswerArgs) -> CliResult {
     let resolved = resolve_cli_vault(&args.vault)?;
     require_vault_registry_contracts(&resolved.path)?;
     let state = load_vault_panel_state(&resolved.path)?;
-    let vault = open_vault(
-        &resolved,
-        panel_read_cfs(&state.panel).map(with_ledger_provenance),
-    )?;
-    let docs = load_docs_resolved(&vault, &state)?;
+    let vault = open_vault(&resolved, Some(with_ledger_provenance(base_read_cfs())))?;
+    let docs = load_kernel_base_docs(&vault)?;
     let outcome = search_outcome_with_freshness(
         &vault,
         &state,
@@ -394,6 +400,42 @@ fn has_grounding(cx: &Constellation, anchor: Option<&AnchorKind>) -> bool {
     cx.anchors
         .iter()
         .any(|item| anchor.is_none_or(|kind| &item.kind == kind))
+}
+
+fn load_kernel_base_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
+    let rows = vault.scan_cf_at(vault.latest_seq(), ColumnFamily::Base)?;
+    let mut docs = BTreeMap::new();
+    for (key, value) in rows {
+        let record = BaseRecord::decode(&value)?;
+        if record.vault_id() != vault.vault_id() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "Base row for {} belongs to vault {} instead of {}",
+                record.cx_id(),
+                record.vault_id(),
+                vault.vault_id()
+            ))
+            .into());
+        }
+        let constellation = record.constellation();
+        if key != base_key(constellation.cx_id) {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "Base row key differs from embedded CxId {}",
+                constellation.cx_id
+            ))
+            .into());
+        }
+        if docs
+            .insert(constellation.cx_id, constellation.clone())
+            .is_some()
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "duplicate Base row for {}",
+                constellation.cx_id
+            ))
+            .into());
+        }
+    }
+    Ok(docs)
 }
 
 fn resolve_cli_vault(vault: &str) -> CliResult<ResolvedVault> {
