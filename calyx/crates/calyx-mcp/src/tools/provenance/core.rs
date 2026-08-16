@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use calyx_aster::cf::ColumnFamily;
 use calyx_aster::ledger_view::AsterLedgerCfStore;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Anchor, AnchorKind, CalyxError, CxId, SlotId, SlotVector};
@@ -142,6 +143,8 @@ pub(super) fn lineage_for_resolved(
     cx_id: CxId,
 ) -> ToolResult<LineageOut> {
     let state = load_vault_panel_state(&resolved.path)?;
+    let mut selected_cfs = resolved_constellation_read_cfs(&state.panel);
+    selected_cfs.push(ColumnFamily::Ledger);
     let vault = AsterVault::open(
         &resolved.path,
         resolved.vault_id,
@@ -150,7 +153,7 @@ pub(super) fn lineage_for_resolved(
             restore_mvcc_rows: false,
             restore_ledger_hook: false,
             read_only: true,
-            selected_cfs: Some(resolved_constellation_read_cfs(&state.panel)),
+            selected_cfs: Some(selected_cfs),
             ..VaultOptions::default()
         },
     )?;
@@ -163,7 +166,7 @@ pub(super) fn lineage_for_resolved(
                 error
             }
         })?;
-    let store = AsterLedgerCfStore::open(&resolved.path)?;
+    let store = vault.retained_read_only_ledger_store()?;
     let entries = get_provenance(&store, &NoQuarantine, cx_id)?;
     verify_current_base_ref(
         cx_id,

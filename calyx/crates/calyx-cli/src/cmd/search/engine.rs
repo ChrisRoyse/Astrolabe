@@ -307,7 +307,10 @@ fn kernel_answer_command(args: KernelAnswerArgs) -> CliResult {
     let resolved = resolve_cli_vault(&args.vault)?;
     require_vault_registry_contracts(&resolved.path)?;
     let state = load_vault_panel_state(&resolved.path)?;
-    let vault = open_vault(&resolved, panel_read_cfs(&state.panel))?;
+    let vault = open_vault(
+        &resolved,
+        panel_read_cfs(&state.panel).map(with_ledger_provenance),
+    )?;
     let docs = load_docs_resolved(&vault, &state)?;
     let outcome = search_outcome_with_freshness(
         &vault,
@@ -414,16 +417,23 @@ fn search_read_cfs(
     guard: GuardChoice,
 ) -> Option<Vec<calyx_aster::cf::ColumnFamily>> {
     match guard {
-        GuardChoice::Off => Some(base_read_cfs()),
+        GuardChoice::Off => Some(with_ledger_provenance(base_read_cfs())),
         GuardChoice::InRegion => {
             // Profile-backed guarding (#1094) reads the calibrated Ward
             // profile from the Guard CF; reading an unselected CF silently
             // returns None, which would masquerade as a missing profile.
             let mut cfs = panel_read_cfs(&state.panel)?;
             cfs.push(calyx_aster::cf::ColumnFamily::Guard);
-            cfs.sort();
-            cfs.dedup();
-            Some(cfs)
+            Some(with_ledger_provenance(cfs))
         }
     }
+}
+
+fn with_ledger_provenance(
+    mut selected_cfs: Vec<calyx_aster::cf::ColumnFamily>,
+) -> Vec<calyx_aster::cf::ColumnFamily> {
+    selected_cfs.push(calyx_aster::cf::ColumnFamily::Ledger);
+    selected_cfs.sort();
+    selected_cfs.dedup();
+    selected_cfs
 }

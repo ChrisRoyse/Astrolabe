@@ -2160,11 +2160,10 @@ fn verify_mcp_shadow_ledger_checkpoint(
 }
 
 fn capture_mcp_shadow_ledger_checkpoint(
-    vault_dir: &Path,
     vault: &AsterVault<SystemClock>,
 ) -> AnyResult<McpShadowLedgerCheckpoint> {
     let snapshot = vault.latest_seq();
-    let physical = AsterLedgerCfStore::open(vault_dir)?;
+    let physical = vault.retained_read_only_ledger_store()?;
     let ledger_rows = physical.scan()?;
     let ledger_head = physical
         .head_anchor()?
@@ -2289,7 +2288,20 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
         "canonical MCP dispatcher input readback differs from written input",
     )?;
 
-    let shadow_ledger_checkpoint = capture_mcp_shadow_ledger_checkpoint(&vault_dir, &vault)?;
+    drop(vault);
+    let reopened = open_read_vault_for_primary_slots(
+        &vault_dir,
+        &[SlotId::new(TQ35_SLOT), SlotId::new(INT8_SLOT)],
+    )?;
+    let shadow_ledger_checkpoint = capture_mcp_shadow_ledger_checkpoint(&reopened)?;
+    let (reopened_tq35, tq35_primary) =
+        raw_unmanifested_slot_state(&vault_dir, &reopened, SlotId::new(TQ35_SLOT))?;
+    let (reopened_int8, int8_primary) =
+        raw_unmanifested_slot_state(&vault_dir, &reopened, SlotId::new(INT8_SLOT))?;
+    require_mcp_raw_candidate(&tq35_primary, &reopened_tq35, SlotId::new(TQ35_SLOT))?;
+    require_mcp_raw_candidate(&int8_primary, &reopened_int8, SlotId::new(INT8_SLOT))?;
+    drop(reopened);
+
     let config_path = cache_dir.join("_config.db");
     write_mcp_config(&config_path, &vault_dir, &shadow_ledger_checkpoint)?;
     let config = read_mcp_config(&config_path, &vault_dir)?;
@@ -2297,17 +2309,6 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
         config.shadow_ledger_checkpoint == shadow_ledger_checkpoint,
         "prepare_mcp shadow Ledger checkpoint readback differs",
     )?;
-    drop(vault);
-    let reopened = open_read_vault_for_primary_slots(
-        &vault_dir,
-        &[SlotId::new(TQ35_SLOT), SlotId::new(INT8_SLOT)],
-    )?;
-    let (reopened_tq35, tq35_primary) =
-        raw_unmanifested_slot_state(&vault_dir, &reopened, SlotId::new(TQ35_SLOT))?;
-    let (reopened_int8, int8_primary) =
-        raw_unmanifested_slot_state(&vault_dir, &reopened, SlotId::new(INT8_SLOT))?;
-    require_mcp_raw_candidate(&tq35_primary, &reopened_tq35, SlotId::new(TQ35_SLOT))?;
-    require_mcp_raw_candidate(&int8_primary, &reopened_int8, SlotId::new(INT8_SLOT))?;
     println!(
         "{}",
         json!({
@@ -2431,7 +2432,7 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
         json_contains_string(&dispatch_result, &current_receipts[0]),
         "dispatcher result does not name the independently read current receipt",
     )?;
-    let ledger_store = AsterLedgerCfStore::open(&vault_dir)?;
+    let ledger_store = vault.retained_read_only_ledger_store()?;
     let ledger_rows = ledger_store.scan()?;
     let chain = verify_chain(&ledger_store, 0..ledger_rows.len() as u64)?;
     require(

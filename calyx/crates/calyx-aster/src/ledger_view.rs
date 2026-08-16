@@ -19,7 +19,7 @@ use crate::compaction::TieringPolicy;
 use crate::manifest::ManifestStore;
 use crate::sst::SstEntry;
 use crate::vault::encode::decode_write_batch;
-use crate::wal::{replay_dir_after, stream_records};
+use crate::wal::{replay_dir_read_only_after, stream_records};
 pub use point_read::{LedgerPointReadTierStats, LedgerPointReadTrace};
 use point_read::{read_sst_ledger_rows_complete, read_sst_ledger_rows_indexed, unresolved_seqs};
 
@@ -68,7 +68,8 @@ impl AsterLedgerCfStore {
         }
 
         if layout.has_wal {
-            let replay = replay_dir_after(vault.join("wal"), layout.wal_replay_floor_seq)?;
+            let replay =
+                replay_dir_read_only_after(vault.join("wal"), layout.wal_replay_floor_seq)?;
             if let Some(torn) = replay.torn_tail {
                 return Err(torn.error());
             }
@@ -209,7 +210,7 @@ fn read_wal_ledger_rows_after_floor(
     wanted: &BTreeSet<u64>,
     rows: &mut BTreeMap<u64, Vec<u8>>,
 ) -> CalyxResult<()> {
-    let replay = replay_dir_after(vault.join("wal"), wal_replay_floor_seq(vault)?)?;
+    let replay = replay_dir_read_only_after(vault.join("wal"), wal_replay_floor_seq(vault)?)?;
     if let Some(torn) = replay.torn_tail {
         return Err(torn.error());
     }

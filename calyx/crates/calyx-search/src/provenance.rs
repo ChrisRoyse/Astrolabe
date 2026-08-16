@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use calyx_aster::cf::{ColumnFamily, base_key};
-use calyx_aster::ledger_view::read_ledger_seqs_traced;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::decode_constellation_base;
@@ -73,6 +72,7 @@ pub(crate) fn hit_base_docs_with_slot_declarations_at(
 }
 
 pub(crate) fn attach_verified_provenance(
+    vault: &AsterVault,
     hits: &mut [Hit],
     docs: &BTreeMap<CxId, Constellation>,
     vault_dir: &Path,
@@ -102,9 +102,7 @@ pub(crate) fn attach_verified_provenance(
     let mut ledger = if pending.is_empty() {
         None
     } else {
-        Some(TargetedLedgerVerifier::open(
-            vault_dir, &pending, docs, trace,
-        )?)
+        Some(TargetedLedgerVerifier::open(vault, &pending, docs, trace)?)
     };
     for (hit, hit_memoized) in hits.iter_mut().zip(memoized) {
         let cx = docs.get(&hit.cx_id).ok_or_else(|| {
@@ -189,7 +187,7 @@ struct TargetedLedgerVerifier {
 
 impl TargetedLedgerVerifier {
     fn open(
-        vault_dir: &Path,
+        vault: &AsterVault,
         hits: &[Hit],
         docs: &BTreeMap<CxId, Constellation>,
         trace: &mut crate::engine_trace::SearchTracer<'_>,
@@ -207,7 +205,7 @@ impl TargetedLedgerVerifier {
                 required.insert(cx.provenance.seq - 1);
             }
         }
-        let (rows, point_read) = read_ledger_seqs_traced(vault_dir, &required)?;
+        let (rows, point_read) = vault.read_physical_ledger_seqs(&required)?;
         // Structured tier attribution (#1112): one event per point-read tier
         // so FSV can assert from the runtime log which tier resolved the
         // targeted ledger seqs and that the complete-SST scan never ran.

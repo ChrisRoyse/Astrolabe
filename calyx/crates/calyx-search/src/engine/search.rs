@@ -197,7 +197,7 @@ where
     budget.check("after_hit_hydration", hit_docs.len())?;
     trace.emit("hit_docs.hydrate.done", None, Some(hit_docs.len()));
     trace.emit("provenance.attach.start", None, Some(hits.len()));
-    attach_verified_provenance(&mut hits, &hit_docs, vault_dir, freshness_tag, trace)?;
+    attach_verified_provenance(vault, &mut hits, &hit_docs, vault_dir, freshness_tag, trace)?;
     trace.emit("provenance.attach.done", None, Some(hits.len()));
     let mut dropped_guard_hits = Vec::new();
     let applied_guard_tau = match &resolved_guard {
