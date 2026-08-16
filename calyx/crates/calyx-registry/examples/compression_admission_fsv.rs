@@ -1891,12 +1891,11 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
     let stats = ingester.drain_and_close()?;
     require(stats.ingested == ROWS, "prepare_mcp raw ingest lost rows")?;
     vault.flush_with_report()?;
-    let after_tq35 = slot_state(&vault, tq35.slot.slot_id)?;
-    let after_int8 = slot_state(&vault, int8.slot.slot_id)?;
-    require_mcp_raw_candidate(&vault, &after_tq35, tq35.slot.slot_id)?;
-    require_mcp_raw_candidate(&vault, &after_int8, int8.slot.slot_id)?;
-    let tq_rows = vault.scan_cf_at(vault.latest_seq(), ColumnFamily::slot(tq35.slot.slot_id))?;
-    let int8_rows = vault.scan_cf_at(vault.latest_seq(), ColumnFamily::slot(int8.slot.slot_id))?;
+    let (after_tq35, tq_rows) = raw_unmanifested_slot_state(&vault_dir, &vault, tq35.slot.slot_id)?;
+    let (after_int8, int8_rows) =
+        raw_unmanifested_slot_state(&vault_dir, &vault, int8.slot.slot_id)?;
+    require_mcp_raw_candidate(&tq_rows, &after_tq35, tq35.slot.slot_id)?;
+    require_mcp_raw_candidate(&int8_rows, &after_int8, int8.slot.slot_id)?;
     require(
         tq_rows == int8_rows,
         "prepare_mcp candidate slots do not contain identical raw source rows",
@@ -1941,14 +1940,16 @@ fn prepare_mcp(root: &Path) -> AnyResult<()> {
     write_mcp_config(&config_path, &vault_dir)?;
     let config = read_mcp_config(&config_path, &vault_dir)?;
     drop(vault);
-    let reopened = open_read_vault_for_slots(
+    let reopened = open_read_vault_for_primary_slots(
         &vault_dir,
         &[SlotId::new(TQ35_SLOT), SlotId::new(INT8_SLOT)],
     )?;
-    let reopened_tq35 = slot_state(&reopened, SlotId::new(TQ35_SLOT))?;
-    let reopened_int8 = slot_state(&reopened, SlotId::new(INT8_SLOT))?;
-    require_mcp_raw_candidate(&reopened, &reopened_tq35, SlotId::new(TQ35_SLOT))?;
-    require_mcp_raw_candidate(&reopened, &reopened_int8, SlotId::new(INT8_SLOT))?;
+    let (reopened_tq35, tq35_primary) =
+        raw_unmanifested_slot_state(&vault_dir, &reopened, SlotId::new(TQ35_SLOT))?;
+    let (reopened_int8, int8_primary) =
+        raw_unmanifested_slot_state(&vault_dir, &reopened, SlotId::new(INT8_SLOT))?;
+    require_mcp_raw_candidate(&tq35_primary, &reopened_tq35, SlotId::new(TQ35_SLOT))?;
+    require_mcp_raw_candidate(&int8_primary, &reopened_int8, SlotId::new(INT8_SLOT))?;
     println!(
         "{}",
         json!({
@@ -2097,7 +2098,7 @@ fn readback_mcp(root: &Path) -> AnyResult<()> {
 }
 
 fn require_mcp_raw_candidate(
-    vault: &AsterVault<SystemClock>,
+    primary: &[(Vec<u8>, Vec<u8>)],
     state: &SlotStateReadback,
     slot_id: SlotId,
 ) -> AnyResult<()> {
@@ -2113,10 +2114,10 @@ fn require_mcp_raw_candidate(
             slot_id.get()
         ),
     )?;
-    for (_, value) in vault.scan_cf_at(state.seq, ColumnFamily::slot(slot_id))? {
+    for (_, value) in primary {
         require(
             value.first().copied() != Some(COMPRESSED_SLOT_TAG)
-                && encode::decode_slot_vector(&value).is_ok(),
+                && encode::decode_slot_vector(value).is_ok(),
             format!(
                 "MCP candidate slot {} contains a non-raw primary row",
                 slot_id.get()
@@ -2496,7 +2497,8 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
     }
 
     let unsupported = panel_slot(&state, UNSUPPORTED_SLOT)?;
-    let unsupported_state = slot_state(&vault, unsupported.slot_id)?;
+    let (unsupported_state, unsupported_primary) =
+        raw_unmanifested_slot_state(vault_dir, &vault, unsupported.slot_id)?;
     require(
         unsupported_state.primary_rows == ROWS
             && unsupported_state.raw_rows == 0
@@ -2506,17 +2508,14 @@ fn verify_persisted_state(vault_dir: &Path) -> AnyResult<Vec<PersistedSlotEviden
             && unsupported_state.current_admission.is_none(),
         "unsupported codec slot did not remain an unmanifested raw column",
     )?;
+    let unsupported_primary = unsupported_primary.into_iter().collect::<BTreeMap<_, _>>();
     for (row, cx_id) in cx_ids.iter().copied().enumerate() {
-        let bytes = required_row(
-            &vault,
-            snapshot,
-            ColumnFamily::slot(unsupported.slot_id),
-            &slot_key(cx_id),
-            "unsupported-slot raw primary",
-        )?;
+        let bytes = unsupported_primary
+            .get(&slot_key(cx_id))
+            .ok_or("unsupported-slot raw primary is absent")?;
         require(
             bytes.first().copied() != Some(COMPRESSED_SLOT_TAG)
-                && encode::decode_slot_vector(&bytes)? == dense_vector(row),
+                && encode::decode_slot_vector(bytes)? == dense_vector(row),
             format!("unsupported slot primary row {row} differs from its known raw input"),
         )?;
     }
@@ -2855,6 +2854,48 @@ fn slot_state(vault: &AsterVault<SystemClock>, slot_id: SlotId) -> AnyResult<Slo
     let seq = vault.latest_seq();
     let primary = vault.scan_cf_at(seq, ColumnFamily::slot(slot_id))?;
     let raw = vault.scan_cf_at(seq, ColumnFamily::slot_raw(slot_id))?;
+    slot_state_from_rows(vault, slot_id, seq, &primary, &raw)
+}
+
+fn raw_unmanifested_slot_state(
+    vault_dir: &Path,
+    vault: &AsterVault<SystemClock>,
+    slot_id: SlotId,
+) -> AnyResult<(SlotStateReadback, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let raw_cf_path = vault_dir
+        .join("cf")
+        .join(ColumnFamily::slot_raw(slot_id).name());
+    match fs::symlink_metadata(&raw_cf_path) {
+        Ok(_) => {
+            return Err(format!(
+                "raw/unmanifested slot {} unexpectedly has a physical sidecar namespace at {}",
+                slot_id.get(),
+                raw_cf_path.display()
+            )
+            .into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "inspect raw sidecar namespace {}: {error}",
+                raw_cf_path.display()
+            )
+            .into());
+        }
+    }
+    let seq = vault.latest_seq();
+    let primary = vault.scan_cf_at(seq, ColumnFamily::slot(slot_id))?;
+    let state = slot_state_from_rows(vault, slot_id, seq, &primary, &[])?;
+    Ok((state, primary))
+}
+
+fn slot_state_from_rows(
+    vault: &AsterVault<SystemClock>,
+    slot_id: SlotId,
+    seq: Seq,
+    primary: &[(Vec<u8>, Vec<u8>)],
+    raw: &[(Vec<u8>, Vec<u8>)],
+) -> AnyResult<SlotStateReadback> {
     let proofs = vault.scan_cf_range_at(
         seq,
         ColumnFamily::Compression,
@@ -2880,9 +2921,9 @@ fn slot_state(vault: &AsterVault<SystemClock>, slot_id: SlotId) -> AnyResult<Slo
     Ok(SlotStateReadback {
         seq,
         primary_rows: primary.len(),
-        primary_sha256: rows_sha256(&primary),
+        primary_sha256: rows_sha256(primary),
         raw_rows: raw.len(),
-        raw_sha256: rows_sha256(&raw),
+        raw_sha256: rows_sha256(raw),
         manifest_sha256: manifest.as_ref().map(|bytes| sha256_hex(bytes)),
         proof_rows: proofs.len(),
         proofs_sha256: rows_sha256(&proofs),
@@ -3158,7 +3199,7 @@ fn open_write_vault(dir: &Path, panel: &Panel) -> AnyResult<Arc<AsterVault<Syste
 }
 
 fn open_read_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
-    open_read_vault_for_slots(
+    open_read_vault_for_slot_layout(
         dir,
         &[
             SlotId::new(TQ35_SLOT),
@@ -3166,6 +3207,12 @@ fn open_read_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
             SlotId::new(REFUSAL_SLOT),
             SlotId::new(UNSUPPORTED_SLOT),
         ],
+        &[
+            SlotId::new(TQ35_SLOT),
+            SlotId::new(INT8_SLOT),
+            SlotId::new(REFUSAL_SLOT),
+        ],
+        false,
     )
 }
 
@@ -3173,28 +3220,47 @@ fn open_read_vault_for_slots(
     dir: &Path,
     slots: &[SlotId],
 ) -> AnyResult<Arc<AsterVault<SystemClock>>> {
-    open_read_vault_for_slots_with_base(dir, slots, false)
+    open_read_vault_for_slot_layout(dir, slots, slots, false)
+}
+
+fn open_read_vault_for_primary_slots(
+    dir: &Path,
+    slots: &[SlotId],
+) -> AnyResult<Arc<AsterVault<SystemClock>>> {
+    open_read_vault_for_slot_layout(dir, slots, &[], false)
 }
 
 fn open_read_vault_for_slots_and_base(
     dir: &Path,
     slots: &[SlotId],
 ) -> AnyResult<Arc<AsterVault<SystemClock>>> {
-    open_read_vault_for_slots_with_base(dir, slots, true)
+    open_read_vault_for_slot_layout(dir, slots, slots, true)
 }
 
-fn open_read_vault_for_slots_with_base(
+fn open_read_vault_for_slot_layout(
     dir: &Path,
-    slots: &[SlotId],
+    primary_slots: &[SlotId],
+    raw_sidecar_slots: &[SlotId],
     include_base: bool,
 ) -> AnyResult<Arc<AsterVault<SystemClock>>> {
+    for raw_slot in raw_sidecar_slots {
+        require(
+            primary_slots.contains(raw_slot),
+            format!(
+                "raw-sidecar slot {} is absent from the selected primary roster",
+                raw_slot.get()
+            ),
+        )?;
+    }
     let vault_id: VaultId = VAULT_ID.parse()?;
     let mut selected = vec![ColumnFamily::Compression, ColumnFamily::Ledger];
     if include_base {
         selected.push(ColumnFamily::Base);
     }
-    for slot in slots {
+    for slot in primary_slots {
         selected.push(ColumnFamily::slot(*slot));
+    }
+    for slot in raw_sidecar_slots {
         selected.push(ColumnFamily::slot_raw(*slot));
     }
     Ok(Arc::new(AsterVault::open(
