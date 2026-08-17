@@ -38,6 +38,11 @@ where
                 .read_cf_at(latest, ColumnFamily::Base, &base_key(id))?
                 .ok_or_else(|| CalyxError::stale_derived("constellation missing at snapshot"))?;
             let mut record = encode::BaseRecord::decode_for_key(id, &base)?;
+            if record.vault_id() != self.vault_id {
+                return Err(CalyxError::vault_access_denied(format!(
+                    "Base row for cx {id} belongs to another vault"
+                )));
+            }
             record.anchors_mut().push(anchor.clone());
             let ungrounded = record.constellation().anchors.is_empty();
             record.flags_mut().ungrounded = ungrounded;

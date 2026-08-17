@@ -438,6 +438,11 @@ where
                     return Ok(id);
                 }
                 let mut merged = encode::BaseRecord::decode_for_key(id, &existing)?;
+                if merged.vault_id() != self.vault_id {
+                    return Err(CalyxError::vault_access_denied(format!(
+                        "persisted Base row for cx {id} belongs to another vault"
+                    )));
+                }
                 let added =
                     anchor_merge::merge_duplicate_anchors_base(&mut merged, &constellation)?;
                 if !added.is_empty() {
@@ -542,6 +547,11 @@ where
                 )?
                 .ok_or_else(|| CalyxError::stale_derived("constellation missing at snapshot"))?;
             let mut record = encode::BaseRecord::decode_for_key(id, &base)?;
+            if record.vault_id() != self.vault_id {
+                return Err(CalyxError::vault_access_denied(format!(
+                    "Base row for cx {id} belongs to another vault"
+                )));
+            }
             record.anchors_mut().push(anchor.clone());
             let ungrounded = record.constellation().anchors.is_empty();
             record.flags_mut().ungrounded = ungrounded;

@@ -1,6 +1,6 @@
 //! Atomic Calyx constellation record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -112,8 +112,15 @@ impl Constellation {
                 return Err(record_schema_error("metadata key must not be empty"));
             }
         }
+        let mut anchor_kinds = BTreeSet::new();
         for anchor in &self.anchors {
             anchor.validate_schema()?;
+            if !anchor_kinds.insert(anchor.kind.clone()) {
+                return Err(record_schema_error(format!(
+                    "constellation contains duplicate anchor kind {:?}",
+                    anchor.kind
+                )));
+            }
         }
         Ok(())
     }

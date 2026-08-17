@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Modality, SlotState, VaultStore};
+use calyx_aster::vault::encode::{BaseRecord, encode_constellation_base};
+use calyx_core::{Constellation, Modality, SlotState, VaultStore};
 use calyx_ledger::{ActorId, SubjectId};
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 
@@ -8,9 +11,12 @@ use crate::cmd::ingest::constellation::{
     ensure_content_panel_floor, measure_constellation_with_runtime_limit,
 };
 use crate::cmd::ingest::route::IngestGpuRoute;
-use crate::cmd::ingest::store::{base_exists, open_vault};
+use crate::cmd::ingest::store::open_vault;
 use crate::cmd::ingest::types::IngestReport;
-use crate::cmd::ingest::verify::verify_base_readback;
+use crate::cmd::ingest::verify::{
+    read_optional_base_record, verify_base_readback, verify_base_record_readback,
+    verify_flushed_base_records,
+};
 use crate::cmd::search::rebuild_persistent_indexes;
 use crate::cmd::vault::{ResolvedVault, now_ms};
 use crate::error::CliResult;
@@ -50,7 +56,6 @@ pub(super) fn ingest_media_with_derived_text(
         gpu_route,
     )?;
     media_cx.metadata = media_metadata(&retained);
-    ensure_content_panel_floor(&media_cx, &state)?;
     let mut text_cx = measure_constellation_with_runtime_limit(
         &vault,
         &state,
@@ -60,10 +65,26 @@ pub(super) fn ingest_media_with_derived_text(
         gpu_route,
     )?;
     text_cx.metadata = derived.metadata.clone();
-    ensure_content_panel_floor(&text_cx, &state)?;
 
-    let media_new = !base_exists(&vault, media_cx.cx_id)?;
-    let text_new = !base_exists(&vault, text_cx.cx_id)?;
+    if media_cx.cx_id == text_cx.cx_id {
+        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+            "raw {:?} media and its derived text resolved to the same cx {}; refusing to publish two incompatible constellation roles under one Base key",
+            retained.input.modality, media_cx.cx_id
+        ))
+        .into());
+    }
+
+    let preflight_snapshot = vault.snapshot();
+    let media_existing = preflight_existing_media_or_text(&vault, preflight_snapshot, &media_cx)?;
+    let text_existing = preflight_existing_media_or_text(&vault, preflight_snapshot, &text_cx)?;
+    let media_new = media_existing.is_none();
+    let text_new = text_existing.is_none();
+    if media_new {
+        ensure_content_panel_floor(&media_cx, &state)?;
+    }
+    if text_new {
+        ensure_content_panel_floor(&text_cx, &state)?;
+    }
     let payload = derivation_ledger_payload(&retained, &derived, media_cx.cx_id, text_cx.cx_id)?;
     let mut staged = Vec::with_capacity(2);
     if media_new {
@@ -74,6 +95,8 @@ pub(super) fn ingest_media_with_derived_text(
     }
     let artifact_draft =
         derived_artifact_draft(&retained, &derived, media_cx.cx_id, text_cx.cx_id)?;
+    // The derivation artifact always writes Graph rows, including an
+    // existing/existing replay, and Graph participates in derived search.
     super::stake_rebuild_required_marker(
         &resolved.path,
         "media_ingest",
@@ -84,39 +107,109 @@ pub(super) fn ingest_media_with_derived_text(
         None,
         None,
     )?;
-    let commit = vault.put_batch_with_ingest_ledger_and_media_artifact(
+    let commit = vault.put_batch_with_ingest_ledger_and_media_artifact_if_current(
+        preflight_snapshot,
         staged,
         SubjectId::Cx(text_cx.cx_id),
         payload,
         ActorId::Service("calyx-cli".to_string()),
         artifact_draft,
     )?;
-    vault.flush()?;
+    let expected_new_ids = [
+        media_new.then_some(media_cx.cx_id),
+        text_new.then_some(text_cx.cx_id),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if commit.ids != expected_new_ids {
+        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+            "media artifact commit returned Base ids {:?}, expected {:?}",
+            commit.ids, expected_new_ids
+        ))
+        .into());
+    }
+    let mut new_records = BTreeMap::new();
+    for record in commit.new_records {
+        let cx_id = record.cx_id();
+        let mut expected = if cx_id == media_cx.cx_id && media_new {
+            media_cx.clone()
+        } else if cx_id == text_cx.cx_id && text_new {
+            text_cx.clone()
+        } else {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "media artifact commit returned unplanned new Base record for cx {cx_id}"
+            ))
+            .into());
+        };
+        expected.provenance = record.constellation().provenance.clone();
+        if record.encode()? != encode_constellation_base(&expected)? {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "media artifact commit returned a different final Base record for cx {cx_id}"
+            ))
+            .into());
+        }
+        if new_records.insert(cx_id, record).is_some() {
+            return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "media artifact commit returned duplicate new Base record for cx {cx_id}"
+            ))
+            .into());
+        }
+    }
+    if new_records.len() != expected_new_ids.len() {
+        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+            "media artifact commit returned {} new Base records for {} expected ids",
+            new_records.len(),
+            expected_new_ids.len()
+        ))
+        .into());
+    }
+    let readback = vault.retain_snapshot_at(commit.readback_seq);
+    let flush_report = vault.flush_with_report()?;
+    verify_flushed_base_records(&flush_report, Some(commit.readback_seq), &new_records)?;
+    if let Some(expected) = media_existing.as_ref() {
+        verify_base_record_readback(&vault, readback.seq(), expected)?;
+    } else {
+        let record = new_records.get(&media_cx.cx_id).ok_or_else(|| {
+            calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "media artifact commit omitted new Base record for cx {}",
+                media_cx.cx_id
+            ))
+        })?;
+        verify_base_record_readback(&vault, readback.seq(), record)?;
+        let mut expected = media_cx.clone();
+        expected.provenance = record.constellation().provenance.clone();
+        verify_base_readback(&vault, readback.seq(), &expected, media_cx.cx_id, &[])?;
+    }
+    readback.record_progress();
+    if let Some(expected) = text_existing.as_ref() {
+        verify_base_record_readback(&vault, readback.seq(), expected)?;
+    } else {
+        let record = new_records.get(&text_cx.cx_id).ok_or_else(|| {
+            calyx_core::CalyxError::aster_corrupt_shard(format!(
+                "media artifact commit omitted new Base record for cx {}",
+                text_cx.cx_id
+            ))
+        })?;
+        verify_base_record_readback(&vault, readback.seq(), record)?;
+        let mut expected = text_cx.clone();
+        expected.provenance = record.constellation().provenance.clone();
+        verify_base_readback(&vault, readback.seq(), &expected, text_cx.cx_id, &[])?;
+    }
+    readback.record_progress();
+    verify_media_artifact_readback(&vault, readback.seq(), &commit.artifact)?;
+    readback.record_progress();
+    drop(readback);
     rebuild_persistent_indexes(&resolved.path, &vault, &state)?;
 
-    let snapshot = vault.snapshot();
-    if media_new {
-        verify_base_readback(&vault, snapshot, &media_cx, media_cx.cx_id, &[])?;
-    } else {
-        verify_existing_media_or_text_readback(&vault, snapshot, &media_cx)?;
-    }
-    if text_new {
-        verify_base_readback(&vault, snapshot, &text_cx, text_cx.cx_id, &[])?;
-    } else {
-        verify_existing_media_or_text_readback(&vault, snapshot, &text_cx)?;
-    }
-    verify_media_artifact_readback(&vault, snapshot, &commit.artifact)?;
-
-    let media_ledger_seq = if media_new {
-        vault.get(media_cx.cx_id, snapshot)?.provenance.seq
-    } else {
-        commit.artifact.ledger_ref.seq
-    };
-    let text_ledger_seq = if text_new {
-        vault.get(text_cx.cx_id, snapshot)?.provenance.seq
-    } else {
-        commit.artifact.ledger_ref.seq
-    };
+    let media_ledger_seq = new_records
+        .get(&media_cx.cx_id)
+        .map(|record| record.constellation().provenance.seq)
+        .unwrap_or(commit.artifact.ledger_ref.seq);
+    let text_ledger_seq = new_records
+        .get(&text_cx.cx_id)
+        .map(|record| record.constellation().provenance.seq)
+        .unwrap_or(commit.artifact.ledger_ref.seq);
     vault.flush()?;
     Ok(vec![
         IngestReport {
@@ -158,24 +251,31 @@ fn ensure_raw_media_panel_route(modality: Modality, state: &VaultPanelState) -> 
     .into())
 }
 
-fn verify_existing_media_or_text_readback(
+fn preflight_existing_media_or_text(
     vault: &AsterVault,
     snapshot: u64,
-    expected: &calyx_core::Constellation,
-) -> CliResult {
-    let stored = vault.get(expected.cx_id, snapshot)?;
-    if stored.panel_version != expected.panel_version
-        || stored.input_ref.hash != expected.input_ref.hash
-        || stored.modality != expected.modality
-        || stored.slots != expected.slots
+    expected: &Constellation,
+) -> CliResult<Option<BaseRecord>> {
+    let Some(stored) = read_optional_base_record(vault, snapshot, expected.cx_id)? else {
+        return Ok(None);
+    };
+    let expected_record =
+        BaseRecord::decode_for_key(expected.cx_id, &encode_constellation_base(expected)?)?;
+    let stored_constellation = stored.constellation();
+    if stored.vault_id() != expected.vault_id
+        || expected_record.vault_id() != expected.vault_id
+        || stored_constellation.panel_version != expected.panel_version
+        || stored_constellation.input_ref.hash != expected.input_ref.hash
+        || stored_constellation.modality != expected.modality
+        || stored.slot_hashes() != expected_record.slot_hashes()
     {
         return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
-            "durable media ingest readback mismatch for existing cx {}",
+            "durable media ingest preflight mismatch for existing cx {}",
             expected.cx_id
         ))
         .into());
     }
-    Ok(())
+    Ok(Some(stored))
 }
 
 fn verify_media_artifact_readback(

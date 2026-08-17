@@ -16,16 +16,24 @@ pub(super) fn run_post_commit_index_rebuild(
     vault: &AsterVault,
     state: &VaultPanelState,
     summary: &BatchIngestSummary,
+    derived_content_before: u64,
     session: &mut Option<&mut BatchIngestSession>,
 ) -> CliResult<()> {
-    if summary.new_count > 0 {
+    let derived_content_after = vault.derived_content_seq();
+    if derived_content_after < derived_content_before {
+        return Err(calyx_core::CalyxError::aster_corrupt_shard(format!(
+            "batch derived-content sequence regressed from {derived_content_before} to {derived_content_after}"
+        ))
+        .into());
+    }
+    if derived_content_after != derived_content_before {
         record_rebuild_required_marker_seq(&resolved.path, vault.snapshot())?;
         if let Some(session) = session.as_deref_mut() {
             session.record_index_phase("running")?;
         }
         ingest_runtime_log(format_args!(
-            "phase=batch_index_rebuild_start new_count={} already_count={}",
-            summary.new_count, summary.already_count
+            "phase=batch_index_rebuild_start new_count={} already_count={} derived_content_before={} derived_content_after={}",
+            summary.new_count, summary.already_count, derived_content_before, derived_content_after
         ));
         if let Err(error) = rebuild_persistent_indexes_with_progress(
             &resolved.path,
@@ -37,8 +45,8 @@ pub(super) fn run_post_commit_index_rebuild(
             return Err(batch_index_rebuild_error(resolved, summary, error));
         }
         ingest_runtime_log(format_args!(
-            "phase=batch_index_rebuild_ok new_count={} already_count={}",
-            summary.new_count, summary.already_count
+            "phase=batch_index_rebuild_ok new_count={} already_count={} derived_content_before={} derived_content_after={}",
+            summary.new_count, summary.already_count, derived_content_before, derived_content_after
         ));
         if let Some(session) = session.as_deref_mut() {
             session.record_index_phase("complete")?;
@@ -46,7 +54,7 @@ pub(super) fn run_post_commit_index_rebuild(
         return Ok(());
     }
     ingest_runtime_log(format_args!(
-        "phase=batch_index_rebuild_skip reason=no_new_constellations already_count={} latest_seq={} derived_content_seq={}",
+        "phase=batch_index_rebuild_skip reason=derived_content_unchanged already_count={} latest_seq={} derived_content_seq={}",
         summary.already_count,
         vault.latest_seq(),
         vault.derived_content_seq()
@@ -59,7 +67,7 @@ pub(super) fn run_post_commit_index_rebuild(
     // run, whose staleness record must survive until a rebuild completes.
     match calyx_search::clear_rebuild_required_marker_if_owned(&resolved.path)? {
         calyx_search::MarkerClearOutcome::Cleared => ingest_runtime_log(format_args!(
-            "phase=derived_rebuild_marker_cleared reason=no_new_constellations"
+            "phase=derived_rebuild_marker_cleared reason=derived_content_unchanged"
         )),
         calyx_search::MarkerClearOutcome::Absent => ingest_runtime_log(format_args!(
             "phase=derived_rebuild_marker_left reason=not_owned_by_this_process"

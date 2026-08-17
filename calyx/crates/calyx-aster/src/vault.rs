@@ -14,6 +14,7 @@ mod durable;
 mod durable_snapshot;
 pub mod encode;
 mod failpoints;
+mod flush_readback;
 mod gc_bridge;
 pub mod grant;
 mod htap;
@@ -56,6 +57,13 @@ use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemCloc
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub use anchor_merge::{
+    ExistingBaseAnchorMerge, ExistingBaseAnchorMergeCommit, ExistingBaseAnchorMergeResult,
+};
+pub use batch_ingest::{
+    AnchorMarkerLedgerDraft, AnchorMarkerLedgerReceipt, BatchIngestWithExistingMergeCommit,
+    MediaArtifactIngestCommit,
+};
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use context::VaultContext;

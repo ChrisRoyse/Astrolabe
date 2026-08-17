@@ -382,6 +382,12 @@ where
                 CalyxError::stale_derived("dedup recurrence base row disappeared at snapshot")
             })?;
         let mut record = encode::BaseRecord::decode_for_key(matched.existing, &base_bytes)?;
+        if record.vault_id() != vault.vault_id() {
+            return Err(CalyxError::vault_access_denied(format!(
+                "dedup recurrence Base row for cx {} belongs to another vault",
+                matched.existing
+            )));
+        }
         before_base = Some(matched.existing_cx.ok_or_else(|| {
             CalyxError::aster_corrupt_shard(
                 "dedup recurrence merge omitted its resolved existing constellation",

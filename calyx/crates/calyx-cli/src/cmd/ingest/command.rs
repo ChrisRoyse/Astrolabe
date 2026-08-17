@@ -4,7 +4,7 @@ use std::io::Write;
 use calyx_aster::cf::{ColumnFamily, anchor_key, base_key};
 use calyx_aster::dedup::{AnchorConflictResult, check_anchor_conflict};
 use calyx_aster::vault::AsterVault;
-use calyx_aster::vault::encode::{self, decode_constellation_base};
+use calyx_aster::vault::encode;
 use calyx_aster::vault::input_store::{self, InputRetention};
 use calyx_core::{
     Anchor, AnchorKind, CalyxError, Constellation, CxId, Input, InputRef, Modality, VaultStore,
@@ -16,21 +16,22 @@ use super::super::search::{rebuild_persistent_indexes, rebuild_persistent_indexe
 use super::super::vault::{ResolvedVault, now_ms};
 use super::super::{AnchorArgs, IngestArgs, MeasureArgs, Subcommand};
 use super::anchor::{parse_anchor_kind, parse_anchor_value};
-use super::batch::{BatchRow, parse_batch_line, validate_batch_file};
+use super::batch::{BatchRow, parse_batch_line, retain_batch_file, validate_batch_file};
 use super::constellation::{
     ensure_content_panel_floor, input_hash, measure_constellation,
     measure_constellation_microbatch_with_runtime_limit, measure_constellation_with_runtime_limit,
     text_input,
 };
-use super::ledger::{
-    append_anchor_ledger, append_anchor_marker_ledger, append_cli_batch_ledger, append_cli_ledger,
-};
+use super::ledger::{append_anchor_ledger, append_cli_batch_ledger, append_cli_ledger};
 use super::oracle_event::{OracleEvent, append_recurrence_if_absent};
 use super::route::{IngestGpuRoute, resolve_ingest_gpu_route};
 use super::session::BatchIngestSession;
 use super::store::{base_exists, ensure_base_exists, open_vault, resolve_cli_vault};
 use super::types::{AnchorReport, BatchIngestSummary, IngestOutput, IngestReport};
-use super::verify::verify_base_readback;
+use super::verify::{
+    read_base_record, read_optional_base_record, verify_base_readback, verify_base_record_readback,
+    verify_flushed_base_records,
+};
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
 use crate::raw_media::retain_media_input;
@@ -192,6 +193,7 @@ pub(crate) fn run(command: Subcommand) -> CliResult {
 
 fn ingest_command(args: IngestArgs) -> CliResult {
     if let Some(batch_path) = args.batch.as_deref() {
+        let _batch_file_lease = retain_batch_file(batch_path)?;
         let validation = validate_batch_file(batch_path)?;
         let resolved = resolve_cli_vault(&args.vault)?;
         let gpu_route = resolve_ingest_gpu_route(
@@ -442,76 +444,275 @@ fn ingest_prepared_inputs(
         state.panel.version,
         state.panel.slots.len()
     ));
+
+    struct TextPlan {
+        input_ref: InputRef,
+        modality: Modality,
+        metadata: BTreeMap<String, String>,
+        existing: Option<encode::BaseRecord>,
+    }
+
     let mut staged = Vec::new();
     let mut staged_inputs: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut new_expected = BTreeMap::<CxId, Constellation>::new();
+    let mut plans = BTreeMap::<CxId, TextPlan>::new();
+    let mut plan_order = Vec::new();
     let mut prepared = Vec::with_capacity(inputs.len());
-    let mut first_new = BTreeSet::new();
-    for prepared_input in inputs {
-        let mut cx = measure_constellation_with_runtime_limit(
-            &vault,
-            &state,
-            &prepared_input.input,
-            now_ms(),
-            None,
-            gpu_route,
-        )?;
-        cx.metadata = prepared_input.metadata;
-        ensure_content_panel_floor(&cx, &state)?;
-        let new = !base_exists(&vault, cx.cx_id)? && first_new.insert(cx.cx_id);
-        if new {
+    let preflight_lease = vault.retain_latest_snapshot();
+    let preflight_snapshot = preflight_lease.seq();
+    for PreparedInput { input, metadata } in inputs {
+        let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
+        let incoming_ref = InputRef {
+            hash: input_hash(&input.bytes),
+            pointer: input.pointer.clone(),
+            redacted: false,
+        };
+        if let Some(plan) = plans.get(&cx_id) {
+            if plan.input_ref != incoming_ref
+                || plan.modality != input.modality
+                || plan.metadata != metadata
+            {
+                return Err(CliError::usage(format!(
+                    "text ingest contains duplicate cx {cx_id} with changed non-anchor identity: {}",
+                    batch_support::identity_mismatch_reason(
+                        batch_support::IdentityFields {
+                            panel_version: state.panel.version,
+                            input_ref: &plan.input_ref,
+                            modality: plan.modality,
+                            metadata: &plan.metadata,
+                        },
+                        batch_support::IdentityFields {
+                            panel_version: state.panel.version,
+                            input_ref: &incoming_ref,
+                            modality: input.modality,
+                            metadata: &metadata,
+                        },
+                    )
+                )));
+            }
+            prepared.push((cx_id, false));
+            preflight_lease.record_progress();
+            continue;
+        }
+
+        let existing = read_optional_base_record(&vault, preflight_snapshot, cx_id)?;
+        let new = existing.is_none();
+        if let Some(record) = existing.as_ref() {
+            let stored = record.constellation();
+            if stored.panel_version != state.panel.version
+                || !batch_support::input_ref_matches_replay(&stored.input_ref, &incoming_ref)
+                || stored.modality != input.modality
+                || stored.metadata != metadata
+            {
+                return Err(CliError::usage(format!(
+                    "idempotent text replay for cx {cx_id} changed stored non-anchor identity: {}",
+                    batch_support::identity_mismatch_reason(
+                        batch_support::IdentityFields {
+                            panel_version: stored.panel_version,
+                            input_ref: &stored.input_ref,
+                            modality: stored.modality,
+                            metadata: &stored.metadata,
+                        },
+                        batch_support::IdentityFields {
+                            panel_version: state.panel.version,
+                            input_ref: &incoming_ref,
+                            modality: input.modality,
+                            metadata: &metadata,
+                        },
+                    )
+                )));
+            }
+        } else {
+            let mut cx = measure_constellation_with_runtime_limit(
+                &vault,
+                &state,
+                &input,
+                now_ms(),
+                None,
+                gpu_route,
+            )?;
+            if cx.cx_id != cx_id {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "text measurement returned cx {} after preflight derived {cx_id}",
+                    cx.cx_id
+                ))
+                .into());
+            }
+            cx.metadata = metadata.clone();
+            ensure_content_panel_floor(&cx, &state)?;
             match retention {
                 InputRetention::Persist => {
                     cx.input_ref.pointer = Some(input_store::input_pointer(&cx.input_ref.hash));
                     cx.input_ref.redacted = false;
-                    staged_inputs.push((cx.input_ref.hash, prepared_input.input.bytes.clone()));
+                    staged_inputs.push((cx.input_ref.hash, input.bytes.clone()));
                 }
                 InputRetention::Redact => {
-                    // Explicit, labeled opt-out: the omission of input bytes is
-                    // declared on the record itself, never silent (#446).
                     cx.input_ref.redacted = true;
                     cx.flags.redacted_input = true;
                 }
             }
-            staged.push(cx.clone());
+            new_expected.insert(cx_id, cx.clone());
+            staged.push(cx);
         }
-        prepared.push((cx.cx_id, new));
+        plan_order.push(cx_id);
+        plans.insert(
+            cx_id,
+            TextPlan {
+                input_ref: incoming_ref,
+                modality: input.modality,
+                metadata,
+                existing,
+            },
+        );
+        prepared.push((cx_id, new));
+        preflight_lease.record_progress();
     }
-    stake_rebuild_required_marker(
-        &resolved.path,
-        "text_ingest",
-        format!(
-            "text ingest of {} prepared inputs ({} newly staged constellations)",
-            prepared.len(),
-            staged.len()
-        ),
-        None,
-        None,
-    )?;
+    drop(preflight_lease);
+    let new_count = staged.len();
+    ingest_runtime_log(format_args!(
+        "phase=text_base_only_preflight rows={} distinct_cx={} existing={} measurement_calls={} slot_decode_skipped={}",
+        prepared.len(),
+        plans.len(),
+        plans
+            .values()
+            .filter(|plan| plan.existing.is_some())
+            .count(),
+        new_count,
+        plans.values().any(|plan| plan.existing.is_some())
+    ));
+    if new_count > 0 {
+        stake_rebuild_required_marker(
+            &resolved.path,
+            "text_ingest",
+            format!(
+                "text ingest of {} prepared inputs ({} newly staged constellations)",
+                prepared.len(),
+                new_count
+            ),
+            None,
+            None,
+        )?;
+    }
     let mut input_rows = Vec::new();
     for (input_hash, bytes) in &staged_inputs {
         input_rows.extend(input_store::encode_input_rows(input_hash, bytes)?);
     }
-    match staged.len() {
-        0 => {}
-        1 => {
-            vault
-                .put_with_input_rows(staged.pop().expect("one staged constellation"), input_rows)?;
+    let existing_requests = plan_order
+        .iter()
+        .filter_map(|cx_id| {
+            plans
+                .get(cx_id)
+                .and_then(|plan| plan.existing.clone())
+                .map(|expected| calyx_aster::vault::ExistingBaseAnchorMerge {
+                    expected,
+                    incoming: Vec::new(),
+                })
+        })
+        .collect();
+    let commit = vault.put_batch_with_input_rows_and_existing_base_anchor_merges(
+        staged,
+        input_rows,
+        existing_requests,
+    )?;
+    ingest_runtime_log(format_args!(
+        "phase=text_atomic_base_commit distinct_cx={} new={} existing={} readback_seq={} commit_seq={}",
+        plans.len(),
+        commit.new_records.len(),
+        commit.existing_results.len(),
+        commit.readback_seq,
+        commit
+            .commit_seq
+            .map(|seq| seq.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    ));
+    let mut final_records = BTreeMap::<CxId, encode::BaseRecord>::new();
+    let mut changed_records = BTreeMap::<CxId, encode::BaseRecord>::new();
+    for record in commit.new_records {
+        let cx_id = record.cx_id();
+        let mut expected = new_expected.get(&cx_id).cloned().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "text atomic commit returned unplanned new Base record for cx {cx_id}"
+            ))
+        })?;
+        expected.provenance = record.constellation().provenance.clone();
+        if record.encode()? != encode::encode_constellation_base(&expected)? {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "text atomic commit returned a different final Base record for new cx {cx_id}"
+            ))
+            .into());
         }
-        _ => {
-            vault.put_batch_with_input_rows(staged, input_rows)?;
+        if changed_records.insert(cx_id, record.clone()).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "text atomic commit returned duplicate changed Base record for cx {cx_id}"
+            ))
+            .into());
+        }
+        if final_records.insert(cx_id, record).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "text atomic commit returned duplicate new Base record for cx {cx_id}"
+            ))
+            .into());
         }
     }
-    vault.flush()?;
-    // FSV in the write path (#446): the persisted input bytes are read back
-    // through the fail-closed store reader and byte-compared before reporting.
+    for result in commit.existing_results {
+        let cx_id = result.record.cx_id();
+        if !result.added.is_empty() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "text atomic commit added anchors to no-anchor replay cx {cx_id}"
+            ))
+            .into());
+        }
+        if final_records.insert(cx_id, result.record).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "text atomic commit returned duplicate existing Base record for cx {cx_id}"
+            ))
+            .into());
+        }
+    }
+    if final_records.len() != plans.len() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "text atomic commit returned {} Base records for {} planned CxIds",
+            final_records.len(),
+            plans.len()
+        ))
+        .into());
+    }
+    if !commit.marker_ledger_receipts.is_empty() {
+        return Err(CalyxError::aster_corrupt_shard(
+            "text atomic commit returned anchor marker receipts for a no-anchor request",
+        )
+        .into());
+    }
+    let readback_lease = vault.retain_snapshot_at(commit.readback_seq);
+    let flush_report = vault.flush_with_report()?;
+    verify_flushed_base_records(&flush_report, commit.commit_seq, &changed_records)?;
+    for (cx_id, record) in &final_records {
+        verify_base_record_readback(&vault, commit.readback_seq, record)?;
+        if let Some(expected) = new_expected.get(cx_id) {
+            verify_base_readback(&vault, commit.readback_seq, expected, *cx_id, &[])?;
+        }
+        readback_lease.record_progress();
+    }
     verify_persisted_inputs(&vault, &staged_inputs)?;
-    rebuild_persistent_indexes(&resolved.path, &vault, &state)?;
-    let snapshot = vault.snapshot();
+    readback_lease.record_progress();
+    drop(readback_lease);
+    if new_count > 0 {
+        rebuild_persistent_indexes(&resolved.path, &vault, &state)?;
+    }
+
     let mut reports = Vec::with_capacity(prepared.len());
     for (cx_id, new) in prepared {
-        let stored = vault.get(cx_id, snapshot)?;
         let ledger_seq = if new {
-            stored.provenance.seq
+            final_records
+                .get(&cx_id)
+                .ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "text report omitted committed Base record for cx {cx_id}"
+                    ))
+                })?
+                .constellation()
+                .provenance
+                .seq
         } else {
             append_cli_ledger(&vault, EntryKind::Ingest, cx_id, "cli-idempotent-ingest")?
         };
@@ -522,6 +723,10 @@ fn ingest_prepared_inputs(
         });
     }
     vault.flush()?;
+    let final_snapshot = vault.snapshot();
+    for record in final_records.values() {
+        verify_base_record_readback(&vault, final_snapshot, record)?;
+    }
     Ok(reports)
 }
 

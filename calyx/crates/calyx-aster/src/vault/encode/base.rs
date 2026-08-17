@@ -15,6 +15,12 @@ use std::collections::BTreeMap;
 
 const IDENTITY_HASH_LEN: usize = 32;
 
+#[derive(Clone, Copy, Debug)]
+enum BaseWireVariant {
+    LegacyNoMetadataTail,
+    MetadataTail,
+}
+
 /// A persisted Base row was updated through a path that could not preserve, or
 /// disagreed with, the immutable per-slot BLAKE3 hashes stored in that row.
 pub const CALYX_ASTER_BASE_SLOT_HASH_VIOLATION: &str = "CALYX_ASTER_BASE_SLOT_HASH_VIOLATION";
@@ -65,6 +71,14 @@ fn encode_base_with_slot_hashes(
     cx: &Constellation,
     slot_hashes: &BTreeMap<SlotId, [u8; 32]>,
 ) -> Result<Vec<u8>> {
+    encode_base_with_slot_hashes_variant(cx, slot_hashes, BaseWireVariant::MetadataTail)
+}
+
+fn encode_base_with_slot_hashes_variant(
+    cx: &Constellation,
+    slot_hashes: &BTreeMap<SlotId, [u8; 32]>,
+    wire_variant: BaseWireVariant,
+) -> Result<Vec<u8>> {
     validate_slot_hash_agreement(cx, slot_hashes)?;
     let mut out = encode_header(cx);
     out.extend_from_slice(&identity_hash_with_slot_hashes(cx, slot_hashes)?.as_bytes()[..]);
@@ -90,7 +104,9 @@ fn encode_base_with_slot_hashes(
         put_bytes(&mut out, &encode_anchor(anchor)?)?;
     }
     out.extend_from_slice(&cx.provenance.hash);
-    encode_string_metadata(&cx.metadata, &mut out)?;
+    if !matches!(wire_variant, BaseWireVariant::LegacyNoMetadataTail) || !cx.metadata.is_empty() {
+        encode_string_metadata(&cx.metadata, &mut out)?;
+    }
     Ok(out)
 }
 
@@ -140,16 +156,19 @@ fn validate_slot_hash_agreement(
 /// A metadata/flag/orphan-repair rewrite that round-trips a persisted Base row
 /// that way corrupts its provenance identity.
 ///
-/// `BaseRecord` keeps the stored slot-hash map alongside the decoded logical
-/// fields, seals the slot set (there is no slot mutator), and re-emits the
-/// stored hashes byte-for-byte via [`BaseRecord::encode`]. Callers update a
-/// persisted Base row in place only through the targeted
-/// flags/metadata/scalars/provenance mutators. This is the only supported path
-/// for updating an already-persisted Base row without hydrating its slots.
+/// `BaseRecord` keeps the stored slot-hash map and recognized wire variant
+/// alongside the decoded logical fields, seals the slot set (there is no slot
+/// mutator), and re-emits the complete row byte-for-byte before any mutation.
+/// That includes the legacy empty-metadata form which omitted the current
+/// zero-count tail. Callers update a persisted Base row in place only through
+/// the targeted flags/metadata/scalars/provenance mutators. This is the only
+/// supported path for updating an already-persisted Base row without hydrating
+/// its slots.
 #[derive(Clone, Debug)]
 pub struct BaseRecord {
     constellation: Constellation,
     slot_hashes: BTreeMap<SlotId, [u8; 32]>,
+    wire_variant: BaseWireVariant,
 }
 
 impl BaseRecord {
@@ -160,8 +179,8 @@ impl BaseRecord {
     /// unique; [`Self::from_parts`] additionally proves the slot set and the
     /// preserved slot-hash map agree.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (constellation, identity) = decode_constellation_base_parts(bytes)?;
-        Self::from_parts(constellation, identity.slot_hashes)
+        let (constellation, identity, wire_variant) = decode_constellation_base_parts(bytes)?;
+        Self::from_parts(constellation, identity.slot_hashes, wire_variant)
     }
 
     /// Decodes a persisted Base row and proves its embedded CxId equals the CF
@@ -181,11 +200,13 @@ impl BaseRecord {
     fn from_parts(
         constellation: Constellation,
         slot_hashes: BTreeMap<SlotId, [u8; 32]>,
+        wire_variant: BaseWireVariant,
     ) -> Result<Self> {
         validate_slot_hash_agreement(&constellation, &slot_hashes)?;
         Ok(Self {
             constellation,
             slot_hashes,
+            wire_variant,
         })
     }
 
@@ -223,7 +244,7 @@ impl BaseRecord {
             seq: 0,
             hash: [0; 32],
         };
-        normalized.encode()
+        encode_base_with_slot_hashes(&normalized.constellation, &normalized.slot_hashes)
     }
 
     /// The exact stored per-slot hashes preserved from the persisted row.
@@ -254,7 +275,11 @@ impl BaseRecord {
     /// Re-encodes the Base row, emitting the preserved per-slot hashes
     /// byte-for-byte and recomputing the identity hash from them.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        encode_base_with_slot_hashes(&self.constellation, &self.slot_hashes)
+        encode_base_with_slot_hashes_variant(
+            &self.constellation,
+            &self.slot_hashes,
+            self.wire_variant,
+        )
     }
 }
 
@@ -267,21 +292,21 @@ impl BaseRecord {
 /// replace the immutable slot hashes with placeholder hashes. Use
 /// [`BaseRecord`] for any in-place persisted Base update.
 pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
-    let (constellation, _) = decode_constellation_base_parts(bytes)?;
+    let (constellation, _, _) = decode_constellation_base_parts(bytes)?;
     Ok(constellation)
 }
 
 pub fn decode_constellation_base_identity(bytes: &[u8]) -> Result<ConstellationBaseIdentity> {
-    let (_, identity) = decode_constellation_base_parts(bytes)?;
+    let (_, identity, _) = decode_constellation_base_parts(bytes)?;
     Ok(identity)
 }
 
 fn decode_constellation_base_parts(
     bytes: &[u8],
-) -> Result<(Constellation, ConstellationBaseIdentity)> {
+) -> Result<(Constellation, ConstellationBaseIdentity, BaseWireVariant)> {
     let header = decode_header(bytes)?;
     let mut cursor = Cursor::new(&bytes[HEADER_LEN..]);
-    let _identity = cursor.bytes(IDENTITY_HASH_LEN)?;
+    let stored_identity: [u8; IDENTITY_HASH_LEN] = cursor.array()?;
     let input_ref = decode_input_ref_tail(&mut cursor, header.input_hash)?;
     let slot_count = cursor.u16()? as usize;
     if slot_count != header.n_slots as usize {
@@ -343,10 +368,13 @@ fn decode_constellation_base_parts(
         seq: header.ledger_seq,
         hash: cursor.array()?,
     };
-    let metadata = if cursor.remaining() == 0 {
-        BTreeMap::new()
+    let (metadata, wire_variant) = if cursor.remaining() == 0 {
+        (BTreeMap::new(), BaseWireVariant::LegacyNoMetadataTail)
     } else {
-        decode_string_metadata(&mut cursor)?
+        (
+            decode_string_metadata(&mut cursor)?,
+            BaseWireVariant::MetadataTail,
+        )
     };
     if cursor.remaining() != 0 {
         return Err(CalyxError::aster_corrupt_shard(
@@ -371,7 +399,22 @@ fn decode_constellation_base_parts(
         cx_id: header.cx_id,
         slot_hashes,
     };
-    Ok((constellation, identity))
+    let computed_identity = identity_hash_with_slot_hashes(&constellation, &identity.slot_hashes)?;
+    if stored_identity != *computed_identity.as_bytes() {
+        return Err(base_slot_hash_violation(format!(
+            "Base row for cx {} has an identity hash that does not match its header, scalar, metadata, and slot-hash fields",
+            constellation.cx_id
+        )));
+    }
+    let canonical =
+        encode_base_with_slot_hashes_variant(&constellation, &identity.slot_hashes, wire_variant)?;
+    if canonical != bytes {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "Base row for cx {} is not byte-canonical for its recognized wire variant",
+            constellation.cx_id
+        )));
+    }
+    Ok((constellation, identity, wire_variant))
 }
 
 fn identity_hash_with_slot_hashes(

@@ -1,6 +1,6 @@
-use calyx_aster::vault::AsterVault;
+use calyx_aster::vault::{AnchorMarkerLedgerDraft, AsterVault};
 use calyx_core::{Anchor, AnchorKind, CxId};
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, LedgerEntryInput, SubjectId};
 
 use super::anchor::anchor_kind_key;
 use crate::error::{CliError, CliResult};
@@ -56,13 +56,20 @@ pub(super) fn append_anchor_ledger(
         .seq)
 }
 
-pub(super) fn append_anchor_marker_ledger(
-    vault: &AsterVault,
+pub(super) fn anchor_marker_ledger_draft(
     cx_id: CxId,
-    kind: &AnchorKind,
-) -> CliResult<u64> {
-    let bytes = anchor_payload(kind)?;
-    append_ledger_payload(vault, EntryKind::Ingest, cx_id, bytes)
+    anchor: &Anchor,
+) -> CliResult<AnchorMarkerLedgerDraft> {
+    Ok(AnchorMarkerLedgerDraft {
+        cx_id,
+        anchor: anchor.clone(),
+        entry: LedgerEntryInput::new(
+            EntryKind::Ingest,
+            SubjectId::Cx(cx_id),
+            anchor_payload(&anchor.kind)?,
+            ActorId::Service("calyx-cli".to_string()),
+        ),
+    })
 }
 
 fn append_ledger_payload(

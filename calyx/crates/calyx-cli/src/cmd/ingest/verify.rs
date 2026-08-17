@@ -1,8 +1,93 @@
-use calyx_aster::vault::AsterVault;
+use std::collections::BTreeMap;
+
+use calyx_aster::cf::{ColumnFamily, base_key};
+use calyx_aster::vault::encode::BaseRecord;
+use calyx_aster::vault::{AsterVault, VaultFlushReport};
 use calyx_core::{Anchor, AnchorKind, CalyxError, Constellation, CxId, VaultStore};
 
 use crate::error::CliResult;
 
+pub(super) fn read_base_record(
+    vault: &AsterVault,
+    snapshot: u64,
+    cx_id: CxId,
+) -> CliResult<BaseRecord> {
+    read_optional_base_record(vault, snapshot, cx_id)?.ok_or_else(|| {
+        CalyxError::aster_corrupt_shard(format!(
+            "durable Base row for cx {cx_id} is missing at snapshot {snapshot}"
+        ))
+        .into()
+    })
+}
+
+pub(super) fn read_optional_base_record(
+    vault: &AsterVault,
+    snapshot: u64,
+    cx_id: CxId,
+) -> CliResult<Option<BaseRecord>> {
+    let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::Base, &base_key(cx_id))? else {
+        return Ok(None);
+    };
+    let record = BaseRecord::decode_for_key(cx_id, &bytes)?;
+    if bytes != record.encode()? {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "durable Base row for cx {cx_id} is not canonically encoded"
+        ))
+        .into());
+    }
+    if record.vault_id() != vault.vault_id() {
+        return Err(CalyxError::vault_access_denied(format!(
+            "durable Base row for cx {cx_id} belongs to another vault"
+        ))
+        .into());
+    }
+    Ok(Some(record))
+}
+
+pub(super) fn verify_base_record_readback(
+    vault: &AsterVault,
+    snapshot: u64,
+    expected: &BaseRecord,
+) -> CliResult {
+    let cx_id = expected.cx_id();
+    let bytes = vault
+        .read_cf_at(snapshot, ColumnFamily::Base, &base_key(cx_id))?
+        .ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "durable Base row for cx {cx_id} is missing at snapshot {snapshot}"
+            ))
+        })?;
+    let observed = BaseRecord::decode_for_key(cx_id, &bytes)?;
+    if expected.vault_id() != vault.vault_id() || observed.vault_id() != vault.vault_id() {
+        return Err(CalyxError::vault_access_denied(format!(
+            "durable Base row for cx {cx_id} belongs to another vault"
+        ))
+        .into());
+    }
+    if bytes != expected.encode()? {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "durable ingest Base readback mismatch for existing cx {cx_id}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Delegates exact Base-SST publication readback to the storage-owned receipt
+/// implementation so CLI code does not duplicate SST layout conventions.
+pub(super) fn verify_flushed_base_records(
+    report: &VaultFlushReport,
+    commit_seq: Option<u64>,
+    expected: &BTreeMap<CxId, BaseRecord>,
+) -> CliResult {
+    report
+        .verify_commit_base_records(commit_seq, expected)
+        .map_err(Into::into)
+}
+
+/// Hydrated physical readback for a freshly written constellation. Existing
+/// replay uses [`verify_base_record_readback`] so compressed Slot CF rows are
+/// never opened without their registry-owned interpretation context.
 pub(super) fn verify_base_readback(
     vault: &AsterVault,
     snapshot: u64,
@@ -14,6 +99,9 @@ pub(super) fn verify_base_readback(
     let mut mismatches = Vec::new();
     if stored.cx_id != expected.cx_id {
         mismatches.push("cx_id");
+    }
+    if stored.vault_id != expected.vault_id || stored.vault_id != vault.vault_id() {
+        mismatches.push("vault_id");
     }
     if stored.panel_version != expected.panel_version {
         mismatches.push("panel_version");

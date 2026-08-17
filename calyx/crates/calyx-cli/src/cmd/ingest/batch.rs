@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
 use std::io::BufRead;
 use std::path::Path;
 
@@ -70,6 +71,26 @@ pub(super) struct BatchValidation {
     pub row_count: usize,
 }
 
+/// Retains the exact JSONL file against write/delete for the complete native
+/// ingest transaction. Validation, Base preflight, and streaming deliberately
+/// reopen the same path for bounded passes; this handle makes those passes one
+/// immutable input generation instead of trusting equal row counts (PC-03,
+/// PC-38).
+pub(super) fn retain_batch_file(path: &Path) -> CliResult<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options
+        .open(path)
+        .map_err(|err| CliError::io(format!("retain batch {}: {err}", path.display())))
+}
+
 /// Parse one batch JSONL line; `None` for a blank line.
 ///
 /// A malformed anchor (unknown kind, unparseable value, out-of-range confidence)
@@ -84,8 +105,17 @@ pub(super) fn parse_batch_line(index: usize, line: &str) -> CliResult<Option<Bat
     validate_text(&parsed.text)?;
     let metadata = validate_provenance(index, parsed.metadata)?;
     let mut anchors = Vec::with_capacity(parsed.anchors.len());
+    let mut anchor_kinds = BTreeSet::new();
     for spec in parsed.anchors {
-        anchors.push(parse_anchor_spec(index, spec)?);
+        let anchor = parse_anchor_spec(index, spec)?;
+        if !anchor_kinds.insert(anchor.kind.clone()) {
+            return Err(CliError::usage(format!(
+                "batch JSONL line {} contains duplicate anchor kind {:?}",
+                index + 1,
+                anchor.kind
+            )));
+        }
+        anchors.push(anchor);
     }
     let oracle = parsed
         .oracle
@@ -100,7 +130,7 @@ pub(super) fn parse_batch_line(index: usize, line: &str) -> CliResult<Option<Bat
 /// row can be parsed and semantically validated before ingest opens the vault or
 /// initializes measurement state, so malformed input fails before side effects.
 pub(super) fn validate_batch_file(path: &Path) -> CliResult<BatchValidation> {
-    let file = std::fs::File::open(path)
+    let file = File::open(path)
         .map_err(|err| CliError::io(format!("open batch {}: {err}", path.display())))?;
     let reader = std::io::BufReader::new(file);
     let mut validation = BatchValidation {

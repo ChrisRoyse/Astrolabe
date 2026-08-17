@@ -155,6 +155,11 @@ where
                 CalyxError::stale_derived("recurrence append requires an existing constellation")
             })?;
         let mut record = encode::BaseRecord::decode_for_key(cx_id, &base_bytes)?;
+        if record.vault_id() != vault.vault_id() {
+            return Err(CalyxError::vault_access_denied(format!(
+                "recurrence Base row for cx {cx_id} belongs to another vault"
+            )));
+        }
         let append = build_append(
             vault,
             record.constellation().clone(),

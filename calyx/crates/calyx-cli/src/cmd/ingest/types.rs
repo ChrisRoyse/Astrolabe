@@ -44,7 +44,7 @@ impl BatchIngestSummary {
     pub(super) fn empty() -> Self {
         Self {
             status: "ingested",
-            source_of_truth: "physical Aster Base CF readback for distinct batch Cx IDs after flush",
+            source_of_truth: "commit-owned Base SST receipts plus exact final-snapshot Base readback for distinct batch Cx IDs",
             row_count: 0,
             new_count: 0,
             already_count: 0,

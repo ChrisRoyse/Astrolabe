@@ -128,6 +128,37 @@ where
     Ok(evaluation.decision)
 }
 
+/// Evaluates one dedup candidate at a caller-pinned snapshot through an
+/// explicit slot resolver without persisting anchor-conflict rows.
+///
+/// Readback surfaces use this entry point with a read-only vault handle so the
+/// decision is bound to the manifest-backed slot interpretation while the
+/// synthetic candidate can never create Online CF state.
+pub fn check_dedup_read_only_resolved_at<C, R>(
+    new_cx: &Constellation,
+    vault: &AsterVault<C>,
+    policy: &DedupPolicy,
+    guard_profile: Option<&dyn GuardTauProfile>,
+    resolver: &R,
+    snapshot: calyx_core::Seq,
+) -> Result<DedupDecision>
+where
+    C: Clock,
+    R: SlotVectorResolver<C> + ?Sized,
+{
+    let snapshot_lease = vault.retain_snapshot_at(snapshot);
+    let evaluation = check_dedup_without_conflict_write_resolved_at(
+        new_cx,
+        vault,
+        policy,
+        guard_profile,
+        resolver,
+        snapshot,
+    )?;
+    snapshot_lease.record_progress();
+    Ok(evaluation.decision)
+}
+
 pub fn check_dedup_with_limit<C>(
     new_cx: &Constellation,
     vault: &AsterVault<C>,

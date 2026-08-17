@@ -15,7 +15,7 @@ use crate::error::{CliError, CliResult};
 const DEFAULT_OUTCOME_KIND: &str = "label:answer";
 const ORACLE_STRUCTURED_METADATA_KEY: &str = "oracle.structured";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct OracleEvent {
     domain: String,
     action: String,

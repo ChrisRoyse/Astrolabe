@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::vault::input_store::{self, InputRetention};
-use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_aster::vault::{AsterVault, ExistingBaseAnchorMerge, VaultOptions, encode};
 use calyx_core::{
     AbsentReason, Anchor, CalyxError, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef,
     Modality, Slot, SlotState, SlotVector, VaultStore,
@@ -246,21 +246,106 @@ fn ingest_prepared_inputs(
     resolved: &ResolvedVault,
     inputs: Vec<PreparedInput>,
 ) -> ToolResult<Vec<IngestReport>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
     let vault = open_vault(resolved)?;
     let retention = vault.input_retention()?;
     let state = load_vault_panel_state(&resolved.path)?;
+
+    struct TextPlan {
+        input: Option<Input>,
+        input_ref: InputRef,
+        modality: Modality,
+        metadata: BTreeMap<String, String>,
+        existing: Option<encode::BaseRecord>,
+    }
+
     let mut staged = Vec::new();
     let mut staged_inputs: Vec<([u8; 32], Vec<u8>)> = Vec::new();
-    let mut prepared = Vec::with_capacity(inputs.len());
-    let mut first_new = BTreeSet::new();
-    for prepared_input in inputs {
-        let PreparedInput { input, metadata } = prepared_input;
-        let input_bytes = input.bytes.clone();
-        let mut measured = measure_constellation(&vault, &state, input, now_ms())?;
-        measured.constellation.metadata = metadata;
-        let cx_id = measured.constellation.cx_id;
-        let new = !base_exists(&vault, cx_id)? && first_new.insert(cx_id);
-        if new {
+    let mut new_expected = BTreeMap::<CxId, Constellation>::new();
+    let mut plans = BTreeMap::<CxId, TextPlan>::new();
+    let mut plan_order = Vec::new();
+    let mut occurrences = Vec::with_capacity(inputs.len());
+    for PreparedInput { input, metadata } in inputs {
+        let modality = input.modality;
+        let cx_id = vault.cx_id_for_input(&input.bytes, state.panel.version);
+        let incoming_ref = InputRef {
+            hash: input_hash(&input.bytes),
+            pointer: input.pointer.clone(),
+            redacted: false,
+        };
+        if let Some(plan) = plans.get(&cx_id) {
+            if plan.input_ref != incoming_ref
+                || plan.modality != modality
+                || plan.metadata != metadata
+            {
+                return Err(ToolError::invalid_params(format!(
+                    "duplicate MCP ingest for cx {cx_id} changed its non-anchor identity"
+                )));
+            }
+            occurrences.push(cx_id);
+            continue;
+        }
+        plan_order.push(cx_id);
+        plans.insert(
+            cx_id,
+            TextPlan {
+                input: Some(input),
+                input_ref: incoming_ref,
+                modality,
+                metadata,
+                existing: None,
+            },
+        );
+        occurrences.push(cx_id);
+    }
+
+    let preflight_lease = vault.retain_latest_snapshot();
+    let preflight_snapshot = preflight_lease.seq();
+    let base_records = read_optional_base_record_batch(&vault, preflight_snapshot, &plan_order)?;
+    preflight_lease.record_progress();
+    let mut new_ids = BTreeSet::new();
+    for (cx_id, existing) in plan_order.iter().copied().zip(base_records) {
+        let plan = plans.get_mut(&cx_id).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "MCP Base preflight returned unplanned cx {cx_id}"
+            ))
+        })?;
+        if let Some(record) = existing {
+            let stored = record.constellation();
+            verify_text_identity_fields(
+                cx_id,
+                stored.panel_version,
+                &stored.input_ref,
+                stored.modality,
+                &stored.metadata,
+                state.panel.version,
+                &plan.input_ref,
+                plan.modality,
+                &plan.metadata,
+                "idempotent MCP ingest replay",
+            )?;
+            plan.existing = Some(record);
+            drop(plan.input.take());
+        } else {
+            new_ids.insert(cx_id);
+            let input = plan.input.take().ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "MCP new-row plan for cx {cx_id} omitted its measurement input"
+                ))
+            })?;
+            let input_bytes = input.bytes.clone();
+            let mut measured = measure_constellation(&vault, &state, input, now_ms())?;
+            if measured.constellation.cx_id != cx_id {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "MCP text measurement returned cx {} after preflight derived {cx_id}",
+                    measured.constellation.cx_id
+                ))
+                .into());
+            }
+            measured.constellation.metadata = plan.metadata.clone();
+            ensure_content_panel_floor(&measured.constellation, &state)?;
             match retention {
                 InputRetention::Persist => {
                     measured.constellation.input_ref.pointer = Some(input_store::input_pointer(
@@ -274,35 +359,163 @@ fn ingest_prepared_inputs(
                     measured.constellation.flags.redacted_input = true;
                 }
             }
-            staged.push(measured.constellation.clone());
+            new_expected.insert(cx_id, measured.constellation.clone());
+            staged.push(measured.constellation);
         }
-        prepared.push((cx_id, new));
+        preflight_lease.record_progress();
     }
+    drop(preflight_lease);
+    let mut reported_new = BTreeSet::new();
+    let prepared = occurrences
+        .into_iter()
+        .map(|cx_id| {
+            let new = new_ids.contains(&cx_id) && reported_new.insert(cx_id);
+            (cx_id, new)
+        })
+        .collect::<Vec<_>>();
+
     let mut input_rows = Vec::new();
     for (input_hash, bytes) in &staged_inputs {
         input_rows.extend(input_store::encode_input_rows(input_hash, bytes)?);
     }
-    match staged.len() {
-        0 => {}
-        1 => {
-            vault
-                .put_with_input_rows(staged.pop().expect("one staged constellation"), input_rows)?;
+    let existing_requests = plan_order
+        .iter()
+        .filter_map(|cx_id| {
+            plans
+                .get(cx_id)
+                .and_then(|plan| plan.existing.clone())
+                .map(|expected| ExistingBaseAnchorMerge {
+                    expected,
+                    incoming: Vec::new(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let commit = vault.put_batch_with_input_rows_and_existing_base_anchor_merges(
+        staged,
+        input_rows,
+        existing_requests,
+    )?;
+    let readback_seq = commit.readback_seq;
+    let commit_seq = commit.commit_seq;
+
+    let mut committed_new_records = BTreeMap::<CxId, encode::BaseRecord>::new();
+    for record in commit.new_records {
+        let cx_id = record.cx_id();
+        let expected = new_expected.get_mut(&cx_id).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "MCP atomic ingest returned unplanned new Base record for cx {cx_id}"
+            ))
+        })?;
+        expected.provenance = record.constellation().provenance.clone();
+        if record.encode()? != encode::encode_constellation_base(expected)? {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MCP atomic ingest returned a different final Base record for new cx {cx_id}"
+            ))
+            .into());
         }
-        _ => {
-            vault.put_batch_with_input_rows(staged, input_rows)?;
+        if committed_new_records.insert(cx_id, record).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MCP atomic ingest returned duplicate new Base record for cx {cx_id}"
+            ))
+            .into());
         }
     }
-    vault.flush()?;
+    let mut existing_records = BTreeMap::<CxId, encode::BaseRecord>::new();
+    for result in commit.existing_results {
+        let cx_id = result.record.cx_id();
+        if !plans
+            .get(&cx_id)
+            .is_some_and(|plan| plan.existing.is_some())
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MCP atomic ingest returned unplanned existing Base record for cx {cx_id}"
+            ))
+            .into());
+        }
+        if !result.added.is_empty() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MCP no-anchor replay unexpectedly added anchors to cx {cx_id}"
+            ))
+            .into());
+        }
+        if committed_new_records.contains_key(&cx_id)
+            || existing_records.insert(cx_id, result.record).is_some()
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MCP atomic ingest returned duplicate existing Base record for cx {cx_id}"
+            ))
+            .into());
+        }
+    }
+    if committed_new_records.len() + existing_records.len() != plans.len() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "MCP atomic ingest returned {} Base records for {} planned CxIds",
+            committed_new_records.len() + existing_records.len(),
+            plans.len()
+        ))
+        .into());
+    }
+    if !commit.marker_ledger_receipts.is_empty() {
+        return Err(CalyxError::aster_corrupt_shard(
+            "MCP no-anchor ingest returned anchor marker Ledger receipts",
+        )
+        .into());
+    }
+
+    let readback_lease = vault.retain_snapshot_at(readback_seq);
+    let flush_report = vault.flush_with_report()?;
+    flush_report.verify_commit_base_records(commit_seq, &committed_new_records)?;
+    let mut final_records = committed_new_records;
+    for (cx_id, record) in existing_records {
+        if final_records.insert(cx_id, record).is_some() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MCP atomic ingest produced overlapping new/existing record for cx {cx_id}"
+            ))
+            .into());
+        }
+    }
+    verify_base_record_batch_readback(&vault, readback_seq, &plan_order, &final_records)?;
+    readback_lease.record_progress();
+    verify_hydrated_new_batch_readback(&vault, readback_seq, &plan_order, &new_expected)?;
+    readback_lease.record_progress();
+    for cx_id in &plan_order {
+        let record = final_records.get(cx_id).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "MCP post-commit readback plan omitted final record for cx {cx_id}"
+            ))
+        })?;
+        verify_stored_text_input_state(&vault, record.constellation())?;
+        readback_lease.record_progress();
+    }
     verify_persisted_inputs(&vault, &staged_inputs)?;
-    let snapshot = vault.snapshot();
+    readback_lease.record_progress();
+    drop(readback_lease);
+
+    let retry_ids = prepared
+        .iter()
+        .filter(|(_, new)| !new)
+        .map(|(cx_id, _)| *cx_id)
+        .collect::<Vec<_>>();
+    let retry_ledger_seq = append_ingest_retry_batch_ledger(&vault, &retry_ids)?;
     let mut reports = Vec::with_capacity(prepared.len());
     for (cx_id, new) in prepared {
-        let stored = vault.get(cx_id, snapshot)?;
-        verify_stored_text_input_state(&vault, &stored)?;
         let ledger_seq = if new {
-            stored.provenance.seq
+            final_records
+                .get(&cx_id)
+                .ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "MCP ingest report omitted committed Base record for cx {cx_id}"
+                    ))
+                })?
+                .constellation()
+                .provenance
+                .seq
         } else {
-            append_ingest_retry_ledger(&vault, cx_id)?
+            retry_ledger_seq.ok_or_else(|| {
+                CalyxError::ledger_group_commit_failed(format!(
+                    "MCP retry report for cx {cx_id} has no batch retry Ledger ref"
+                ))
+            })?
         };
         reports.push(IngestReport {
             cx_id: cx_id.to_string(),
@@ -311,7 +524,228 @@ fn ingest_prepared_inputs(
         });
     }
     vault.flush()?;
+    let final_snapshot = vault.snapshot();
+    verify_base_record_batch_readback(&vault, final_snapshot, &plan_order, &final_records)?;
     Ok(reports)
+}
+
+fn verify_text_identity_fields(
+    cx_id: CxId,
+    stored_panel_version: u32,
+    stored_ref: &InputRef,
+    stored_modality: Modality,
+    stored_metadata: &BTreeMap<String, String>,
+    incoming_panel_version: u32,
+    incoming_ref: &InputRef,
+    incoming_modality: Modality,
+    incoming_metadata: &BTreeMap<String, String>,
+    context: &str,
+) -> ToolResult<()> {
+    let mut changed = Vec::new();
+    if stored_panel_version != incoming_panel_version {
+        changed.push("panel_version");
+    }
+    if !input_ref_matches_replay(stored_ref, incoming_ref) {
+        changed.push("input_ref");
+    }
+    if stored_modality != incoming_modality {
+        changed.push("modality");
+    }
+    if stored_metadata != incoming_metadata {
+        changed.push("metadata");
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(ToolError::invalid_params(format!(
+        "{context} for cx {cx_id} changed stored non-anchor fields: {}",
+        changed.join(",")
+    )))
+}
+
+fn input_ref_matches_replay(stored: &InputRef, incoming: &InputRef) -> bool {
+    if stored == incoming {
+        return true;
+    }
+    if stored.hash != incoming.hash {
+        return false;
+    }
+    if !stored.redacted
+        && !incoming.redacted
+        && incoming.pointer.is_none()
+        && stored.pointer.as_deref() == Some(input_store::input_pointer(&stored.hash).as_str())
+    {
+        return true;
+    }
+    stored.redacted && !incoming.redacted && stored.pointer == incoming.pointer
+}
+
+fn read_optional_base_record_batch(
+    vault: &AsterVault,
+    snapshot: u64,
+    cx_ids: &[CxId],
+) -> ToolResult<Vec<Option<encode::BaseRecord>>> {
+    let reads = cx_ids
+        .iter()
+        .map(|cx_id| (ColumnFamily::Base, base_key(*cx_id)))
+        .collect::<Vec<_>>();
+    let values = vault.read_cf_batch_at(snapshot, reads)?;
+    if values.len() != cx_ids.len() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "ordered MCP Base preflight returned {} rows for {} requested CxIds",
+            values.len(),
+            cx_ids.len()
+        ))
+        .into());
+    }
+    let mut records = Vec::with_capacity(cx_ids.len());
+    for (cx_id, value) in cx_ids.iter().copied().zip(values) {
+        let Some(bytes) = value else {
+            records.push(None);
+            continue;
+        };
+        let record = encode::BaseRecord::decode_for_key(cx_id, &bytes)?;
+        if bytes != record.encode()? {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "durable MCP Base row for cx {cx_id} is not canonically encoded"
+            ))
+            .into());
+        }
+        if record.vault_id() != vault.vault_id() {
+            return Err(CalyxError::vault_access_denied(format!(
+                "durable MCP Base row for cx {cx_id} belongs to another vault"
+            ))
+            .into());
+        }
+        records.push(Some(record));
+    }
+    Ok(records)
+}
+
+fn verify_base_record_batch_readback(
+    vault: &AsterVault,
+    snapshot: u64,
+    cx_ids: &[CxId],
+    expected: &BTreeMap<CxId, encode::BaseRecord>,
+) -> ToolResult<()> {
+    if expected.len() != cx_ids.len() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "ordered MCP Base readback has {} expected rows for {} requested CxIds",
+            expected.len(),
+            cx_ids.len()
+        ))
+        .into());
+    }
+    let reads = cx_ids
+        .iter()
+        .map(|cx_id| (ColumnFamily::Base, base_key(*cx_id)))
+        .collect::<Vec<_>>();
+    let values = vault.read_cf_batch_at(snapshot, reads)?;
+    if values.len() != cx_ids.len() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "ordered MCP Base readback returned {} rows for {} requested CxIds",
+            values.len(),
+            cx_ids.len()
+        ))
+        .into());
+    }
+    for (cx_id, value) in cx_ids.iter().copied().zip(values) {
+        let bytes = value.ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "durable MCP Base row for cx {cx_id} is missing at snapshot {snapshot}"
+            ))
+        })?;
+        let observed = encode::BaseRecord::decode_for_key(cx_id, &bytes)?;
+        if bytes != observed.encode()? {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "durable MCP Base row for cx {cx_id} is not canonically encoded"
+            ))
+            .into());
+        }
+        if observed.vault_id() != vault.vault_id() {
+            return Err(CalyxError::vault_access_denied(format!(
+                "durable MCP Base row for cx {cx_id} belongs to another vault"
+            ))
+            .into());
+        }
+        let expected = expected.get(&cx_id).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "ordered MCP Base readback omitted expected record for cx {cx_id}"
+            ))
+        })?;
+        if bytes != expected.encode()? {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "durable MCP ingest Base readback mismatch for cx {cx_id}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_hydrated_new_batch_readback(
+    vault: &AsterVault,
+    snapshot: u64,
+    plan_order: &[CxId],
+    expected: &BTreeMap<CxId, Constellation>,
+) -> ToolResult<()> {
+    let new_order = plan_order
+        .iter()
+        .copied()
+        .filter(|cx_id| expected.contains_key(cx_id))
+        .collect::<Vec<_>>();
+    let stored = vault.get_many_at(snapshot, &new_order)?;
+    if stored.len() != new_order.len() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "ordered MCP hydrated readback returned {} rows for {} new CxIds",
+            stored.len(),
+            new_order.len()
+        ))
+        .into());
+    }
+    for (cx_id, stored) in new_order.into_iter().zip(stored) {
+        let expected = expected.get(&cx_id).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "ordered MCP hydrated readback omitted expected new cx {cx_id}"
+            ))
+        })?;
+        if stored != *expected {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "durable MCP ingest hydrated readback mismatch for new cx {cx_id}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_content_panel_floor(
+    constellation: &Constellation,
+    state: &VaultPanelState,
+) -> ToolResult<()> {
+    let mut declared = 0_usize;
+    let mut present = 0_usize;
+    for slot in &state.panel.slots {
+        if !slot.counts_toward_degraded(constellation.modality) {
+            continue;
+        }
+        declared += 1;
+        if constellation
+            .slots
+            .get(&slot.slot_id)
+            .is_some_and(|vector| !vector.is_absent())
+        {
+            present += 1;
+        }
+    }
+    if declared > 0 && present == 0 {
+        return Err(CalyxError::lens_unreachable(format!(
+            "MCP ingest refused cx {} because none of its {declared} declared content slots materialized",
+            constellation.cx_id
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn verify_persisted_inputs(
@@ -469,10 +903,33 @@ fn measure_slot(
     }
 }
 
-fn append_ingest_retry_ledger(vault: &AsterVault, cx_id: CxId) -> ToolResult<u64> {
-    let bytes = serde_json::to_vec(&json!({ "mode": "mcp-idempotent-ingest" }))
-        .map_err(|err| CalyxError::aster_corrupt_shard(format!("encode retry ledger: {err}")))?;
-    append_ledger_payload(vault, EntryKind::Ingest, cx_id, bytes)
+fn append_ingest_retry_batch_ledger(
+    vault: &AsterVault,
+    cx_ids: &[CxId],
+) -> ToolResult<Option<u64>> {
+    let Some(first_cx_id) = cx_ids.first().copied() else {
+        return Ok(None);
+    };
+    let ordered_ids = cx_ids.iter().map(CxId::to_string).collect::<Vec<_>>();
+    let first = first_cx_id.to_string();
+    let last = cx_ids
+        .last()
+        .copied()
+        .ok_or_else(|| {
+            CalyxError::ledger_group_commit_failed(
+                "non-empty MCP retry batch omitted its final CxId",
+            )
+        })?
+        .to_string();
+    let bytes = serde_json::to_vec(&json!({
+        "mode": "mcp-idempotent-ingest-batch",
+        "count": ordered_ids.len(),
+        "cx_ids": ordered_ids,
+        "first_cx_id": first,
+        "last_cx_id": last,
+    }))
+    .map_err(|err| CalyxError::aster_corrupt_shard(format!("encode retry ledger: {err}")))?;
+    append_ledger_payload(vault, EntryKind::Ingest, first_cx_id, bytes).map(Some)
 }
 
 fn append_ledger_payload(
@@ -501,7 +958,10 @@ fn open_vault(resolved: &ResolvedVault) -> ToolResult<AsterVault> {
         &resolved.path,
         resolved.vault_id,
         vault_salt(resolved.vault_id, &resolved.name),
-        VaultOptions::default(),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            ..VaultOptions::default()
+        },
     )?)
 }
 

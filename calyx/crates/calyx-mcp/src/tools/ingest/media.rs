@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use calyx_core::{CalyxError, Input, Modality, SlotState, VaultStore, media_modality_name};
+use calyx_core::{CalyxError, Input, Modality, SlotState, media_modality_name};
 use calyx_ledger::{ActorId, SubjectId};
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,7 +18,7 @@ use crate::tools::vault::store::ResolvedVault;
 
 use super::input_retention::{INPUT_POINTER_PREFIX, write_input_blob};
 use super::{
-    base_exists, decode, def, derived_text, enum_string, measure_constellation, open_vault,
+    decode, def, derived_text, enum_string, measure_constellation, open_vault,
     resolve_requested_vault,
 };
 

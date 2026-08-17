@@ -314,6 +314,11 @@ where
         // rewrite. A plain decode -> encode_constellation_base round-trip would
         // replace every stored slot hash with the hash of an Absent placeholder.
         let mut record = BaseRecord::decode_for_key(cx_id, &bytes)?;
+        if record.vault_id() != self.vault.vault_id() {
+            return Err(CalyxError::vault_access_denied(format!(
+                "orphan-repair Base row for cx {cx_id} belongs to another vault"
+            )));
+        }
         record.flags_mut().degraded = true;
         record.metadata_mut().insert(
             REBUILD_METADATA_KEY.to_string(),

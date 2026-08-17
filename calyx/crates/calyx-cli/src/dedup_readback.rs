@@ -1,12 +1,19 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use calyx_aster::dedup::{DedupAction, DedupPolicy, TauStrategy, TctCosineConfig, check_dedup};
+use calyx_aster::cf::{ColumnFamily, base_key};
+use calyx_aster::dedup::{
+    DedupAction, DedupPolicy, TauStrategy, TctCosineConfig, check_dedup_read_only_resolved_at,
+};
+use calyx_aster::manifest::ManifestStore;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{CxId, GuardTauProfile, SlotId, SlotVector, VaultId, VaultStore, dense_cosine};
+use calyx_core::{CalyxError, CxId, GuardTauProfile, SlotId, SlotVector, VaultId, dense_cosine};
+use calyx_registry::load_vault_panel_state;
 use serde_json::json;
 
 use crate::error::CliError;
+
+const MAX_ABSENT_CX_PROBES: u64 = 16;
 
 pub struct DedupReadbackArgs<'a> {
     pub vault: &'a Path,
@@ -28,14 +35,35 @@ pub fn readback_dedup_check(args: DedupReadbackArgs<'_>) -> crate::error::CliRes
         .map_err(|error| CliError::usage(format!("invalid --cx-id: {error}")))?;
     let vault_id = VaultId::from_str(args.vault_id)
         .map_err(|error| CliError::usage(format!("invalid --vault-id: {error}")))?;
+    // CURRENT advances monotonically to immutable, ref-validated manifests.
+    // Bracket the operation with its CURRENT pointer identity so a panel-only
+    // publication cannot mix one resolver generation with another (PC-03,
+    // PC-13, PC-35, PC-41).
+    let manifest_store = ManifestStore::open(args.vault);
+    let panel_generation = manifest_store.current_pointer()?;
     let vault = AsterVault::open(
         args.vault,
         vault_id,
         args.salt.as_bytes(),
-        VaultOptions::default(),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(vec![
+                ColumnFamily::Base,
+                ColumnFamily::Compression,
+                ColumnFamily::slot(slot),
+            ]),
+            ..VaultOptions::default()
+        },
     )?;
-    let snapshot = vault.snapshot();
-    let existing = vault.get(cx_id, snapshot)?;
+    require_panel_generation(&manifest_store, &panel_generation)?;
+    let state = load_vault_panel_state(args.vault)?;
+    require_panel_generation(&manifest_store, &panel_generation)?;
+    let operation = vault.retain_latest_snapshot();
+    let snapshot = operation.seq();
+    let existing = vault.get_selected_slots_resolved_at(cx_id, snapshot, [slot], &state)?;
+    operation.record_progress();
     let source = existing
         .slots
         .get(&slot)
@@ -45,20 +73,42 @@ pub fn readback_dedup_check(args: DedupReadbackArgs<'_>) -> crate::error::CliRes
         })?;
     let near_vector = vector_at_cosine(source, near_cos)?;
     let distinct_vector = vector_at_cosine(source, distinct_cos)?;
+    let near_cx_id = absent_probe_cx_id(
+        &vault,
+        snapshot,
+        cx_id,
+        b"calyx-dedup-readback-near-v1",
+        &[],
+    )?;
+    let distinct_cx_id = absent_probe_cx_id(
+        &vault,
+        snapshot,
+        cx_id,
+        b"calyx-dedup-readback-distinct-v1",
+        &[near_cx_id],
+    )?;
+    operation.record_progress();
     let mut near = existing.clone();
-    near.cx_id = CxId::from_bytes([0xd0; 16]);
+    near.cx_id = near_cx_id;
     near.slots.insert(slot, dense(near_vector.clone()));
     let mut distinct = existing.clone();
-    distinct.cx_id = CxId::from_bytes([0xd1; 16]);
+    distinct.cx_id = distinct_cx_id;
     distinct.slots.insert(slot, dense(distinct_vector.clone()));
     let policy = DedupPolicy::TctCosine(TctCosineConfig::new(
         vec![slot],
         TauStrategy::PerSlot(vec![(slot, tau)]),
         DedupAction::Collapse,
     )?);
+    policy.validate(&state.panel)?;
     let no_profile: Option<&dyn GuardTauProfile> = None;
-    let near_decision = check_dedup(&near, &vault, &policy, no_profile)?;
-    let distinct_decision = check_dedup(&distinct, &vault, &policy, no_profile)?;
+    let near_decision =
+        check_dedup_read_only_resolved_at(&near, &vault, &policy, no_profile, &state, snapshot)?;
+    operation.record_progress();
+    let distinct_decision = check_dedup_read_only_resolved_at(
+        &distinct, &vault, &policy, no_profile, &state, snapshot,
+    )?;
+    operation.record_progress();
+    require_panel_generation(&manifest_store, &panel_generation)?;
     let readback = json!({
         "existing": cx_id,
         "slot": slot,
@@ -81,6 +131,49 @@ pub fn readback_dedup_check(args: DedupReadbackArgs<'_>) -> crate::error::CliRes
         serde_json::to_string_pretty(&readback)
             .map_err(|error| CliError::runtime(format!("serialize readback: {error}")))?
     );
+    Ok(())
+}
+
+fn absent_probe_cx_id(
+    vault: &AsterVault,
+    snapshot: u64,
+    source: CxId,
+    domain: &[u8],
+    reserved: &[CxId],
+) -> crate::error::CliResult<CxId> {
+    for counter in 0_u64..MAX_ABSENT_CX_PROBES {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(domain);
+        hasher.update(source.as_bytes());
+        hasher.update(&counter.to_be_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        let candidate = CxId::from_bytes(bytes);
+        if candidate == source || reserved.contains(&candidate) {
+            continue;
+        }
+        if vault
+            .read_cf_at(snapshot, ColumnFamily::Base, &base_key(candidate))?
+            .is_none()
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(CalyxError::aster_corrupt_shard(format!(
+        "dedup readback could not derive an absent CxId in {MAX_ABSENT_CX_PROBES} deterministic probes"
+    ))
+    .into())
+}
+
+fn require_panel_generation(store: &ManifestStore, expected: &str) -> crate::error::CliResult {
+    let observed = store.current_pointer()?;
+    if observed != expected {
+        return Err(CalyxError::stale_derived(format!(
+            "vault panel generation changed during dedup readback: expected {expected}, observed {observed}"
+        ))
+        .into());
+    }
     Ok(())
 }
 
