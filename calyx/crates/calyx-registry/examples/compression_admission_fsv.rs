@@ -17,12 +17,25 @@
 //! invariant D/codec/lens/query/backend. `point_read_cost_readback` repeats the
 //! deterministic observations in a fresh process while treating latency as
 //! non-invariant.
+//! `base_record_replay_prepare` creates a CLI-compatible two-row vault whose
+//! active dense slot is a real lossy TurboQuant generation, then publishes the
+//! fixed replay inputs and an exact durable baseline. After the shipping CLI
+//! exercises text, no-anchor batch, anchor-add, repeat, and metadata-mismatch
+//! roles, `base_record_replay_readback` independently verifies the Base,
+//! Anchors, Ledger, compressed serving rows, and exact WAL suffix.
+//! `base_record_media_replay_prepare` creates a separate CLI-compatible
+//! Text/Image byte-feature vault. After shipping media ingest seeds the real
+//! PNG and its deterministic caption, `base_record_media_replay_compress`
+//! commissions two real lossy TQ3.5 generations and seals an exact baseline.
+//! A second shipping media ingest is followed by
+//! `base_record_media_replay_readback`, which proves byte-identical Base and
+//! compression state plus exactly one new joined Graph/Ledger artifact.
 //!
-//! Source of truth: the reopened Aster primary/raw/Compression/Ledger column
-//! families, immutable manifest and membership-proof rows, physical Ledger
-//! view, and every regular file below the vault root. The readback phase hashes
-//! those bytes independently and proves that read-only inspection changed no
-//! file.
+//! Source of truth: the reopened Aster primary/raw/Compression/Graph/Ledger
+//! column families, immutable manifest and membership-proof rows, physical
+//! Ledger view, and every regular file below the vault root. The readback phase
+//! hashes those bytes independently and proves that read-only inspection
+//! changed no file.
 //!
 //! Cost boundary (#1064 PC-02/03/05/35/41): the fixed manual fixture is
 //! R=8 rows, D=32 coefficients, Q=2 held-out queries, U=1 warmup, M=3 measured
@@ -37,9 +50,14 @@
 //! Panel/Registry state and query values are invariant for the complete run and
 //! are loaded once per process. The final filesystem audit is FSV-only and is
 //! not reachable from production.
+//! The BaseRecord replay modes are a separate fixed N=2, S=1 correctness
+//! fixture and make no cost or performance claim.
+//! The media replay modes are a separate fixed N=2 role, D=16, S=2
+//! correctness fixture and likewise make no production cost claim.
 //!
 //! Build/stage the real example with the canonical native launcher, then run
-//! the same staged artifact twice through `scripts/native-fsv-run.ps1`:
+//! the same staged artifact through each required `scripts/native-fsv-run.ps1`
+//! role:
 //!
 //! ```text
 //! ASTROLABE_COMPRESSION_FSV_MODE=exercise
@@ -55,7 +73,18 @@
 //! ASTROLABE_COMPRESSION_FSV_MODE=point_read_cost
 //! ASTROLABE_COMPRESSION_FSV_POINT_COST_PRODUCTION_VAULT=<preserved-r14-production-vault>
 //! ASTROLABE_COMPRESSION_FSV_MODE=point_read_cost_readback
+//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issue-1138\<run-id>
+//! ASTROLABE_COMPRESSION_FSV_MODE=base_record_replay_prepare
+//! ASTROLABE_COMPRESSION_FSV_MODE=base_record_replay_readback
+//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issue-1138\<media-run-id>
+//! ASTROLABE_COMPRESSION_FSV_MODE=base_record_media_replay_prepare
+//! ASTROLABE_COMPRESSION_FSV_MODE=base_record_media_replay_compress
+//! ASTROLABE_COMPRESSION_FSV_MODE=base_record_media_replay_readback
 //! ```
+//!
+//! The shipping CLI media roles set `CALYX_MEDIA_DERIVED_TEXT_CMD` to this same
+//! promoted artifact; its adapter argument path intentionally requires no FSV
+//! mode or root.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -97,10 +126,14 @@ use calyx_registry::{
     StoredSlotCodec, VaultPanelState, load_vault_panel_state, persist_vault_panel_state,
 };
 use rusqlite::{Connection, OpenFlags, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "compression_admission_fsv/base_record_media_replay.rs"]
+mod base_record_media_replay;
+#[path = "compression_admission_fsv/base_record_replay.rs"]
+mod base_record_replay;
 #[path = "compression_admission_fsv/point_read_cost.rs"]
 mod point_read_cost;
 
@@ -133,6 +166,7 @@ const SHADOW_LEDGER_CHECKPOINT_SCHEMA: &str = "astrolabe.shadow-ledger-checkpoin
 const SHADOW_LEDGER_TIP_HASH_ALGORITHM: &str = "blake3-256";
 const ROOT_ENV: &str = "ASTROLABE_COMPRESSION_FSV_ROOT";
 const MODE_ENV: &str = "ASTROLABE_COMPRESSION_FSV_MODE";
+const MODE_HELP: &str = "`exercise`, `readback`, `production`, `prepare_mcp`, `readback_mcp`, `point_read_cost`, `point_read_cost_readback`, `base_record_replay_prepare`, `base_record_replay_readback`, `base_record_media_replay_prepare`, `base_record_media_replay_compress`, or `base_record_media_replay_readback`";
 const COMPRESSION_WORK_MODEL: &str = "calyx.registry.compression_work.v3";
 type AnyResult<T> = Result<T, Box<dyn Error>>;
 
@@ -200,7 +234,7 @@ struct SlotStateReadback {
     ledger_sha256: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct FileReadback {
     relative_path: String,
     bytes: u64,
@@ -268,13 +302,67 @@ fn main() {
 }
 
 fn run() -> AnyResult<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if base_record_media_replay::try_run_adapter(&args)? {
+        return Ok(());
+    }
+    require(
+        args.is_empty(),
+        "compression admission FSV accepts arguments only for its derived-media adapter",
+    )?;
     let workspace = std::env::current_dir()?;
-    let root = issue_root(&workspace)?;
-    let mode = std::env::var(MODE_ENV).map_err(|_| {
-        format!(
-            "{MODE_ENV} must be exactly `exercise`, `readback`, `production`, `prepare_mcp`, `readback_mcp`, `point_read_cost`, or `point_read_cost_readback`"
-        )
-    })?;
+    let mode = std::env::var(MODE_ENV)
+        .map_err(|_| format!("{MODE_ENV} must be exactly one of {MODE_HELP}"))?;
+    require(
+        known_mode(&mode),
+        format!("{MODE_ENV}={mode:?}; expected exactly one of {MODE_HELP}"),
+    )?;
+    let root = issue_root(&workspace, &mode)?;
+    let cost_boundary = if matches!(
+        mode.as_str(),
+        "base_record_replay_prepare" | "base_record_replay_readback"
+    ) {
+        json!({
+            "fixture_scope": "base_record_replay",
+            "rows_n": 2,
+            "dimension_d": DIM,
+            "held_out_queries_q": 2,
+            "warmups_u": WARMUP_RUNS,
+            "measured_runs_m": MEASURED_RUNS,
+            "slots_s": 1,
+            "invariant_across_compression_loop": "fixed slot81, Panel/Registry snapshot, and two held-out query vectors",
+            "claim": "correctness fixture only; no production cost or performance claim",
+        })
+    } else if matches!(
+        mode.as_str(),
+        "base_record_media_replay_prepare"
+            | "base_record_media_replay_compress"
+            | "base_record_media_replay_readback"
+    ) {
+        json!({
+            "fixture_scope": "base_record_media_replay",
+            "role_rows_n": 2,
+            "dimension_d": 16,
+            "held_out_queries_q_per_slot": 1,
+            "warmups_u": WARMUP_RUNS,
+            "measured_runs_m": MEASURED_RUNS,
+            "slots_s": 2,
+            "invariant_across_compression_loop": "exact PNG/caption bytes, Text/Image Panel/Registry snapshot, slots86/87, and each per-slot held-out query vector",
+            "production_n": "unknown and not estimated by this fixture",
+            "claim": "correctness fixture only; no production cost or performance claim",
+        })
+    } else {
+        json!({
+            "fixture_scope": "compression_admission_legacy_modes",
+            "rows_r": ROWS,
+            "dimension_d": DIM,
+            "held_out_queries_q": 2,
+            "warmups_u": WARMUP_RUNS,
+            "measured_runs_m": MEASURED_RUNS,
+            "slots_s": 5,
+            "production_r_d_q_u_m_b": "unknown for compressed generations; fixture is not a cost measurement",
+        })
+    };
     println!(
         "{}",
         json!({
@@ -285,15 +373,7 @@ fn run() -> AnyResult<()> {
             "artifact": std::env::current_exe()?,
             "workspace": workspace,
             "fixture_root": root,
-            "cost_boundary": {
-                "rows_r": ROWS,
-                "dimension_d": DIM,
-                "held_out_queries_q": 2,
-                "warmups_u": WARMUP_RUNS,
-                "measured_runs_m": MEASURED_RUNS,
-                "slots_s": 5,
-                "production_r_d_q_u_m_b": "unknown for compressed generations; fixture is not a cost measurement",
-            },
+            "cost_boundary": cost_boundary,
         })
     );
     match mode.as_str() {
@@ -304,11 +384,31 @@ fn run() -> AnyResult<()> {
         "readback_mcp" => readback_mcp(&root),
         "point_read_cost" => point_read_cost::exercise(&root),
         "point_read_cost_readback" => point_read_cost::readback(&root),
-        other => Err(format!(
-            "{MODE_ENV}={other:?}; expected `exercise`, `readback`, `production`, `prepare_mcp`, `readback_mcp`, `point_read_cost`, or `point_read_cost_readback`"
-        )
-        .into()),
+        "base_record_replay_prepare" => base_record_replay::prepare(&root),
+        "base_record_replay_readback" => base_record_replay::readback(&root),
+        "base_record_media_replay_prepare" => base_record_media_replay::prepare(&root),
+        "base_record_media_replay_compress" => base_record_media_replay::compress(&root),
+        "base_record_media_replay_readback" => base_record_media_replay::readback(&root),
+        other => Err(format!("{MODE_ENV}={other:?}; expected exactly one of {MODE_HELP}").into()),
     }
+}
+
+fn known_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "exercise"
+            | "readback"
+            | "production"
+            | "prepare_mcp"
+            | "readback_mcp"
+            | "point_read_cost"
+            | "point_read_cost_readback"
+            | "base_record_replay_prepare"
+            | "base_record_replay_readback"
+            | "base_record_media_replay_prepare"
+            | "base_record_media_replay_compress"
+            | "base_record_media_replay_readback"
+    )
 }
 
 fn exercise(root: &Path) -> AnyResult<()> {
@@ -4229,8 +4329,8 @@ fn exact_registered(slots: &[Registered], slot_id: u16) -> AnyResult<&Registered
     Ok(matches[0])
 }
 
-fn required_row(
-    vault: &AsterVault<SystemClock>,
+fn required_row<C: calyx_core::Clock>(
+    vault: &AsterVault<C>,
     snapshot: Seq,
     cf: ColumnFamily,
     key: &[u8],
@@ -4394,7 +4494,7 @@ fn dense_vector(row: usize) -> SlotVector {
     SlotVector::Dense { dim: DIM, data }
 }
 
-fn issue_root(workspace: &Path) -> AnyResult<PathBuf> {
+fn issue_root(workspace: &Path, mode: &str) -> AnyResult<PathBuf> {
     let raw = std::env::var_os(ROOT_ENV)
         .ok_or_else(|| format!("{ROOT_ENV} must name a fresh issue-scoped evidence directory"))?;
     let supplied = PathBuf::from(raw);
@@ -4416,10 +4516,19 @@ fn issue_root(workspace: &Path) -> AnyResult<PathBuf> {
     } else {
         workspace.join(supplied)
     };
-    let allowed = workspace
-        .join(".tmp")
-        .join("manual-fsv")
-        .join("issues-557-564");
+    let issue_scope = if matches!(
+        mode,
+        "base_record_replay_prepare"
+            | "base_record_replay_readback"
+            | "base_record_media_replay_prepare"
+            | "base_record_media_replay_compress"
+            | "base_record_media_replay_readback"
+    ) {
+        "issue-1138"
+    } else {
+        "issues-557-564"
+    };
+    let allowed = workspace.join(".tmp").join("manual-fsv").join(issue_scope);
     require(
         root.starts_with(&allowed) && root != allowed,
         format!(
