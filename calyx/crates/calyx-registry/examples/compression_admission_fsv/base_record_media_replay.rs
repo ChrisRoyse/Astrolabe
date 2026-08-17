@@ -8,7 +8,7 @@ use calyx_aster::cf::ledger_key;
 use calyx_aster::media_artifact::{DerivedMediaArtifactRecord, derived_media_artifact_key};
 use calyx_aster::vault::encode::BaseRecord;
 use calyx_core::{
-    DERIVED_TEXT_MODE, FixedClock, Input, LEDGER_FIELD_DERIVED_ARTIFACT_ID,
+    AbsentReason, DERIVED_TEXT_MODE, FixedClock, Input, LEDGER_FIELD_DERIVED_ARTIFACT_ID,
     LEDGER_FIELD_DERIVED_KIND, LEDGER_FIELD_MODE, LEDGER_FIELD_MODEL_ID, LEDGER_FIELD_RUNTIME_ID,
     LEDGER_FIELD_SOURCE_CX_ID, LEDGER_FIELD_SOURCE_INPUT_HASH, LEDGER_FIELD_SOURCE_MODALITY,
     LEDGER_FIELD_SOURCE_SHA256, LEDGER_FIELD_TARGET_CX_ID, LEDGER_FIELD_TARGET_TEXT_SHA256,
@@ -17,6 +17,7 @@ use calyx_core::{
     METADATA_DERIVED_RUNTIME, METADATA_DERIVED_TEXT_BYTES, METADATA_DERIVED_TEXT_SHA256,
 };
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger_entry};
+use calyx_registry::CALYX_COMPRESSION_ADMISSION_REFUSED;
 use serde::{Deserialize, Serialize};
 
 const PREPARE_SCHEMA: &str = "astrolabe.base-record-media-replay-prepare.v1";
@@ -120,47 +121,13 @@ struct BaseEvidence {
     provenance: LedgerIdentity,
 }
 
+/// One product refusal of a real commissioning attempt against one slot of the
+/// shared two-slot media panel. `error` is the complete `Display` form of the
+/// `CalyxError` the shipping Registry returned (`"{code}: {message}"`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RawSidecarEvidence {
-    role: String,
-    cx_id: String,
+struct CompressionRefusalEvidence {
     slot_id: u16,
-    key_hex: String,
-    value: ValueIdentity,
-    source_f32_bits: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct ResolvedVectorEvidence {
-    role: String,
-    cx_id: String,
-    slot_id: u16,
-    dim: u32,
-    source_f32_bits: Vec<String>,
-    resolved_f32_bits: Vec<String>,
-    source_slot_blake3: String,
-    differing_coefficients: usize,
-    representation: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct CompressionEvidence {
-    role: String,
-    cx_id: String,
-    slot_id: u16,
-    modality: String,
-    stored_codec: String,
-    manifest_key_hex: String,
-    manifest: ValueIdentity,
-    primary_key_hex: String,
-    primary: ValueIdentity,
-    membership_key_hex: String,
-    membership_proof: ValueIdentity,
-    generation_identity: Value,
-    resolved: ResolvedVectorEvidence,
-    raw_sidecar: RawSidecarEvidence,
-    serving_selected_column_families: Vec<String>,
-    raw_sidecar_selected_for_serving: bool,
+    error: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +202,8 @@ struct BaselineReport {
     target_cx_id: String,
     snapshot: Seq,
     base: Vec<BaseEvidence>,
-    compression: Vec<CompressionEvidence>,
+    compression_refusals: Vec<CompressionRefusalEvidence>,
+    refusals_left_base_and_vault_files_unchanged: bool,
     graph: GraphEvidence,
     ledger: LedgerEvidence,
     retained_blobs: RetainedBlobEvidence,
@@ -256,7 +224,7 @@ struct ReadbackReport {
     baseline_sha256: String,
     snapshot: Seq,
     base: Vec<BaseEvidence>,
-    compression: Vec<CompressionEvidence>,
+    compression_refusals: Vec<CompressionRefusalEvidence>,
     graph: GraphEvidence,
     graph_new_rows: Vec<KeyValueEvidence>,
     new_artifact: ArtifactIdentity,
@@ -267,8 +235,8 @@ struct ReadbackReport {
     selected_column_families: Vec<String>,
     raw_sidecar_selected_for_serving: bool,
     base_bytes_and_slot_hashes_unchanged: bool,
-    compressed_generation_bytes_unchanged: bool,
-    recovery_raw_sidecars_unchanged: bool,
+    commission_refusals_byte_identical: bool,
+    no_compression_state_persisted: bool,
     exact_two_deterministic_adapter_outputs: bool,
     exact_one_artifact_graph_ledger_transition: bool,
     disk_unchanged_during_readback: bool,
@@ -547,32 +515,67 @@ pub(super) fn compress(root: &Path) -> AnyResult<()> {
         &source_bytes,
     )?;
 
-    commission_slot(
+    // Refusal proof. This fixture's ONE panel carries two active slots (86
+    // Text, 87 Image), and the shipping ingest measures every panel slot for
+    // every Cx, so each slot column necessarily holds one cross-modality
+    // `SlotVector::Absent { NotApplicable }` row beside its one dense row. The
+    // product's commissioning preflight requires every row of the candidate
+    // column to decode Dense before it rewrites the column atomically
+    // (`calyx-registry/src/compression/measurement.rs:1736-1741`,
+    // `compression/mod.rs:1105-1119`), so commissioning here can only ever be
+    // refused. That is fail-closed product design, not a defect: this mode
+    // proves the exact refusal per slot plus the byte-immutability of the seed
+    // it refused to touch. Compressing only the dense subset of a multimodal
+    // column is a deliberate product-capability gap and is out of scope here.
+    let files_before_refusals = disk_inventory(&vault_dir)?;
+    let compression_refusals = vec![
+        require_commission_refusal(
+            &vault,
+            &state.registry,
+            panel_slot(&state, TEXT_SLOT)?,
+            TEXT_ROLE,
+            &target_vector,
+            source_cx_id,
+        )?,
+        require_commission_refusal(
+            &vault,
+            &state.registry,
+            panel_slot(&state, IMAGE_SLOT)?,
+            IMAGE_ROLE,
+            &source_vector,
+            target_cx_id,
+        )?,
+    ];
+    require(
+        vault.latest_seq() == seed_snapshot,
+        "refused media commissioning advanced the vault sequence",
+    )?;
+    require(
+        base_evidence_set(
+            &vault,
+            seed_snapshot,
+            source_cx_id,
+            target_cx_id,
+            &source_bytes,
+            &source_vector,
+            &target_vector,
+        )? == base_before,
+        "refused media commissioning changed the shipping seed Base bytes or sealed slot hashes",
+    )?;
+    require_cross_modality_raw_columns(
         &vault,
-        &state.registry,
-        panel_slot(&state, TEXT_SLOT)?,
-        TEXT_ROLE,
+        seed_snapshot,
+        source_cx_id,
         target_cx_id,
+        &source_vector,
         &target_vector,
     )?;
-    commission_slot(
-        &vault,
-        &state.registry,
-        panel_slot(&state, IMAGE_SLOT)?,
-        IMAGE_ROLE,
-        source_cx_id,
-        &source_vector,
+    require(
+        disk_inventory(&vault_dir)? == files_before_refusals,
+        "refused media commissioning changed vault files",
     )?;
-    vault.flush_with_report()?;
     drop(vault);
 
-    let raw = raw_sidecar_evidence(
-        &vault_dir,
-        &[
-            (TEXT_ROLE, target_cx_id, TEXT_SLOT, &target_vector),
-            (IMAGE_ROLE, source_cx_id, IMAGE_SLOT, &source_vector),
-        ],
-    )?;
     let serving = open_serving_vault(&vault_dir)?;
     let snapshot = serving.latest_seq();
     let reopened_state = load_vault_panel_state(&vault_dir)?;
@@ -591,21 +594,13 @@ pub(super) fn compress(root: &Path) -> AnyResult<()> {
         base == base_before,
         "compression preparation changed the shipping seed Base bytes or sealed slot hashes",
     )?;
-    let compression = compression_evidence_set(
+    require_cross_modality_raw_columns(
         &serving,
-        &reopened_state,
         snapshot,
         source_cx_id,
         target_cx_id,
         &source_vector,
         &target_vector,
-        &raw,
-    )?;
-    require(
-        compression
-            .iter()
-            .all(|slot| slot.resolved.differing_coefficients > 0),
-        "real TQ3.5 media generations did not demonstrably alter both vectors",
     )?;
     let graph = graph_evidence(&serving, snapshot, source_cx_id, target_cx_id)?;
     require(
@@ -634,7 +629,8 @@ pub(super) fn compress(root: &Path) -> AnyResult<()> {
         target_cx_id: target_cx_id.to_string(),
         snapshot,
         base,
-        compression,
+        compression_refusals,
+        refusals_left_base_and_vault_files_unchanged: true,
         graph,
         ledger,
         retained_blobs,
@@ -656,16 +652,16 @@ pub(super) fn compress(root: &Path) -> AnyResult<()> {
             "source_cx_id": source_cx_id,
             "target_cx_id": target_cx_id,
             "snapshot": snapshot,
-            "compressed_slots": [TEXT_SLOT, IMAGE_SLOT],
-            "lossy_coefficients": report
-                .compression
+            "refused_slots": [TEXT_SLOT, IMAGE_SLOT],
+            "compression_refusals": report
+                .compression_refusals
                 .iter()
                 .map(|slot| json!({
                     "slot_id": slot.slot_id,
-                    "role": slot.role,
-                    "differing_coefficients": slot.resolved.differing_coefficients,
+                    "error": slot.error,
                 }))
                 .collect::<Vec<_>>(),
+            "refusals_left_base_and_vault_files_unchanged": true,
             "selected_column_families": report.selected_column_families,
             "raw_sidecar_selected_for_serving": false,
             "cli_replay_role": prepare.cli_roles[1],
@@ -707,13 +703,6 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
     let source_vector = expected_vector(IMAGE_ROLE, &source_bytes)?;
     let target_vector = expected_vector(TEXT_ROLE, DERIVED_TEXT.as_bytes())?;
     let files_before = disk_inventory(&vault_dir)?;
-    let raw = raw_sidecar_evidence(
-        &vault_dir,
-        &[
-            (TEXT_ROLE, target_cx_id, TEXT_SLOT, &target_vector),
-            (IMAGE_ROLE, source_cx_id, IMAGE_SLOT, &source_vector),
-        ],
-    )?;
     let vault = open_serving_vault(&vault_dir)?;
     let snapshot = vault.latest_seq();
     let state = load_vault_panel_state(&vault_dir)?;
@@ -733,19 +722,43 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
         base == baseline.base,
         "identical shipping media replay changed Base bytes or sealed slot-hash maps",
     )?;
-    let compression = compression_evidence_set(
+    // Determinism of the fail-closed refusal: the same two commissioning
+    // attempts are made against the replayed vault and must produce the exact
+    // baseline refusal strings, because the cross-modality Absent row that
+    // causes them is itself immutable.
+    let compression_refusals = vec![
+        require_commission_refusal(
+            &vault,
+            &state.registry,
+            panel_slot(&state, TEXT_SLOT)?,
+            TEXT_ROLE,
+            &target_vector,
+            source_cx_id,
+        )?,
+        require_commission_refusal(
+            &vault,
+            &state.registry,
+            panel_slot(&state, IMAGE_SLOT)?,
+            IMAGE_ROLE,
+            &source_vector,
+            target_cx_id,
+        )?,
+    ];
+    require(
+        compression_refusals == baseline.compression_refusals,
+        "identical shipping media replay changed the product's fail-closed commissioning refusals",
+    )?;
+    require(
+        vault.latest_seq() == snapshot,
+        "refused media commissioning advanced the replayed vault sequence",
+    )?;
+    require_cross_modality_raw_columns(
         &vault,
-        &state,
         snapshot,
         source_cx_id,
         target_cx_id,
         &source_vector,
         &target_vector,
-        &raw,
-    )?;
-    require(
-        compression == baseline.compression,
-        "identical shipping media replay changed compressed manifest/proof/primary/raw bytes",
     )?;
     let graph = graph_evidence(&vault, snapshot, source_cx_id, target_cx_id)?;
     let (graph_new_rows, new_artifact) = validate_graph_suffix(&baseline.graph, &graph)?;
@@ -818,7 +831,7 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
         baseline_sha256: baseline_sha256.clone(),
         snapshot,
         base,
-        compression,
+        compression_refusals,
         graph,
         graph_new_rows,
         new_artifact,
@@ -829,8 +842,8 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
         selected_column_families: serving_selected_cf_names(),
         raw_sidecar_selected_for_serving: false,
         base_bytes_and_slot_hashes_unchanged: true,
-        compressed_generation_bytes_unchanged: true,
-        recovery_raw_sidecars_unchanged: true,
+        commission_refusals_byte_identical: true,
+        no_compression_state_persisted: true,
         exact_two_deterministic_adapter_outputs: true,
         exact_one_artifact_graph_ledger_transition: true,
         disk_unchanged_during_readback: true,
@@ -856,8 +869,16 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
             "selected_column_families": report.selected_column_families,
             "raw_sidecar_selected_for_serving": false,
             "base_bytes_and_slot_hashes_unchanged": true,
-            "compressed_generation_bytes_unchanged": true,
-            "recovery_raw_sidecars_unchanged": true,
+            "commission_refusals_byte_identical": true,
+            "no_compression_state_persisted": true,
+            "compression_refusals": report
+                .compression_refusals
+                .iter()
+                .map(|slot| json!({
+                    "slot_id": slot.slot_id,
+                    "error": slot.error,
+                }))
+                .collect::<Vec<_>>(),
             "deterministic_adapter_outputs": report.adapter_outputs.len(),
             "new_graph_rows": report.graph_new_rows.len(),
             "new_ledger_rows": 1,
@@ -1026,7 +1047,7 @@ fn cli_roles(root: &Path, source_path: &Path) -> Vec<CliRole> {
             arguments,
             expected_exit: 0,
             expected_reports: vec![false, false],
-            expected_effect: "Base and both sealed compressed generations unchanged; one new derived-media Graph artifact and one Ledger entry"
+            expected_effect: "Base rows and both raw cross-modality slot columns unchanged; one new derived-media Graph artifact and one Ledger entry"
                 .to_string(),
         },
     ]
@@ -1092,12 +1113,46 @@ fn validate_baseline_contract(
             && report.source_cx_id == prepare.source_cx_id
             && report.target_cx_id == prepare.target_cx_id
             && report.base.len() == FIXTURE_N_ROLES
-            && report.compression.len() == FIXTURE_N_ROLES
+            && report.compression_refusals.len() == FIXTURE_N_ROLES
+            && report.refusals_left_base_and_vault_files_unchanged
             && report.adapter_outputs.len() == 1
             && report.selected_column_families == serving_selected_cf_names()
             && !report.raw_sidecar_selected_for_serving,
         "media fixture baseline contract differs from the exact deterministic schema",
-    )
+    )?;
+    // Slot 86 (Text) is dense only for the derived-text Cx, so its one
+    // cross-modality Absent row belongs to the source-image Cx; slot 87 (Image)
+    // is the exact mirror.
+    let expected_refusals = [
+        (TEXT_SLOT, prepare.source_cx_id.as_str()),
+        (IMAGE_SLOT, prepare.target_cx_id.as_str()),
+    ];
+    let observed_slots = report
+        .compression_refusals
+        .iter()
+        .map(|refusal| refusal.slot_id)
+        .collect::<Vec<_>>();
+    require(
+        observed_slots == [TEXT_SLOT, IMAGE_SLOT],
+        "media fixture baseline refusals are not exactly the ordered text/image slot pair",
+    )?;
+    for (refusal, (slot_id, non_dense_cx_id)) in
+        report.compression_refusals.iter().zip(expected_refusals)
+    {
+        require(
+            !refusal.error.is_empty()
+                && refusal
+                    .error
+                    .starts_with(&format!("{CALYX_COMPRESSION_ADMISSION_REFUSED}: "))
+                && refusal
+                    .error
+                    .contains(&expected_not_dense_refusal(slot_id, non_dense_cx_id)),
+            format!(
+                "media fixture baseline slot {slot_id} refusal is not the product's fail-closed not-dense contract"
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn require_expected_cx_derivation<C: calyx_core::Clock>(
@@ -1132,14 +1187,19 @@ fn expected_vector(role: &str, bytes: &[u8]) -> AnyResult<Vec<f32>> {
     Ok(data)
 }
 
-fn commission_slot(
+/// Attempts one real commissioning of `slot` and requires the shipping product
+/// to refuse it with its exact not-dense contract for `non_dense_cx_id`, the
+/// one cross-modality `Absent { NotApplicable }` row this fixture's shared
+/// two-slot panel persists in that slot column.
+fn require_commission_refusal(
     vault: &Arc<AsterVault<SystemClock>>,
     registry: &Registry,
     slot: &Slot,
     role: &str,
-    cx_id: CxId,
     values: &[f32],
-) -> AnyResult<()> {
+    non_dense_cx_id: CxId,
+) -> AnyResult<CompressionRefusalEvidence> {
+    let slot_id = slot.slot_id.get();
     let query = CompressionQuery {
         cx_id: vault.cx_id_for_input(
             format!("issue-1138-media-held-out-{role}").as_bytes(),
@@ -1147,23 +1207,94 @@ fn commission_slot(
         ),
         values: values.to_vec(),
     };
-    let work = exact_work_plan(&[candidate_work_spec(slot, 1, MEDIA_DIM)?], 1)?;
-    let candidate = registry.build_and_evaluate_compression_candidate(
+    // The declared corpus bound must admit the real FIXTURE_N_ROLES-row slot
+    // column: the product checks its declared row ceiling before it decodes a
+    // row (`measurement.rs:1722-1741`), so a one-row declaration would refuse
+    // with a work-limit diagnostic and hide the modality contract being proven.
+    let work = exact_work_plan(
+        &[candidate_work_spec(
+            slot,
+            u32::try_from(FIXTURE_N_ROLES)?,
+            MEDIA_DIM,
+        )?],
+        1,
+    )?;
+    let refused = registry.build_and_evaluate_compression_candidate(
         vault,
         slot,
         candidate_request_with_k(vec![query], 1, work.limits.clone(), passing_gates()),
-    )?;
-    require_v3_work_plan(&candidate.evaluation.receipt, &work)?;
-    require_unpublished_candidate(&candidate.evaluation)?;
+    );
+    let error = match refused {
+        Ok(_) => {
+            return Err(format!(
+                "{role} slot {slot_id} commissioning was admitted, but its column retains a cross-modality Absent row that the full-column-dense contract must refuse"
+            )
+            .into());
+        }
+        Err(error) => error.to_string(),
+    };
     require(
-        candidate.generation.stored_codec == StoredSlotCodec::TurboQuantBits3p5
-            && candidate.generation.rows.len() == 1
-            && candidate.generation.rows[0].cx_id == cx_id
-            && candidate.generation.snapshot.is_some()
-            && candidate.generation.ledger.is_some()
-            && candidate.evaluation.receipt.verdict == CompressionAdmissionVerdict::Admitted,
-        format!("{role} TQ3.5 generation was substituted, incomplete, or refused"),
-    )
+        error.starts_with(&format!("{CALYX_COMPRESSION_ADMISSION_REFUSED}: "))
+            && error.contains(&expected_not_dense_refusal(
+                slot_id,
+                &non_dense_cx_id.to_string(),
+            )),
+        format!(
+            "{role} slot {slot_id} refusal is not the product's fail-closed not-dense contract: {error}"
+        ),
+    )?;
+    Ok(CompressionRefusalEvidence { slot_id, error })
+}
+
+/// The product's exact fail-closed refusal for a candidate slot column that
+/// holds a non-dense row, quoted from
+/// `calyx-registry/src/compression/measurement.rs:1736-1741`.
+fn expected_not_dense_refusal(slot_id: u16, non_dense_cx_id: &str) -> String {
+    format!("candidate slot {slot_id} row {non_dense_cx_id} is not dense")
+}
+
+/// Independently reads back the exact persisted slot columns that make
+/// commissioning impossible here: each column holds one dense source row for
+/// its own modality plus one cross-modality `Absent { NotApplicable }` row, and
+/// no compressed envelope or Compression row exists at `snapshot`.
+fn require_cross_modality_raw_columns<C: calyx_core::Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    source_cx_id: CxId,
+    target_cx_id: CxId,
+    source_vector: &[f32],
+    target_vector: &[f32],
+) -> AnyResult<()> {
+    require(
+        vault
+            .scan_cf_at(snapshot, ColumnFamily::Compression)?
+            .is_empty(),
+        "media fixture Compression CF is not empty",
+    )?;
+    let absent = not_applicable_slot_encoding()?;
+    for (slot_id, dense_cx_id, dense_vector, absent_cx_id) in [
+        (TEXT_SLOT, target_cx_id, target_vector, source_cx_id),
+        (IMAGE_SLOT, source_cx_id, source_vector, target_cx_id),
+    ] {
+        let rows = vault.scan_cf_at(snapshot, ColumnFamily::slot(SlotId::new(slot_id)))?;
+        let expected = vec![
+            (slot_key(dense_cx_id), dense_slot_encoding(dense_vector)?),
+            (slot_key(absent_cx_id), absent.clone()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        require(
+            rows.len() == FIXTURE_N_ROLES
+                && rows.iter().cloned().collect::<BTreeMap<_, _>>() == expected
+                && rows
+                    .iter()
+                    .all(|(_, value)| value.first().copied() != Some(COMPRESSED_SLOT_TAG)),
+            format!(
+                "slot {slot_id} column is not exactly its dense source row plus one cross-modality Absent row"
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn open_serving_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
@@ -1182,6 +1313,10 @@ fn open_serving_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
     )?))
 }
 
+/// Exactly the column families this fixture family persists. `Compression` is
+/// created empty by every write-capable vault open (it is a static CF) and is
+/// selected so the refusal readback can prove it stayed empty; no `slot_8x.raw`
+/// sidecar CF exists here, because commissioning is always refused.
 fn serving_selected_cfs() -> Vec<ColumnFamily> {
     vec![
         ColumnFamily::Base,
@@ -1246,7 +1381,7 @@ fn base_evidence<C: calyx_core::Clock>(
     let bytes = required_row(vault, snapshot, ColumnFamily::Base, &base_key(cx_id), role)?;
     let record = BaseRecord::decode_for_key(cx_id, &bytes)?;
     let cx = record.constellation();
-    let expected_slot_hash = source_slot_hash(source_vector)?;
+    let expected_slot_hashes = expected_base_slot_hashes(slot_id, source_vector)?;
     require(
         record.vault_id() == VAULT_ID.parse::<VaultId>()?
             && record.encode()? == bytes
@@ -1255,9 +1390,8 @@ fn base_evidence<C: calyx_core::Clock>(
             && cx.modality == modality
             && cx.input_ref.hash == *blake3::hash(input_bytes).as_bytes()
             && !cx.input_ref.redacted
-            && record.slot_hashes().len() == 1
-            && record.slot_hashes().get(&SlotId::new(slot_id)) == Some(&expected_slot_hash),
-        format!("{role} Base row does not retain its exact identity and sealed slot hash"),
+            && *record.slot_hashes() == expected_slot_hashes,
+        format!("{role} Base row does not retain its exact identity and sealed slot-hash roster"),
     )?;
     match role {
         IMAGE_ROLE => {
@@ -1347,224 +1481,6 @@ fn require_exact_base_roster<C: calyx_core::Clock>(
         rows.len() == FIXTURE_N_ROLES && observed == expected,
         "Base CF does not contain exactly the fixed media/text Cx roster",
     )
-}
-
-fn raw_sidecar_evidence(
-    vault_dir: &Path,
-    roles: &[(&str, CxId, u16, &[f32])],
-) -> AnyResult<Vec<RawSidecarEvidence>> {
-    require(
-        roles.len() == FIXTURE_N_ROLES,
-        "raw-sidecar evidence requires exactly the media/text role pair",
-    )?;
-    let vault = AsterVault::open(
-        vault_dir,
-        VAULT_ID.parse::<VaultId>()?,
-        fixture_salt(),
-        VaultOptions {
-            dedup_policy: Some(DedupPolicy::Off),
-            restore_mvcc_rows: false,
-            restore_ledger_hook: false,
-            read_only: true,
-            selected_cfs: Some(vec![
-                ColumnFamily::slot_raw(SlotId::new(TEXT_SLOT)),
-                ColumnFamily::slot_raw(SlotId::new(IMAGE_SLOT)),
-            ]),
-            ..VaultOptions::default()
-        },
-    )?;
-    let snapshot = vault.latest_seq();
-    let mut evidence = Vec::with_capacity(roles.len());
-    for (role, cx_id, slot_id, source_vector) in roles {
-        let cf = ColumnFamily::slot_raw(SlotId::new(*slot_id));
-        let rows = vault.scan_cf_at(snapshot, cf)?;
-        let expected_key = slot_key(*cx_id);
-        let expected_value = encode::encode_slot_vector(&SlotVector::Dense {
-            dim: MEDIA_DIM,
-            data: source_vector.to_vec(),
-        })?;
-        require(
-            rows.len() == 1 && rows[0].0 == expected_key && rows[0].1 == expected_value,
-            format!("{role} recovery raw sidecar is not its byte-exact D=16 source vector"),
-        )?;
-        evidence.push(RawSidecarEvidence {
-            role: (*role).to_string(),
-            cx_id: cx_id.to_string(),
-            slot_id: *slot_id,
-            key_hex: hex(&expected_key),
-            value: value_identity(&rows[0].1),
-            source_f32_bits: f32_bits(source_vector),
-        });
-    }
-    Ok(evidence)
-}
-
-fn compression_evidence_set<C: calyx_core::Clock>(
-    vault: &AsterVault<C>,
-    state: &VaultPanelState,
-    snapshot: Seq,
-    source_cx_id: CxId,
-    target_cx_id: CxId,
-    source_vector: &[f32],
-    target_vector: &[f32],
-    raw: &[RawSidecarEvidence],
-) -> AnyResult<Vec<CompressionEvidence>> {
-    Ok(vec![
-        compression_evidence(
-            vault,
-            state,
-            snapshot,
-            TEXT_ROLE,
-            target_cx_id,
-            TEXT_SLOT,
-            Modality::Text,
-            target_vector,
-            exact_raw(raw, TEXT_ROLE)?,
-        )?,
-        compression_evidence(
-            vault,
-            state,
-            snapshot,
-            IMAGE_ROLE,
-            source_cx_id,
-            IMAGE_SLOT,
-            Modality::Image,
-            source_vector,
-            exact_raw(raw, IMAGE_ROLE)?,
-        )?,
-    ])
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compression_evidence<C: calyx_core::Clock>(
-    vault: &AsterVault<C>,
-    state: &VaultPanelState,
-    snapshot: Seq,
-    role: &str,
-    cx_id: CxId,
-    slot_id: u16,
-    modality: Modality,
-    source_vector: &[f32],
-    raw_sidecar: &RawSidecarEvidence,
-) -> AnyResult<CompressionEvidence> {
-    let slot = panel_slot(state, slot_id)?;
-    require(
-        slot.modality == modality
-            && slot.shape == SlotShape::Dense(MEDIA_DIM)
-            && slot.state == SlotState::Active
-            && slot.quant
-                == QuantPolicy::TurboQuant {
-                    bits_per_channel_x2: 7,
-                },
-        format!("{role} slot is not the exact active dense TQ3.5 contract"),
-    )?;
-    let index = state.registry.compressed_slot_index(vault, slot)?;
-    let serving_rows = index.read_all_at(snapshot)?;
-    require(
-        serving_rows.len() == 1 && serving_rows[0].0 == cx_id,
-        format!("{role} compressed serving read returned the wrong Cx roster"),
-    )?;
-    let resolved = state
-        .resolve_slot_vector_at(vault, snapshot, cx_id, slot.slot_id)?
-        .ok_or_else(|| format!("{role} compressed resolver returned no vector"))?;
-    let resolved = resolved_vector_evidence(
-        vault,
-        snapshot,
-        role,
-        cx_id,
-        slot_id,
-        source_vector,
-        resolved,
-    )?;
-    let manifest_key = compression_manifest_key(slot.slot_id);
-    let manifest = required_row(
-        vault,
-        snapshot,
-        ColumnFamily::Compression,
-        &manifest_key,
-        role,
-    )?;
-    let primary_key = slot_key(cx_id);
-    let primary_rows = vault.scan_cf_at(snapshot, ColumnFamily::slot(slot.slot_id))?;
-    require(
-        primary_rows.len() == 1
-            && primary_rows[0].0 == primary_key
-            && primary_rows[0].1.first().copied() == Some(COMPRESSED_SLOT_TAG),
-        format!("{role} primary slot is not one compressed registry envelope"),
-    )?;
-    let proof_key = compression_membership_proof_key(slot.slot_id, cx_id);
-    let proof_rows = vault.scan_cf_range_at(
-        snapshot,
-        ColumnFamily::Compression,
-        &compression_membership_proof_prefix_range(slot.slot_id),
-    )?;
-    require(
-        proof_rows.len() == 1 && proof_rows[0].0 == proof_key,
-        format!("{role} compression membership proof roster differs"),
-    )?;
-    Ok(CompressionEvidence {
-        role: role.to_string(),
-        cx_id: cx_id.to_string(),
-        slot_id,
-        modality: modality.stable_str().to_string(),
-        stored_codec: "turboquant_bits3p5".to_string(),
-        manifest_key_hex: hex(&manifest_key),
-        manifest: value_identity(&manifest),
-        primary_key_hex: hex(&primary_key),
-        primary: value_identity(&primary_rows[0].1),
-        membership_key_hex: hex(&proof_key),
-        membership_proof: value_identity(&proof_rows[0].1),
-        generation_identity: serde_json::to_value(index.generation_identity_at(snapshot)?)?,
-        resolved,
-        raw_sidecar: raw_sidecar.clone(),
-        serving_selected_column_families: serving_selected_cf_names(),
-        raw_sidecar_selected_for_serving: false,
-    })
-}
-
-fn resolved_vector_evidence<C: calyx_core::Clock>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-    role: &str,
-    cx_id: CxId,
-    slot_id: u16,
-    source_vector: &[f32],
-    resolved: SlotVector,
-) -> AnyResult<ResolvedVectorEvidence> {
-    let SlotVector::Dense { dim, data } = resolved else {
-        return Err(format!("{role} compressed resolver returned a non-dense vector").into());
-    };
-    require(
-        dim == MEDIA_DIM && data.len() == MEDIA_DIM as usize,
-        format!("{role} compressed resolver returned the wrong dimension"),
-    )?;
-    let expected_slot_hash = source_slot_hash(source_vector)?;
-    let base = BaseRecord::decode_for_key(
-        cx_id,
-        &required_row(vault, snapshot, ColumnFamily::Base, &base_key(cx_id), role)?,
-    )?;
-    require(
-        base.slot_hashes().get(&SlotId::new(slot_id)) == Some(&expected_slot_hash),
-        format!("{role} Base row does not bind the byte-exact source vector"),
-    )?;
-    let source_f32_bits = f32_bits(source_vector);
-    let resolved_f32_bits = f32_bits(&data);
-    let differing_coefficients = source_f32_bits
-        .iter()
-        .zip(&resolved_f32_bits)
-        .filter(|(left, right)| left != right)
-        .count();
-    Ok(ResolvedVectorEvidence {
-        role: role.to_string(),
-        cx_id: cx_id.to_string(),
-        slot_id,
-        dim,
-        source_f32_bits,
-        resolved_f32_bits,
-        source_slot_blake3: hex(&expected_slot_hash),
-        differing_coefficients,
-        representation: "manifest_authenticated_turboquant_primary".to_string(),
-    })
 }
 
 fn graph_evidence<C: calyx_core::Clock>(
@@ -1896,21 +1812,6 @@ fn adapter_output_evidence(vault_dir: &Path) -> AnyResult<Vec<FileReadback>> {
     Ok(outputs)
 }
 
-fn exact_raw<'a>(raw: &'a [RawSidecarEvidence], role: &str) -> AnyResult<&'a RawSidecarEvidence> {
-    let matching = raw
-        .iter()
-        .filter(|row| row.role == role)
-        .collect::<Vec<_>>();
-    require(
-        matching.len() == 1,
-        format!(
-            "raw-sidecar evidence has {} rows for {role}",
-            matching.len()
-        ),
-    )?;
-    Ok(matching[0])
-}
-
 fn slot_hash_evidence(hashes: &BTreeMap<SlotId, [u8; 32]>) -> BTreeMap<u16, String> {
     hashes
         .iter()
@@ -1918,19 +1819,47 @@ fn slot_hash_evidence(hashes: &BTreeMap<SlotId, [u8; 32]>) -> BTreeMap<u16, Stri
         .collect()
 }
 
-fn source_slot_hash(values: &[f32]) -> AnyResult<[u8; 32]> {
-    let bytes = encode::encode_slot_vector(&SlotVector::Dense {
-        dim: MEDIA_DIM,
-        data: values.to_vec(),
-    })?;
-    Ok(*blake3::hash(&bytes).as_bytes())
+/// The exact sealed slot-hash roster the shipping ingest persists for one Cx of
+/// this fixture: the applicable slot binds its dense source vector, and the
+/// other slot of the shared panel binds the cross-modality
+/// `Absent { NotApplicable }` placeholder the ingest measured for it.
+fn expected_base_slot_hashes(
+    applicable_slot: u16,
+    source_vector: &[f32],
+) -> AnyResult<BTreeMap<SlotId, [u8; 32]>> {
+    let inapplicable_slot = match applicable_slot {
+        TEXT_SLOT => IMAGE_SLOT,
+        IMAGE_SLOT => TEXT_SLOT,
+        other => return Err(format!("unknown media fixture slot {other}").into()),
+    };
+    Ok(BTreeMap::from([
+        (
+            SlotId::new(applicable_slot),
+            source_slot_hash(source_vector)?,
+        ),
+        (SlotId::new(inapplicable_slot), not_applicable_slot_hash()?),
+    ]))
 }
 
-fn f32_bits(values: &[f32]) -> Vec<String> {
-    values
-        .iter()
-        .map(|value| format!("{:08x}", value.to_bits()))
-        .collect()
+fn dense_slot_encoding(values: &[f32]) -> AnyResult<Vec<u8>> {
+    Ok(encode::encode_slot_vector(&SlotVector::Dense {
+        dim: MEDIA_DIM,
+        data: values.to_vec(),
+    })?)
+}
+
+fn not_applicable_slot_encoding() -> AnyResult<Vec<u8>> {
+    Ok(encode::encode_slot_vector(&SlotVector::Absent {
+        reason: AbsentReason::NotApplicable,
+    })?)
+}
+
+fn source_slot_hash(values: &[f32]) -> AnyResult<[u8; 32]> {
+    Ok(*blake3::hash(&dense_slot_encoding(values)?).as_bytes())
+}
+
+fn not_applicable_slot_hash() -> AnyResult<[u8; 32]> {
+    Ok(*blake3::hash(&not_applicable_slot_encoding()?).as_bytes())
 }
 
 fn cx_id_from_key(key: &[u8]) -> AnyResult<CxId> {
