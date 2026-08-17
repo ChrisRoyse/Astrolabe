@@ -139,7 +139,8 @@ impl CfRouter {
                 }
             }
             report.candidate_sst_files += candidate_paths.len();
-            let current = self.levels.get(cf).cloned().unwrap_or_default();
+            let empty_level = SstLevel::new();
+            let current = self.levels.get(cf).unwrap_or(&empty_level);
             candidate_levels.insert(
                 *cf,
                 current.reconcile_oldest_first_with_lookup(candidate_paths, &refresh)?,

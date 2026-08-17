@@ -12,6 +12,11 @@
 //! `production` consumes the real read-only C-code-poly node-vector database.
 //! `prepare_mcp` produces a real uncompressed two-candidate shadow vault and
 //! `_config.db`; `readback_mcp` independently inspects it after an MCP call.
+//! `point_read_cost` builds two exact C-code-poly prefixes beside the preserved
+//! full production generation and measures the real authenticated point path at
+//! invariant D/codec/lens/query/backend. `point_read_cost_readback` repeats the
+//! deterministic observations in a fresh process while treating latency as
+//! non-invariant.
 //!
 //! Source of truth: the reopened Aster primary/raw/Compression/Ledger column
 //! families, immutable manifest and membership-proof rows, physical Ledger
@@ -47,6 +52,9 @@
 //! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issues-557-564\<run-id>
 //! ASTROLABE_COMPRESSION_FSV_MODE=readback_mcp
 //! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issues-557-564\<run-id>
+//! ASTROLABE_COMPRESSION_FSV_MODE=point_read_cost
+//! ASTROLABE_COMPRESSION_FSV_POINT_COST_PRODUCTION_VAULT=<preserved-r14-production-vault>
+//! ASTROLABE_COMPRESSION_FSV_MODE=point_read_cost_readback
 //! ```
 
 use std::collections::BTreeMap;
@@ -92,6 +100,9 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+#[path = "compression_admission_fsv/point_read_cost.rs"]
+mod point_read_cost;
 
 const DIM: u32 = 32;
 const ROWS: usize = 8;
@@ -261,7 +272,7 @@ fn run() -> AnyResult<()> {
     let root = issue_root(&workspace)?;
     let mode = std::env::var(MODE_ENV).map_err(|_| {
         format!(
-            "{MODE_ENV} must be exactly `exercise`, `readback`, `production`, `prepare_mcp`, or `readback_mcp`"
+            "{MODE_ENV} must be exactly `exercise`, `readback`, `production`, `prepare_mcp`, `readback_mcp`, `point_read_cost`, or `point_read_cost_readback`"
         )
     })?;
     println!(
@@ -291,8 +302,10 @@ fn run() -> AnyResult<()> {
         "production" => production(&root),
         "prepare_mcp" => prepare_mcp(&root),
         "readback_mcp" => readback_mcp(&root),
+        "point_read_cost" => point_read_cost::exercise(&root),
+        "point_read_cost_readback" => point_read_cost::readback(&root),
         other => Err(format!(
-            "{MODE_ENV}={other:?}; expected `exercise`, `readback`, `production`, `prepare_mcp`, or `readback_mcp`"
+            "{MODE_ENV}={other:?}; expected `exercise`, `readback`, `production`, `prepare_mcp`, `readback_mcp`, `point_read_cost`, or `point_read_cost_readback`"
         )
         .into()),
     }

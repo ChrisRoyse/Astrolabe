@@ -164,6 +164,14 @@ pub struct OrderedReadbackMetrics {
     /// Avoided reopen/remap operations: probes after the first on each retained
     /// immutable generation.
     pub sst_map_reuses: u64,
+    /// Exact-key lookups performed against the retained per-level SST route
+    /// index. This count is independent of the number of physical SST files.
+    pub sst_exact_route_lookups: u64,
+    /// Exact-key route lookups that selected a newest immutable generation.
+    pub sst_exact_route_hits: u64,
+    /// File/key metadata checks performed only by an unindexed compatibility
+    /// level. A fully indexed selected-CF handle reports zero.
+    pub sst_fallback_file_key_checks: u64,
     /// Peak transient ordinal/CF/key-reference index bytes retained at once
     /// while ordering and resolving the plan.
     pub plan_index_bytes: u64,
@@ -179,6 +187,12 @@ impl OrderedReadbackMetrics {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "ordered readback reported {} SST opens for {} unique generations",
                 other.sst_files_opened, other.unique_sst_generations
+            )));
+        }
+        if other.sst_exact_route_hits > other.sst_exact_route_lookups {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "ordered readback reported {} SST exact-route hits for {} lookups",
+                other.sst_exact_route_hits, other.sst_exact_route_lookups
             )));
         }
         if self.read_batches != 0
@@ -223,6 +237,21 @@ impl OrderedReadbackMetrics {
             checked_metric_add(self.sst_key_probes, other.sst_key_probes, "sst_key_probes")?;
         self.sst_map_reuses =
             checked_metric_add(self.sst_map_reuses, other.sst_map_reuses, "sst_map_reuses")?;
+        self.sst_exact_route_lookups = checked_metric_add(
+            self.sst_exact_route_lookups,
+            other.sst_exact_route_lookups,
+            "sst_exact_route_lookups",
+        )?;
+        self.sst_exact_route_hits = checked_metric_add(
+            self.sst_exact_route_hits,
+            other.sst_exact_route_hits,
+            "sst_exact_route_hits",
+        )?;
+        self.sst_fallback_file_key_checks = checked_metric_add(
+            self.sst_fallback_file_key_checks,
+            other.sst_fallback_file_key_checks,
+            "sst_fallback_file_key_checks",
+        )?;
         self.plan_index_bytes = self.plan_index_bytes.max(other.plan_index_bytes);
         self.max_readback_batch_bytes = self
             .max_readback_batch_bytes

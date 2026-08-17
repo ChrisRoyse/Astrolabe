@@ -47,6 +47,9 @@ pub(crate) struct RouterPlanReadMetrics {
     pub sst_files_opened: u64,
     pub sst_key_probes: u64,
     pub sst_map_reuses: u64,
+    pub sst_exact_route_lookups: u64,
+    pub sst_exact_route_hits: u64,
+    pub sst_fallback_file_key_checks: u64,
     pub max_value_bytes: u64,
     pub plan_index_bytes: u64,
 }
@@ -527,12 +530,9 @@ impl CfRouter {
                 }
             }
         }
-        let level_metrics = self
-            .levels
-            .get(&cf)
-            .cloned()
-            .unwrap_or_default()
-            .visit_key_plan(keys, &mut resolved, on_value)?;
+        let empty_level = SstLevel::new();
+        let level = self.levels.get(&cf).unwrap_or(&empty_level);
+        let level_metrics = level.visit_key_plan(keys, &mut resolved, on_value)?;
         merge_sst_plan_metrics(&mut metrics, level_metrics)?;
         for (position, (ordinal, _)) in keys.iter().enumerate() {
             if let Some(value) = memtable_values[position].as_deref() {
@@ -585,10 +585,10 @@ impl CfRouter {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let empty_level = SstLevel::new();
         self.levels
             .get(&cf)
-            .cloned()
-            .unwrap_or_default()
+            .unwrap_or(&empty_level)
             .range_page_with_overlay(start, end, after_key, limit, overlay)
     }
 
@@ -780,6 +780,30 @@ where
         .ok_or_else(|| {
             E::from(CalyxError::aster_corrupt_shard(
                 "router ordered-readback SST map-reuse counter overflow",
+            ))
+        })?;
+    metrics.sst_exact_route_lookups = metrics
+        .sst_exact_route_lookups
+        .checked_add(sst.exact_route_lookups)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback SST exact-route lookup counter overflow",
+            ))
+        })?;
+    metrics.sst_exact_route_hits = metrics
+        .sst_exact_route_hits
+        .checked_add(sst.exact_route_hits)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback SST exact-route hit counter overflow",
+            ))
+        })?;
+    metrics.sst_fallback_file_key_checks = metrics
+        .sst_fallback_file_key_checks
+        .checked_add(sst.fallback_file_key_checks)
+        .ok_or_else(|| {
+            E::from(CalyxError::aster_corrupt_shard(
+                "router ordered-readback SST fallback file-key check counter overflow",
             ))
         })?;
     metrics.max_value_bytes = metrics.max_value_bytes.max(sst.max_value_bytes);

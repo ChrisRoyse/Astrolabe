@@ -387,6 +387,9 @@ impl VersionedCfStore {
         metrics.unique_sst_generations = router_metrics.sst_files_opened;
         metrics.sst_key_probes = router_metrics.sst_key_probes;
         metrics.sst_map_reuses = router_metrics.sst_map_reuses;
+        metrics.sst_exact_route_lookups = router_metrics.sst_exact_route_lookups;
+        metrics.sst_exact_route_hits = router_metrics.sst_exact_route_hits;
+        metrics.sst_fallback_file_key_checks = router_metrics.sst_fallback_file_key_checks;
         metrics.plan_index_bytes = metrics
             .plan_index_bytes
             .checked_add(router_metrics.plan_index_bytes)
