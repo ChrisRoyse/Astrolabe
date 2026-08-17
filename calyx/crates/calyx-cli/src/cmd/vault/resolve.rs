@@ -90,7 +90,7 @@ fn resolve_direct_indexed(
 ) -> CliResult<Option<ResolvedVault>> {
     let direct = direct.canonicalize()?;
     for entry in &index.vaults {
-        let path = home.join(&entry.path);
+        let path = entry_path(home, entry);
         if path.exists() && path.canonicalize()? == direct {
             return Ok(Some(resolve_entry(home, entry)));
         }
@@ -100,8 +100,23 @@ fn resolve_direct_indexed(
 
 fn resolve_entry(home: &Path, entry: &VaultIndexEntry) -> ResolvedVault {
     ResolvedVault {
-        path: home.join(&entry.path),
+        path: entry_path(home, entry),
         name: entry.name.clone(),
         vault_id: entry.vault_id,
     }
+}
+
+/// Join a catalog entry's `/`-separated relative path onto `home` component-wise.
+///
+/// `Path::join` inserts the platform separator but copies the argument verbatim, so joining
+/// the raw catalog string would yield `home\vaults/<id>` on Windows. That spelling is accepted
+/// by the OS but is persisted (`status.json` `vault_path`) and string-compared by other
+/// components, and it disagrees with the id branch of `resolve_vault_info`, which already
+/// builds the same location component-wise.
+fn entry_path(home: &Path, entry: &VaultIndexEntry) -> PathBuf {
+    let mut path = home.to_path_buf();
+    for component in entry.path.split('/').filter(|part| !part.is_empty()) {
+        path.push(component);
+    }
+    path
 }

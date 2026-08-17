@@ -4550,8 +4550,7 @@ fn issue_root(workspace: &Path, mode: &str) -> AnyResult<PathBuf> {
 fn disk_inventory(root: &Path) -> AnyResult<Vec<FileReadback>> {
     let mut paths = Vec::new();
     collect_files(root, root, &mut paths)?;
-    paths.sort();
-    paths
+    let mut inventory = paths
         .into_iter()
         .map(|path| {
             let metadata = fs::symlink_metadata(&path)?;
@@ -4569,7 +4568,13 @@ fn disk_inventory(root: &Path) -> AnyResult<Vec<FileReadback>> {
                 sha256: sha256_file(&path)?,
             })
         })
-        .collect()
+        .collect::<AnyResult<Vec<_>>>()?;
+    // Order on the emitted `/`-joined string, not on PathBuf: `Ord for Path` compares
+    // component-wise, so `cf/slot_81` precedes `cf/slot_81.raw`, while every consumer of
+    // this inventory orders the flattened form, where '.' (0x2E) precedes '/' (0x2F).
+    // `directory_inventory` already sorts the flattened form.
+    inventory.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(inventory)
 }
 
 fn collect_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> AnyResult<()> {

@@ -352,7 +352,15 @@ pub(super) fn validate_session_id(value: &str) -> CliResult<()> {
 }
 
 fn session_dir(vault_path: &Path, session_id: &str) -> PathBuf {
-    vault_path.join(SESSION_ROOT).join(session_id)
+    // Push each `SESSION_ROOT` component separately: `Path::join` copies its argument
+    // verbatim, so joining the `/`-separated constant would embed forward slashes in a
+    // Windows path that is persisted as `status_path` and string-compared downstream.
+    let mut path = vault_path.to_path_buf();
+    for component in SESSION_ROOT.split('/') {
+        path.push(component);
+    }
+    path.push(session_id);
+    path
 }
 
 fn generated_session_id() -> CliResult<String> {
