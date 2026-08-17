@@ -406,11 +406,11 @@ pub(super) fn prepare(root: &Path) -> AnyResult<()> {
     let queries = vec![
         CompressionQuery {
             cx_id: vault.cx_id_for_input(b"issue-1138-held-out-text", PANEL_VERSION),
-            values: fixture_vector(TEXT_ROLE),
+            values: fixture_query_vector(TEXT_ROLE),
         },
         CompressionQuery {
             cx_id: vault.cx_id_for_input(b"issue-1138-held-out-batch", PANEL_VERSION),
-            values: fixture_vector(BATCH_ROLE),
+            values: fixture_query_vector(BATCH_ROLE),
         },
     ];
     let work = exact_work_plan(
@@ -870,6 +870,28 @@ fn fixture_vector(role: &str) -> Vec<f32> {
                 -(centered / 7.0 + index as f32 * 0.003_125)
             }
             _ => unreachable!("fixed fixture role"),
+        })
+        .collect()
+}
+
+/// Held-out recall queries for the TQ3.5 admission of `TQ35_SLOT`.
+///
+/// These deliberately are not the stored row vectors. `calyx-registry` recall
+/// admission refuses a query that lies on the same positive ray as any stored
+/// row (`CALYX_VECTOR_COMPRESSION_INVALID`), because a query collinear with a
+/// corpus row cannot measure whether compression changed top-k membership.
+/// Each query rotates its role's direction by an independent deterministic
+/// modular generator (13/31) that is not proportional to the stored 17/29 row
+/// generator, so no query is a positive scalar multiple of either stored row or
+/// of the other query, while the intended row still wins its exact and packed
+/// top-1 by a wide cosine margin.
+fn fixture_query_vector(role: &str) -> Vec<f32> {
+    fixture_vector(role)
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let tilt = ((index * 13 + 5) % 31) as f32 - 15.0;
+            value + tilt / 14.0
         })
         .collect()
 }
