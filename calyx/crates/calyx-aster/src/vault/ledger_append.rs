@@ -12,6 +12,10 @@ where
     C: Clock,
 {
     /// Adds an anchor and stamps the stored base row with the same ledger ref.
+    ///
+    /// Grounding does not consume slot vectors. The read-modify-write therefore
+    /// uses the lossless Base record directly, preserving its sealed slot hashes
+    /// without opening, decoding, or substituting any slot representation.
     pub fn anchor_with_ledger_entry(
         &self,
         id: CxId,
@@ -30,11 +34,16 @@ where
         anchor.validate_schema()?;
         self.with_durable_commit_lock(|| {
             let latest = self.snapshot();
-            let mut constellation = self.get(id, latest)?;
-            constellation.anchors.push(anchor.clone());
-            constellation.flags.ungrounded = constellation.anchors.is_empty();
+            let base = self
+                .read_cf_at(latest, ColumnFamily::Base, &base_key(id))?
+                .ok_or_else(|| CalyxError::stale_derived("constellation missing at snapshot"))?;
+            let mut record = encode::BaseRecord::decode_for_key(id, &base)?;
+            record.anchors_mut().push(anchor.clone());
+            let ungrounded = record.constellation().anchors.is_empty();
+            record.flags_mut().ungrounded = ungrounded;
+            record.constellation().validate_schema()?;
             let Some(hook) = &self.ledger_hook else {
-                return self.anchor_with_raw_ledger_entry(id, &mut constellation, anchor, entry);
+                return self.anchor_with_raw_ledger_entry(id, &mut record, anchor, entry);
             };
             let mut guard = ledger_hook::lock_hook(hook)?;
             let staged = guard.stage_with_checkpoints(
@@ -47,8 +56,8 @@ where
                 .first()
                 .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
                 .ledger_ref();
-            constellation.provenance = ledger_ref.clone();
-            let mut rows = anchor_rows(id, &constellation, &anchor)?;
+            record.set_provenance(ledger_ref.clone());
+            let mut rows = anchor_rows(id, &record, &anchor)?;
             rows.extend(staged.iter().map(|row| encode::WriteRow {
                 cf: ColumnFamily::Ledger,
                 key: row.key().to_vec(),
@@ -296,14 +305,14 @@ where
     fn anchor_with_raw_ledger_entry(
         &self,
         id: CxId,
-        constellation: &mut calyx_core::Constellation,
+        record: &mut encode::BaseRecord,
         anchor: Anchor,
         entry: LedgerEntryInput,
     ) -> Result<LedgerRef> {
         let (ledger_row, ledger_ref) =
             self.raw_prepared_ledger_row(entry.kind, entry.subject, entry.payload, entry.actor)?;
-        constellation.provenance = ledger_ref.clone();
-        let mut rows = anchor_rows(id, constellation, &anchor)?;
+        record.set_provenance(ledger_ref.clone());
+        let mut rows = anchor_rows(id, record, &anchor)?;
         rows.push(ledger_row);
         self.commit_rows_locked(&rows)?;
         Ok(ledger_ref)
@@ -444,14 +453,14 @@ fn sequence_conflict_error(expected: calyx_core::Seq, current: calyx_core::Seq) 
 
 fn anchor_rows(
     id: CxId,
-    constellation: &calyx_core::Constellation,
+    record: &encode::BaseRecord,
     anchor: &Anchor,
 ) -> Result<Vec<encode::WriteRow>> {
     Ok(vec![
         encode::WriteRow {
             cf: ColumnFamily::Base,
             key: base_key(id),
-            value: encode::encode_constellation_base(constellation)?,
+            value: record.encode()?,
         },
         encode::WriteRow {
             cf: ColumnFamily::Anchors,

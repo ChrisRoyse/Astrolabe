@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{AsterVault, encode, ledger_hook};
 use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
@@ -25,7 +25,8 @@ where
     /// This is for one semantic grounding event that has more than one anchor axis. The batch is
     /// idempotent only when every requested anchor already exists and the Base provenance points to
     /// the same requested ledger entry. A partial pre-existing batch fails closed so a legacy
-    /// unstamped anchor is never silently upgraded.
+    /// unstamped anchor is never silently upgraded. Slot vectors are not grounding inputs, so the
+    /// mutation preserves the lossless Base record's sealed slot hashes without hydrating slots.
     pub fn anchors_with_ledger_entry(
         &self,
         id: CxId,
@@ -44,11 +45,21 @@ where
         };
         self.with_durable_commit_lock(|| {
             let latest = self.snapshot();
-            let mut constellation = self.get(id, latest)?;
+            let base = self
+                .read_cf_at(latest, ColumnFamily::Base, &base_key(id))?
+                .ok_or_else(|| CalyxError::stale_derived("constellation missing at snapshot"))?;
+            let mut record = encode::BaseRecord::decode_for_key(id, &base)?;
+            let mut existing_anchors = BTreeMap::<_, Vec<_>>::new();
+            for anchor in &record.constellation().anchors {
+                existing_anchors
+                    .entry(anchor.kind.clone())
+                    .or_default()
+                    .push(anchor);
+            }
             let mut missing = Vec::new();
             let mut existing_count = 0usize;
             for anchor in &anchors {
-                match classify_anchor_state(self, latest, id, &constellation, anchor)? {
+                match classify_anchor_state(self, latest, id, &existing_anchors, anchor)? {
                     AnchorState::Existing => existing_count += 1,
                     AnchorState::Missing => missing.push(anchor.clone()),
                 }
@@ -58,10 +69,10 @@ where
                     self,
                     latest,
                     id,
-                    &constellation.provenance,
+                    &record.constellation().provenance,
                     &entry,
                 )?;
-                return Ok(constellation.provenance.clone());
+                return Ok(record.constellation().provenance.clone());
             }
             if existing_count != 0 {
                 return Err(CalyxError::aster_corrupt_shard(format!(
@@ -77,12 +88,8 @@ where
                 let prepared =
                     appender.prepare(entry.kind, entry.subject, entry.payload, entry.actor)?;
                 let ledger_ref = prepared.ledger_ref();
-                let mut rows = anchor_batch_rows_with_ledger_ref(
-                    id,
-                    &mut constellation,
-                    &missing,
-                    &ledger_ref,
-                )?;
+                let mut rows =
+                    anchor_batch_rows_with_ledger_ref(id, &mut record, &missing, &ledger_ref)?;
                 rows.push(encode::WriteRow {
                     cf: ColumnFamily::Ledger,
                     key: ledger_key(prepared.seq()),
@@ -104,7 +111,7 @@ where
                 .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
                 .ledger_ref();
             let mut rows =
-                anchor_batch_rows_with_ledger_ref(id, &mut constellation, &missing, &ledger_ref)?;
+                anchor_batch_rows_with_ledger_ref(id, &mut record, &missing, &ledger_ref)?;
             rows.extend(staged.iter().map(|row| encode::WriteRow {
                 cf: ColumnFamily::Ledger,
                 key: row.key().to_vec(),
@@ -128,20 +135,19 @@ fn classify_anchor_state<C: Clock>(
     vault: &AsterVault<C>,
     snapshot: u64,
     id: CxId,
-    constellation: &calyx_core::Constellation,
+    existing_anchors: &BTreeMap<calyx_core::AnchorKind, Vec<&Anchor>>,
     anchor: &Anchor,
 ) -> Result<AnchorState> {
     let key = anchor_key(id, &anchor.kind);
     let anchor_bytes = encode::encode_anchor(anchor)?;
-    let matching_base_anchor_count = constellation
-        .anchors
+    let matching = existing_anchors
+        .get(&anchor.kind)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let matching_base_anchor_count = matching.len();
+    let exact_base_anchor_count = matching
         .iter()
-        .filter(|existing| existing.kind == anchor.kind)
-        .count();
-    let exact_base_anchor_count = constellation
-        .anchors
-        .iter()
-        .filter(|existing| *existing == anchor)
+        .filter(|existing| **existing == anchor)
         .count();
     match vault.read_cf_at(snapshot, ColumnFamily::Anchors, &key)? {
         Some(existing_bytes) => {
@@ -209,19 +215,19 @@ fn validate_existing_batch_ledger<C: Clock>(
 
 fn anchor_batch_rows_with_ledger_ref(
     id: CxId,
-    constellation: &mut calyx_core::Constellation,
+    record: &mut encode::BaseRecord,
     anchors: &[Anchor],
     ledger_ref: &LedgerRef,
 ) -> Result<Vec<encode::WriteRow>> {
-    constellation.provenance = ledger_ref.clone();
-    constellation.anchors.extend_from_slice(anchors);
-    constellation.flags.ungrounded = false;
-    constellation.validate_schema()?;
+    record.set_provenance(ledger_ref.clone());
+    record.anchors_mut().extend_from_slice(anchors);
+    record.flags_mut().ungrounded = false;
+    record.constellation().validate_schema()?;
     let mut rows = Vec::with_capacity(1 + anchors.len());
     rows.push(encode::WriteRow {
         cf: ColumnFamily::Base,
         key: base_key(id),
-        value: encode::encode_constellation_base(constellation)?,
+        value: record.encode()?,
     });
     for anchor in anchors {
         rows.push(encode::WriteRow {
