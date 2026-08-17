@@ -12,8 +12,8 @@ use calyx_core::{Anchor, AnchorKind, AnchorValue, FixedClock, LedgerRef, SlotVec
 use calyx_ledger::{ActorId, LedgerEntry, SubjectId, decode as decode_ledger_entry};
 use serde::{Deserialize, Serialize};
 
-const BASELINE_SCHEMA: &str = "astrolabe.base-record-replay-baseline.v1";
-const READBACK_SCHEMA: &str = "astrolabe.base-record-replay-readback.v1";
+const BASELINE_SCHEMA: &str = "astrolabe.base-record-replay-baseline.v2";
+const READBACK_SCHEMA: &str = "astrolabe.base-record-replay-readback.v2";
 const FIXTURE_DATE: &str = "2026-08-17";
 const FIXTURE_N: usize = 2;
 const FIXED_CLOCK_MS: u64 = 1_787_000_000_000;
@@ -32,6 +32,12 @@ const TEXT_FILE: &str = "base-record-text.txt";
 const BATCH_NO_ANCHOR_FILE: &str = "base-record-batch-no-anchor.jsonl";
 const BATCH_ANCHOR_FILE: &str = "base-record-batch.jsonl";
 const BATCH_MISMATCH_FILE: &str = "base-record-batch-mismatch.jsonl";
+const IDENTITY_CLONES_DIR: &str = "identity-clones";
+const INPUT_REF_CLONE: &str = "input-ref";
+const PANEL_VERSION_CLONE: &str = "panel-version";
+const INPUT_REF_MISMATCH_SESSION: &str = "issue1138-input-ref-mismatch";
+const PANEL_VERSION_MISMATCH_SESSION: &str = "issue1138-panel-version-mismatch";
+const FOREIGN_INPUT_POINTER: &str = "issue1138:mismatch:foreign";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ValueIdentity {
@@ -178,6 +184,79 @@ struct CliRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CfRowsEvidence {
+    rows: usize,
+    rows_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PhysicalControlEvidence {
+    current: ValueIdentity,
+    manifest: ValueIdentity,
+    pointed_manifest_relative_path: String,
+    pointed_manifest: ValueIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IdentityCloneDurableState {
+    snapshot: Seq,
+    base: CfRowsEvidence,
+    anchors: CfRowsEvidence,
+    ledger: LedgerEvidence,
+    compression_cf: CfRowsEvidence,
+    slot_primary: CfRowsEvidence,
+    slot_raw: CfRowsEvidence,
+    time_index: CfRowsEvidence,
+    compression: CompressionEvidence,
+    wal: WalEvidence,
+    physical_controls: PhysicalControlEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IdentityCloneBaseline {
+    axis: String,
+    calyx_home: String,
+    vault_dir: String,
+    same_key_cx_id: String,
+    session_id: String,
+    expected_mismatch_reason: String,
+    cli_role: CliRole,
+    copied_source_file_count: usize,
+    copied_source_bytes: u64,
+    copied_source_files_sha256: String,
+    copied_source_directory_count: usize,
+    copied_source_directories_sha256: String,
+    seed_commit_seq: Seq,
+    seed_ledger: LedgerIdentity,
+    seed_wal_record: WalRecordEvidence,
+    stored_base: BaseEvidence,
+    state: IdentityCloneDurableState,
+    vault_files: Vec<FileReadback>,
+    vault_directories: Vec<String>,
+    home_files: Vec<FileReadback>,
+    home_directories: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IdentityCloneReadback {
+    axis: String,
+    session_id: String,
+    status_path: String,
+    status: Value,
+    state: IdentityCloneDurableState,
+    only_status_file_and_required_directories_added: bool,
+    read_only_audit_changed_no_file: bool,
+    vault_files_before_readback: Vec<FileReadback>,
+    vault_files_after_readback: Vec<FileReadback>,
+    vault_directories_before_readback: Vec<String>,
+    vault_directories_after_readback: Vec<String>,
+    home_files_before_readback: Vec<FileReadback>,
+    home_files_after_readback: Vec<FileReadback>,
+    home_directories_before_readback: Vec<String>,
+    home_directories_after_readback: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct BaselineReport {
     schema: String,
     fixture_date: String,
@@ -202,6 +281,7 @@ struct BaselineReport {
     expected_anchor_key_hex: String,
     expected_anchor_without_observed_at: Value,
     cli_roles: Vec<CliRole>,
+    identity_clones: BTreeMap<String, IdentityCloneBaseline>,
     legacy_rewrite_ledger: LedgerIdentity,
     base: Vec<BaseEvidence>,
     compression: CompressionEvidence,
@@ -238,6 +318,7 @@ struct ReadbackReport {
     ledger: LedgerEvidence,
     ledger_suffix: Vec<LedgerSuffixEvidence>,
     batch_sessions: BTreeMap<String, Value>,
+    identity_clones: BTreeMap<String, IdentityCloneReadback>,
     wal: WalEvidence,
     wal_suffix: Vec<WalRecordEvidence>,
     selected_column_families: Vec<String>,
@@ -250,6 +331,7 @@ struct ReadbackReport {
     ledger_prefix_byte_identical: bool,
     exact_five_commit_suffix: bool,
     mismatch_added_no_commit: bool,
+    identity_mismatch_clones_added_no_commit: bool,
     disk_unchanged_during_readback: bool,
     vault_files_before: Vec<FileReadback>,
     vault_files_after: Vec<FileReadback>,
@@ -366,6 +448,7 @@ pub(super) fn prepare(root: &Path) -> AnyResult<()> {
     write_json_durable(&catalog_path, &catalog)?;
 
     let input_paths = write_replay_inputs(root, &metadata)?;
+    let identity_clones = prepare_identity_clones(root, &home, &panel, batch_cx_id)?;
     let read_vault = open_replay_read_vault(&vault_dir)?;
     let snapshot = read_vault.latest_seq();
     let loaded = load_vault_panel_state(&vault_dir)?;
@@ -421,7 +504,8 @@ pub(super) fn prepare(root: &Path) -> AnyResult<()> {
         schema: BASELINE_SCHEMA.to_string(),
         fixture_date: FIXTURE_DATE.to_string(),
         fixture_n: FIXTURE_N,
-        cost_claim: "fixed N=2 manual fixture; no production performance claim".to_string(),
+        cost_claim: "fixed N=2 manual fixture plus two one-time FSV-only full-home byte copies outside production loops whose exact files/bytes/directories are inventoried; no production performance claim"
+            .to_string(),
         fixture_root: root.display().to_string(),
         calyx_home: home.display().to_string(),
         vault_dir: vault_dir.display().to_string(),
@@ -441,6 +525,7 @@ pub(super) fn prepare(root: &Path) -> AnyResult<()> {
         expected_anchor_key_hex: hex(&anchor_key(batch_cx_id, &expected_anchor.kind)),
         expected_anchor_without_observed_at: anchor_without_time_json(&expected_anchor),
         cli_roles: cli_roles(root),
+        identity_clones,
         legacy_rewrite_ledger: ledger_identity(&legacy_rewrite_ledger),
         base,
         compression,
@@ -471,6 +556,7 @@ pub(super) fn prepare(root: &Path) -> AnyResult<()> {
             "batch_cx_id": batch_cx_id,
             "input_paths": report.inputs,
             "cli_roles": report.cli_roles,
+            "identity_clones": report.identity_clones,
             "baseline_path": baseline_path,
             "baseline_sha256": baseline_sha256,
             "next_required_mode": "base_record_replay_readback",
@@ -633,7 +719,23 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
         text_cx_id,
         batch_cx_id,
     )?;
-    let batch_sessions = validate_batch_sessions(&vault_dir, &baseline)?;
+    let mut batch_sessions = validate_batch_sessions(&vault_dir, &baseline)?;
+    let identity_clones = validate_identity_clone_readbacks(&baseline)?;
+    for clone in identity_clones.values() {
+        require(
+            batch_sessions
+                .insert(clone.session_id.clone(), clone.status.clone())
+                .is_none(),
+            format!(
+                "identity-clone session {} duplicates a canonical session",
+                clone.session_id
+            ),
+        )?;
+    }
+    require(
+        batch_sessions.len() == 6,
+        "base-record replay readback did not collect exactly six batch session records",
+    )?;
 
     let wal = wal_evidence(&vault_dir, 0)?;
     require(
@@ -698,6 +800,7 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
         ledger,
         ledger_suffix,
         batch_sessions,
+        identity_clones,
         wal,
         wal_suffix,
         selected_column_families: serving_selected_cf_names(),
@@ -710,6 +813,7 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
         ledger_prefix_byte_identical: true,
         exact_five_commit_suffix: true,
         mismatch_added_no_commit: true,
+        identity_mismatch_clones_added_no_commit: true,
         disk_unchanged_during_readback: true,
         vault_files_before: files_before,
         vault_files_after: files_after,
@@ -742,7 +846,8 @@ pub(super) fn readback(root: &Path) -> AnyResult<()> {
             "text_base_byte_identical": true,
             "batch_slot_hashes_and_non_anchor_identity_unchanged": true,
             "exactly_one_label_test_anchor": true,
-            "repeat_and_mismatch_added_no_base_or_anchor_write": true,
+            "repeat_and_three_mismatches_added_no_base_or_anchor_write": true,
+            "identity_mismatch_clones_added_no_commit": true,
             "compressed_serving_vectors_verified_without_raw_sidecar": true,
         })
     );
@@ -861,6 +966,633 @@ fn rewrite_empty_metadata_row_as_legacy(
     Ok(ledger_ref)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityMismatchAxis {
+    InputRef,
+    PanelVersion,
+}
+
+impl IdentityMismatchAxis {
+    fn key(self) -> &'static str {
+        match self {
+            Self::InputRef => "input_ref",
+            Self::PanelVersion => "panel_version",
+        }
+    }
+
+    fn directory(self) -> &'static str {
+        match self {
+            Self::InputRef => INPUT_REF_CLONE,
+            Self::PanelVersion => PANEL_VERSION_CLONE,
+        }
+    }
+
+    fn session_id(self) -> &'static str {
+        match self {
+            Self::InputRef => INPUT_REF_MISMATCH_SESSION,
+            Self::PanelVersion => PANEL_VERSION_MISMATCH_SESSION,
+        }
+    }
+
+    fn expected_reason(self) -> String {
+        match self {
+            Self::InputRef => "input_ref fields=pointer".to_string(),
+            Self::PanelVersion => format!(
+                "panel_version existing={} incoming={PANEL_VERSION}",
+                PANEL_VERSION + 1
+            ),
+        }
+    }
+
+    fn seed_clock_offset_ms(self) -> u64 {
+        match self {
+            Self::InputRef => 1,
+            Self::PanelVersion => 2,
+        }
+    }
+}
+
+fn prepare_identity_clones(
+    root: &Path,
+    source_home: &Path,
+    panel: &Panel,
+    batch_cx_id: CxId,
+) -> AnyResult<BTreeMap<String, IdentityCloneBaseline>> {
+    let source_files = disk_inventory(source_home)?;
+    let source_directories = directory_inventory(source_home)?;
+    require(
+        !source_files.is_empty(),
+        "identity-clone source home has no regular files",
+    )?;
+    let source_files_sha256 = sha256_hex(&serde_json::to_vec(&source_files)?);
+    let source_directories_sha256 = sha256_hex(&serde_json::to_vec(&source_directories)?);
+    let mut clones = BTreeMap::new();
+    for axis in [
+        IdentityMismatchAxis::InputRef,
+        IdentityMismatchAxis::PanelVersion,
+    ] {
+        let clone = prepare_identity_clone(
+            root,
+            source_home,
+            panel,
+            batch_cx_id,
+            axis,
+            &source_files,
+            &source_files_sha256,
+            &source_directories,
+            &source_directories_sha256,
+        )?;
+        require(
+            clones.insert(axis.key().to_string(), clone).is_none(),
+            format!("duplicate identity-clone axis {}", axis.key()),
+        )?;
+    }
+    Ok(clones)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_identity_clone(
+    root: &Path,
+    source_home: &Path,
+    panel: &Panel,
+    batch_cx_id: CxId,
+    axis: IdentityMismatchAxis,
+    source_files: &[FileReadback],
+    source_files_sha256: &str,
+    source_directories: &[String],
+    source_directories_sha256: &str,
+) -> AnyResult<IdentityCloneBaseline> {
+    let clone_home = identity_clone_home(root, axis);
+    copy_tree_exact(source_home, &clone_home)?;
+    let copied_files = disk_inventory(&clone_home)?;
+    let copied_directories = directory_inventory(&clone_home)?;
+    require(
+        copied_files.as_slice() == source_files
+            && copied_directories.as_slice() == source_directories,
+        format!(
+            "{} identity-clone home is not an exact file/directory copy of the closed compressed source home",
+            axis.key()
+        ),
+    )?;
+    let vault_dir = clone_home.join("vaults").join(VAULT_ID);
+    let before = identity_clone_durable_state(&vault_dir)?;
+    let vault_files_before_seed = disk_inventory(&vault_dir)?;
+    let vault = open_identity_clone_write_vault(&vault_dir, panel, axis)?;
+    require(
+        vault.latest_seq() == before.snapshot
+            && disk_inventory(&vault_dir)? == vault_files_before_seed,
+        format!(
+            "{} identity-clone writer open changed its snapshot or a vault file before the seed transaction",
+            axis.key()
+        ),
+    )?;
+    let source_bytes = required_row(
+        &vault,
+        before.snapshot,
+        ColumnFamily::Base,
+        &base_key(batch_cx_id),
+        "identity-clone source batch Base",
+    )?;
+    let source = BaseRecord::decode_for_key(batch_cx_id, &source_bytes)?;
+    let source_constellation = source.constellation().clone();
+    require(
+        source_constellation.panel_version == PANEL_VERSION
+            && source_constellation.input_ref.hash
+                == *blake3::hash(BATCH_INPUT.as_bytes()).as_bytes()
+            && source_constellation.input_ref.pointer.is_none()
+            && !source_constellation.input_ref.redacted
+            && source_constellation.metadata == batch_metadata(),
+        format!(
+            "{} identity-clone source Base does not have the fixed incoming batch identity",
+            axis.key()
+        ),
+    )?;
+
+    let mut mutated = source_constellation.clone();
+    let prior_slot = mutated.slots.insert(
+        SlotId::new(TQ35_SLOT),
+        SlotVector::Dense {
+            dim: DIM,
+            data: fixture_vector(BATCH_ROLE),
+        },
+    );
+    require(
+        mutated.slots.len() == 1
+            && matches!(prior_slot, Some(SlotVector::Absent { .. }))
+            && encode::encode_constellation_base(&mutated)? == source_bytes,
+        format!(
+            "{} identity-clone could not reconstruct the exact Base bytes from the known raw slot vector",
+            axis.key()
+        ),
+    )?;
+    match axis {
+        IdentityMismatchAxis::InputRef => {
+            mutated.input_ref.pointer = Some(FOREIGN_INPUT_POINTER.to_string());
+        }
+        IdentityMismatchAxis::PanelVersion => {
+            mutated.panel_version = PANEL_VERSION + 1;
+        }
+    }
+    let mutated_bytes = encode::encode_constellation_base(&mutated)?;
+    let mutated_record = BaseRecord::decode_for_key(batch_cx_id, &mutated_bytes)?;
+    require(
+        mutated_bytes != source_bytes && mutated_record.slot_hashes() == source.slot_hashes(),
+        format!(
+            "{} identity-clone mutation did not change Base identity while preserving exact slot hashes",
+            axis.key()
+        ),
+    )?;
+    let mut normalized = mutated_record.constellation().clone();
+    match axis {
+        IdentityMismatchAxis::InputRef => {
+            require(
+                normalized.input_ref.hash == source_constellation.input_ref.hash
+                    && normalized.input_ref.pointer.as_deref() == Some(FOREIGN_INPUT_POINTER)
+                    && normalized.input_ref.redacted == source_constellation.input_ref.redacted,
+                "input-ref identity clone did not change exactly the stored foreign pointer",
+            )?;
+            normalized.input_ref = source_constellation.input_ref.clone();
+        }
+        IdentityMismatchAxis::PanelVersion => {
+            require(
+                normalized.panel_version == PANEL_VERSION + 1,
+                "panel-version identity clone did not carry the exact next panel version",
+            )?;
+            normalized.panel_version = source_constellation.panel_version;
+        }
+    }
+    require(
+        normalized == source_constellation,
+        format!(
+            "{} identity-clone changed a field outside its one requested mismatch axis",
+            axis.key()
+        ),
+    )?;
+
+    let payload = serde_json::to_vec(&json!({
+        "mode": "issue-1138-same-key-identity-clone",
+        "axis": axis.key(),
+        "cx_id": batch_cx_id,
+        "source_base_sha256": sha256_hex(&source_bytes),
+        "stored_base_sha256": sha256_hex(&mutated_bytes),
+    }))?;
+    let (seed_commit_seq, seed_ledger) = vault.write_cf_batch_with_ledger_entry_if_seq(
+        before.snapshot,
+        [(
+            ColumnFamily::Base,
+            base_key(batch_cx_id),
+            mutated_bytes.clone(),
+        )],
+        EntryKind::Migrate,
+        SubjectId::Cx(batch_cx_id),
+        payload.clone(),
+        ActorId::Service("issue-1138-manual-fsv".to_string()),
+    )?;
+    require(
+        seed_commit_seq == before.snapshot + 1
+            && required_row(
+                &vault,
+                seed_commit_seq,
+                ColumnFamily::Base,
+                &base_key(batch_cx_id),
+                "identity-clone stored batch Base",
+            )? == mutated_bytes,
+        format!(
+            "{} identity-clone seed commit or immediate Base readback differs",
+            axis.key()
+        ),
+    )?;
+    let ledger_entry = decode_ledger_row(&vault, seed_ledger.seq)?;
+    require(
+        ledger_entry.entry_hash == seed_ledger.hash
+            && ledger_entry.kind == EntryKind::Migrate
+            && ledger_entry.subject == SubjectId::Cx(batch_cx_id)
+            && ledger_entry.actor == ActorId::Service("issue-1138-manual-fsv".to_string())
+            && ledger_entry.payload == payload,
+        format!("{} identity-clone seed Ledger row differs", axis.key()),
+    )?;
+    vault.flush_with_report()?;
+    drop(vault);
+
+    let after = identity_clone_durable_state(&vault_dir)?;
+    validate_identity_clone_seed_delta(
+        axis,
+        batch_cx_id,
+        &before,
+        &after,
+        &mutated_bytes,
+        &seed_ledger,
+        seed_commit_seq,
+    )?;
+    let stored_base = {
+        let read = open_identity_clone_read_vault(&vault_dir)?;
+        let evidence = base_evidence(
+            &read,
+            read.latest_seq(),
+            BATCH_ROLE,
+            BATCH_INPUT,
+            batch_cx_id,
+        )?;
+        drop(read);
+        evidence
+    };
+    let expected_slot_hash = before
+        .compression
+        .rows
+        .iter()
+        .find(|row| row.role == BATCH_ROLE)
+        .ok_or("identity-clone baseline has no batch compression row")?
+        .resolved
+        .original_slot_blake3
+        .clone();
+    require(
+        stored_base.slot_hashes == BTreeMap::from([(TQ35_SLOT, expected_slot_hash)]),
+        format!(
+            "{} identity-clone stored Base no longer seals the exact original slot hash",
+            axis.key()
+        ),
+    )?;
+    let vault_files = disk_inventory(&vault_dir)?;
+    Ok(IdentityCloneBaseline {
+        axis: axis.key().to_string(),
+        calyx_home: clone_home.display().to_string(),
+        vault_dir: vault_dir.display().to_string(),
+        same_key_cx_id: batch_cx_id.to_string(),
+        session_id: axis.session_id().to_string(),
+        expected_mismatch_reason: axis.expected_reason(),
+        cli_role: identity_clone_cli_role(root, axis),
+        copied_source_file_count: source_files.len(),
+        copied_source_bytes: source_files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.bytes)
+                .ok_or("identity-clone source byte total overflow")
+        })?,
+        copied_source_files_sha256: source_files_sha256.to_string(),
+        copied_source_directory_count: source_directories.len(),
+        copied_source_directories_sha256: source_directories_sha256.to_string(),
+        seed_commit_seq,
+        seed_ledger: ledger_identity(&seed_ledger),
+        seed_wal_record: after
+            .wal
+            .records
+            .last()
+            .cloned()
+            .ok_or("identity-clone seed WAL record is absent")?,
+        stored_base,
+        state: after,
+        vault_files,
+        vault_directories: directory_inventory(&vault_dir)?,
+        home_files: disk_inventory(&clone_home)?,
+        home_directories: directory_inventory(&clone_home)?,
+    })
+}
+
+fn validate_identity_clone_seed_delta(
+    axis: IdentityMismatchAxis,
+    batch_cx_id: CxId,
+    before: &IdentityCloneDurableState,
+    after: &IdentityCloneDurableState,
+    mutated_base: &[u8],
+    seed_ledger: &LedgerRef,
+    seed_commit_seq: Seq,
+) -> AnyResult<()> {
+    require(
+        after.snapshot == seed_commit_seq
+            && seed_commit_seq == before.snapshot + 1
+            && after.base.rows == before.base.rows
+            && after.base.rows_sha256 != before.base.rows_sha256
+            && after.anchors == before.anchors
+            && after.compression_cf == before.compression_cf
+            && after.slot_primary == before.slot_primary
+            && after.slot_raw == before.slot_raw
+            && after.time_index.rows == before.time_index.rows + 1
+            && after.time_index.rows_sha256 != before.time_index.rows_sha256
+            && after.compression == before.compression,
+        format!(
+            "{} identity-clone seed changed state outside Base/Ledger/WAL/TimeIndex controls",
+            axis.key()
+        ),
+    )?;
+    require(
+        after.ledger.rows.len() == before.ledger.rows.len() + 1
+            && after.ledger.rows[..before.ledger.rows.len()] == before.ledger.rows
+            && after
+                .ledger
+                .rows
+                .last()
+                .is_some_and(|row| row.seq == seed_ledger.seq),
+        format!(
+            "{} identity-clone seed did not append exactly one Ledger row",
+            axis.key()
+        ),
+    )?;
+    require(
+        after.wal.records.len() == before.wal.records.len() + 1
+            && after.wal.records[..before.wal.records.len()] == before.wal.records,
+        format!(
+            "{} identity-clone seed did not append exactly one WAL record",
+            axis.key()
+        ),
+    )?;
+    let record = after
+        .wal
+        .records
+        .last()
+        .ok_or("identity-clone appended WAL record is absent")?;
+    let ledger_row = after
+        .ledger
+        .rows
+        .last()
+        .ok_or("identity-clone appended Ledger row is absent")?;
+    let expected_rows = vec![
+        WalRowEvidence {
+            column_family: ColumnFamily::Base.name().to_string(),
+            key_hex: hex(&base_key(batch_cx_id)),
+            value_sha256: sha256_hex(mutated_base),
+            value_bytes: mutated_base.len(),
+        },
+        WalRowEvidence {
+            column_family: ColumnFamily::Ledger.name().to_string(),
+            key_hex: hex(&ledger_key(seed_ledger.seq)),
+            value_sha256: ledger_row.value.sha256.clone(),
+            value_bytes: ledger_row.value.bytes,
+        },
+        time_index_wal_row(record),
+    ];
+    require(
+        record.seq == seed_commit_seq
+            && record.rows == expected_rows
+            && after.wal.tip_seq == seed_commit_seq,
+        format!(
+            "{} identity-clone seed WAL is not exact Base+Migrate-Ledger+TimeIndex order",
+            axis.key()
+        ),
+    )
+}
+
+fn identity_clone_home(root: &Path, axis: IdentityMismatchAxis) -> PathBuf {
+    root.join(IDENTITY_CLONES_DIR)
+        .join(axis.directory())
+        .join("calyx-home")
+}
+
+fn copy_tree_exact(source: &Path, destination: &Path) -> AnyResult<()> {
+    require(
+        source.is_dir() && !destination.exists(),
+        format!(
+            "identity-clone copy requires an existing source and absent destination: {} -> {}",
+            source.display(),
+            destination.display()
+        ),
+    )?;
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_tree_exact(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            require(
+                !destination_path.exists(),
+                format!(
+                    "identity-clone copy refuses to overwrite {}",
+                    destination_path.display()
+                ),
+            )?;
+            let copied = fs::copy(&source_path, &destination_path)?;
+            require(
+                copied == fs::metadata(&source_path)?.len(),
+                format!(
+                    "identity-clone copy length mismatch for {}",
+                    source_path.display()
+                ),
+            )?;
+        } else {
+            return Err(format!(
+                "identity-clone source contains a non-file/non-directory entry: {}",
+                source_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn directory_inventory(root: &Path) -> AnyResult<Vec<String>> {
+    let mut directories = Vec::new();
+    collect_directories(root, root, &mut directories)?;
+    directories.sort();
+    Ok(directories)
+}
+
+fn collect_directories(root: &Path, current: &Path, output: &mut Vec<String>) -> AnyResult<()> {
+    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "identity-clone directory inventory refuses symlink: {}",
+                path.display()
+            )
+            .into());
+        }
+        if metadata.is_dir() {
+            output.push(
+                path.strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            collect_directories(root, &path, output)?;
+        } else if !metadata.is_file() {
+            return Err(format!(
+                "identity-clone directory inventory found a non-file/non-directory entry: {}",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn open_identity_clone_write_vault(
+    dir: &Path,
+    panel: &Panel,
+    axis: IdentityMismatchAxis,
+) -> AnyResult<Arc<AsterVault<FixedClock>>> {
+    // Fixture-preparation boundary: seed one latest Base plus its Ledger/TimeIndex
+    // transaction; historical MVCC row restoration is neither needed nor selected.
+    Ok(Arc::new(AsterVault::open_with_clock(
+        dir,
+        VAULT_ID.parse::<VaultId>()?,
+        fixture_salt(),
+        VaultOptions {
+            dedup_policy: Some(DedupPolicy::Off),
+            panel: Some(panel.clone()),
+            restore_mvcc_rows: false,
+            ..VaultOptions::default()
+        },
+        FixedClock::new(FIXED_CLOCK_MS + axis.seed_clock_offset_ms()),
+    )?))
+}
+
+fn open_identity_clone_read_vault(dir: &Path) -> AnyResult<Arc<AsterVault<SystemClock>>> {
+    Ok(Arc::new(AsterVault::open(
+        dir,
+        VAULT_ID.parse::<VaultId>()?,
+        fixture_salt(),
+        VaultOptions {
+            dedup_policy: Some(DedupPolicy::Off),
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            read_only: true,
+            selected_cfs: Some(vec![
+                ColumnFamily::Base,
+                ColumnFamily::Anchors,
+                ColumnFamily::Ledger,
+                ColumnFamily::Compression,
+                ColumnFamily::slot(SlotId::new(TQ35_SLOT)),
+                ColumnFamily::slot_raw(SlotId::new(TQ35_SLOT)),
+                ColumnFamily::TimeIndex,
+            ]),
+            ..VaultOptions::default()
+        },
+    )?))
+}
+
+fn identity_clone_durable_state(vault_dir: &Path) -> AnyResult<IdentityCloneDurableState> {
+    let text_cx_id = CxId::from_input(TEXT_INPUT.as_bytes(), PANEL_VERSION, &fixture_salt());
+    let batch_cx_id = CxId::from_input(BATCH_INPUT.as_bytes(), PANEL_VERSION, &fixture_salt());
+    let raw_sidecar = raw_sidecar_evidence(
+        vault_dir,
+        &[(TEXT_ROLE, text_cx_id), (BATCH_ROLE, batch_cx_id)],
+    )?;
+    let vault = open_identity_clone_read_vault(vault_dir)?;
+    let snapshot = vault.latest_seq();
+    let panel = load_vault_panel_state(vault_dir)?;
+    require(
+        vault.cx_id_for_input(TEXT_INPUT.as_bytes(), PANEL_VERSION) == text_cx_id
+            && vault.cx_id_for_input(BATCH_INPUT.as_bytes(), PANEL_VERSION) == batch_cx_id,
+        "identity-clone Cx derivation differs from the fixed salt/panel/input contract",
+    )?;
+    let base = cf_rows_evidence(&vault, snapshot, ColumnFamily::Base)?;
+    let anchors = cf_rows_evidence(&vault, snapshot, ColumnFamily::Anchors)?;
+    let compression_cf = cf_rows_evidence(&vault, snapshot, ColumnFamily::Compression)?;
+    let slot_primary =
+        cf_rows_evidence(&vault, snapshot, ColumnFamily::slot(SlotId::new(TQ35_SLOT)))?;
+    let slot_raw = cf_rows_evidence(
+        &vault,
+        snapshot,
+        ColumnFamily::slot_raw(SlotId::new(TQ35_SLOT)),
+    )?;
+    let time_index = cf_rows_evidence(&vault, snapshot, ColumnFamily::TimeIndex)?;
+    let compression = compression_evidence(
+        &vault,
+        &panel,
+        snapshot,
+        &[(TEXT_ROLE, text_cx_id), (BATCH_ROLE, batch_cx_id)],
+        raw_sidecar,
+    )?;
+    let ledger = ledger_evidence(&vault)?;
+    drop(vault);
+    Ok(IdentityCloneDurableState {
+        snapshot,
+        base,
+        anchors,
+        ledger,
+        compression_cf,
+        slot_primary,
+        slot_raw,
+        time_index,
+        compression,
+        wal: wal_evidence(vault_dir, 0)?,
+        physical_controls: physical_control_evidence(vault_dir)?,
+    })
+}
+
+fn cf_rows_evidence<C: calyx_core::Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    column_family: ColumnFamily,
+) -> AnyResult<CfRowsEvidence> {
+    let mut rows = vault.scan_cf_at(snapshot, column_family)?;
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(CfRowsEvidence {
+        rows: rows.len(),
+        rows_sha256: rows_sha256(&rows),
+    })
+}
+
+fn physical_control_evidence(vault_dir: &Path) -> AnyResult<PhysicalControlEvidence> {
+    let current = fs::read(vault_dir.join("CURRENT"))?;
+    let pointer = std::str::from_utf8(&current)?;
+    require(
+        !pointer.is_empty()
+            && pointer == pointer.trim()
+            && Path::new(pointer)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(pointer),
+        "identity-clone CURRENT is not one exact relative manifest filename",
+    )?;
+    let manifest = fs::read(vault_dir.join("MANIFEST"))?;
+    let pointed_manifest = fs::read(vault_dir.join(pointer))?;
+    require(
+        manifest == pointed_manifest,
+        "identity-clone MANIFEST mirror differs from CURRENT's immutable manifest",
+    )?;
+    Ok(PhysicalControlEvidence {
+        current: value_identity(&current),
+        manifest: value_identity(&manifest),
+        pointed_manifest_relative_path: pointer.to_string(),
+        pointed_manifest: value_identity(&pointed_manifest),
+    })
+}
+
 fn write_replay_inputs(
     root: &Path,
     metadata: &BTreeMap<String, String>,
@@ -922,10 +1654,7 @@ fn write_replay_inputs(
 }
 
 fn cli_roles(root: &Path) -> Vec<CliRole> {
-    let environment = BTreeMap::from([(
-        "CALYX_HOME".to_string(),
-        root.join("calyx-home").display().to_string(),
-    )]);
+    let environment = cli_environment(&root.join("calyx-home"));
     vec![
         CliRole {
             role: "text_existing_replay".to_string(),
@@ -974,7 +1703,31 @@ fn cli_roles(root: &Path) -> Vec<CliRole> {
             "usage refusal before any vault commit",
             environment,
         ),
+        identity_clone_cli_role(root, IdentityMismatchAxis::InputRef),
+        identity_clone_cli_role(root, IdentityMismatchAxis::PanelVersion),
     ]
+}
+
+fn identity_clone_cli_role(root: &Path, axis: IdentityMismatchAxis) -> CliRole {
+    let role = match axis {
+        IdentityMismatchAxis::InputRef => "batch_input_ref_mismatch",
+        IdentityMismatchAxis::PanelVersion => "batch_panel_version_mismatch",
+    };
+    batch_cli_role(
+        role,
+        root.join(BATCH_NO_ANCHOR_FILE),
+        axis.session_id(),
+        2,
+        &format!(
+            "usage refusal before any vault commit; exact reason: {}",
+            axis.expected_reason()
+        ),
+        cli_environment(&identity_clone_home(root, axis)),
+    )
+}
+
+fn cli_environment(calyx_home: &Path) -> BTreeMap<String, String> {
+    BTreeMap::from([("CALYX_HOME".to_string(), calyx_home.display().to_string())])
 }
 
 fn batch_cli_role(
@@ -1734,6 +2487,8 @@ fn validate_baseline_contract(root: &Path, baseline: &BaselineReport) -> AnyResu
             && baseline.batch_text == BATCH_INPUT
             && baseline.base.len() == FIXTURE_N
             && baseline.cli_roles == cli_roles(root)
+            && baseline.cli_roles.len() == 7
+            && baseline.identity_clones.len() == 2
             && baseline.snapshot == baseline.wal.tip_seq
             && baseline.compression.serving_selected_column_families == serving_selected_cf_names()
             && !baseline.compression.raw_sidecar_selected_for_serving,
@@ -1755,6 +2510,103 @@ fn validate_baseline_contract(root: &Path, baseline: &BaselineReport) -> AnyResu
                 }]
             }),
         "CLI vault catalog rows differ from the exact fixed index entry",
+    )?;
+    let mut copied_source_hashes = BTreeSet::new();
+    let mut copied_source_directory_hashes = BTreeSet::new();
+    for axis in [
+        IdentityMismatchAxis::InputRef,
+        IdentityMismatchAxis::PanelVersion,
+    ] {
+        let clone = baseline
+            .identity_clones
+            .get(axis.key())
+            .ok_or_else(|| format!("baseline identity clone {} is absent", axis.key()))?;
+        let expected_home = identity_clone_home(root, axis);
+        let expected_vault = expected_home.join("vaults").join(VAULT_ID);
+        let status_relative_path = format!("idx/ingest/runs/{}/status.json", axis.session_id());
+        let session_relative_path = format!("idx/ingest/runs/{}", axis.session_id());
+        let home_status_relative_path = format!(
+            "vaults/{VAULT_ID}/idx/ingest/runs/{}/status.json",
+            axis.session_id()
+        );
+        let home_session_relative_path =
+            format!("vaults/{VAULT_ID}/idx/ingest/runs/{}", axis.session_id());
+        let expected_panel_version = match axis {
+            IdentityMismatchAxis::InputRef => PANEL_VERSION,
+            IdentityMismatchAxis::PanelVersion => PANEL_VERSION + 1,
+        };
+        let expected_pointer = match axis {
+            IdentityMismatchAxis::InputRef => Some(FOREIGN_INPUT_POINTER),
+            IdentityMismatchAxis::PanelVersion => None,
+        };
+        require(
+            clone.axis == axis.key()
+                && clone.calyx_home == expected_home.display().to_string()
+                && clone.vault_dir == expected_vault.display().to_string()
+                && clone.same_key_cx_id == baseline.batch_cx_id
+                && clone.session_id == axis.session_id()
+                && clone.expected_mismatch_reason == axis.expected_reason()
+                && clone.cli_role == identity_clone_cli_role(root, axis)
+                && clone.copied_source_file_count > 0
+                && clone.copied_source_bytes > 0
+                && clone.copied_source_directory_count > 0
+                && clone.seed_commit_seq == clone.state.snapshot
+                && clone.seed_commit_seq == clone.state.wal.tip_seq
+                && &clone.seed_wal_record
+                    == clone.state.wal.records.last().ok_or_else(|| {
+                        format!("{} identity-clone seed WAL record is absent", axis.key())
+                    })?
+                && clone.stored_base.cx_id == baseline.batch_cx_id
+                && clone.stored_base.non_anchor_identity.panel_version == expected_panel_version
+                && clone
+                    .stored_base
+                    .non_anchor_identity
+                    .input_pointer
+                    .as_deref()
+                    == expected_pointer
+                && clone.stored_base.non_anchor_identity.input_hash
+                    == hex(blake3::hash(BATCH_INPUT.as_bytes()).as_bytes())
+                && !clone.stored_base.non_anchor_identity.input_redacted
+                && clone.stored_base.slot_hashes
+                    == baseline_base(baseline, BATCH_ROLE)?.slot_hashes
+                && clone.state.compression == baseline.compression
+                && clone
+                    .vault_files
+                    .iter()
+                    .all(|file| file.relative_path != status_relative_path)
+                && !clone.vault_directories.contains(&session_relative_path)
+                && clone
+                    .home_files
+                    .iter()
+                    .all(|file| file.relative_path != home_status_relative_path)
+                && !clone.home_directories.contains(&home_session_relative_path),
+            format!(
+                "{} identity-clone baseline does not match its exact same-key one-axis contract",
+                axis.key()
+            ),
+        )?;
+        let catalog_files = clone
+            .home_files
+            .iter()
+            .filter(|file| file.relative_path == "vaults/index.json")
+            .collect::<Vec<_>>();
+        let clone_catalog_path = expected_home.join("vaults").join("index.json");
+        require(
+            catalog_files.len() == 1
+                && catalog_files[0].bytes == fs::metadata(&clone_catalog_path)?.len()
+                && catalog_files[0].sha256 == sha256_file(&clone_catalog_path)?
+                && serde_json::from_slice::<Value>(&fs::read(&clone_catalog_path)?)? == catalog,
+            format!(
+                "{} identity-clone catalog is not the exact fixed copied catalog",
+                axis.key()
+            ),
+        )?;
+        copied_source_hashes.insert(clone.copied_source_files_sha256.clone());
+        copied_source_directory_hashes.insert(clone.copied_source_directories_sha256.clone());
+    }
+    require(
+        copied_source_hashes.len() == 1 && copied_source_directory_hashes.len() == 1,
+        "identity clones do not bind one common closed compressed source-home inventory",
     )?;
     Ok(())
 }
@@ -1850,6 +2702,279 @@ fn validate_batch_sessions(
         sessions.insert(session_id.to_string(), value);
     }
     Ok(sessions)
+}
+
+fn validate_identity_clone_readbacks(
+    baseline: &BaselineReport,
+) -> AnyResult<BTreeMap<String, IdentityCloneReadback>> {
+    let mut readbacks = BTreeMap::new();
+    for axis in [
+        IdentityMismatchAxis::InputRef,
+        IdentityMismatchAxis::PanelVersion,
+    ] {
+        let clone = baseline
+            .identity_clones
+            .get(axis.key())
+            .ok_or_else(|| format!("baseline identity clone {} is absent", axis.key()))?;
+        let vault_dir = PathBuf::from(&clone.vault_dir);
+        let status_path = vault_dir
+            .join("idx")
+            .join("ingest")
+            .join("runs")
+            .join(axis.session_id())
+            .join("status.json");
+        let clone_home = PathBuf::from(&clone.calyx_home);
+        let files_before_readback = disk_inventory(&vault_dir)?;
+        let directories_before_readback = directory_inventory(&vault_dir)?;
+        let home_files_before_readback = disk_inventory(&clone_home)?;
+        let home_directories_before_readback = directory_inventory(&clone_home)?;
+        let status_bytes = fs::read(&status_path)?;
+        let status: Value = serde_json::from_slice(&status_bytes)?;
+        validate_identity_clone_status(axis, clone, baseline, &status_path, &status)?;
+        let state = identity_clone_durable_state(&vault_dir)?;
+        require(
+            state == clone.state,
+            format!(
+                "{} identity-clone refusal changed WAL/Base/Anchors/Ledger/Compression/slot/raw/CURRENT/MANIFEST state",
+                axis.key()
+            ),
+        )?;
+        let files_after_readback = disk_inventory(&vault_dir)?;
+        let directories_after_readback = directory_inventory(&vault_dir)?;
+        let home_files_after_readback = disk_inventory(&clone_home)?;
+        let home_directories_after_readback = directory_inventory(&clone_home)?;
+        require(
+            files_before_readback == files_after_readback
+                && directories_before_readback == directories_after_readback
+                && home_files_before_readback == home_files_after_readback
+                && home_directories_before_readback == home_directories_after_readback,
+            format!(
+                "read-only {} identity-clone audit changed a CALYX_HOME file or directory",
+                axis.key()
+            ),
+        )?;
+        let status_relative_path = format!("idx/ingest/runs/{}/status.json", axis.session_id());
+        let status_files = files_after_readback
+            .iter()
+            .filter(|file| file.relative_path == status_relative_path)
+            .collect::<Vec<_>>();
+        require(
+            status_files.len() == 1
+                && status_files[0].bytes == status_bytes.len() as u64
+                && status_files[0].sha256 == sha256_hex(&status_bytes),
+            format!(
+                "{} identity-clone status file inventory differs from its exact bytes",
+                axis.key()
+            ),
+        )?;
+        let mut without_status = files_after_readback.clone();
+        without_status.retain(|file| file.relative_path != status_relative_path);
+        require(
+            files_after_readback.len() == clone.vault_files.len() + 1
+                && without_status == clone.vault_files,
+            format!(
+                "{} identity-clone refusal added or changed a file other than its exact failed status.json",
+                axis.key()
+            ),
+        )?;
+        let required_directories = [
+            "idx".to_string(),
+            "idx/ingest".to_string(),
+            "idx/ingest/runs".to_string(),
+            format!("idx/ingest/runs/{}", axis.session_id()),
+        ];
+        require(
+            !clone.vault_directories.contains(
+                required_directories
+                    .last()
+                    .ok_or("required session directory is absent")?,
+            ),
+            format!(
+                "{} identity-clone baseline already contains its one-shot session directory",
+                axis.key()
+            ),
+        )?;
+        let mut expected_directories = clone
+            .vault_directories
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        expected_directories.extend(required_directories);
+        require(
+            directories_after_readback == expected_directories.into_iter().collect::<Vec<_>>(),
+            format!(
+                "{} identity-clone refusal added a directory outside its exact status ancestors",
+                axis.key()
+            ),
+        )?;
+        let home_status_relative_path = format!(
+            "vaults/{VAULT_ID}/idx/ingest/runs/{}/status.json",
+            axis.session_id()
+        );
+        let mut home_without_status = home_files_after_readback.clone();
+        home_without_status.retain(|file| file.relative_path != home_status_relative_path);
+        require(
+            home_files_after_readback.len() == clone.home_files.len() + 1
+                && home_without_status == clone.home_files,
+            format!(
+                "{} identity-clone refusal changed CALYX_HOME outside its exact failed status.json",
+                axis.key()
+            ),
+        )?;
+        let home_required_directories = [
+            format!("vaults/{VAULT_ID}/idx"),
+            format!("vaults/{VAULT_ID}/idx/ingest"),
+            format!("vaults/{VAULT_ID}/idx/ingest/runs"),
+            format!("vaults/{VAULT_ID}/idx/ingest/runs/{}", axis.session_id()),
+        ];
+        require(
+            !clone.home_directories.contains(
+                home_required_directories
+                    .last()
+                    .ok_or("required CALYX_HOME session directory is absent")?,
+            ),
+            format!(
+                "{} identity-clone CALYX_HOME baseline already contains its one-shot session directory",
+                axis.key()
+            ),
+        )?;
+        let mut expected_home_directories = clone
+            .home_directories
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        expected_home_directories.extend(home_required_directories);
+        require(
+            home_directories_after_readback
+                == expected_home_directories.into_iter().collect::<Vec<_>>(),
+            format!(
+                "{} identity-clone refusal added a CALYX_HOME directory outside its exact status ancestors",
+                axis.key()
+            ),
+        )?;
+        let readback = IdentityCloneReadback {
+            axis: axis.key().to_string(),
+            session_id: axis.session_id().to_string(),
+            status_path: status_path.display().to_string(),
+            status,
+            state,
+            only_status_file_and_required_directories_added: true,
+            read_only_audit_changed_no_file: true,
+            vault_files_before_readback: files_before_readback,
+            vault_files_after_readback: files_after_readback,
+            vault_directories_before_readback: directories_before_readback,
+            vault_directories_after_readback: directories_after_readback,
+            home_files_before_readback,
+            home_files_after_readback,
+            home_directories_before_readback,
+            home_directories_after_readback,
+        };
+        require(
+            readbacks.insert(axis.key().to_string(), readback).is_none(),
+            format!("duplicate identity-clone readback axis {}", axis.key()),
+        )?;
+    }
+    Ok(readbacks)
+}
+
+fn validate_identity_clone_status(
+    axis: IdentityMismatchAxis,
+    clone: &IdentityCloneBaseline,
+    baseline: &BaselineReport,
+    status_path: &Path,
+    status: &Value,
+) -> AnyResult<()> {
+    let input = baseline
+        .inputs
+        .get("batch_no_anchor")
+        .ok_or("baseline no-anchor input evidence is absent")?;
+    let canonical_input = fs::canonicalize(&input.path)?;
+    let expected_message = format!(
+        "idempotent batch replay for cx {} changed stored non-anchor identity: {}",
+        clone.same_key_cx_id, clone.expected_mismatch_reason
+    );
+    require(
+        status.get("schema_version").and_then(Value::as_u64) == Some(1)
+            && status.get("session_id").and_then(Value::as_str) == Some(axis.session_id())
+            && status.get("status").and_then(Value::as_str) == Some("failed")
+            && status.get("phase").and_then(Value::as_str) == Some("failed")
+            && status
+                .get("process_id")
+                .and_then(Value::as_u64)
+                .is_some_and(|pid| pid > 0)
+            && status.get("vault_name").and_then(Value::as_str) == Some(FIXED_VAULT_NAME)
+            && status.get("vault_id").and_then(Value::as_str) == Some(VAULT_ID)
+            && status.get("vault_path").and_then(Value::as_str) == Some(clone.vault_dir.as_str())
+            && status.get("batch_path").and_then(Value::as_str)
+                == Some(canonical_input.to_string_lossy().as_ref())
+            && status.get("batch_sha256").and_then(Value::as_str)
+                == Some(input.value.sha256.as_str())
+            && status.get("batch_bytes").and_then(Value::as_u64) == Some(input.value.bytes as u64)
+            && status.get("batch_line_count").and_then(Value::as_u64) == Some(1)
+            && status.get("planned_row_count").and_then(Value::as_u64) == Some(1)
+            && status.get("rows_started").and_then(Value::as_u64) == Some(0)
+            && status.get("rows_committed").and_then(Value::as_u64) == Some(0)
+            && status.get("committed_new_rows").and_then(Value::as_u64) == Some(0)
+            && status
+                .get("already_idempotent_rows")
+                .and_then(Value::as_u64)
+                == Some(0)
+            && status.get("failed_rows").and_then(Value::as_u64) == Some(1)
+            && status.get("distinct_cx_count").and_then(Value::as_u64) == Some(0)
+            && status.get("first_cx_id").is_some_and(Value::is_null)
+            && status.get("last_cx_id").is_some_and(Value::is_null)
+            && status.get("first_ledger_seq").is_some_and(Value::is_null)
+            && status.get("last_ledger_seq").is_some_and(Value::is_null)
+            && status.get("final_chain_seq").is_some_and(Value::is_null)
+            && status.get("index_rebuild_phase").and_then(Value::as_str) == Some("not_started")
+            && status
+                .get("started_at_unix_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+            && status
+                .get("updated_at_unix_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+            && status
+                .get("completed_at_unix_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+            && status.get("status_path").and_then(Value::as_str)
+                == Some(status_path.to_string_lossy().as_ref())
+            && status
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                == Some("CALYX_CLI_USAGE_ERROR")
+            && status
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                == Some(expected_message.as_str()),
+        format!(
+            "{} identity-clone session did not persist the exact zero-row preflight refusal",
+            axis.key()
+        ),
+    )?;
+    let started = status
+        .get("started_at_unix_ms")
+        .and_then(Value::as_u64)
+        .ok_or("identity-clone session start time is absent")?;
+    let updated = status
+        .get("updated_at_unix_ms")
+        .and_then(Value::as_u64)
+        .ok_or("identity-clone session update time is absent")?;
+    let completed = status
+        .get("completed_at_unix_ms")
+        .and_then(Value::as_u64)
+        .ok_or("identity-clone session completion time is absent")?;
+    require(
+        started <= updated && updated == completed,
+        format!(
+            "{} identity-clone failed-session timestamps are not monotonic and terminal",
+            axis.key()
+        ),
+    )
 }
 
 fn validate_input_files(baseline: &BaselineReport) -> AnyResult<()> {

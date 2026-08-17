@@ -20,9 +20,13 @@
 //! `base_record_replay_prepare` creates a CLI-compatible two-row vault whose
 //! active dense slot is a real lossy TurboQuant generation, then publishes the
 //! fixed replay inputs and an exact durable baseline. After the shipping CLI
-//! exercises text, no-anchor batch, anchor-add, repeat, and metadata-mismatch
-//! roles, `base_record_replay_readback` independently verifies the Base,
-//! Anchors, Ledger, compressed serving rows, and exact WAL suffix.
+//! exercises text, no-anchor batch, anchor-add, repeat, metadata-mismatch, and
+//! same-key input-ref and panel-version mismatch roles against two exact
+//! disposable closed-home clones, `base_record_replay_readback` independently
+//! verifies the Base, Anchors, Ledger, compressed serving rows, and exact WAL
+//! suffix. It also proves each clone's WAL/Base/Anchors/Ledger/Compression,
+//! slot/raw, CURRENT, and MANIFEST state stayed byte-identical, with only the
+//! exact failed status file and its required directory ancestors added.
 //! `base_record_media_replay_prepare` creates a separate CLI-compatible
 //! Text/Image byte-feature vault. After shipping media ingest seeds the real
 //! PNG and its deterministic caption, `base_record_media_replay_compress`
@@ -51,7 +55,9 @@
 //! are loaded once per process. The final filesystem audit is FSV-only and is
 //! not reachable from production.
 //! The BaseRecord replay modes are a separate fixed N=2, S=1 correctness
-//! fixture and make no cost or performance claim.
+//! fixture. They make two one-time byte-exact closed-home copies outside every
+//! production loop, persist each copy's exact file/byte and directory inventory,
+//! and make no cost or performance claim.
 //! The media replay modes are a separate fixed N=2 role, D=16, S=2
 //! correctness fixture and likewise make no production cost claim.
 //!
