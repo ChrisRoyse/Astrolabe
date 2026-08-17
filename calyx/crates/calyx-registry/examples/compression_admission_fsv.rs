@@ -73,13 +73,14 @@
 //! ASTROLABE_COMPRESSION_FSV_MODE=point_read_cost
 //! ASTROLABE_COMPRESSION_FSV_POINT_COST_PRODUCTION_VAULT=<preserved-r14-production-vault>
 //! ASTROLABE_COMPRESSION_FSV_MODE=point_read_cost_readback
-//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issue-1138\<run-id>
+//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issues-557-564\<point-cost-run-id>
 //! ASTROLABE_COMPRESSION_FSV_MODE=base_record_replay_prepare
 //! ASTROLABE_COMPRESSION_FSV_MODE=base_record_replay_readback
-//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issue-1138\<media-run-id>
+//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issue-1138\<base-replay-run-id>
 //! ASTROLABE_COMPRESSION_FSV_MODE=base_record_media_replay_prepare
 //! ASTROLABE_COMPRESSION_FSV_MODE=base_record_media_replay_compress
 //! ASTROLABE_COMPRESSION_FSV_MODE=base_record_media_replay_readback
+//! ASTROLABE_COMPRESSION_FSV_ROOT=C:\code\Astrolabe\.tmp\manual-fsv\issue-1138\<media-replay-run-id>
 //! ```
 //!
 //! The shipping CLI media roles set `CALYX_MEDIA_DERIVED_TEXT_CMD` to this same
