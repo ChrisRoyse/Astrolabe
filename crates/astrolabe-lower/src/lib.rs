@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use astrolabe_domain::knobs::U64KnobDeclaration;
@@ -348,7 +349,7 @@ where
         &vault_fingerprint_sha256,
         &options.lowered_at,
     )?;
-    let artifact_sha256 = hex_lower(&sha256_digest(&fs::read(output_path)?));
+    let artifact_sha256 = hex_lower(&sha256_file_digest(output_path)?);
     Ok(LoweredArtifactBuild {
         lowered,
         source_ledger_head_hash,
@@ -470,8 +471,8 @@ where
     C: Clock,
 {
     let artifact_path = artifact_path.as_ref().to_path_buf();
-    let bytes = match fs::read(&artifact_path) {
-        Ok(bytes) => bytes,
+    let artifact_sha256 = match sha256_file_digest(&artifact_path) {
+        Ok(digest) => hex_lower(&digest),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(LowerError::refused(
                 ASTRO_LOWER_ARTIFACT_MISSING,
@@ -484,7 +485,6 @@ where
         }
         Err(error) => return Err(error.into()),
     };
-    let artifact_sha256 = hex_lower(&sha256_digest(&bytes));
     let meta = read_astro_meta(&artifact_path)?;
 
     let manifest_key = lowered_manifest_key(project, &meta.vault_fingerprint);
@@ -1495,6 +1495,49 @@ fn sha256_digest(bytes: impl AsRef<[u8]>) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes.as_ref());
     hasher.finalize().into()
+}
+
+fn sha256_file_digest(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = fs::File::open(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "open lowered artifact {} for SHA-256: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                offset = offset.checked_add(read as u64).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "SHA-256 byte offset overflow while reading lowered artifact {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "read lowered artifact {} for SHA-256 at byte offset {offset}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

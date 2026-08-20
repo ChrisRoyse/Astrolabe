@@ -612,16 +612,16 @@ where
             .get_or_insert(hydration_snapshot);
         source_receipt.hydration_snapshot_last = Some(hydration_snapshot);
         let source_session = vault.sst_read_session_at(hydration_snapshot)?;
-        let records = load_constellation_batch(
+        let records = load_constellation_batch(ConstellationBatchRequest {
             vault,
-            &source_session,
-            &source,
-            source_ids,
-            &current_sources,
-            &mut roster_cache,
-            &slot_representation_ids,
-            &mut source_receipt,
-        )?;
+            source: &source_session,
+            slot_source: &source,
+            cx_ids: source_ids,
+            current_sources: &current_sources,
+            roster_cache: &mut roster_cache,
+            slot_representation_ids: &slot_representation_ids,
+            receipt: &mut source_receipt,
+        })?;
         drop(source_session);
         if vault.snapshot() != hydration_snapshot {
             return Err(source_corrupt(format!(
@@ -1150,19 +1150,36 @@ where
     })
 }
 
+struct ConstellationBatchRequest<'batch, 'vault, C>
+where
+    C: Clock,
+{
+    vault: &'batch AsterVault<C>,
+    source: &'batch SstReadSession<'vault, C>,
+    slot_source: &'batch WeaveSlotSource,
+    cx_ids: &'batch [CxId],
+    current_sources: &'batch BTreeMap<CxId, String>,
+    roster_cache: &'batch mut BTreeMap<u32, BTreeSet<SlotId>>,
+    slot_representation_ids: &'batch BTreeMap<SlotId, String>,
+    receipt: &'batch mut CompleteAssociationSourceReceipt,
+}
+
 fn load_constellation_batch<C>(
-    vault: &AsterVault<C>,
-    source: &SstReadSession<'_, C>,
-    slot_source: &WeaveSlotSource,
-    cx_ids: &[CxId],
-    current_sources: &BTreeMap<CxId, String>,
-    roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
-    slot_representation_ids: &BTreeMap<SlotId, String>,
-    receipt: &mut CompleteAssociationSourceReceipt,
+    request: ConstellationBatchRequest<'_, '_, C>,
 ) -> calyx_core::Result<Vec<AssociationConstellation>>
 where
     C: Clock,
 {
+    let ConstellationBatchRequest {
+        vault,
+        source,
+        slot_source,
+        cx_ids,
+        current_sources,
+        roster_cache,
+        slot_representation_ids,
+        receipt,
+    } = request;
     let base_reads = cx_ids
         .iter()
         .enumerate()
