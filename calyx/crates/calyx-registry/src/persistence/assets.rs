@@ -108,7 +108,8 @@ fn tmp_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("registry-asset");
     path.with_file_name(format!(
-        ".{file_name}.{:?}.tmp",
+        ".{file_name}.{}.{:?}.tmp",
+        std::process::id(),
         std::thread::current().id()
     ))
 }

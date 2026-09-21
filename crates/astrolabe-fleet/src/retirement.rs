@@ -22,7 +22,10 @@ use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{git_capture, integrity_gate, same_remote, target_dir};
-use crate::compose::{FLEET_KERNEL_REPORT_KIND, load_repo_kernel, read_fleet_kernel};
+use crate::compose::{load_repo_kernel, read_verified_fleet_kernel_generation};
+use crate::kernel_generation::{
+    read_current_fleet_kernel_generation, read_current_fleet_kernel_generation_header,
+};
 use crate::orchestrator::repo_store_identity;
 use crate::record::{FleetRepoRow, SourceRetirement, SourceRetirementStage};
 use crate::state::RepoState;
@@ -62,6 +65,8 @@ struct KernelBinding {
     repo_members_hash: String,
     fleet_compose_input_hash: String,
     fleet_members_hash: String,
+    fleet_generation_id: String,
+    fleet_source_generation_identity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +306,8 @@ fn retire_one(
         row.record.github_id,
         head,
         &inventory.hash,
+        &binding.fleet_generation_id,
+        &binding.fleet_source_generation_identity,
     );
     let tombstone =
         source_path.with_file_name(format!(".astrolabe-source-retirement-{transaction_id}"));
@@ -334,6 +341,8 @@ fn retire_one(
         fleet_scope: config.scope.clone(),
         fleet_compose_input_hash: binding.fleet_compose_input_hash,
         fleet_members_hash: binding.fleet_members_hash,
+        fleet_generation_id: Some(binding.fleet_generation_id),
+        fleet_source_generation_identity: Some(binding.fleet_source_generation_identity),
     };
     catalog.begin_source_retirement(row.record.github_id, name, transaction.clone())?;
     resume_transaction(catalog, config, &row, transaction, false)
@@ -365,13 +374,38 @@ fn resume_transaction(
             ),
         ));
     }
-    let _binding = verify_kernel_binding(
+    let expected_fleet_generation = transaction.fleet_generation_id.as_deref().ok_or_else(|| {
+        refusal(
+            name,
+            "legacy pending retirement has no exact atomic fleet generation id; preserve every byte and start no destructive resume",
+        )
+    })?;
+    let expected_fleet_source = transaction
+        .fleet_source_generation_identity
+        .as_deref()
+        .ok_or_else(|| {
+            refusal(
+                name,
+                "legacy pending retirement has no exact atomic fleet source-generation identity; preserve every byte and start no destructive resume",
+            )
+        })?;
+    let binding = verify_kernel_binding(
         catalog,
         &config.store_root,
         &config.scope,
         row,
         Some(&transaction.repo_members_hash),
     )?;
+    if binding.fleet_compose_input_hash != transaction.fleet_compose_input_hash
+        || binding.fleet_members_hash != transaction.fleet_members_hash
+        || binding.fleet_generation_id != expected_fleet_generation
+        || binding.fleet_source_generation_identity != expected_fleet_source
+    {
+        return Err(refusal(
+            name,
+            "current atomic fleet generation changed from the exact generation bound by the pending destructive transaction",
+        ));
+    }
     let intent_path = transaction_dir(config, &transaction).join("intent.json");
     let mut intent_record = transaction.clone();
     intent_record.stage = SourceRetirementStage::Intent;
@@ -528,6 +562,10 @@ fn resume_transaction(
         "fleet_compose_input_hash_current": post_binding.fleet_compose_input_hash,
         "fleet_members_hash_at_intent": transaction.fleet_members_hash,
         "fleet_members_hash_current": post_binding.fleet_members_hash,
+        "fleet_generation_id_at_intent": transaction.fleet_generation_id,
+        "fleet_generation_id_current": post_binding.fleet_generation_id,
+        "fleet_source_generation_identity_at_intent": transaction.fleet_source_generation_identity,
+        "fleet_source_generation_identity_current": post_binding.fleet_source_generation_identity,
         "completion_file": completion_path.display().to_string(),
         "completion_readback": "byte_identical",
     }))
@@ -581,6 +619,10 @@ fn readback_retired(
         "repo_members_hash": binding.repo_members_hash,
         "fleet_compose_input_hash_current": binding.fleet_compose_input_hash,
         "fleet_members_hash_current": binding.fleet_members_hash,
+        "fleet_generation_id_at_retirement": transaction.fleet_generation_id,
+        "fleet_generation_id_current": binding.fleet_generation_id,
+        "fleet_source_generation_identity_at_retirement": transaction.fleet_source_generation_identity,
+        "fleet_source_generation_identity_current": binding.fleet_source_generation_identity,
         "completion_file": completion_path.display().to_string(),
         "completion_readback": "byte_identical",
     }))
@@ -612,6 +654,8 @@ fn persist_completion(
         "repo_members_hash": transaction.repo_members_hash,
         "fleet_compose_input_hash_at_retirement": transaction.fleet_compose_input_hash,
         "fleet_members_hash_at_retirement": transaction.fleet_members_hash,
+        "fleet_generation_id_at_retirement": transaction.fleet_generation_id,
+        "fleet_source_generation_identity_at_retirement": transaction.fleet_source_generation_identity,
     });
     let completion_bytes =
         serde_json::to_vec_pretty(&completion).expect("retirement completion serializes");
@@ -663,6 +707,13 @@ fn verify_git(row: &FleetRepoRow, source: &Path) -> Result<(), CalyxError> {
     Ok(())
 }
 
+/// Proves the exact target repository is contained in the current atomic fleet
+/// generation. Initial destructive admission performs one full source/projection
+/// rebuild; durable resume stages reopen immutable rows/Ledger and reload only
+/// the target repository. At measured repository `N=192,873/E=328,899`
+/// (2026-08-20), target reload is `O(N+E+A+K*D)`; fleet totals remain unknown.
+/// No Ledger-history scan or repeated `V_f²` projection is performed
+/// (PC-02/03/05/14/24/28/32/35/41/43; #1064).
 fn verify_kernel_binding(
     catalog: &FleetCatalog,
     store_root: &Path,
@@ -673,86 +724,116 @@ fn verify_kernel_binding(
     let name = row.record.full_name.as_str();
     let identity = repo_store_identity(row)?;
     let project = identity.store_key;
-    let repo = load_repo_kernel(store_root, &project, &identity.index_project)?
-        .ok_or_else(|| refusal(name, "per-repo persisted kernel is absent"))?;
-    if let Some(expected) = expected_repo_hash
-        && repo.members_hash != expected
-    {
-        return Err(refusal(
-            name,
-            &format!(
-                "per-repo members hash {} differs from durable retirement hash {expected}",
-                repo.members_hash
-            ),
-        ));
-    }
-    let (fleet_summary, _fleet_raw) = read_fleet_kernel(catalog, scope)?;
-    let sidecar_bytes = catalog
-        .read_fleet_report(FLEET_KERNEL_REPORT_KIND, scope)?
-        .ok_or_else(|| refusal(name, "fleet-kernel sidecar is absent"))?;
-    let sidecar: Value = serde_json::from_slice(&sidecar_bytes).map_err(|error| {
-        refusal(
-            name,
-            &format!("fleet-kernel sidecar does not parse: {error}"),
-        )
-    })?;
-    let repo_claim = sidecar["repos"]
-        .as_array()
-        .and_then(|repos| {
-            repos
-                .iter()
-                .find(|claim| claim["project"].as_str() == Some(project.as_str()))
+    let fleet = if expected_repo_hash.is_none() {
+        // Initial destructive admission pays the complete independent
+        // multi-repository projection rebuild exactly once. That verification
+        // already reloads this target repository twice around the fleet
+        // projection; a third standalone target load would be PC-02/05
+        // amplification and add no evidence.
+        read_verified_fleet_kernel_generation(catalog, store_root, scope)?
+    } else {
+        // Crash-resume/readback first selects the complete immutable atomic
+        // rows and physical Ledger. The exact target repository is reloaded
+        // once below, followed by a narrow fleet-header readback. Repeating
+        // V_f² projection work at every durable stage would be PC-02/05/24
+        // amplification and adds no target-binding evidence.
+        read_current_fleet_kernel_generation(catalog.vault(), scope)?.ok_or_else(|| {
+            refusal(
+                name,
+                "atomic fleet current generation is absent during retirement resume",
+            )
+        })?
+    };
+    let repo_claim = fleet
+        .source_roster
+        .repositories
+        .iter()
+        .find(|claim| {
+            claim.store_key == project && claim.index_project == identity.index_project
         })
         .ok_or_else(|| {
             refusal(
                 name,
-                &format!("fleet scope {scope:?} does not include project {project}"),
+                &format!(
+                    "atomic fleet generation {} at scope {scope:?} does not include exact repository identity ({project:?},{:?})",
+                    fleet.manifest.generation_id, identity.index_project,
+                ),
             )
         })?;
-    if repo_claim["members_hash"].as_str() != Some(repo.members_hash.as_str()) {
+    if repo_claim.catalog_project != project || repo_claim.kernel_scope != identity.kernel_scope {
         return Err(refusal(
             name,
-            "fleet sidecar repo members hash differs from the physical per-repo kernel",
+            "atomic fleet source binding differs from the exact durable catalog repository identity",
         ));
     }
-    let fleet_members_hash = fleet_summary["members_hash_persisted"]
-        .as_str()
-        .ok_or_else(|| {
-            refusal(
+    if let Some(expected) = expected_repo_hash {
+        let repo = load_repo_kernel(store_root, &project, &identity.index_project)?
+            .ok_or_else(|| refusal(name, "per-repo persisted kernel is absent"))?;
+        if repo.members_hash != expected {
+            return Err(refusal(
                 name,
-                "fleet kernel readback carries no persisted members hash",
-            )
-        })?
-        .to_string();
-    if sidecar["kernel"]["members_hash"].as_str() != Some(fleet_members_hash.as_str()) {
+                &format!(
+                    "per-repo members hash {} differs from durable retirement hash {expected}",
+                    repo.members_hash
+                ),
+            ));
+        }
+        if repo_claim.members_hash != repo.members_hash
+            || repo_claim.generation_id != repo.generation_id
+            || repo_claim.source_generation_identity != repo.source_generation_identity
+            || repo_claim.kernel_header_blake3 != repo.kernel_header_blake3
+            || repo_claim.base_content_generation != repo.base_content_generation
+            || repo_claim.blob_content_generation != repo.blob_content_generation
+            || repo_claim.compose_source_hash != repo.compose_source_hash
+            || repo_claim.artifact_source_identity_hash != repo.source_identity_hash
+            || repo_claim.member_count != repo.occurrences.len()
+            || repo_claim.panel_version != repo.panel_version
+            || repo_claim.semantic_dim != repo.semantic_dim
+            || repo_claim.s20_source_binding_seq != repo.s20_source_binding_seq
+            || repo_claim.s20_source_final_verification_seq
+                != repo.s20_source_final_verification_seq
+            || repo_claim.s20_source_binding != repo.s20_source_binding
+        {
+            return Err(refusal(
+                name,
+                "atomic fleet source binding differs from the exact current per-repository generation",
+            ));
+        }
+        let selected = read_current_fleet_kernel_generation_header(catalog.vault(), scope)?
+            .ok_or_else(|| {
+                refusal(
+                    name,
+                    "atomic fleet current generation disappeared after target repository readback",
+                )
+            })?;
+        if selected.manifest != fleet.manifest || selected.pointer != fleet.pointer {
+            return Err(refusal(
+                name,
+                "atomic fleet current generation moved during target repository readback",
+            ));
+        }
+    }
+    if !fleet.provenance.members.iter().any(|member| {
+        member
+            .occurrences
+            .iter()
+            .any(|occurrence| occurrence.project == project)
+    }) {
         return Err(refusal(
             name,
-            "fleet sidecar kernel hash differs from the physical fleet artifact",
+            "atomic fleet member provenance contains no occurrence from the repository being retired",
         ));
     }
-    let compose_input_hash = sidecar["compose_input_hash"]
-        .as_str()
-        .ok_or_else(|| refusal(name, "fleet sidecar carries no compose_input_hash"))?
-        .to_string();
-    let chain = astrolabe_ingest::verify_chain(catalog.vault()).map_err(|error| {
-        refusal(
-            name,
-            &format!("catalog ledger verification failed: {error}"),
-        )
-    })?;
-    if !chain.is_intact() {
-        return Err(refusal(
-            name,
-            &format!(
-                "catalog ledger chain is {} at {:?}",
-                chain.status, chain.at_seq
-            ),
-        ));
-    }
+    let fleet_members_hash = fleet.manifest.members_hash.clone();
+    let compose_input_hash = fleet.manifest.compose_input_hash.clone();
+    let fleet_generation_id = fleet.manifest.generation_id.clone();
+    let fleet_source_generation_identity = fleet.manifest.source_generation_identity.clone();
     Ok(KernelBinding {
-        repo_members_hash: repo.members_hash,
+        repo_members_hash: repo_claim.members_hash.clone(),
         fleet_compose_input_hash: compose_input_hash,
         fleet_members_hash,
+        fleet_generation_id,
+        fleet_source_generation_identity,
     })
 }
 
@@ -884,8 +965,17 @@ fn verify_inventory(
     Ok(())
 }
 
-fn transaction_id(at: u64, github_id: u64, head: &str, inventory_hash: &str) -> String {
-    let preimage = format!("{at}\n{github_id}\n{head}\n{inventory_hash}");
+fn transaction_id(
+    at: u64,
+    github_id: u64,
+    head: &str,
+    inventory_hash: &str,
+    fleet_generation_id: &str,
+    fleet_source_generation_identity: &str,
+) -> String {
+    let preimage = format!(
+        "{at}\n{github_id}\n{head}\n{inventory_hash}\n{fleet_generation_id}\n{fleet_source_generation_identity}"
+    );
     let digest = blake3::hash(preimage.as_bytes()).to_hex().to_string();
     format!("retire-{at}-{github_id}-{}", &digest[..16])
 }

@@ -178,23 +178,23 @@ pub(super) fn ingest_media_with_derived_text(
     let flush_report = vault.flush_with_report()?;
     flush_report.verify_commit_base_records(Some(commit.readback_seq), &new_records)?;
     let mut final_records = new_records;
-    if let Some(record) = media_existing {
-        if final_records.insert(media.cx_id, record).is_some() {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "MCP media readback plan contains duplicate raw-media cx {}",
-                media.cx_id
-            ))
-            .into());
-        }
+    if let Some(record) = media_existing
+        && final_records.insert(media.cx_id, record).is_some()
+    {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "MCP media readback plan contains duplicate raw-media cx {}",
+            media.cx_id
+        ))
+        .into());
     }
-    if let Some(record) = text_existing {
-        if final_records.insert(text.cx_id, record).is_some() {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "MCP media readback plan contains duplicate derived-text cx {}",
-                text.cx_id
-            ))
-            .into());
-        }
+    if let Some(record) = text_existing
+        && final_records.insert(text.cx_id, record).is_some()
+    {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "MCP media readback plan contains duplicate derived-text cx {}",
+            text.cx_id
+        ))
+        .into());
     }
     super::super::verify_base_record_batch_readback(
         &vault,
@@ -347,7 +347,7 @@ fn verify_media_artifact_readback(
     }
     let source_records =
         vault.derived_media_artifacts_for_source(snapshot, expected.source_cx_id)?;
-    if !source_records.iter().any(|record| record == expected) {
+    if !source_records.contains(expected) {
         return Err(CalyxError::aster_corrupt_shard(format!(
             "derived media artifact {} missing from source index",
             expected.artifact_id
@@ -356,7 +356,7 @@ fn verify_media_artifact_readback(
     }
     let target_records =
         vault.derived_media_artifacts_for_target(snapshot, expected.target_cx_id)?;
-    if !target_records.iter().any(|record| record == expected) {
+    if !target_records.contains(expected) {
         return Err(CalyxError::aster_corrupt_shard(format!(
             "derived media artifact {} missing from target index",
             expected.artifact_id

@@ -3,6 +3,16 @@ use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Clock, CxId, LedgerRef, Result, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
+struct LedgerBoundWriteRequest {
+    data_rows: Vec<encode::WriteRow>,
+    expected_seq: Option<Seq>,
+    kind: EntryKind,
+    subject: SubjectId,
+    payload: Vec<u8>,
+    actor: ActorId,
+    collect_row_digests: bool,
+}
+
 impl<C> AsterVault<C>
 where
     C: Clock,
@@ -24,12 +34,15 @@ where
         }
 
         self.write_cf_batch_with_ledger_entry_owned(
-            data_rows,
-            kind,
-            subject,
-            payload,
-            actor,
-            false,
+            LedgerBoundWriteRequest {
+                data_rows,
+                expected_seq: None,
+                kind,
+                subject,
+                payload,
+                actor,
+                collect_row_digests: false,
+            },
             |_, _| Ok((Vec::new(), ())),
         )
         .map(|(commit, ())| commit.seq)
@@ -62,12 +75,15 @@ where
             ));
         }
         self.write_cf_batch_with_ledger_entry_owned(
-            data_rows,
-            kind,
-            subject,
-            payload,
-            actor,
-            true,
+            LedgerBoundWriteRequest {
+                data_rows,
+                expected_seq: None,
+                kind,
+                subject,
+                payload,
+                actor,
+                collect_row_digests: true,
+            },
             |_, _| Ok((Vec::new(), ())),
         )
         .map(|(commit, ())| commit)
@@ -108,24 +124,42 @@ where
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
         self.write_cf_batch_with_ledger_entry_owned(
-            data_rows,
-            kind,
-            subject,
-            payload,
-            actor,
-            true,
+            LedgerBoundWriteRequest {
+                data_rows,
+                expected_seq: None,
+                kind,
+                subject,
+                payload,
+                actor,
+                collect_row_digests: true,
+            },
             derive_rows,
         )
     }
 
-    fn write_cf_batch_with_ledger_entry_owned<T, F>(
+    /// Atomically writes one sequence-guarded, ledger-paired batch plus rows
+    /// derived from the exact staged [`LedgerRef`].
+    ///
+    /// The sequence comparison runs under the same durable commit lock that
+    /// stages the Ledger entry, invokes `derive_rows`, and commits the combined
+    /// batch. A stale `expected_seq` therefore invokes no callback and writes no
+    /// data, Ledger, or time-index row. This is the publication primitive for a
+    /// current pointer whose bytes must name the Ledger row committed beside it;
+    /// callers must never predict or repair that reference in a later commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CALYX_ASTER_SEQUENCE_CONFLICT` before staging any row when the
+    /// retained vault generation differs from `expected_seq`. All derived-row,
+    /// ledger-staging, and group-commit failures propagate without a fallback.
+    pub fn write_cf_batch_with_ledger_entry_with_row_digests_and_derived_if_seq<T, F>(
         &self,
-        mut data_rows: Vec<encode::WriteRow>,
+        expected_seq: Seq,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
         kind: EntryKind,
         subject: SubjectId,
         payload: Vec<u8>,
         actor: ActorId,
-        collect_row_digests: bool,
         derive_rows: F,
     ) -> Result<(LedgerBoundCommit, T)>
     where
@@ -134,7 +168,57 @@ where
             &[encode::WriteRow],
         ) -> Result<(Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>, T)>,
     {
+        let data_rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        self.write_cf_batch_with_ledger_entry_owned(
+            LedgerBoundWriteRequest {
+                data_rows,
+                expected_seq: Some(expected_seq),
+                kind,
+                subject,
+                payload,
+                actor,
+                collect_row_digests: true,
+            },
+            derive_rows,
+        )
+    }
+
+    fn write_cf_batch_with_ledger_entry_owned<T, F>(
+        &self,
+        request: LedgerBoundWriteRequest,
+        derive_rows: F,
+    ) -> Result<(LedgerBoundCommit, T)>
+    where
+        F: FnOnce(
+            &LedgerRef,
+            &[encode::WriteRow],
+        ) -> Result<(Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>, T)>,
+    {
+        let LedgerBoundWriteRequest {
+            mut data_rows,
+            expected_seq,
+            kind,
+            subject,
+            payload,
+            actor,
+            collect_row_digests,
+        } = request;
         self.with_durable_commit_lock(|| {
+            if let Some(expected_seq) = expected_seq {
+                let current_seq = self.latest_seq();
+                if current_seq != expected_seq {
+                    return Err(CalyxError {
+                        code: "CALYX_ASTER_SEQUENCE_CONFLICT",
+                        message: format!(
+                            "ledger-bound derived batch expected seq {expected_seq}, current seq is {current_seq}; no rows were staged or written"
+                        ),
+                        remediation: "re-read the current snapshot, rebuild every derived row from that exact generation, and retry once with its sequence",
+                    });
+                }
+            }
             let mut derive_rows = Some(derive_rows);
             if let Some(hook) = &self.ledger_hook {
                 let mut hook = ledger_hook::lock_hook(hook)?;
@@ -162,15 +246,19 @@ where
                     ));
                 }
                 let data_row_count = data_rows.len();
-                let data_row_digests = collect_row_digests
-                    .then(|| digest_rows(&data_rows))
-                    .unwrap_or_default();
+                let data_row_digests = if collect_row_digests {
+                    digest_rows(&data_rows)
+                } else {
+                    Vec::new()
+                };
                 rows.extend(data_rows);
                 bind.stop("ledger_bind", data_row_count, 0);
                 // Ownership handed straight to the commit path: no full-batch copy
                 // to append the time-index row (#444 lever).
                 let seq = self.commit_rows_locked_owned(rows, false)?;
-                ledger_hook::commit_staged(&mut hook, &staged)?;
+                ledger_hook::commit_staged(&mut hook, &staged).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(seq, &error)
+                })?;
                 return Ok((
                     LedgerBoundCommit {
                         seq,
@@ -205,13 +293,16 @@ where
                 ));
             }
             let data_row_count = data_rows.len();
-            let data_row_digests = collect_row_digests
-                .then(|| digest_rows(&data_rows))
-                .unwrap_or_default();
+            let data_row_digests = if collect_row_digests {
+                digest_rows(&data_rows)
+            } else {
+                Vec::new()
+            };
             rows.extend(data_rows);
             bind.stop("ledger_bind", data_row_count, 0);
             let seq = self.commit_rows_locked_owned(rows, false)?;
-            ledger_hook::commit_staged(hook, &staged)?;
+            ledger_hook::commit_staged(hook, &staged)
+                .map_err(|error| self.reconcile_post_commit_ledger_hook_failure(seq, &error))?;
             Ok((
                 LedgerBoundCommit {
                     seq,
@@ -245,8 +336,15 @@ where
             &durable::RecoveredBatches {
                 batches,
                 last_recovered_seq: self.latest_seq(),
+                manifest_seq: 0,
                 wal_replay_floor_seq: 0,
                 derived_content_floor_seq: 0,
+                cf_content_generation_floor_seq: 0,
+                cf_content_generations: if self.latest_seq() == 0 {
+                    std::collections::BTreeMap::new()
+                } else {
+                    std::collections::BTreeMap::from([(ColumnFamily::Ledger, self.latest_seq())])
+                },
                 torn_tail: None,
                 temporal_policy: None,
                 dedup_policy: None,

@@ -285,6 +285,15 @@ pub struct SourceRetirement {
     pub fleet_compose_input_hash: String,
     /// Exact cumulative fleet members hash.
     pub fleet_members_hash: String,
+    /// Exact atomic fleet generation selected before destructive admission.
+    /// Legacy transactions decode as absent and are preserving on resume.
+    #[serde(default)]
+    pub fleet_generation_id: Option<String>,
+    /// Stable identity of every immutable row/admission input in that fleet
+    /// generation. Legacy transactions decode as absent and cannot authorize
+    /// a resumed deletion.
+    #[serde(default)]
+    pub fleet_source_generation_identity: Option<String>,
 }
 
 /// One decoded catalog row: the discovery facts plus the lifecycle fields.

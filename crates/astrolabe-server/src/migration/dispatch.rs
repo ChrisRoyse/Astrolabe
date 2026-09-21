@@ -1,10 +1,156 @@
 use super::*;
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
+#[derive(Default)]
+struct DuplicateJsonKeyState {
+    first: Option<(String, String)>,
+}
+
+struct DuplicateJsonKeySeed<'a> {
+    path: String,
+    state: &'a std::cell::RefCell<DuplicateJsonKeyState>,
+}
+
+struct DuplicateJsonKeyVisitor<'a> {
+    path: String,
+    state: &'a std::cell::RefCell<DuplicateJsonKeyState>,
+}
+
+impl<'de> DeserializeSeed<'de> for DuplicateJsonKeySeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateJsonKeyVisitor {
+            path: self.path,
+            state: self.state,
+        })
+    }
+}
+
+impl<'de> Visitor<'de> for DuplicateJsonKeyVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut index = 0_u64;
+        while sequence
+            .next_element_seed(DuplicateJsonKeySeed {
+                path: format!("{}[{index}]", self.path),
+                state: self.state,
+            })?
+            .is_some()
+        {
+            index = index.checked_add(1).ok_or_else(|| {
+                serde::de::Error::custom("JSON array index exceeded u64 representation")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut names = BTreeSet::new();
+        while let Some(name) = object.next_key::<String>()? {
+            if !names.insert(name.clone()) && self.state.borrow().first.is_none() {
+                self.state.borrow_mut().first = Some((self.path.clone(), name.clone()));
+            }
+            object.next_value_seed(DuplicateJsonKeySeed {
+                path: format!("{}.{}", self.path, name),
+                state: self.state,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Return the first duplicate object member in an otherwise valid JSON value.
+/// Syntax failures remain owned by the existing JSON-RPC/tool parser, while a
+/// duplicate is refused before serde's map representation can collapse it.
+fn first_duplicate_json_object_key(raw: &str) -> Option<(String, String)> {
+    let state = std::cell::RefCell::new(DuplicateJsonKeyState::default());
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    DuplicateJsonKeySeed {
+        path: "$".to_string(),
+        state: &state,
+    }
+    .deserialize(&mut deserializer)
+    .ok()?;
+    deserializer.end().ok()?;
+    state.into_inner().first
+}
+
+fn duplicate_json_key_fault(path: &str, key: &str) -> ToolFault {
+    ToolFault::new(
+        "ASTRO_MCP_DUPLICATE_JSON_KEY",
+        format!("JSON object {path} contains duplicate member {key:?}"),
+        "send every JSON object member exactly once; the host will not collapse duplicate keys or choose a winning value",
+    )
+    .with_detail("object_path", path)
+    .with_detail("duplicate_key", key)
+}
 
 pub fn handle_tool_raw(
     runner: &CbmToolRunner,
     tool_name: &str,
     args_json: &str,
 ) -> Result<String, DynError> {
+    if let Some((path, key)) = first_duplicate_json_object_key(args_json) {
+        let fault = duplicate_json_key_fault(&path, &key);
+        tracing::warn!(
+            tool = tool_name,
+            code = fault.code(),
+            object_path = path,
+            duplicate_key = key,
+            "mcp.tool.duplicate_json_key_refused"
+        );
+        return fault.into_result();
+    }
     let _activation_fence = crate::activation_epoch::admit_tool_call(tool_name, args_json)?;
     handle_tool_raw_admitted(runner, tool_name, args_json)
 }
@@ -71,6 +217,31 @@ pub fn handle_jsonrpc_raw(
     runner: &CbmToolRunner,
     request_json: &str,
 ) -> Result<Option<String>, DynError> {
+    if let Some((path, key)) = first_duplicate_json_object_key(request_json) {
+        let fault = duplicate_json_key_fault(&path, &key);
+        tracing::warn!(
+            code = fault.code(),
+            object_path = path,
+            duplicate_key = key,
+            "mcp.request.duplicate_json_key_refused"
+        );
+        if path == "$" && key == "id" {
+            // A duplicate correlation identity has no canonical winner.  Do not
+            // let serde's map representation pick one merely for the error
+            // response; JSON-RPC's null id is the honest unevaluable identity.
+            return Ok(Some(jsonrpc_invalid_params_response(Value::Null, fault)?));
+        }
+        let request = serde_json::from_str::<Value>(request_json)?;
+        let request_obj = request.as_object().ok_or_else(|| -> DynError {
+            ToolFault::new(
+                "ASTRO_MCP_REQUEST_OBJECT_REQUIRED",
+                "a duplicate-key JSON-RPC request is not an object",
+                "send one JSON-RPC request object with every member present at most once",
+            )
+            .into()
+        })?;
+        return request_invalid_params_response(request_obj, fault);
+    }
     let Ok(request) = serde_json::from_str::<Value>(request_json) else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
@@ -774,7 +945,7 @@ const INDEX_REPOSITORY_BASE_PUBLIC_ARGS: [&str; 5] = [
     GENERATION_OBSERVED_AT_MS_ARG,
     "persistence",
 ];
-const INDEX_REPOSITORY_PUBLIC_ARGS: [&str; 8] = [
+const INDEX_REPOSITORY_PUBLIC_ARGS: [&str; 9] = [
     "repo_path",
     "mode",
     "target_projects",
@@ -783,6 +954,7 @@ const INDEX_REPOSITORY_PUBLIC_ARGS: [&str; 8] = [
     MIGRATION_DIAL_ARG,
     SEARCH_SCALE_ARG,
     SKILL_DISCOVERY_ARG,
+    KERNEL_ADMISSION_ARG,
 ];
 
 fn index_repository_astrolabe_property_overlay() -> Vec<(String, Value)> {
@@ -802,6 +974,10 @@ fn index_repository_astrolabe_property_overlay() -> Vec<(String, Value)> {
         (
             SKILL_DISCOVERY_ARG.to_string(),
             skill_discovery_override_property_schema(),
+        ),
+        (
+            KERNEL_ADMISSION_ARG.to_string(),
+            kernel_admission_property_schema(),
         ),
     ]
 }
@@ -945,12 +1121,61 @@ fn overlay_get_architecture_extensions(tool: &mut Value) -> Result<(), DynError>
         .ok_or_else(|| -> DynError {
             "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: get_architecture properties are missing; remediation: repair the immutable CBM definition".into()
         })?;
+    for field in ARCHITECTURE_CLUSTER_CONTROL_FIELDS {
+        let spec = properties
+            .get(field)
+            .and_then(Value::as_object)
+            .ok_or_else(|| -> DynError {
+                format!(
+                    "ASTRO_MCP_ARCHITECTURE_SCHEMA_DRIFT: get_architecture.{field} is absent or not an object; remediation: keep the CBM schema and ArchitectureRequestPlan clustering controls byte-semantically aligned"
+                )
+                .into()
+            })?;
+        let type_valid = if field == "resolution" {
+            spec.get("type").and_then(Value::as_str) == Some("number")
+                && spec.get("exclusiveMinimum").and_then(Value::as_u64) == Some(0)
+        } else {
+            spec.get("type").and_then(Value::as_str) == Some("integer")
+                && spec.get("minimum").and_then(Value::as_u64) == Some(1)
+        };
+        let maximum_valid = match field {
+            "cluster_max_nodes" | "cluster_max_edges" => {
+                spec.get("maximum").and_then(Value::as_u64) == Some(2_147_483_647)
+            }
+            "cluster_max_move_visits" | "cluster_max_result_bytes" => {
+                spec.get("maximum").and_then(Value::as_u64) == Some(u64::MAX)
+            }
+            "resolution" => true,
+            _ => false,
+        };
+        if !type_valid || !maximum_valid {
+            return Err(format!(
+                "ASTRO_MCP_ARCHITECTURE_SCHEMA_DRIFT: get_architecture.{field} has incompatible schema {spec:?}; remediation: expose the exact finite-resolution/positive-integer caller-owned clustering control contract"
+            )
+            .into());
+        }
+    }
     let aspects = properties
         .get_mut("aspects")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| -> DynError {
             "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: get_architecture.aspects is not an object; remediation: repair the immutable CBM definition".into()
         })?;
+    let native_max_aspects = u64::try_from(CBM_ARCHITECTURE_ASPECTS.len() - 1)
+        .map_err(|_| -> DynError {
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: native architecture selector count does not fit u64; remediation: repair the closed selector contract before serving tools/list"
+                .into()
+        })?;
+    if aspects.get("type").and_then(Value::as_str) != Some("array")
+        || aspects.get("minItems").and_then(Value::as_u64) != Some(1)
+        || aspects.get("maxItems").and_then(Value::as_u64) != Some(native_max_aspects)
+        || aspects.get("uniqueItems").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "ASTRO_MCP_ARCHITECTURE_SCHEMA_DRIFT: native get_architecture.aspects bounds are {aspects:?}, expected type=array minItems=1 maxItems={native_max_aspects} uniqueItems=true; remediation: keep the native vocabulary and host overlay byte-semantically aligned"
+        )
+        .into());
+    }
     let variants = aspects
         .get_mut("items")
         .and_then(Value::as_object_mut)
@@ -975,10 +1200,18 @@ fn overlay_get_architecture_extensions(tool: &mut Value) -> Result<(), DynError>
             .into_iter()
             .map(|aspect| Value::String(aspect.to_string())),
     );
+    let public_max_aspects = u64::try_from(
+        CBM_ARCHITECTURE_ASPECTS.len() - 1 + ASTROLABE_ARCHITECTURE_ASPECTS.len(),
+    )
+    .map_err(|_| -> DynError {
+        "ASTRO_MCP_ARCHITECTURE_SCHEMA_INVALID: public architecture selector count does not fit u64; remediation: repair the closed selector contract before serving tools/list"
+            .into()
+    })?;
+    aspects.insert("maxItems".to_string(), json!(public_max_aspects));
     aspects.insert(
         "description".to_string(),
         Value::String(
-            "Aspects to include. Omit for the complete legacy CBM architecture without extra Calyx reads; overview is the compact legacy summary; all includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. search_scale serves the exact Calyx backend/admission plan; weave serves the exact Weave/Loom family, cross-term, association, Sextant quantization, and Forge commissioning receipts. signal_ranking reads the exact committed Assay transaction and returns a structured tool error for a validated preserved failed publication even when the live shadow dial is absent. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
+            "Aspects to include. Omit for the narrow overview only; file_tree and clusters are never implicit. Selecting clusters or all requires explicit resolution, cluster_max_nodes, cluster_max_edges, cluster_max_move_visits, and cluster_max_result_bytes with no defaults. cluster_max_result_bytes bounds the final logical architecture payload bytes mirrored in content[0].text and structuredContent after every Astrolabe augmentation; generic MCP envelope framing is excluded. all must be the sole selector and includes every legacy and Astrolabe aspect. Astrolabe selectors read only their named persisted project surface. search_scale serves the exact Calyx backend/admission plan; weave serves the exact Weave/Loom family, cross-term, association, Sextant quantization, and Forge commissioning receipts. signal_ranking reads the exact committed Assay transaction and returns a structured tool error for a validated preserved failed publication even when the live shadow dial is absent. kernel is an alias for kernel_context and n_eff is an alias for redundancy. Astrolabe aspects are project-scoped and refuse a non-empty path rather than returning an unscoped answer."
                 .to_string(),
         ),
     );
@@ -1054,15 +1287,11 @@ pub(crate) fn should_wrap_tool(
         "search_graph" => {
             Ok(search_graph_has_astrolabe_knob(args) || shadow_project_requested(args)?.is_some())
         }
-        "detect_changes" => {
-            // Only augment grounded risk when the project is shadow-indexed; a
-            // non-shadow project has no vault, so it passes straight through with
-            // the pure legacy detect_changes shape.
-            let Some(project) = status_project_from_args(args)? else {
-                return Ok(false);
-            };
-            Ok(read_dial(&project)? == MigrationDial::Shadow)
-        }
+        // Always enforce the closed v2 Git/mapping/bound contract. `scope=files`
+        // is explicitly not applicable to grounding and returns without a vault;
+        // symbol scope without one admitted shadow/oracle generation refuses
+        // instead of silently serving the old ungrounded shape.
+        "detect_changes" => Ok(true),
         "trace_path" | "trace_call_path" => {
             // A stale shadow graph must be refused before either the scored Astrolabe
             // ranking or the byte-identical CBM traversal can serve it (#916).
@@ -1198,6 +1427,10 @@ pub(crate) fn handle_index_repository(
             .into_result();
         }
     };
+    let kernel_admission = match parse_kernel_admission_request(args_obj) {
+        Ok(value) => value,
+        Err(fault) => return fault.into_result(),
+    };
     let project = index_project_from_args(args_obj)?;
     let explicit_dial = args_obj.get(MIGRATION_DIAL_ARG);
     let dial = match explicit_dial {
@@ -1223,6 +1456,21 @@ pub(crate) fn handle_index_repository(
             .transpose()?
             .unwrap_or(MigrationDial::Off),
     };
+    if dial == MigrationDial::Off && kernel_admission.is_some() {
+        return ToolFault::new(
+            "ASTRO_KERNEL_ADMISSION_WITHOUT_SHADOW",
+            "kernel_admission was supplied while calyx shadow indexing is disabled",
+            "pass calyx=\"shadow\" (or use a project whose persisted dial is shadow), or remove kernel_admission",
+        )
+        .with_argument(
+            KERNEL_ADMISSION_ARG,
+            "present only for a shadow kernel generation",
+            args_obj
+                .get(KERNEL_ADMISSION_ARG)
+                .unwrap_or(&Value::Null),
+        )
+        .into_result();
+    }
 
     let sanitized_args = strip_calyx_arg(args_obj)?;
     let repo_path = string_arg(args_obj, "repo_path").map(PathBuf::from);
@@ -1382,11 +1630,30 @@ pub(crate) fn handle_index_repository(
             return fault.into_result();
         }
     };
+    let kernel_admission_action = match kernel_admission.as_ref() {
+        Some(admission) => explicit_kernel_admission_action_identity(admission),
+        None => reusable_kernel_admission_action_identity(&cache_dir, &project),
+    };
+    let kernel_admission_action = match kernel_admission_action {
+        Ok(identity) => identity,
+        Err(error) => {
+            return ToolFault::new(
+                "ASTRO_KERNEL_ADMISSION_IDENTITY_FAILED",
+                format!(
+                    "cannot bind the shadow no-op action to one exact kernel query/encoder identity: {error}"
+                ),
+                "preserve the current generation, repair the named query-corpus/encoder/config state, and retry with an explicit complete kernel_admission object when no valid current corpus exists",
+            )
+            .with_detail("project", project.clone())
+            .into_result();
+        }
+    };
     let index_admission_identity = shadow_index_admission_identity(
         &sanitized_args,
         &search_scale_settings,
         &skills,
         &similarity_config,
+        &kernel_admission_action,
     )?;
     let mut action_policy =
         shadow_index_action_policy(&cache_dir, &project, &index_admission_identity)?;
@@ -1625,13 +1892,14 @@ pub(crate) fn handle_index_repository(
                     repo: repo_path.as_deref(),
                     action_policy: &action_policy,
                     generation_clock,
+                    kernel_admission: kernel_admission.as_ref(),
                 })?;
                 Ok((result, outcome))
             })();
             let (result, outcome) = match staged {
                 Ok(staged) => staged,
                 Err(error) => {
-                    return tool_error_result(publication.abort("staged build", error).to_string());
+                    return publication.abort_tool_fault("staged build", error);
                 }
             };
             let publish_started = std::time::Instant::now();
@@ -1689,6 +1957,7 @@ pub(crate) fn handle_index_repository(
                 &result,
                 json!({
                     "calyx": "shadow",
+                    "sqlite_publication_started": outcome.publication_required,
                     "generation_clock": outcome.generation_clock_provenance.clone(),
                     "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
                     "grounding_summary": grounding_summary(&outcome)?,
@@ -2029,6 +2298,157 @@ fn architecture_aspect_read_failed_result(
     .into_result()
 }
 
+/// One parsed architecture result carried across the native-error check,
+/// optional Astrolabe augmentation, mirror verification and final byte bound.
+/// The native payload scales with the complete cluster-member roster, so
+/// reparsing the same envelope at every boundary is a corpus-scale cost bug.
+struct ArchitectureToolResult {
+    original: String,
+    envelope: Value,
+    content: Option<Value>,
+    is_error: bool,
+    changed: bool,
+}
+
+impl ArchitectureToolResult {
+    fn parse(original: String) -> Result<Self, DynError> {
+        let envelope: Value = serde_json::from_str(&original).map_err(|error| {
+            format!(
+                "ASTRO_ARCHITECTURE_RESULT_ENVELOPE_INVALID: get_architecture result is not JSON: {error}; remediation: repair the result producer before retrying the unchanged request"
+            )
+        })?;
+        let is_error = envelope
+            .get("isError")
+            .and_then(Value::as_bool)
+            .ok_or(
+                "ASTRO_ARCHITECTURE_RESULT_ERROR_FLAG_INVALID: get_architecture result has no boolean isError; remediation: repair the result producer before retrying the unchanged request",
+            )?;
+        if is_error {
+            return Ok(Self {
+                original,
+                envelope,
+                content: None,
+                is_error,
+                changed: false,
+            });
+        }
+        let content_text = envelope
+            .get("content")
+            .and_then(Value::as_array)
+            .filter(|content| content.len() == 1)
+            .and_then(|content| content[0].get("text"))
+            .and_then(Value::as_str)
+            .ok_or(
+                "ASTRO_ARCHITECTURE_RESULT_TEXT_INVALID: successful get_architecture result must contain exactly one content[0].text JSON payload; remediation: repair the result producer before retrying the unchanged request",
+            )?;
+        let content: Value = serde_json::from_str(content_text).map_err(|error| {
+            format!(
+                "ASTRO_ARCHITECTURE_RESULT_TEXT_JSON_INVALID: successful get_architecture content text is not JSON: {error}; remediation: repair the result producer before retrying the unchanged request"
+            )
+        })?;
+        let structured = envelope.get("structuredContent").ok_or(
+            "ASTRO_ARCHITECTURE_RESULT_MIRROR_MISSING: successful get_architecture result has no structuredContent mirror; remediation: repair the result producer before retrying the unchanged request",
+        )?;
+        if &content != structured {
+            return Err(
+                "ASTRO_ARCHITECTURE_RESULT_MIRROR_MISMATCH: content[0].text and structuredContent differ; remediation: repair the result producer before retrying the unchanged request"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            original,
+            envelope,
+            content: Some(content),
+            is_error,
+            changed: false,
+        })
+    }
+
+    fn augment(&mut self, additions: Value) -> Result<(), DynError> {
+        let additions = additions
+            .as_object()
+            .ok_or("architecture result additions must be a JSON object")?;
+        let structured = self
+            .envelope
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
+            .ok_or(
+                "ASTRO_ARCHITECTURE_RESULT_MIRROR_INVALID: successful get_architecture structuredContent must be an object; remediation: repair the result producer before augmentation",
+            )?;
+        let content = self
+            .content
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .ok_or(
+                "ASTRO_ARCHITECTURE_RESULT_TEXT_OBJECT_INVALID: successful get_architecture content payload must be an object; remediation: repair the result producer before augmentation",
+            )?;
+        merge_object(structured, additions);
+        merge_object(content, additions);
+        let content_text = serde_json::to_string(content)?;
+        let envelope_text = self
+            .envelope
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .filter(|content| content.len() == 1)
+            .and_then(|content| content[0].get_mut("text"))
+            .ok_or(
+                "ASTRO_ARCHITECTURE_RESULT_TEXT_INVALID: content[0].text disappeared during augmentation; remediation: repair the in-memory result transformation",
+            )?;
+        *envelope_text = Value::String(content_text);
+        self.changed = true;
+        Ok(())
+    }
+
+    fn finish(self, project: &str, bound: Option<u64>) -> Result<String, DynError> {
+        if self.is_error {
+            return Ok(self.original);
+        }
+        let content_text = self
+            .envelope
+            .get("content")
+            .and_then(Value::as_array)
+            .filter(|content| content.len() == 1)
+            .and_then(|content| content[0].get("text"))
+            .and_then(Value::as_str)
+            .ok_or(
+                "ASTRO_ARCHITECTURE_RESULT_TEXT_INVALID: successful get_architecture result lost content[0].text; remediation: repair the in-memory result transformation",
+            )?;
+        let observed_bytes = u64::try_from(content_text.len()).map_err(|error| {
+            format!(
+                "ASTRO_ARCHITECTURE_RESULT_SIZE_OVERFLOW: get_architecture payload length is not representable as u64: {error}; remediation: request a smaller exact scope"
+            )
+        })?;
+        if let Some(bound) = bound
+            && observed_bytes > bound
+        {
+            tracing::warn!(
+                code = "ASTRO_ARCHITECTURE_SERIALIZED_RESULT_BOUND_EXCEEDED",
+                project,
+                observed_bytes,
+                bound,
+                "mcp.get_architecture.result_refused"
+            );
+            return ToolFault::new(
+                "ASTRO_ARCHITECTURE_SERIALIZED_RESULT_BOUND_EXCEEDED",
+                format!(
+                    "final logical architecture payload is {observed_bytes} UTF-8 bytes, exceeding cluster_max_result_bytes={bound}"
+                ),
+                "request an exact smaller scope or a larger caller-owned representable result budget; no partial architecture result was returned",
+            )
+            .with_detail("project", project)
+            .with_detail("observed_result_bytes", observed_bytes)
+            .with_detail("cluster_max_result_bytes", bound)
+            .with_detail("measured_payload", "content[0].text")
+            .into_result();
+        }
+        if self.changed {
+            Ok(serde_json::to_string(&self.envelope)?)
+        } else {
+            Ok(self.original)
+        }
+    }
+}
+
 pub(crate) fn handle_get_architecture(
     runner: &CbmToolRunner,
     args_json: &str,
@@ -2094,7 +2514,12 @@ pub(crate) fn handle_get_architecture(
             .cbm_args_json
             .as_deref()
             .expect("a request without Astrolabe aspects always retains CBM arguments");
-        return Ok(runner.handle_tool_raw("get_architecture", cbm_args)?);
+        let result = runner.handle_tool_raw("get_architecture", cbm_args)?;
+        if plan.cluster_result_byte_bound.is_none() {
+            return Ok(result);
+        }
+        return ArchitectureToolResult::parse(result)?
+            .finish(&project, plan.cluster_result_byte_bound);
     }
     if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "get_architecture")?
     {
@@ -2124,8 +2549,12 @@ pub(crate) fn handle_get_architecture(
     // In a mixed request the CBM architecture result is a prerequisite. Do not
     // open any Calyx store when that prerequisite refuses or errors (PC-13/35).
     let result = runner.handle_tool_raw("get_architecture", cbm_args)?;
-    if tool_result_is_error(&result)? || plan.astrolabe_outputs.is_empty() {
+    if plan.astrolabe_outputs.is_empty() && plan.cluster_result_byte_bound.is_none() {
         return Ok(result);
+    }
+    let mut result = ArchitectureToolResult::parse(result)?;
+    if result.is_error || plan.astrolabe_outputs.is_empty() {
+        return result.finish(&project, plan.cluster_result_byte_bound);
     }
     let astrolabe =
         match read_astrolabe_architecture_aspects(&cache_dir, &project, &plan.astrolabe_outputs) {
@@ -2138,12 +2567,10 @@ pub(crate) fn handle_get_architecture(
                 );
             }
         };
-    augment_tool_result(
-        &result,
-        json!({
-            "astrolabe": astrolabe,
-        }),
-    )
+    result.augment(json!({
+        "astrolabe": astrolabe,
+    }))?;
+    result.finish(&project, plan.cluster_result_byte_bound)
 }
 
 /// The Astrolabe-only `search_graph` knobs that must never reach the CBM tool

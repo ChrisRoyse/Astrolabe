@@ -81,7 +81,7 @@ pub(crate) fn anchor_erase_json_at(
         ));
     }
 
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
@@ -91,6 +91,7 @@ pub(crate) fn anchor_erase_json_at(
             ColumnFamily::Ledger,
             ColumnFamily::Anchors,
             ColumnFamily::Kv,
+            ColumnFamily::TimeIndex,
         ],
     )?;
     let report = match astrolabe_anchors::erase_anchors_by_source(

@@ -68,9 +68,11 @@ where
                 key: row.key().to_vec(),
                 value: row.value().to_vec(),
             }));
-            self.commit_rows_locked(&rows)?;
+            let committed_seq = self.commit_rows_locked(&rows)?;
             for row in &staged {
-                guard.commit_staged(row)?;
+                guard.commit_staged(row).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(committed_seq, &error)
+                })?;
             }
             Ok(ledger_ref)
         })
@@ -162,7 +164,9 @@ where
         }));
         let seq = self.commit_rows_if_current_volatile(expected_seq, rows)?;
         for row in &staged {
-            guard.commit_staged(row)?;
+            guard
+                .commit_staged(row)
+                .map_err(|error| self.reconcile_post_commit_ledger_hook_failure(seq, &error))?;
         }
         Ok((seq, ledger_refs))
     }
@@ -193,9 +197,11 @@ where
                     value: row.value().to_vec(),
                 })
                 .collect::<Vec<_>>();
-            self.commit_rows_locked(&rows)?;
+            let committed_seq = self.commit_rows_locked(&rows)?;
             for row in &staged {
-                guard.commit_staged(row)?;
+                guard.commit_staged(row).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(committed_seq, &error)
+                })?;
             }
             Ok(ledger_ref)
         })
@@ -370,9 +376,11 @@ where
             key: row.key().to_vec(),
             value: row.value().to_vec(),
         }));
-        self.commit_rows_locked(&rows)?;
+        let committed_seq = self.commit_rows_locked(&rows)?;
         for row in &staged {
-            guard.commit_staged(row)?;
+            guard.commit_staged(row).map_err(|error| {
+                self.reconcile_post_commit_ledger_hook_failure(committed_seq, &error)
+            })?;
         }
         Ok(ledger_refs)
     }
@@ -496,6 +504,17 @@ where
         }
         rows.sort_by_key(|row| row.seq);
         Ok(rows)
+    }
+
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        Ok(self
+            .vault
+            .read_cf_at(
+                self.vault.snapshot(),
+                ColumnFamily::Ledger,
+                &ledger_key(seq),
+            )?
+            .map(|bytes| LedgerRow { seq, bytes }))
     }
 
     /// Fail-closed: the raw adapter never persists ledger rows.

@@ -75,7 +75,7 @@ pub fn resolve_multivector_storage(
 ) -> Result<MultiVectorStorageCodec> {
     match (shape, policy) {
         (SlotShape::Multi { token_dim }, QuantPolicy::ColbertResidual2Bit)
-            if token_dim > 0 && token_dim % 4 == 0 =>
+            if token_dim > 0 && token_dim.is_multiple_of(4) =>
         {
             Ok(MultiVectorStorageCodec::ColbertResidual2BitV1)
         }

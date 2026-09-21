@@ -3,17 +3,18 @@ use crate::manifest::{ImmutableRef, ManifestStore, VaultManifest};
 use crate::timetravel::RetentionHorizon;
 use crate::vault::input_store::InputRetention;
 use calyx_core::{CalyxError, Panel, Result};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::io::Write;
 use std::path::Path;
 
 impl DurableVault {
-    pub(super) fn retention_horizon(&self) -> RetentionHorizon {
+    pub(super) fn retention_horizon(&self) -> Result<RetentionHorizon> {
         self.retention_horizon
             .lock()
             .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .map_err(|_| CalyxError::backpressure("retention horizon lock poisoned"))
     }
 
     pub(in crate::vault) fn write_retention_horizon_manifest(
@@ -22,9 +23,7 @@ impl DurableVault {
     ) -> Result<()> {
         horizon.validate()?;
         let current = self.current_manifest()?;
-        let manifest_seq = current
-            .as_ref()
-            .map_or(1, |manifest| manifest.manifest_seq.saturating_add(1));
+        let manifest_seq = next_manifest_seq(current.as_ref())?;
         let durable_seq = current.as_ref().map_or(0, |manifest| manifest.durable_seq);
         self.write_manifest_with_seq_and_horizon(manifest_seq, durable_seq, horizon)?;
         *self
@@ -44,9 +43,12 @@ impl DurableVault {
     }
 
     pub(super) fn write_manifest(&self, seq: u64) -> Result<()> {
-        let manifest_seq = self.current_manifest()?.map_or(seq.max(1), |manifest| {
-            manifest.manifest_seq.saturating_add(1)
-        });
+        let current = self.current_manifest()?;
+        let manifest_seq = if current.is_some() {
+            next_manifest_seq(current.as_ref())?
+        } else {
+            seq.max(1)
+        };
         self.write_manifest_with_seq(manifest_seq, seq)
     }
 
@@ -55,7 +57,7 @@ impl DurableVault {
         manifest_seq: u64,
         durable_seq: u64,
     ) -> Result<()> {
-        let horizon = self.retention_horizon();
+        let horizon = self.retention_horizon()?;
         self.write_manifest_with_seq_and_horizon(manifest_seq, durable_seq, &horizon)
     }
 
@@ -101,19 +103,67 @@ impl DurableVault {
                 derived_content_seq.max(current.effective_derived_content_seq().min(durable_seq));
         }
         manifest.derived_content_seq = Some(derived_content_seq);
+        let cf_content_generation_floor_seq = current.as_ref().map_or(0, |manifest| {
+            manifest.effective_cf_content_generation_floor_seq()
+        });
+        let mut cf_content_generations = current
+            .as_ref()
+            .map(VaultManifest::decoded_cf_content_generations)
+            .transpose()?
+            .unwrap_or_default();
+        let local_generations = self
+            .checkpointed_cf_content_generations
+            .lock()
+            .map_err(|_| CalyxError::backpressure("checkpointed CF generation lock poisoned"))?;
+        for (cf, generation) in local_generations.iter() {
+            if *generation > durable_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "checkpointed {} generation {} exceeds manifest durable_seq {durable_seq}",
+                    cf.name(),
+                    generation
+                )));
+            }
+            if *generation > cf_content_generation_floor_seq {
+                cf_content_generations
+                    .entry(*cf)
+                    .and_modify(|current| *current = (*current).max(*generation))
+                    .or_insert(*generation);
+            }
+        }
+        drop(local_generations);
+        cf_content_generations
+            .retain(|_, generation| *generation > cf_content_generation_floor_seq);
+        manifest.cf_content_generation_floor_seq = Some(cf_content_generation_floor_seq);
+        manifest.cf_content_generations = canonical_cf_content_generations(cf_content_generations);
         manifest.retention_horizon = horizon.clone();
-        manifest.registry_ref = current.and_then(|manifest| manifest.registry_ref);
+        if let Some(current) = current.as_ref() {
+            manifest.registry_ref = current.registry_ref.clone();
+            manifest.degraded_rebuildable = current.degraded_rebuildable;
+            manifest.quarantines = current.quarantines.clone();
+        }
         manifest.validate()?;
-        ManifestStore::open(&self.root).write_current(&manifest)?;
+        ManifestStore::open(&self.root).write_current_under_commit_lock(&manifest)?;
+        self.observe_manifest_seq(manifest.manifest_seq);
         Ok(())
     }
 
     fn current_manifest(&self) -> Result<Option<VaultManifest>> {
-        if self.root.join("CURRENT").exists() {
+        if self
+            .root
+            .join("CURRENT")
+            .try_exists()
+            .map_err(|error| storage_error("inspect current manifest pointer", error))?
+        {
             ManifestStore::open(&self.root).load_current().map(Some)
         } else {
             Ok(None)
         }
+    }
+
+    pub(in crate::vault) fn manifest_seq_on_disk(&self) -> Result<u64> {
+        Ok(self
+            .current_manifest()?
+            .map_or(0, |manifest| manifest.manifest_seq))
     }
 
     /// Raw-input retention policy declared by this vault's manifest (#446).
@@ -125,6 +175,25 @@ impl DurableVault {
             .map(|manifest| manifest.input_retention)
             .unwrap_or_default())
     }
+}
+
+fn next_manifest_seq(current: Option<&VaultManifest>) -> Result<u64> {
+    current.map_or(Ok(1), |manifest| {
+        manifest.manifest_seq.checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "manifest sequence exhausted at u64::MAX; no manifest was overwritten",
+            )
+        })
+    })
+}
+
+fn canonical_cf_content_generations(
+    generations: BTreeMap<crate::cf::ColumnFamily, u64>,
+) -> BTreeMap<String, u64> {
+    generations
+        .into_iter()
+        .map(|(cf, generation)| (cf.name(), generation))
+        .collect()
 }
 
 fn ensure_manifest_assets(

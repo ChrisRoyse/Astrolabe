@@ -239,14 +239,11 @@ pub(super) fn lineage_for_resolved(
         .panel
         .slots
         .iter()
-        .filter_map(|slot| {
-            measured_slots
-                .contains(&slot.slot_id)
-                .then(|| LensMeasureOut {
-                    slot: slot.slot_id.get(),
-                    lens_id: slot.lens_id.to_string(),
-                    measured_at: stored.created_at,
-                })
+        .filter(|slot| measured_slots.contains(&slot.slot_id))
+        .map(|slot| LensMeasureOut {
+            slot: slot.slot_id.get(),
+            lens_id: slot.lens_id.to_string(),
+            measured_at: stored.created_at,
         })
         .collect();
     let anchors = anchor_outputs(cx_id, ingest.seq, &stored.anchors, &entries)?;

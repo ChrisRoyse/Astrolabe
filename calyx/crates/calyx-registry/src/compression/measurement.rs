@@ -4607,10 +4607,7 @@ fn validate_query_observations(receipt: &CompressionAdmissionReceipt) -> Result<
             || observation.exact_top_k.len() != receipt.k as usize
             || observation.packed_top_k.len() != receipt.k as usize
             || observation.latency_samples_ns.len() != receipt.measured_runs as usize
-            || observation
-                .latency_samples_ns
-                .iter()
-                .any(|sample| *sample == 0)
+            || observation.latency_samples_ns.contains(&0)
         {
             return Err(admission_error(format!(
                 "compression admission query observation for {} has inconsistent identity, hit count, or samples",

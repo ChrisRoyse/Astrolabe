@@ -36,6 +36,11 @@ pub(crate) struct DedupEvaluation {
     pub snapshot: calyx_core::Seq,
 }
 
+struct DedupCheckOptions {
+    candidate_limit: usize,
+    write_conflict_rows: bool,
+}
+
 pub fn resolve_tau(
     slot_id: SlotId,
     config: &TctCosineConfig,
@@ -119,8 +124,10 @@ where
         vault,
         policy,
         guard_profile,
-        DEFAULT_DEDUP_DPI_CANDIDATE_LIMIT,
-        true,
+        DedupCheckOptions {
+            candidate_limit: DEFAULT_DEDUP_DPI_CANDIDATE_LIMIT,
+            write_conflict_rows: true,
+        },
         resolver,
         snapshot,
     )?;
@@ -198,8 +205,10 @@ where
         vault,
         policy,
         guard_profile,
-        candidate_limit,
-        true,
+        DedupCheckOptions {
+            candidate_limit,
+            write_conflict_rows: true,
+        },
         resolver,
         snapshot,
     )?;
@@ -224,8 +233,10 @@ where
         vault,
         policy,
         guard_profile,
-        DEFAULT_DEDUP_DPI_CANDIDATE_LIMIT,
-        false,
+        DedupCheckOptions {
+            candidate_limit: DEFAULT_DEDUP_DPI_CANDIDATE_LIMIT,
+            write_conflict_rows: false,
+        },
         resolver,
         snapshot,
     )
@@ -236,8 +247,7 @@ fn check_dedup_inner<C, R>(
     vault: &AsterVault<C>,
     policy: &DedupPolicy,
     guard_profile: Option<&dyn GuardTauProfile>,
-    candidate_limit: usize,
-    write_conflict_rows: bool,
+    options: DedupCheckOptions,
     resolver: &R,
     snapshot: calyx_core::Seq,
 ) -> Result<DedupEvaluation>
@@ -245,6 +255,10 @@ where
     C: Clock,
     R: SlotVectorResolver<C> + ?Sized,
 {
+    let DedupCheckOptions {
+        candidate_limit,
+        write_conflict_rows,
+    } = options;
     match policy {
         DedupPolicy::Off => Ok(DedupEvaluation {
             decision: DedupDecision::NoMatch,
@@ -317,6 +331,7 @@ where
                     if write_conflict_rows {
                         write_anchor_conflict(
                             vault,
+                            snapshot,
                             new_cx.cx_id,
                             existing_id,
                             anchor_type,
@@ -491,6 +506,7 @@ fn cx_id_from_base_key(key: &[u8]) -> Result<CxId> {
 
 fn write_anchor_conflict<C>(
     vault: &AsterVault<C>,
+    evaluation_seq: calyx_core::Seq,
     new_id: CxId,
     existing_id: CxId,
     anchor_type: calyx_core::AnchorKind,
@@ -509,15 +525,18 @@ where
         anchor_type,
         reason,
     };
-    vault.commit_online_rows([
-        (
-            contested_with_key(new_id),
-            encode_contested_with(&new_value)?,
-        ),
-        (
-            contested_with_key(existing_id),
-            encode_contested_with(&existing_value)?,
-        ),
-    ])?;
+    vault.commit_online_rows(
+        evaluation_seq,
+        [
+            (
+                contested_with_key(new_id),
+                encode_contested_with(&new_value)?,
+            ),
+            (
+                contested_with_key(existing_id),
+                encode_contested_with(&existing_value)?,
+            ),
+        ],
+    )?;
     Ok(())
 }

@@ -1,5 +1,15 @@
 #![forbid(unsafe_code)]
 
+// Re-export the kernel generation value types at the data-plane boundary. This
+// lets downstream atomic publication own a complete artifact without adding a
+// reverse dependency from `astrolabe-kernel` back into ingest/weave.
+pub use astrolabe_kernel::{
+    GraphRoutedQuery, GraphRoutedRecallParams, GraphRoutedRecallReport, KernelArtifact,
+    KernelBuildConfig, KernelGraph, KernelSourceIdentity, graph_routed_kernel_artifact_hash,
+    graph_routed_query_content_hash, graph_routed_query_cx_id, graph_routed_query_vector_hash,
+    validate_graph_routed_recall_report,
+};
+
 mod erasure_scrub;
 pub mod fsv;
 mod graph_projection;
@@ -51,21 +61,25 @@ pub use graph_projection::{
     ASTRO_GRAPH_PROJECTION_CORRUPT, AtomicKernelProjectionReport,
     CompositeKernelProjectionVerifyReport, CompositeKernelSegmentEvidence,
     GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions, GraphProjectionCsr,
-    GraphProjectionCsrEdge, GraphProjectionKind, GraphProjectionMaterializeEntry,
-    GraphProjectionMaterializeReport, GraphProjectionNode, SimOnlyKernelEdgeEvidence,
-    ensure_graph_projection_csr, materialize_graph_projection, materialize_graph_projections,
-    read_graph_projection_csr, read_graph_projection_csr_at, verify_composite_kernel_projection,
+    GraphProjectionCsrEdge, GraphProjectionKind, GraphProjectionManifestIdentity,
+    GraphProjectionMaterializeEntry, GraphProjectionMaterializeReport, GraphProjectionNode,
+    GraphProjectionReadBinding, SimOnlyKernelEdgeEvidence, ensure_graph_projection_csr,
+    materialize_graph_projection, materialize_graph_projections, read_graph_projection_csr,
+    read_graph_projection_csr_at, read_graph_projection_csr_bound_at,
+    read_graph_projection_manifest_identity_at, verify_composite_kernel_projection,
 };
 pub use kernel_artifact::{
     ASTRO_KERNEL_ARTIFACT_PERSIST_READBACK, ASTRO_KERNEL_GRAPH_ADAPTER_REFUSED,
     KERNEL_ARTIFACT_ACTOR, KERNEL_ARTIFACT_CF_PREFIX, KernelArtifactPersistReport,
-    build_and_persist_kernel, kernel_graph_from_projection_csr, persist_kernel_artifact,
-    read_persisted_kernel_artifact,
+    PreparedKernelArtifactRows, build_and_persist_kernel,
+    build_kernel_artifact_from_projection_csr, decode_kernel_artifact_rows,
+    kernel_graph_from_projection_csr, persist_kernel_artifact, prepare_kernel_artifact_rows,
+    read_persisted_kernel_artifact, read_persisted_kernel_artifact_at,
 };
 pub use ledger_scan::{
     ASTRO_LEDGER_SCAN_CHAIN_NOT_INTACT, ASTRO_LEDGER_SCAN_ROW_CORRUPT,
-    ASTRO_LEDGER_SCAN_SUBJECT_EMPTY, LedgerScanRow, ledger_subject_key, scan_subject_ledger_rows,
-    scan_subject_ledger_rows_vault_path,
+    ASTRO_LEDGER_SCAN_SUBJECT_EMPTY, ASTRO_LEDGER_SCAN_VAULT_UNEVALUABLE, LedgerScanRow,
+    ledger_subject_key, scan_subject_ledger_rows, scan_subject_ledger_rows_vault_path,
 };
 pub use ledger_verify::{
     ASTRO_FSV_JANITOR_BUDGET_INVALID, JanitorCheckpoint, JanitorSliceReport, VerifyChainReport,
@@ -92,14 +106,15 @@ pub use sqlite_import::{
     CxGraphErasureReport, EdgeSkipCounters, HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA,
     HistoricalSymbolAdmissionBatch, HistoricalSymbolAdmissionReport,
     HistoricalSymbolAdmissionSession, HistoricalSymbolLocation, InjectedNodeFault,
-    PreparedHistoricalSymbolAdmission, QuantizationGateConfig, QuantizationGateMeasurement,
-    QuantizationGatePolicyReport, QuantizationSlotDecision, SqliteImportDeepVerifyCounts,
-    SqliteImportOptions, SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
-    admit_historical_symbol_snapshot, erase_imported_cx_graph_rows, fingerprint_sqlite_hex,
-    import_cbm_graph_snapshot_to_vault, import_cbm_graph_snapshot_to_vault_direct,
-    import_sqlite_to_vault, inject_node_property_fault, read_cbm_compact_graph_snapshot,
-    read_cbm_graph_snapshot, read_cbm_graph_snapshot_at, read_cbm_sqlite_pipeline_rows,
-    read_node_map_cx_ids,
+    PersistedNodeMapIdentity, PreparedHistoricalSymbolAdmission, QuantizationGateConfig,
+    QuantizationGateMeasurement, QuantizationGatePolicyReport, QuantizationSlotDecision,
+    SqliteImportDeepVerifyCounts, SqliteImportOptions, SqliteImportQuantizationReport,
+    SqliteImportReadback, SqliteImportReport, admit_historical_symbol_snapshot,
+    erase_imported_cx_graph_rows, fingerprint_sqlite_hex, import_cbm_graph_snapshot_to_vault,
+    import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, inject_node_property_fault,
+    read_cbm_compact_graph_snapshot, read_cbm_graph_snapshot, read_cbm_graph_snapshot_at,
+    read_cbm_sqlite_pipeline_rows, read_node_map_cx_ids, read_node_map_identities_at,
+    read_node_map_identity_at, semantic_sqlite_source_schema_sha256_hex,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

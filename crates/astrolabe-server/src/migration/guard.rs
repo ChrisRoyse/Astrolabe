@@ -287,11 +287,11 @@ fn finalize_guard_calibration(
             "rerun index_repository with calyx=\"shadow\" before calibrating the guard".to_string(),
         );
     }
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Ledger],
+        vec![ColumnFamily::Ledger, ColumnFamily::TimeIndex],
     )?;
     let payload = calibration_meta_payload_bytes(&profile);
     let profile_hash = profile.canonical_profile_hash().to_vec();

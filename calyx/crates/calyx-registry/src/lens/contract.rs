@@ -65,7 +65,9 @@ pub fn validate_quant_policy_for_shape(
         },
         SlotShape::Multi { token_dim } => match policy {
             QuantPolicy::None => Ok(()),
-            QuantPolicy::ColbertResidual2Bit if token_dim > 0 && token_dim % 4 == 0 => Ok(()),
+            QuantPolicy::ColbertResidual2Bit if token_dim > 0 && token_dim.is_multiple_of(4) => {
+                Ok(())
+            }
             QuantPolicy::ColbertResidual2Bit => Err(shape_policy_error(
                 name,
                 shape,

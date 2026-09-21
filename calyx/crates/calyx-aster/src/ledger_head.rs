@@ -18,14 +18,20 @@ pub fn head_anchor_path(vault: &Path) -> PathBuf {
 
 pub fn read_head_anchor(vault: &Path) -> Result<Option<LedgerHeadAnchor>> {
     let path = head_anchor_path(vault);
-    if !path.exists() {
+    if !path.try_exists().map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "inspect Aster ledger head path {}: {error}",
+            path.display()
+        ))
+    })? {
         return Ok(None);
     }
     let bytes = fs::read(&path)
         .map_err(|error| CalyxError::disk_pressure(format!("read Aster ledger head: {error}")))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| CalyxError::ledger_corrupt(format!("decode Aster ledger head: {error}")))
+    let anchor = serde_json::from_slice::<LedgerHeadAnchor>(&bytes).map_err(|error| {
+        CalyxError::ledger_corrupt(format!("decode Aster ledger head: {error}"))
+    })?;
+    LedgerHeadAnchor::new(anchor.height, anchor.tip_hash).map(Some)
 }
 
 pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Result<()> {
@@ -99,8 +105,13 @@ pub(crate) fn require_head_anchor_for_rows(
     rows: &[LedgerRow],
 ) -> Result<Option<LedgerHeadAnchor>> {
     if anchor.is_none()
-        && let Some(head) = rows.last().map(|row| row.seq.saturating_add(1))
+        && let Some(last) = rows.last()
     {
+        let head = last.seq.checked_add(1).ok_or_else(|| {
+            CalyxError::ledger_corrupt(
+                "Aster ledger head height is not representable above sequence u64::MAX",
+            )
+        })?;
         return Err(missing_head_anchor(vault, head));
     }
     Ok(anchor)
@@ -113,13 +124,35 @@ pub(crate) fn missing_head_anchor(vault: &Path, head: u64) -> CalyxError {
     ))
 }
 
+#[cfg(windows)]
 fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| {
-            CalyxError::disk_pressure(format!("replace Aster ledger head: {error}"))
-        })?;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(CalyxError::disk_pressure(format!(
+            "atomically replace Aster ledger head {} -> {} with MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH): {}",
+            tmp.display(),
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
     }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
     fs::rename(tmp, path)
         .map_err(|error| CalyxError::disk_pressure(format!("rename Aster ledger head: {error}")))
 }

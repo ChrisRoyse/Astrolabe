@@ -2,6 +2,7 @@ mod generation_injection;
 
 use super::{AsterVault, durable, encode, ledger_hook};
 use crate::cf::{CfRouter, ColumnFamily, compression_membership_proof_prefix_range};
+use crate::mvcc::LatestRouterRecoveryState;
 use calyx_core::{CalyxError, Clock, Result, Seq};
 use generation_injection::validate_generation_injection_shape;
 
@@ -14,18 +15,65 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Explicitly refreshes this handle from the latest durable generation
+    /// without creating a commit.
+    ///
+    /// This is the named, commit-free cross-process synchronization boundary:
+    /// it acquires the durable commit lock, replays a newer durable tip through
+    /// the handle's configured recovery mode, mutates the handle's router,
+    /// generation, Ledger-hook, retention, and pending-checkpoint state, and
+    /// returns the observed latest sequence. Writable recovery may also
+    /// truncate a detected torn WAL tail; it never fabricates a compensating
+    /// commit. Callers must hoist it outside row/item loops. With `W` retained
+    /// WAL bytes, `S` immutable SST bytes, `K` SST index keys/routes, `R`
+    /// recovered tail rows, and `H` bounded Ledger hydration work, the existing
+    /// latest-router recovery costs `O(W + S + K log K + R log R + H)` time and
+    /// `O(K + R + differing-tail bytes + H)` memory. Production values remain
+    /// unmeasured; a manual fixture is not their bound (PC-04, PC-18, PC-41,
+    /// PC-43). Cost-hypothesis owner: #1147; expires at the first
+    /// production-sized durable-refresh receipt.
+    pub fn refresh_latest_from_durable(&self) -> Result<Seq> {
+        self.ensure_writeable("durable latest-generation refresh")?;
+        self.rows.ensure_no_terminal_durable_fault()?;
+        let Some(durable) = &self.durable else {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_DURABLE_REFRESH_REQUIRED",
+                message: "latest-generation refresh requires a durable Aster vault handle"
+                    .to_string(),
+                remediation: "open the exact durable vault write-capable before requesting a cross-process latest-generation refresh",
+            });
+        };
+        let _commit_guard = crate::file_lock::FileLockGuard::acquire(&durable.commit_lock_path())?;
+        self.refresh_from_durable()?;
+        Ok(self.latest_seq())
+    }
+
     pub(crate) fn with_durable_commit_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let Some(durable) = &self.durable else {
             return f();
         };
+        // Automatic admission refresh must never erase a terminal post-WAL
+        // fault. Only the explicitly named refresh API may attempt recovery;
+        // ordinary reads/writes keep returning the original exact diagnostic.
+        self.rows.ensure_no_terminal_durable_fault()?;
         let _commit_guard = crate::file_lock::FileLockGuard::acquire(&durable.commit_lock_path())?;
-        if durable.durable_tip_seq()? > self.latest_seq() {
+        if durable.durable_tip_seq()? != self.latest_seq()
+            || durable.manifest_seq_on_disk()? != durable.observed_manifest_seq()
+        {
             self.refresh_from_durable()?;
+        }
+        let durable_tip = durable.durable_tip_seq()?;
+        if durable_tip != self.latest_seq() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "durable commit admission could not reconcile WAL tip {durable_tip} with live sequence {}; no WAL bytes were appended",
+                self.latest_seq()
+            )));
         }
         f()
     }
 
     pub(crate) fn with_recurrence_write_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.rows.ensure_no_terminal_durable_fault()?;
         let _guard = self
             .recurrence_write_lock
             .lock()
@@ -37,14 +85,25 @@ where
                 crate::file_lock::FileLockGuard::acquire(&durable.recurrence_lock_path())
             })
             .transpose()?;
-        if self
-            .durable
-            .as_ref()
-            .map(|durable| durable.durable_tip_seq())
-            .transpose()?
-            .is_some_and(|tip| tip > self.latest_seq())
-        {
-            self.refresh_from_durable()?;
+        if let Some(durable) = &self.durable {
+            if durable.durable_tip_seq()? != self.latest_seq()
+                || durable.manifest_seq_on_disk()? != durable.observed_manifest_seq()
+            {
+                let _commit_guard =
+                    crate::file_lock::FileLockGuard::acquire(&durable.commit_lock_path())?;
+                if durable.durable_tip_seq()? != self.latest_seq()
+                    || durable.manifest_seq_on_disk()? != durable.observed_manifest_seq()
+                {
+                    self.refresh_from_durable()?;
+                }
+                let durable_tip = durable.durable_tip_seq()?;
+                if durable_tip != self.latest_seq() {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "recurrence write admission could not reconcile WAL tip {durable_tip} with live sequence {}; no recurrence rows were evaluated or written",
+                        self.latest_seq()
+                    )));
+                }
+            }
         }
         f()
     }
@@ -60,72 +119,71 @@ where
             durable::RecoveryMode::FullMvcc
         };
         let recovered = durable.recover_current_batches(mode)?;
-        let latest_candidate = if mode == durable::RecoveryMode::LatestRouter {
-            let mut router = CfRouter::open_with_tiering_latest(
-                durable.root(),
-                self.rows.latest_router_memtable_byte_cap()?,
-                durable.tiering_policy().cloned(),
-            )?;
-            router.replay_latest_rows(recovered.batches.iter().flat_map(|batch| {
-                batch
+        let recovered_derived_seq = recovered.batches.iter().fold(
+            recovered.derived_content_floor_seq,
+            |derived_seq, batch| {
+                if batch
                     .rows
                     .iter()
-                    .map(move |row| (batch.seq, row.cf, row.key.as_slice(), row.value.as_slice()))
+                    .any(|row| row.cf.feeds_derived_search_content())
+                {
+                    derived_seq.max(batch.seq)
+                } else {
+                    derived_seq
+                }
+            },
+        );
+        let latest_candidate = if mode == durable::RecoveryMode::LatestRouter {
+            let memtable_byte_cap = self.rows.latest_router_memtable_byte_cap()?;
+            let mut router = match durable.selected_cfs() {
+                Some(selected) => CfRouter::open_selected_cfs(
+                    durable.root(),
+                    memtable_byte_cap,
+                    selected.iter().copied(),
+                )?,
+                None => CfRouter::open_with_tiering_latest(
+                    durable.root(),
+                    memtable_byte_cap,
+                    durable.tiering_policy().cloned(),
+                )?,
+            };
+            router.replay_latest_rows(recovered.batches.iter().flat_map(|batch| {
+                batch.rows.iter().filter_map(move |row| {
+                    durable
+                        .selected_cfs()
+                        .is_none_or(|selected| selected.contains(&row.cf))
+                        .then_some((batch.seq, row.cf, row.key.as_slice(), row.value.as_slice()))
+                })
             }))?;
             Some(router)
         } else {
             None
         };
-        if let Some(hook) = &self.ledger_hook {
-            ledger_hook::refresh_hook(
-                hook,
+        if let Some(candidate) = latest_candidate.as_ref() {
+            let expected_selected = durable.selected_cfs().map(|selected| {
+                selected
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            if candidate.selected_cfs() != expected_selected.as_ref() {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "latest-router refresh candidate capability differs from retained writer scope: candidate={:?}, expected={expected_selected:?}",
+                    candidate.selected_cfs()
+                )));
+            }
+        }
+        let prepared_hook = if self.ledger_hook.is_some() {
+            Some(ledger_hook::prepare_hook_refresh(
                 durable.root(),
                 &recovered,
                 durable.ledger_checkpoint(),
                 durable.tiering_policy(),
                 std::sync::Arc::clone(&self.clock),
-            )?;
-        }
-        self.replace_retention_horizon(recovered.retention_horizon.clone())?;
-        durable.advance_derived_content_watermark_to_at_least(recovered.derived_content_floor_seq);
-        // WAL-tail batches from a foreign writer have no durable-batch SSTs
-        // yet; stage them here so this handle's next checkpoint flush cannot
-        // advance the manifest past them if that writer dies (issue #1132).
-        match mode {
-            durable::RecoveryMode::FullMvcc => {
-                self.rows
-                    .advance_derived_content_seq_to_at_least(recovered.derived_content_floor_seq);
-                for batch in &recovered.batches {
-                    if batch.seq <= current {
-                        continue;
-                    }
-                    let rows_at_seq = batch
-                        .rows
-                        .iter()
-                        .map(|row| (row.cf, row.key.clone(), row.value.clone()));
-                    self.rows.restore_mvcc_batch(batch.seq, rows_at_seq)?;
-                }
-                self.rows.advance_to_at_least(recovered.last_recovered_seq);
-            }
-            durable::RecoveryMode::LatestRouter => {
-                let candidate = latest_candidate.ok_or_else(|| {
-                    CalyxError::aster_corrupt_shard(
-                        "latest-router refresh completed recovery without a candidate router",
-                    )
-                })?;
-                self.rows.replace_latest_recovered_router(
-                    current,
-                    recovered.last_recovered_seq,
-                    recovered.wal_replay_floor_seq,
-                    recovered.derived_content_floor_seq,
-                    recovered
-                        .batches
-                        .iter()
-                        .flat_map(|batch| batch.rows.iter().map(move |row| (batch.seq, row.cf))),
-                    candidate,
-                )?;
-            }
-        }
+            )?)
+        } else {
+            None
+        };
         durable.stage_recovered_wal_batches(
             recovered
                 .batches
@@ -134,11 +192,135 @@ where
                 .map(|batch| (batch.seq, batch.rows.clone()))
                 .collect(),
         )?;
+        let mut hook_guard = self
+            .ledger_hook
+            .as_ref()
+            .map(ledger_hook::lock_hook)
+            .transpose()?;
+        let mut retention_guard = self
+            .retention_horizon
+            .lock()
+            .map_err(|_| CalyxError::backpressure("retention horizon lock poisoned"))?;
+        // WAL-tail batches from a foreign writer have no durable-batch SSTs
+        // yet; stage them here so this handle's next checkpoint flush cannot
+        // advance the manifest past them if that writer dies (issue #1132).
+        let publication: Result<()> = (|| match mode {
+            durable::RecoveryMode::FullMvcc => {
+                let future_batches = recovered
+                    .batches
+                    .iter()
+                    .filter(|batch| batch.seq > current)
+                    .map(|batch| {
+                        let rows = batch
+                            .rows
+                            .iter()
+                            .filter(|row| {
+                                durable
+                                    .selected_cfs()
+                                    .is_none_or(|selected| selected.contains(&row.cf))
+                            })
+                            .map(|row| (row.cf, row.key.clone(), row.value.clone()))
+                            .collect();
+                        (batch.seq, rows)
+                    })
+                    .collect();
+                self.rows.publish_recovered_full_mvcc_state(
+                    current,
+                    recovered.last_recovered_seq,
+                    recovered_derived_seq,
+                    recovered.cf_content_generation_floor_seq,
+                    recovered.cf_content_generations.clone(),
+                    future_batches,
+                )
+            }
+            durable::RecoveryMode::LatestRouter => {
+                let candidate = latest_candidate.ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(
+                        "latest-router refresh completed recovery without a candidate router",
+                    )
+                })?;
+                self.rows.replace_latest_recovered_router(
+                    LatestRouterRecoveryState {
+                        expected_current: current,
+                        recovered_seq: recovered.last_recovered_seq,
+                        content_generation_floor_seq: recovered.cf_content_generation_floor_seq,
+                        content_generations: recovered.cf_content_generations.clone(),
+                        derived_content_floor_seq: recovered.derived_content_floor_seq,
+                    },
+                    recovered
+                        .batches
+                        .iter()
+                        .flat_map(|batch| batch.rows.iter().map(move |row| (batch.seq, row.cf))),
+                    candidate,
+                )
+            }
+        })();
+        if let Err(error) = publication {
+            let terminal = refresh_publication_error(&error);
+            self.rows
+                .latch_terminal_durable_fault_requires_reopen(terminal.clone());
+            return Err(terminal);
+        }
+        let generation_readback = (|| {
+            let durable_tip = durable.durable_tip_seq()?;
+            let manifest_seq = durable.manifest_seq_on_disk()?;
+            let live_seq = self.latest_seq();
+            if durable_tip != recovered.last_recovered_seq
+                || live_seq != recovered.last_recovered_seq
+                || manifest_seq != recovered.manifest_seq
+            {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "durable refresh generation readback diverged: recovered_seq={}, live_seq={live_seq}, durable_tip={durable_tip}, recovered_manifest_seq={}, disk_manifest_seq={manifest_seq}",
+                    recovered.last_recovered_seq, recovered.manifest_seq
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = generation_readback {
+            let terminal = refresh_publication_error(&error);
+            self.rows
+                .latch_terminal_durable_fault_requires_reopen(terminal.clone());
+            return Err(terminal);
+        }
+        if let (Some(guard), Some(replacement)) = (hook_guard.as_mut(), prepared_hook) {
+            **guard = replacement;
+        }
+        *retention_guard = recovered.retention_horizon.clone();
+        durable.advance_derived_content_watermark_to_at_least(recovered_derived_seq);
+        durable.observe_manifest_seq(recovered.manifest_seq);
         Ok(())
     }
 
     pub(super) fn commit_rows(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
         self.with_durable_commit_lock(|| self.commit_rows_locked(rows))
+    }
+
+    pub(crate) fn commit_rows_if_seq(
+        &self,
+        expected_seq: Seq,
+        rows: Vec<encode::WriteRow>,
+        operation: &'static str,
+    ) -> Result<Seq> {
+        if self.durable.is_none() {
+            return self.commit_rows_if_current_volatile(expected_seq, rows);
+        }
+        self.with_durable_commit_lock(|| {
+            let current_seq = self.latest_seq();
+            if current_seq != expected_seq {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_SEQUENCE_CONFLICT",
+                    message: format!(
+                        "{operation} evaluated seq {expected_seq}, but the current seq is {current_seq}; no rows were written"
+                    ),
+                    remediation:
+                        "re-read the current snapshot and explicitly submit a newly derived operation; the vault does not retry stale derivations",
+                });
+            }
+            if rows.is_empty() {
+                return Ok(current_seq);
+            }
+            self.commit_rows_locked_owned(rows, false)
+        })
     }
 
     pub(crate) fn commit_rows_locked(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
@@ -301,14 +483,26 @@ where
         // time mapping (A15). We hold the durable commit lock here, so the next
         // allocated seq is exactly current_seq()+1; we assert that against the
         // committed seq below and fail loud on any divergence (never silent).
-        let predicted = self.rows.current_seq().saturating_add(1);
+        let predicted = self.rows.current_seq().checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "vault sequence exhausted at u64::MAX before time-index staging",
+            )
+        })?;
         let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
         rows.push(encode::WriteRow { cf, key, value });
         let committed = self.commit_prepared_rows_owned(rows, skip_compression_guard)?;
         if committed != predicted {
-            return Err(CalyxError::aster_corrupt_shard(format!(
+            let mismatch = CalyxError::aster_corrupt_shard(format!(
                 "time-index seqno prediction {predicted} diverged from committed seq {committed}"
-            )));
+            ));
+            if self.durable.is_some() {
+                return Err(self.reconcile_post_wal_failure(
+                    committed,
+                    "time_index_sequence_readback",
+                    &mismatch,
+                ));
+            }
+            return Err(mismatch);
         }
         Ok(committed)
     }
@@ -370,53 +564,147 @@ where
         // closed on reopen — exactly candidate 4's intended no-silent-truncation
         // behavior.
         let anchor_timer = crate::commit_timing::start();
-        if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(&rows)? {
-            crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
-        }
+        let anchor_result = (|| {
+            if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(&rows)? {
+                crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
+            }
+            Ok(())
+        })();
         anchor_timer.stop("ledger_head_anchor", row_count, 0);
+        if let Err(anchor_error) = anchor_result {
+            return Err(self.reconcile_post_wal_failure(
+                durable_seq,
+                "ledger_head_anchor",
+                &anchor_error,
+            ));
+        }
         #[cfg(any(test, feature = "crash-fsv"))]
-        crash_fsv_after_wal_append(durable_seq)?;
+        if let Err(error) = crash_fsv_after_wal_append(durable_seq) {
+            return Err(self.reconcile_post_wal_failure(
+                durable_seq,
+                "crash_fsv_after_wal_append",
+                &error,
+            ));
+        }
         let mvcc = crate::commit_timing::start();
         let mvcc_result = self.commit_rows_to_mvcc(&rows, skip_compression_guard);
         mvcc.stop("mvcc_commit", row_count, 0);
         let mvcc_seq = match mvcc_result {
             Ok(seq) => seq,
             Err(mvcc_error) => {
-                let restore = self.refresh_from_durable();
-                let checkpoint = match &restore {
-                    Ok(()) => self.flush_locked().map(|_| ()),
-                    Err(error) => Err(CalyxError {
-                        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
-                        message: format!(
-                            "checkpoint skipped because durable refresh failed first: [{}] {}",
-                            error.code, error.message
-                        ),
-                        remediation: "reopen the vault to reconstruct the exact durable generation before attempting a checkpoint",
-                    }),
-                };
-                return Err(post_wal_commit_error(
+                return Err(self.reconcile_post_wal_failure(
                     durable_seq,
+                    "mvcc_apply",
                     &mvcc_error,
-                    &restore,
-                    &checkpoint,
                 ));
             }
         };
         if mvcc_seq != durable_seq {
-            return Err(CalyxError::aster_corrupt_shard(format!(
+            let mismatch = CalyxError::aster_corrupt_shard(format!(
                 "durable WAL seq {durable_seq} diverged from MVCC seq {mvcc_seq}"
-            )));
+            ));
+            return Err(self.reconcile_post_wal_failure(
+                durable_seq,
+                "mvcc_sequence_readback",
+                &mismatch,
+            ));
         }
         let stage = crate::commit_timing::start();
-        durable.stage_checkpoint_batch_owned(durable_seq, rows)?;
+        let stage_result = durable.stage_checkpoint_batch_owned(durable_seq, rows);
         stage.stop("checkpoint_stage", row_count, 0);
+        if let Err(stage_error) = stage_result {
+            return Err(self.reconcile_post_wal_failure(
+                durable_seq,
+                "checkpoint_stage",
+                &stage_error,
+            ));
+        }
         // Crash boundary (#276): the batch is now in the WAL and the MVCC
         // memtable and staged for checkpoint, but its checkpoint SST + manifest
         // advance have not happened. A crash here recovers via WAL replay with a
         // manifest still behind the committed seq.
         #[cfg(any(test, feature = "crash-fsv"))]
-        crate::vault::failpoints::crash_fsv_after_mvcc_commit(mvcc_seq)?;
+        if let Err(error) = crate::vault::failpoints::crash_fsv_after_mvcc_commit(mvcc_seq) {
+            return Err(self.reconcile_post_wal_failure(
+                durable_seq,
+                "crash_fsv_after_mvcc_commit",
+                &error,
+            ));
+        }
         Ok(mvcc_seq)
+    }
+
+    fn reconcile_post_wal_failure(
+        &self,
+        durable_seq: Seq,
+        failed_stage: &str,
+        stage_error: &CalyxError,
+    ) -> CalyxError {
+        // Every core commit entrypoint may retain its Ledger-hook guard while
+        // this boundary executes. Attempting in-place refresh would reacquire
+        // that same mutex and self-deadlock. More importantly, a post-WAL
+        // failure means the live router/MVCC/witness/checkpoint tuple is no
+        // longer one provable generation. Preserve it and require a fresh open.
+        let restore = Err(CalyxError {
+            code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+            message: format!(
+                "automatic refresh refused after {failed_stage}: mandatory post-WAL state cannot be proven identical to the durable WAL generation while caller-owned commit guards remain retained"
+            ),
+            remediation: "discard this handle and reopen the vault so only the exact durable WAL generation is reconstructed",
+        });
+        let checkpoint = Err(CalyxError {
+            code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+            message: "checkpoint skipped because a fresh durable reopen is required first"
+                .to_string(),
+            remediation: "reopen the vault to reconstruct the exact durable generation before attempting a checkpoint",
+        });
+        let terminal = post_wal_commit_error(
+            durable_seq,
+            failed_stage,
+            stage_error,
+            &restore,
+            &checkpoint,
+        );
+        self.rows
+            .latch_terminal_durable_fault_requires_reopen(terminal.clone());
+        terminal
+    }
+
+    /// Classifies an in-memory Ledger-hook finalization failure that occurred
+    /// after the exact Ledger rows were already committed with the data batch.
+    /// Callers invoke this while retaining the failed hook guard, so attempting
+    /// an in-place hook refresh here would self-deadlock. The handle is therefore
+    /// latched terminal and a fresh durable reopen is required to reconstruct
+    /// the hook from the committed physical rows. A volatile handle has no such
+    /// reconstruction source and must be discarded. In either case the caller
+    /// receives the failure instead of a false success.
+    pub(crate) fn reconcile_post_commit_ledger_hook_failure(
+        &self,
+        committed_seq: Seq,
+        error: &CalyxError,
+    ) -> CalyxError {
+        let durable = self.durable.is_some();
+        let terminal = CalyxError {
+            code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+            message: format!(
+                "commit {committed_seq} reached {} but its in-memory Ledger hook failed to finalize: [{}] {}",
+                if durable {
+                    "durable WAL/MVCC"
+                } else {
+                    "volatile MVCC"
+                },
+                error.code,
+                error.message
+            ),
+            remediation: if durable {
+                "discard this handle and reopen the vault so the Ledger hook is reconstructed from the exact committed physical Ledger rows"
+            } else {
+                "discard this volatile vault handle; no durable source exists from which to reconstruct the failed Ledger hook"
+            },
+        };
+        self.rows
+            .latch_terminal_durable_fault_requires_reopen(terminal.clone());
+        terminal
     }
 
     fn commit_owned_rows_to_mvcc(
@@ -451,21 +739,33 @@ where
 
 fn post_wal_commit_error(
     durable_seq: Seq,
-    mvcc_error: &CalyxError,
+    failed_stage: &str,
+    stage_error: &CalyxError,
     restore: &Result<()>,
     checkpoint: &Result<()>,
 ) -> CalyxError {
     CalyxError {
         code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
         message: format!(
-            "WAL commit is durable but live MVCC/router application failed; wal_seq={durable_seq} \
-             mvcc=error[{}]: {} restore={} checkpoint={}",
-            mvcc_error.code,
-            mvcc_error.message,
+            "WAL commit is durable but post-WAL stage {failed_stage} failed; wal_seq={durable_seq} \
+             stage_error=error[{}]: {} restore={} checkpoint={}",
+            stage_error.code,
+            stage_error.message,
             reconciliation_outcome(restore),
             reconciliation_outcome(checkpoint),
         ),
         remediation: "treat wal_seq as durably committed; reconcile by idempotency/readback or reopen the vault before retrying",
+    }
+}
+
+fn refresh_publication_error(error: &CalyxError) -> CalyxError {
+    CalyxError {
+        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+        message: format!(
+            "durable refresh reconstructed source bytes but could not publish one coherent live generation: underlying=error[{}]: {}",
+            error.code, error.message
+        ),
+        remediation: "discard this terminally faulted handle and reopen the vault; do not read or write through the partial live generation",
     }
 }
 

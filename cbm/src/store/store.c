@@ -12,6 +12,7 @@
 #include "foundation/constants.h"
 #include "foundation/schema_version.h"
 
+#include <float.h>
 #include <math.h>
 
 enum {
@@ -47,7 +48,6 @@ enum {
     ST_INIT_CAP_4 = 4,
     ST_HEADER_PREFIX = 3,
     ST_MIN_INDEGREE = 3,
-    ST_MAX_PATH_DEPTH = 3,
     ST_MAX_ITERATIONS = 10,
     ST_MAX_SECTIONS = 16,
     ST_METHOD_PROP_LEN = 8,
@@ -156,6 +156,7 @@ struct cbm_store {
     const char *db_path; /* heap-allocated, or NULL for :memory: */
     char errbuf[CBM_SZ_512];
     int errcode;
+    cbm_cluster_receipt_t cluster_receipt;
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -169,6 +170,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
+    sqlite3_stmt *stmt_find_node_identities_by_file;
     sqlite3_stmt *stmt_count_nodes;
     sqlite3_stmt *stmt_delete_nodes_by_project;
     sqlite3_stmt *stmt_delete_nodes_by_file;
@@ -506,9 +508,8 @@ static int init_schema(cbm_store_t *s) {
         "  index_mode TEXT NOT NULL CHECK(index_mode IN ('full','moderate','fast')),"
         "  semantic_state TEXT NOT NULL CHECK(semantic_state IN "
         "    ('available','unavailable_mode','unavailable_corpus')),"
-        "  semantic_vector_dimension INTEGER NOT NULL CHECK(semantic_vector_dimension = "
-        CBM_SEMANTIC_VECTOR_DIMENSION_SQL
-        "),"
+        "  semantic_vector_dimension INTEGER NOT NULL CHECK(semantic_vector_dimension "
+        "= " CBM_SEMANTIC_VECTOR_DIMENSION_SQL "),"
         "  semantic_eligible_node_count INTEGER,"
         "  node_vector_count INTEGER NOT NULL CHECK(node_vector_count >= 0),"
         "  token_vector_count INTEGER NOT NULL CHECK(token_vector_count >= 0),"
@@ -591,17 +592,13 @@ static int init_schema(cbm_store_t *s) {
         "CREATE TABLE IF NOT EXISTS node_vectors ("
         "  node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,"
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
-        "  vector BLOB NOT NULL CHECK(length(vector) = "
-        CBM_SEMANTIC_VECTOR_DIMENSION_SQL
-        ")"
+        "  vector BLOB NOT NULL CHECK(length(vector) = " CBM_SEMANTIC_VECTOR_DIMENSION_SQL ")"
         ");"
         "CREATE TABLE IF NOT EXISTS token_vectors ("
         "  id INTEGER PRIMARY KEY,"
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
         "  token TEXT NOT NULL CHECK(length(token) > 0),"
-        "  vector BLOB NOT NULL CHECK(length(vector) = "
-        CBM_SEMANTIC_VECTOR_DIMENSION_SQL
-        "),"
+        "  vector BLOB NOT NULL CHECK(length(vector) = " CBM_SEMANTIC_VECTOR_DIMENSION_SQL "),"
         "  idf INTEGER NOT NULL CHECK(idf > 0)"
         ");";
 
@@ -1001,10 +998,8 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
     }
     int len_a = sqlite3_value_bytes(argv[0]);
     int len_b = sqlite3_value_bytes(argv[SKIP_ONE]);
-    if (len_a != CBM_SEMANTIC_VECTOR_DIMENSION ||
-        len_b != CBM_SEMANTIC_VECTOR_DIMENSION) {
-        sqlite3_result_error(ctx, "persisted semantic vector dimension is invalid",
-                             CBM_NOT_FOUND);
+    if (len_a != CBM_SEMANTIC_VECTOR_DIMENSION || len_b != CBM_SEMANTIC_VECTOR_DIMENSION) {
+        sqlite3_result_error(ctx, "persisted semantic vector dimension is invalid", CBM_NOT_FOUND);
         return;
     }
     const int8_t *a = (const int8_t *)sqlite3_value_blob(argv[0]);
@@ -4413,6 +4408,7 @@ cbm_store_close_status_t cbm_store_close(cbm_store_t **store, cbm_store_close_re
         STORE_CLOSE_SLOT(stmt_find_nodes_by_name_any),
         STORE_CLOSE_SLOT(stmt_find_nodes_by_label),
         STORE_CLOSE_SLOT(stmt_find_nodes_by_file),
+        STORE_CLOSE_SLOT(stmt_find_node_identities_by_file),
         STORE_CLOSE_SLOT(stmt_count_nodes),
         STORE_CLOSE_SLOT(stmt_delete_nodes_by_project),
         STORE_CLOSE_SLOT(stmt_delete_nodes_by_file),
@@ -4984,10 +4980,9 @@ static int read_project_row(cbm_store_t *s, sqlite3_stmt *stmt, cbm_project_t *o
     bool mode_valid = cbm_index_mode_parse(mode_text, &out->capability.index_mode);
     bool state_valid = cbm_semantic_state_parse(state_text, &out->capability.semantic_state);
     out->capability.vector_dimension = sqlite3_column_int(stmt, ST_COL_5);
-    out->capability.eligible_node_count =
-        sqlite3_column_type(stmt, ST_COL_6) == SQLITE_NULL
-            ? CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED
-            : sqlite3_column_int(stmt, ST_COL_6);
+    out->capability.eligible_node_count = sqlite3_column_type(stmt, ST_COL_6) == SQLITE_NULL
+                                              ? CBM_SEMANTIC_ELIGIBLE_NOT_EVALUATED
+                                              : sqlite3_column_int(stmt, ST_COL_6);
     out->capability.node_vector_count = sqlite3_column_int(stmt, ST_COL_7);
     out->capability.token_vector_count = sqlite3_column_int(stmt, ST_COL_8);
 
@@ -5008,8 +5003,9 @@ static int read_project_row(cbm_store_t *s, sqlite3_stmt *stmt, cbm_project_t *o
         store_set_error(s, detail);
         cbm_log_error("store.index_capability_invalid", "code",
                       "CBM_INDEX_CAPABILITY_STATE_INVALID", "operation", operation, "detail",
-                      detail, "message", "the persisted index capability is internally inconsistent",
-                      "remediation", "preserve the database and rebuild it from the exact source");
+                      detail, "message",
+                      "the persisted index capability is internally inconsistent", "remediation",
+                      "preserve the database and rebuild it from the exact source");
         return CBM_STORE_SEMANTIC_STATE_INVALID;
     }
     return CBM_STORE_OK;
@@ -5018,9 +5014,9 @@ static int read_project_row(cbm_store_t *s, sqlite3_stmt *stmt, cbm_project_t *o
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_project,
-                        "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
-                        "semantic_vector_dimension, semantic_eligible_node_count, "
-                        "node_vector_count, token_vector_count FROM projects WHERE name = ?1;");
+                       "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
+                       "semantic_vector_dimension, semantic_eligible_node_count, "
+                       "node_vector_count, token_vector_count FROM projects WHERE name = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -5041,9 +5037,9 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     *count = 0;
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_list_projects,
-                        "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
-                        "semantic_vector_dimension, semantic_eligible_node_count, "
-                        "node_vector_count, token_vector_count FROM projects ORDER BY name;");
+                       "SELECT name, indexed_at, root_path, index_mode, semantic_state, "
+                       "semantic_vector_dimension, semantic_eligible_node_count, "
+                       "node_vector_count, token_vector_count FROM projects ORDER BY name;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -5503,14 +5499,246 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
                               project, file_path, true, out, count);
 }
 
+/* Narrow deterministic identity projection for detect_changes. Properties and
+ * source blobs are intentionally absent because that route serves only these
+ * six persisted fields. */
+static void node_identity_free_fields(cbm_node_identity_t *node) {
+    if (!node) {
+        return;
+    }
+    free((void *)node->atom_id);
+    free((void *)node->name);
+    free((void *)node->qualified_name);
+    free((void *)node->label);
+    free((void *)node->file_path);
+    memset(node, 0, sizeof(*node));
+}
+
+void cbm_store_free_node_identities(cbm_node_identity_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        node_identity_free_fields(&rows[i]);
+    }
+    free(rows);
+}
+
+static int scan_node_identity(cbm_store_t *s, sqlite3_stmt *stmt, cbm_node_identity_t *node,
+                              size_t string_byte_bound, size_t *string_bytes) {
+    memset(node, 0, sizeof(*node));
+    if (!string_bytes) {
+        store_set_error(s, "node identity query has no retained-byte output");
+        return CBM_STORE_ERR;
+    }
+    *string_bytes = 0;
+    if (sqlite3_column_count(stmt) != 6 || sqlite3_column_type(stmt, 0) != SQLITE_INTEGER) {
+        store_set_error(s, "node identity query returned an invalid column contract");
+        return CBM_STORE_ERR;
+    }
+    int64_t id = sqlite3_column_int64(stmt, 0);
+    const char *atom_id = (const char *)sqlite3_column_text(stmt, 1);
+    const char *name = (const char *)sqlite3_column_text(stmt, 2);
+    const char *qualified_name = (const char *)sqlite3_column_text(stmt, 3);
+    const char *label = (const char *)sqlite3_column_text(stmt, 4);
+    const char *file_path = (const char *)sqlite3_column_text(stmt, 5);
+    const char *values[] = {atom_id, name, qualified_name, label, file_path};
+    size_t retained = 0;
+    for (int i = 0; i < 5; i++) {
+        int column_bytes = sqlite3_column_bytes(stmt, i + 1);
+        size_t retained_value =
+            column_bytes > 0 ? (size_t)column_bytes + (size_t)1 : SIZE_MAX;
+        if (!values[i] || column_bytes <= 0 || strlen(values[i]) != (size_t)column_bytes ||
+            (size_t)column_bytes == SIZE_MAX || retained_value > string_byte_bound ||
+            retained > string_byte_bound - retained_value) {
+            store_set_error(s,
+                            "node identity row has an invalid string or exceeds its caller byte bound");
+            return CBM_STORE_ERR;
+        }
+        retained += retained_value;
+    }
+    if (id <= 0 || !is_canonical_atom_id(atom_id) || !name || !name[0] || !qualified_name ||
+        !qualified_name[0] || !label || !label[0] || !file_path || !file_path[0]) {
+        store_set_error(s, "node identity row is incomplete or non-canonical");
+        return CBM_STORE_ERR;
+    }
+    node->id = id;
+    node->atom_id = heap_strdup(atom_id);
+    node->name = heap_strdup(name);
+    node->qualified_name = heap_strdup(qualified_name);
+    node->label = heap_strdup(label);
+    node->file_path = heap_strdup(file_path);
+    if (!node->atom_id || !node->name || !node->qualified_name || !node->label ||
+        !node->file_path) {
+        node_identity_free_fields(node);
+        store_set_error(s, "node identity row allocation failed");
+        return CBM_STORE_ERR;
+    }
+    *string_bytes = retained;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_find_node_identities_by_file(cbm_store_t *s, const char *project,
+                                           const char *file_path, int max_count,
+                                           size_t max_retained_bytes,
+                                           cbm_node_identity_t **out, int *count,
+                                           size_t *retained_bytes) {
+    if (!out || !count || !retained_bytes) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    *retained_bytes = 0;
+    if (!s || !s->db || !project || !project[0] || !file_path || !file_path[0] ||
+        max_count < 0 || max_retained_bytes == 0) {
+        if (s) {
+            store_set_error(s, "node identity query received an invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_find_node_identities_by_file,
+        "SELECT id, atom_id, name, qualified_name, label, file_path FROM nodes "
+        "WHERE project = ?1 AND file_path = ?2 ORDER BY id;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    int bind_rc = bind_text(stmt, 1, project);
+    if (bind_rc == SQLITE_OK) {
+        bind_rc = bind_text(stmt, 2, file_path);
+    }
+    if (bind_rc != SQLITE_OK) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        store_set_error_sqlite_code(s, "node identity query bind", bind_rc);
+        return CBM_STORE_ERR;
+    }
+
+    cbm_node_identity_t *rows = NULL;
+    int row_count = 0;
+    int capacity = 0;
+    size_t retained_strings = 0;
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (row_count == max_count) {
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            store_set_error(s, "node identity query exceeds its caller row bound");
+            return CBM_STORE_ERR;
+        }
+        if (row_count == INT_MAX) {
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            store_set_error(s, "node identity row count exceeds INT_MAX");
+            return CBM_STORE_ERR;
+        }
+        int required_capacity = row_count + 1;
+        size_t next_capacity = capacity > 0 ? (size_t)capacity : 8U;
+        while (next_capacity < (size_t)required_capacity) {
+            if (next_capacity > (size_t)INT_MAX / 2U) {
+                next_capacity = (size_t)required_capacity;
+                break;
+            }
+            next_capacity *= 2U;
+        }
+        if (next_capacity > (size_t)INT_MAX || next_capacity > SIZE_MAX / sizeof(*rows)) {
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            store_set_error(s, "node identity row storage size overflowed");
+            return CBM_STORE_ERR;
+        }
+        size_t array_bytes = next_capacity * sizeof(*rows);
+        if (array_bytes > max_retained_bytes ||
+            retained_strings > max_retained_bytes - array_bytes) {
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            store_set_error(s, "node identity row storage exceeds its caller byte bound");
+            return CBM_STORE_ERR;
+        }
+
+        cbm_node_identity_t row = {0};
+        size_t row_string_bytes = 0;
+        if (scan_node_identity(s, stmt, &row,
+                               max_retained_bytes - array_bytes - retained_strings,
+                               &row_string_bytes) != CBM_STORE_OK) {
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            return CBM_STORE_ERR;
+        }
+        if (store_array_reserve(s, (void **)&rows, &capacity, required_capacity, sizeof(*rows),
+                                "node identity query") != CBM_STORE_OK) {
+            node_identity_free_fields(&row);
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            return CBM_STORE_ERR;
+        }
+        if ((size_t)capacity != next_capacity) {
+            node_identity_free_fields(&row);
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            store_set_error(s, "node identity row capacity differs from its admitted allocation");
+            return CBM_STORE_ERR;
+        }
+        if (row_count > 0 && rows[row_count - 1].id >= row.id) {
+            node_identity_free_fields(&row);
+            cbm_store_free_node_identities(rows, row_count);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            store_set_error(s, "node identity query is not strictly id-ordered and unique");
+            return CBM_STORE_ERR;
+        }
+        rows[row_count] = row;
+        retained_strings += row_string_bytes;
+        row_count++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        cbm_store_free_node_identities(rows, row_count);
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        store_set_error_sqlite(s, "node identity query step");
+        return CBM_STORE_ERR;
+    }
+    int reset_rc = sqlite3_reset(stmt);
+    int clear_rc = sqlite3_clear_bindings(stmt);
+    if (reset_rc != SQLITE_OK || clear_rc != SQLITE_OK) {
+        cbm_store_free_node_identities(rows, row_count);
+        store_set_error_sqlite_code(s, "node identity query reset",
+                                    reset_rc != SQLITE_OK ? reset_rc : clear_rc);
+        return CBM_STORE_ERR;
+    }
+    if ((size_t)row_count > (SIZE_MAX - retained_strings) / sizeof(*rows)) {
+        cbm_store_free_node_identities(rows, row_count);
+        store_set_error(s, "node identity retained-byte count overflowed");
+        return CBM_STORE_ERR;
+    }
+    *out = rows;
+    *count = row_count;
+    *retained_bytes = (size_t)row_count * sizeof(*rows) + retained_strings;
+    return CBM_STORE_OK;
+}
+
 /* A cached COUNT statement reaches SQLITE_ROW, not SQLITE_DONE.  Reset it
  * before returning so the connection releases its read transaction instead of
  * retaining a table lock until the next invocation or store destruction. */
 static int finish_cached_count(cbm_store_t *s, sqlite3_stmt *stmt, int step_rc,
                                const char *operation) {
     int result = CBM_STORE_ERR;
-    if (step_rc == SQLITE_ROW) {
-        result = sqlite3_column_int(stmt, 0);
+    if (step_rc == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_INTEGER) {
+        sqlite3_int64 count = sqlite3_column_int64(stmt, 0);
+        if (count >= 0 && count <= INT_MAX) {
+            result = (int)count;
+        } else {
+            store_set_error(s, "cached count is not representable by the public result type");
+        }
+    } else if (step_rc == SQLITE_ROW) {
+        store_set_error(s, "cached count query returned a non-integer value");
     } else {
         store_set_error_sqlite(s, operation);
     }
@@ -5524,8 +5752,11 @@ static int finish_cached_count(cbm_store_t *s, sqlite3_stmt *stmt, int step_rc,
 }
 
 int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
-    if (!s || !s->db) {
-        return 0;
+    if (!s || !s->db || !project || !project[0]) {
+        if (s) {
+            store_set_error(s, "invalid node-count arguments");
+        }
+        return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_count_nodes, "SELECT COUNT(*) FROM nodes WHERE project = ?1;");
@@ -5533,7 +5764,12 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, SKIP_ONE, project);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error_sqlite(s, "count_nodes.bind");
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        return CBM_STORE_ERR;
+    }
     return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_nodes.step_or_reset");
 }
 
@@ -5588,8 +5824,7 @@ int cbm_store_count_nodes_by_label_and_name(cbm_store_t *s, const char *project,
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    const char *sql =
-        "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = ?2 AND name = ?3;";
+    const char *sql = "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = ?2 AND name = ?3;";
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
         if (stmt) {
             sqlite3_finalize(stmt);
@@ -5607,7 +5842,8 @@ int cbm_store_count_nodes_by_label_and_name(cbm_store_t *s, const char *project,
         if (observed >= 0 && observed <= INT_MAX) {
             count = (int)observed;
         } else {
-            store_set_error(s, "typed outcome-code count is outside the current int representation");
+            store_set_error(s,
+                            "typed outcome-code count is outside the current int representation");
         }
     } else {
         store_set_error(s, sqlite3_errmsg(s->db));
@@ -5860,8 +6096,11 @@ int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char
 }
 
 int cbm_store_count_edges(cbm_store_t *s, const char *project) {
-    if (!s || !s->db) {
-        return 0;
+    if (!s || !s->db || !project || !project[0]) {
+        if (s) {
+            store_set_error(s, "invalid edge-count arguments");
+        }
+        return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_count_edges, "SELECT COUNT(*) FROM edges WHERE project = ?1;");
@@ -5869,7 +6108,12 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, SKIP_ONE, project);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error_sqlite(s, "count_edges.bind");
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        return CBM_STORE_ERR;
+    }
     return finish_cached_count(s, stmt, sqlite3_step(stmt), "count_edges.step_or_reset");
 }
 
@@ -7550,138 +7794,286 @@ static void schema_discover_props(sqlite3 *db, const char *sql, const char *proj
     *out_count = pn;
 }
 
-/* Path scoping for architecture / schema (shared). */
-static bool arch_path_is_set(const char *path) {
-    if (!path) {
-        return false;
-    }
-    while (*path == ' ' || *path == '\t' || *path == '\n' || *path == '\r') {
-        path++;
-    }
-    return path[0] != '\0';
-}
+/* Path scoping for architecture / schema (shared).  A path is normalized once
+ * into a dynamically sized byte string.  SQL uses a BINARY half-open range for
+ * descendants: [path + '/', path + '0').  This treats '%' and '_' literally,
+ * avoids LIKE wildcard semantics entirely, and cannot truncate a long scope. */
+typedef struct {
+    char *norm;
+    bool scoped;
+} arch_path_scope_t;
 
-static bool arch_path_prepare(const char *path, char *norm_out, size_t norm_sz, char *like_out,
-                              size_t like_sz) {
-    if (!arch_path_is_set(path)) {
-        return false;
+static int arch_path_prepare(const char *path, arch_path_scope_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!path) {
+        return CBM_STORE_OK;
     }
     while (*path == ' ' || *path == '\t' || *path == '\n' || *path == '\r') {
         path++;
     }
-    if (path[0] == '\0') {
-        return false;
-    }
-    if (strncmp(path, "./", 2) == 0) {
-        path += 2;
-    }
-    while (*path == '/') {
-        path++;
-    }
-    if (path[0] == '\0') {
-        return false;
-    }
-    strncpy(norm_out, path, norm_sz - 1);
-    norm_out[norm_sz - 1] = '\0';
-    size_t len = strlen(norm_out);
-    while (len > 0 &&
-           (norm_out[len - 1] == ' ' || norm_out[len - 1] == '\t' || norm_out[len - 1] == '/')) {
-        norm_out[--len] = '\0';
-    }
-    /* Collapse duplicate slashes */
-    size_t w = 0;
-    for (size_t r = 0; norm_out[r] != '\0'; r++) {
-        if (norm_out[r] == '/' && w > 0 && norm_out[w - 1] == '/') {
+    for (;;) {
+        while (*path == '/' || *path == '\\') {
+            path++;
+        }
+        if (path[0] == '.' && (path[1] == '/' || path[1] == '\\')) {
+            path += 2;
             continue;
         }
-        norm_out[w++] = norm_out[r];
+        break;
     }
-    norm_out[w] = '\0';
-    if (norm_out[0] == '\0') {
-        return false;
+    const char *end = path + strlen(path);
+    while (end > path && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r' ||
+                          end[-1] == '/' || end[-1] == '\\')) {
+        end--;
     }
-    snprintf(like_out, like_sz, "%s/%%", norm_out);
-    return true;
+    if (end == path) {
+        return CBM_STORE_OK;
+    }
+    size_t input_len = (size_t)(end - path);
+    if (input_len == 1 && path[0] == '.') {
+        return CBM_STORE_OK;
+    }
+    if (input_len == SIZE_MAX) {
+        return CBM_STORE_ERR;
+    }
+    char *norm = malloc(input_len + 1);
+    if (!norm) {
+        return CBM_STORE_ERR;
+    }
+    size_t written = 0;
+    for (size_t read = 0; read < input_len; read++) {
+        char current = path[read] == '\\' ? '/' : path[read];
+        if (current == '/' && written > 0 && norm[written - 1] == '/') {
+            continue;
+        }
+        norm[written++] = current;
+    }
+    while (written > 0 && norm[written - 1] == '/') {
+        written--;
+    }
+    if (written == 0) {
+        free(norm);
+        return CBM_STORE_OK;
+    }
+    norm[written] = '\0';
+    out->norm = norm;
+    out->scoped = true;
+    return CBM_STORE_OK;
 }
+
+static void arch_path_scope_free(arch_path_scope_t *scope) {
+    if (!scope) {
+        return;
+    }
+    free(scope->norm);
+    scope->norm = NULL;
+    scope->scoped = false;
+}
+
+#define ARCH_PATH_PREDICATE(column)                                                            \
+    "(" column " COLLATE BINARY = ?2 OR (" column " COLLATE BINARY >= (?2 || '/') AND " column \
+    " COLLATE BINARY < (?2 || '0')))"
 
 static const char *arch_path_scope_sql(void) {
-    return " AND (file_path = ? OR file_path LIKE ?)";
+    return " AND " ARCH_PATH_PREDICATE("file_path");
 }
 
-static void arch_bind_path_scope(sqlite3_stmt *stmt, int exact_idx, int like_idx, const char *norm,
-                                 const char *like_pat) {
-    bind_text(stmt, exact_idx, norm);
-    bind_text(stmt, like_idx, like_pat);
+static int arch_bind_path_scope(sqlite3_stmt *stmt, int exact_idx, const char *norm) {
+    return bind_text(stmt, exact_idx, norm);
+}
+
+/* SQLite TEXT may legally contain embedded NUL bytes, while every public
+ * architecture result owns ordinary C strings.  Refuse such rows instead of
+ * hashing, grouping, or returning a silent prefix. */
+static bool arch_sqlite_text_is_exact_c_string(sqlite3_stmt *stmt, int column) {
+    if (sqlite3_column_type(stmt, column) != SQLITE_TEXT) {
+        return false;
+    }
+    const char *text = (const char *)sqlite3_column_text(stmt, column);
+    int bytes = sqlite3_column_bytes(stmt, column);
+    return text && bytes >= 0 && strlen(text) == (size_t)bytes;
+}
+
+int cbm_store_normalize_arch_path_alloc(const char *path, char **norm_out) {
+    if (!norm_out) {
+        return CBM_STORE_ERR;
+    }
+    *norm_out = NULL;
+    arch_path_scope_t scope = {0};
+    if (arch_path_prepare(path, &scope) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (!scope.scoped) {
+        return 0;
+    }
+    *norm_out = scope.norm;
+    return 1;
 }
 
 bool cbm_store_arch_path_scoped(const char *path) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512 + 4];
-    return arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    arch_path_scope_t scope = {0};
+    int rc = arch_path_prepare(path, &scope);
+    bool scoped = rc == CBM_STORE_OK && scope.scoped;
+    arch_path_scope_free(&scope);
+    return scoped;
 }
 
 bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz) {
-    char like[CBM_SZ_512 + 4];
-    return arch_path_prepare(path, norm_out, norm_sz, like, sizeof(like));
+    if (!norm_out || norm_sz == 0) {
+        return false;
+    }
+    arch_path_scope_t scope = {0};
+    if (arch_path_prepare(path, &scope) != CBM_STORE_OK || !scope.scoped) {
+        arch_path_scope_free(&scope);
+        return false;
+    }
+    size_t len = strlen(scope.norm);
+    if (len >= norm_sz) {
+        arch_path_scope_free(&scope);
+        return false;
+    }
+    memcpy(norm_out, scope.norm, len + 1);
+    arch_path_scope_free(&scope);
+    return true;
 }
 
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path) {
-    if (!s || !s->db || !project) {
-        return 0;
+    if (!s || !s->db || !project || !project[0]) {
+        if (s) {
+            store_set_error(s, "invalid scoped node-count arguments");
+        }
+        return CBM_STORE_ERR;
     }
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    if (!arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like))) {
-        return cbm_store_count_nodes(s, project);
+    arch_path_scope_t scope = {0};
+    if (arch_path_prepare(path, &scope) != CBM_STORE_OK) {
+        store_set_error(s, "architecture path normalization allocation failed");
+        return CBM_STORE_ERR;
+    }
+    if (!scope.scoped) {
+        int count = cbm_store_count_nodes(s, project);
+        arch_path_scope_free(&scope);
+        return count;
     }
     const char *sql = "SELECT COUNT(*) FROM nodes WHERE project = ?1 "
-                      "AND (file_path = ?2 OR file_path LIKE ?3);";
+                      "AND " ARCH_PATH_PREDICATE("file_path") ";";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
         if (stmt) {
             sqlite3_finalize(stmt);
         }
+        store_set_error_sqlite(s, "architecture scoped node-count prepare");
+        arch_path_scope_free(&scope);
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, ST_COL_1, project);
-    arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
-    int n = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        n = sqlite3_column_int(stmt, 0);
+    if (bind_text(stmt, ST_COL_1, project) != SQLITE_OK ||
+        arch_bind_path_scope(stmt, ST_COL_2, scope.norm) != SQLITE_OK) {
+        store_set_error_sqlite(s, "architecture scoped node-count bind");
+        sqlite3_finalize(stmt);
+        arch_path_scope_free(&scope);
+        return CBM_STORE_ERR;
     }
-    sqlite3_finalize(stmt);
+    int n = CBM_STORE_ERR;
+    int step_rc = sqlite3_step(stmt);
+    bool count_range_invalid = false;
+    bool count_row_malformed = false;
+    if (step_rc == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_INTEGER) {
+        sqlite3_int64 count = sqlite3_column_int64(stmt, 0);
+        if (count >= 0 && count <= INT_MAX && sqlite3_step(stmt) == SQLITE_DONE) {
+            n = (int)count;
+        } else if (count < 0 || count > INT_MAX) {
+            count_range_invalid = true;
+        }
+    } else if (step_rc == SQLITE_ROW) {
+        count_row_malformed = true;
+    }
+    if (n == CBM_STORE_ERR) {
+        if (count_range_invalid) {
+            store_set_error(s, "architecture scoped node count is not representable");
+        } else if (count_row_malformed) {
+            store_set_error(s, "architecture scoped node count row is malformed");
+        } else {
+            store_set_error_sqlite(s, "architecture scoped node-count step");
+        }
+    }
+    if (sqlite3_finalize(stmt) != SQLITE_OK) {
+        store_set_error_sqlite(s, "architecture scoped node-count finalize");
+        n = CBM_STORE_ERR;
+    }
+    arch_path_scope_free(&scope);
     return n;
 }
 
 int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path) {
-    if (!s || !s->db || !project) {
-        return 0;
+    if (!s || !s->db || !project || !project[0]) {
+        if (s) {
+            store_set_error(s, "invalid scoped edge-count arguments");
+        }
+        return CBM_STORE_ERR;
     }
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    if (!arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like))) {
-        return cbm_store_count_edges(s, project);
+    arch_path_scope_t scope = {0};
+    if (arch_path_prepare(path, &scope) != CBM_STORE_OK) {
+        store_set_error(s, "architecture path normalization allocation failed");
+        return CBM_STORE_ERR;
+    }
+    if (!scope.scoped) {
+        int count = cbm_store_count_edges(s, project);
+        arch_path_scope_free(&scope);
+        return count;
     }
     const char *sql =
         "SELECT COUNT(*) FROM edges e WHERE e.project = ?1 "
         "AND EXISTS (SELECT 1 FROM nodes ns WHERE ns.id = e.source_id AND ns.project = ?1 "
-        "AND (ns.file_path = ?2 OR ns.file_path LIKE ?3)) "
-        "AND EXISTS (SELECT 1 FROM nodes nt WHERE nt.id = e.target_id AND nt.project = ?1 "
-        "AND (nt.file_path = ?2 OR nt.file_path LIKE ?3));";
+        "AND " ARCH_PATH_PREDICATE("ns.file_path") ") "
+                                                   "AND EXISTS (SELECT 1 FROM nodes nt WHERE nt.id "
+                                                   "= e.target_id AND nt.project = ?1 "
+                                                   "AND " ARCH_PATH_PREDICATE("nt.file_path") ");";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
         if (stmt) {
             sqlite3_finalize(stmt);
         }
+        store_set_error_sqlite(s, "architecture scoped edge-count prepare");
+        arch_path_scope_free(&scope);
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, ST_COL_1, project);
-    arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
-    int n = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        n = sqlite3_column_int(stmt, 0);
+    if (bind_text(stmt, ST_COL_1, project) != SQLITE_OK ||
+        arch_bind_path_scope(stmt, ST_COL_2, scope.norm) != SQLITE_OK) {
+        store_set_error_sqlite(s, "architecture scoped edge-count bind");
+        sqlite3_finalize(stmt);
+        arch_path_scope_free(&scope);
+        return CBM_STORE_ERR;
     }
-    sqlite3_finalize(stmt);
+    int n = CBM_STORE_ERR;
+    int step_rc = sqlite3_step(stmt);
+    bool count_range_invalid = false;
+    bool count_row_malformed = false;
+    if (step_rc == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_INTEGER) {
+        sqlite3_int64 count = sqlite3_column_int64(stmt, 0);
+        if (count >= 0 && count <= INT_MAX && sqlite3_step(stmt) == SQLITE_DONE) {
+            n = (int)count;
+        } else if (count < 0 || count > INT_MAX) {
+            count_range_invalid = true;
+        }
+    } else if (step_rc == SQLITE_ROW) {
+        count_row_malformed = true;
+    }
+    if (n == CBM_STORE_ERR) {
+        if (count_range_invalid) {
+            store_set_error(s, "architecture scoped edge count is not representable");
+        } else if (count_row_malformed) {
+            store_set_error(s, "architecture scoped edge count row is malformed");
+        } else {
+            store_set_error_sqlite(s, "architecture scoped edge-count step");
+        }
+    }
+    if (sqlite3_finalize(stmt) != SQLITE_OK) {
+        store_set_error_sqlite(s, "architecture scoped edge-count finalize");
+        n = CBM_STORE_ERR;
+    }
+    arch_path_scope_free(&scope);
     return n;
 }
 
@@ -7840,119 +8232,192 @@ int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_
 
 int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
                                        cbm_schema_info_t *out) {
+    if (!s || !s->db || !project || !project[0] || !out) {
+        if (s) {
+            store_set_error(s, "invalid scoped schema-count arguments");
+        }
+        return CBM_STORE_ERR;
+    }
     memset(out, 0, sizeof(*out));
-    if (!s || !s->db) {
-        return CBM_NOT_FOUND;
+    arch_path_scope_t scope = {0};
+    if (arch_path_prepare(path, &scope) != CBM_STORE_OK) {
+        store_set_error(s, "architecture path normalization allocation failed");
+        return CBM_STORE_ERR;
     }
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
-    if (!scoped) {
-        return get_schema_impl(s, project, out, false);
-    }
-
-    char sqlbuf[ST_SQL_BUF];
     {
-        const char *base = "SELECT label, COUNT(*) FROM nodes WHERE project = ?1";
-        snprintf(sqlbuf, sizeof(sqlbuf), "%s%s GROUP BY label ORDER BY COUNT(*) DESC;", base,
-                 arch_path_scope_sql());
+        const char *sql =
+            scope.scoped
+                ? "SELECT label, COUNT(*) FROM nodes WHERE project = ?1 AND " ARCH_PATH_PREDICATE(
+                      "file_path") " GROUP BY label ORDER BY COUNT(*) DESC, label COLLATE BINARY;"
+                : "SELECT label, COUNT(*) FROM nodes WHERE project = ?1 GROUP BY "
+                  "label ORDER BY COUNT(*) DESC, label COLLATE BINARY;";
         sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(s->db, sqlbuf, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
                 sqlite3_finalize(stmt);
             }
-            return CBM_NOT_FOUND;
+            store_set_error_sqlite(s, "architecture scoped node-label counts prepare");
+            arch_path_scope_free(&scope);
+            return CBM_STORE_ERR;
         }
-        bind_text(stmt, SKIP_ONE, project);
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
-
-        int cap = ST_INIT_CAP_8;
-        int n = 0;
-        cbm_label_count_t *arr = malloc(cap * sizeof(cbm_label_count_t));
-        if (!arr) {
+        if (bind_text(stmt, ST_COL_1, project) != SQLITE_OK ||
+            (scope.scoped && arch_bind_path_scope(stmt, ST_COL_2, scope.norm) != SQLITE_OK)) {
+            store_set_error_sqlite(s, "architecture scoped node-label counts bind");
             sqlite3_finalize(stmt);
-            return CBM_NOT_FOUND;
+            arch_path_scope_free(&scope);
+            return CBM_STORE_ERR;
         }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            if (n >= cap) {
-                int new_cap = cap * ST_GROWTH;
-                void *tmp = realloc(arr, new_cap * sizeof(cbm_label_count_t));
-                if (!tmp) {
-                    for (int i = 0; i < n; i++) {
-                        safe_str_free(&arr[i].label);
-                    }
-                    free(arr);
-                    sqlite3_finalize(stmt);
-                    return CBM_NOT_FOUND;
-                }
-                arr = tmp;
-                cap = new_cap;
+        int cap = 0;
+        int n = 0;
+        cbm_label_count_t *arr = NULL;
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (!arch_sqlite_text_is_exact_c_string(stmt, 0) ||
+                sqlite3_column_type(stmt, 1) != SQLITE_INTEGER) {
+                store_set_error(s, "architecture node-label count row is malformed");
+                goto node_counts_failed;
             }
-            arr[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-            arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
+            sqlite3_int64 count = sqlite3_column_int64(stmt, 1);
+            const char *label = (const char *)sqlite3_column_text(stmt, 0);
+            if (!label || !label[0] || count < 0 || count > INT_MAX || n == INT_MAX ||
+                store_array_reserve(s, (void **)&arr, &cap, n + 1, sizeof(*arr),
+                                    "architecture node-label counts") != CBM_STORE_OK) {
+                if (!label || !label[0] || count < 0 || count > INT_MAX || n == INT_MAX) {
+                    store_set_error(s, "architecture node-label count is not representable");
+                }
+                goto node_counts_failed;
+            }
+            memset(&arr[n], 0, sizeof(arr[n]));
+            arr[n].label = heap_strdup(label);
+            if (!arr[n].label) {
+                store_set_error(s, "architecture node-label allocation failed");
+                goto node_counts_failed;
+            }
+            arr[n].count = (int)count;
             arr[n].properties = NULL;
             arr[n].property_count = 0;
             n++;
         }
-        sqlite3_finalize(stmt);
+        if (step_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "architecture scoped node-label counts step");
+            goto node_counts_failed;
+        }
+        if (sqlite3_finalize(stmt) != SQLITE_OK) {
+            stmt = NULL;
+            store_set_error_sqlite(s, "architecture scoped node-label counts finalize");
+            goto node_counts_failed;
+        }
+        stmt = NULL;
         out->node_labels = arr;
         out->node_label_count = n;
+        goto node_counts_complete;
+
+    node_counts_failed:
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        for (int i = 0; i < n; i++) {
+            safe_str_free(&arr[i].label);
+        }
+        free(arr);
+        arch_path_scope_free(&scope);
+        return CBM_STORE_ERR;
+    node_counts_complete:;
     }
 
     {
-        const char *esql =
-            "SELECT e.type, COUNT(*) FROM edges e WHERE e.project = ?1 "
-            "AND EXISTS (SELECT 1 FROM nodes ns WHERE ns.id = e.source_id AND ns.project = ?1 "
-            "AND (ns.file_path = ?2 OR ns.file_path LIKE ?3)) "
-            "AND EXISTS (SELECT 1 FROM nodes nt WHERE nt.id = e.target_id AND nt.project = ?1 "
-            "AND (nt.file_path = ?2 OR nt.file_path LIKE ?3)) "
-            "GROUP BY e.type ORDER BY COUNT(*) DESC;";
+        const char *sql =
+            scope.scoped
+                ? "SELECT e.type, COUNT(*) FROM edges e WHERE e.project = ?1 "
+                  "AND EXISTS (SELECT 1 FROM nodes ns WHERE ns.id = e.source_id AND ns.project = "
+                  "?1 AND " ARCH_PATH_PREDICATE(
+                      "ns.file_path") ") "
+                                      "AND EXISTS (SELECT 1 FROM nodes nt WHERE nt.id = "
+                                      "e.target_id AND nt.project = "
+                                      "?1 AND " ARCH_PATH_PREDICATE(
+                                          "nt.file_path") ") "
+                                                          "GROUP BY e.type ORDER BY COUNT(*) DESC, "
+                                                          "e.type COLLATE BINARY;"
+                : "SELECT type, COUNT(*) FROM edges WHERE project = ?1 GROUP BY type ORDER BY "
+                  "COUNT(*) DESC, type COLLATE BINARY;";
         sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
                 sqlite3_finalize(stmt);
             }
+            store_set_error_sqlite(s, "architecture scoped edge-type counts prepare");
             cbm_store_schema_free(out);
-            return CBM_NOT_FOUND;
+            arch_path_scope_free(&scope);
+            return CBM_STORE_ERR;
         }
-        bind_text(stmt, SKIP_ONE, project);
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
-
-        int cap = ST_INIT_CAP_8;
-        int n = 0;
-        cbm_type_count_t *arr = malloc(cap * sizeof(cbm_type_count_t));
-        if (!arr) {
+        if (bind_text(stmt, ST_COL_1, project) != SQLITE_OK ||
+            (scope.scoped && arch_bind_path_scope(stmt, ST_COL_2, scope.norm) != SQLITE_OK)) {
+            store_set_error_sqlite(s, "architecture scoped edge-type counts bind");
             sqlite3_finalize(stmt);
             cbm_store_schema_free(out);
-            return CBM_NOT_FOUND;
+            arch_path_scope_free(&scope);
+            return CBM_STORE_ERR;
         }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            if (n >= cap) {
-                int new_cap = cap * ST_GROWTH;
-                void *tmp = realloc(arr, new_cap * sizeof(cbm_type_count_t));
-                if (!tmp) {
-                    for (int i = 0; i < n; i++) {
-                        safe_str_free(&arr[i].type);
-                    }
-                    free(arr);
-                    sqlite3_finalize(stmt);
-                    cbm_store_schema_free(out);
-                    return CBM_NOT_FOUND;
-                }
-                arr = tmp;
-                cap = new_cap;
+        int cap = 0;
+        int n = 0;
+        cbm_type_count_t *arr = NULL;
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (!arch_sqlite_text_is_exact_c_string(stmt, 0) ||
+                sqlite3_column_type(stmt, 1) != SQLITE_INTEGER) {
+                store_set_error(s, "architecture edge-type count row is malformed");
+                goto edge_counts_failed;
             }
-            arr[n].type = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-            arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
+            sqlite3_int64 count = sqlite3_column_int64(stmt, 1);
+            const char *type = (const char *)sqlite3_column_text(stmt, 0);
+            if (!type || !type[0] || count < 0 || count > INT_MAX || n == INT_MAX ||
+                store_array_reserve(s, (void **)&arr, &cap, n + 1, sizeof(*arr),
+                                    "architecture edge-type counts") != CBM_STORE_OK) {
+                if (!type || !type[0] || count < 0 || count > INT_MAX || n == INT_MAX) {
+                    store_set_error(s, "architecture edge-type count is not representable");
+                }
+                goto edge_counts_failed;
+            }
+            memset(&arr[n], 0, sizeof(arr[n]));
+            arr[n].type = heap_strdup(type);
+            if (!arr[n].type) {
+                store_set_error(s, "architecture edge-type allocation failed");
+                goto edge_counts_failed;
+            }
+            arr[n].count = (int)count;
             arr[n].properties = NULL;
             arr[n].property_count = 0;
             n++;
         }
-        sqlite3_finalize(stmt);
+        if (step_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "architecture scoped edge-type counts step");
+            goto edge_counts_failed;
+        }
+        if (sqlite3_finalize(stmt) != SQLITE_OK) {
+            stmt = NULL;
+            store_set_error_sqlite(s, "architecture scoped edge-type counts finalize");
+            goto edge_counts_failed;
+        }
+        stmt = NULL;
         out->edge_types = arr;
         out->edge_type_count = n;
+        goto edge_counts_complete;
+
+    edge_counts_failed:
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        for (int i = 0; i < n; i++) {
+            safe_str_free(&arr[i].type);
+        }
+        free(arr);
+        cbm_store_schema_free(out);
+        arch_path_scope_free(&scope);
+        return CBM_STORE_ERR;
+    edge_counts_complete:;
     }
 
+    arch_path_scope_free(&scope);
     return CBM_STORE_OK;
 }
 
@@ -8126,11 +8591,9 @@ static const char *file_ext(const char *path) {
 
 /* ── Architecture aspect implementations ───────────────────────── */
 
-static int arch_languages(cbm_store_t *s, const char *project, const char *path,
+static int arch_languages(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                           cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT file_path FROM nodes WHERE project=?1 AND label='File'";
     if (scoped) {
@@ -8143,9 +8606,11 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
         store_set_error_sqlite(s, "arch_languages");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture languages bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     /* Count per language using a simple parallel array */
@@ -8153,7 +8618,13 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
     int lang_counts[CBM_SZ_64];
     int nlang = 0;
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (!arch_sqlite_text_is_exact_c_string(stmt, 0)) {
+            store_set_error(s, "architecture language file path is not an exact C string");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
         const char *fp = (const char *)sqlite3_column_text(stmt, 0);
         const char *ext = file_ext(fp);
         const char *lang = ext_to_lang(ext);
@@ -8175,7 +8646,11 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
             nlang++;
         }
     }
-    sqlite3_finalize(stmt);
+    int finalize_rc = sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE || finalize_rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "architecture languages read/finalize");
+        return CBM_STORE_ERR;
+    }
 
     /* Sort by count descending (simple insertion sort) */
     for (int i = SKIP_ONE; i < nlang; i++) {
@@ -8195,19 +8670,32 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
     }
 
     out->languages = (nlang > 0) ? calloc(nlang, sizeof(cbm_language_count_t)) : NULL;
+    if (nlang > 0 && !out->languages) {
+        out->language_count = 0;
+        store_set_error(s, "architecture language result allocation failed");
+        return CBM_STORE_ERR;
+    }
     out->language_count = nlang;
     for (int i = 0; i < nlang; i++) {
         out->languages[i].language = heap_strdup(lang_names[i]);
+        if (!out->languages[i].language) {
+            for (int j = 0; j < i; j++) {
+                safe_str_free(&out->languages[j].language);
+            }
+            free(out->languages);
+            out->languages = NULL;
+            out->language_count = 0;
+            store_set_error(s, "architecture language name allocation failed");
+            return CBM_STORE_ERR;
+        }
         out->languages[i].file_count = lang_counts[i];
     }
     return CBM_STORE_OK;
 }
 
-static int arch_entry_points(cbm_store_t *s, const char *project, const char *path,
+static int arch_entry_points(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                              cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT name, qualified_name, file_path FROM nodes "
                        "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
@@ -8224,9 +8712,11 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
         store_set_error_sqlite(s, "arch_entry_points");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture entry points bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     int cap = 0;
@@ -8303,11 +8793,9 @@ static char *extract_json_string_prop(const char *json, const char *key, int key
     return heap_strdup(vbuf);
 }
 
-static int arch_routes(cbm_store_t *s, const char *project, const char *path,
+static int arch_routes(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                        cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT name, properties, COALESCE(file_path, '') FROM nodes "
                        "WHERE project=?1 AND label='Route' "
@@ -8323,9 +8811,11 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
         store_set_error_sqlite(s, "arch_routes");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture routes bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     int cap = 0;
@@ -8402,22 +8892,23 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
     return CBM_STORE_OK;
 }
 
-static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
+static int arch_hotspots(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                          cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT n.name, n.qualified_name, COUNT(*) as fan_in "
-                       "FROM nodes n JOIN edges e ON e.target_id = n.id AND e.type = 'CALLS' "
+                       "FROM nodes n JOIN edges e ON e.target_id = n.id "
+                       "AND e.project = n.project AND e.type = 'CALLS' "
+                       "JOIN nodes ns ON ns.id = e.source_id AND ns.project = e.project "
                        "WHERE n.project=?1 AND n.label IN ('Function', 'Method') "
                        "AND (json_extract(n.properties, '$.is_test') IS NULL OR "
                        "json_extract(n.properties, '$.is_test') != 1) "
                        "AND n.file_path NOT LIKE '%test%'";
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf),
-                 "%s AND (n.file_path = ?2 OR n.file_path LIKE ?3) "
-                 "GROUP BY n.id ORDER BY fan_in DESC LIMIT 10",
+                 "%s AND " ARCH_PATH_PREDICATE("n.file_path") " AND " ARCH_PATH_PREDICATE(
+                     "ns.file_path") " "
+                                     "GROUP BY n.id ORDER BY fan_in DESC LIMIT 10",
                  base);
     } else {
         snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY n.id ORDER BY fan_in DESC LIMIT 10", base);
@@ -8427,9 +8918,11 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
         store_set_error_sqlite(s, "arch_hotspots");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture hotspots bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     int cap = 0;
@@ -8529,11 +9022,9 @@ static bool accum_boundary(const char *src_pkg, const char *tgt_pkg, char **bfro
     return true;
 }
 
-static int arch_boundaries(cbm_store_t *s, const char *project, const char *path,
+static int arch_boundaries(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                            cbm_cross_pkg_boundary_t **out_arr, int *out_count) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase =
         "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
@@ -8548,9 +9039,11 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         store_set_error_sqlite(s, "arch_boundaries_nodes");
         return CBM_STORE_ERR;
     }
-    bind_text(nstmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(nstmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(nstmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(nstmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture boundary nodes bind");
+        sqlite3_finalize(nstmt);
+        return CBM_STORE_ERR;
     }
 
     int nid_cap = 0;
@@ -8592,10 +9085,24 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     }
     sqlite3_finalize(nstmt);
 
-    /* Scan edges, count cross-package calls */
-    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    /* Scan only the exact induced CALLS roster for a scoped request. The
+     * former project-wide scan discarded crossing rows after O(global E)
+     * endpoint lookups, defeating the caller's narrow scope. */
+    char esqlbuf[ST_SQL_BUF];
+    const char *ebase = "SELECT e.source_id, e.target_id FROM edges e "
+                        "JOIN nodes ns ON ns.id=e.source_id AND ns.project=e.project "
+                        "JOIN nodes nt ON nt.id=e.target_id AND nt.project=e.project "
+                        "WHERE e.project=?1 AND e.type='CALLS'";
+    if (scoped) {
+        snprintf(esqlbuf, sizeof(esqlbuf),
+                 "%s AND " ARCH_PATH_PREDICATE("ns.file_path") " AND " ARCH_PATH_PREDICATE(
+                     "nt.file_path"),
+                 ebase);
+    } else {
+        snprintf(esqlbuf, sizeof(esqlbuf), "%s", ebase);
+    }
     sqlite3_stmt *estmt = NULL;
-    if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &estmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(s->db, esqlbuf, CBM_NOT_FOUND, &estmt, NULL) != SQLITE_OK) {
         for (int i = 0; i < nn; i++) {
             free(npkgs[i]);
         }
@@ -8604,7 +9111,14 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         store_set_error_sqlite(s, "arch_boundaries_edges");
         return CBM_STORE_ERR;
     }
-    bind_text(estmt, SKIP_ONE, project);
+    if (bind_text(estmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(estmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture boundary edges bind");
+        store_free_strings(npkgs, nn);
+        free(nids);
+        sqlite3_finalize(estmt);
+        return CBM_STORE_ERR;
+    }
 
     int bcap = CBM_SZ_32;
     int bn = 0;
@@ -8708,11 +9222,10 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
 #define MAX_PREVIEW_NAMES 15
 
 /* Fallback: derive packages from QN segments when no Package nodes exist. */
-static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char *path,
-                                 cbm_package_summary_t **out_arr, int *out_count) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+static int arch_packages_from_qn(cbm_store_t *s, const char *project,
+                                 const arch_path_scope_t *scope, cbm_package_summary_t **out_arr,
+                                 int *out_count) {
+    bool scoped = scope->scoped;
     char qsqlbuf[ST_SQL_BUF];
     const char *qbase = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
                         "('Function','Method','Class')";
@@ -8726,15 +9239,24 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         store_set_error_sqlite(s, "arch_packages_qn");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture packages fallback bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     char *pnames[CBM_SZ_64];
     int pcounts[CBM_SZ_64];
     int np = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (!arch_sqlite_text_is_exact_c_string(stmt, 0)) {
+            store_free_strings(pnames, np);
+            store_set_error(s, "architecture package fallback row is malformed");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
         const char *pkg = cbm_qn_to_package(qn);
         if (!pkg[0]) {
@@ -8748,14 +9270,32 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
             }
         }
         if (found >= 0) {
+            if (pcounts[found] == INT_MAX) {
+                store_free_strings(pnames, np);
+                store_set_error(s, "architecture package fallback count overflowed");
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
             pcounts[found]++;
         } else if (np < CBM_SZ_64) {
             pnames[np] = heap_strdup(pkg);
+            if (!pnames[np]) {
+                store_free_strings(pnames, np);
+                store_set_error(s, "architecture package fallback allocation failed");
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
             pcounts[np] = SKIP_ONE;
             np++;
         }
     }
-    sqlite3_finalize(stmt);
+    int finalize_rc = sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE || finalize_rc != SQLITE_OK) {
+        store_free_strings(pnames, np);
+        store_set_error_sqlite_code(s, "architecture package fallback read/finalize",
+                                    step_rc != SQLITE_DONE ? step_rc : finalize_rc);
+        return CBM_STORE_ERR;
+    }
 
     /* Sort by count desc */
     for (int i = SKIP_ONE; i < np; i++) {
@@ -8778,6 +9318,11 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     }
 
     cbm_package_summary_t *arr = (np > 0) ? calloc(np, sizeof(cbm_package_summary_t)) : NULL;
+    if (np > 0 && !arr) {
+        store_free_strings(pnames, np);
+        store_set_error(s, "architecture package fallback result allocation failed");
+        return CBM_STORE_ERR;
+    }
     for (int i = 0; i < np; i++) {
         arr[i].name = pnames[i];
         arr[i].node_count = pcounts[i];
@@ -8787,18 +9332,17 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     return CBM_STORE_OK;
 }
 
-static int arch_packages(cbm_store_t *s, const char *project, const char *path,
+static int arch_packages(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                          cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT n.name, COUNT(*) as cnt FROM nodes n "
                        "WHERE n.project=?1 AND n.label='Package'";
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf),
-                 "%s AND (n.file_path = ?2 OR n.file_path LIKE ?3) "
-                 "GROUP BY n.name ORDER BY cnt DESC LIMIT 15",
+                 "%s AND " ARCH_PATH_PREDICATE(
+                     "n.file_path") " "
+                                    "GROUP BY n.name ORDER BY cnt DESC LIMIT 15",
                  base);
     } else {
         snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY n.name ORDER BY cnt DESC LIMIT 15", base);
@@ -8808,9 +9352,11 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
         store_set_error_sqlite(s, "arch_packages");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture packages bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     int cap = 0;
@@ -8855,7 +9401,7 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
     /* Fallback: group by QN segment if no Package nodes */
     if (n == 0) {
         free(arr);
-        int rc = arch_packages_from_qn(s, project, path, &arr, &n);
+        int rc = arch_packages_from_qn(s, project, scope, &arr, &n);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -8928,11 +9474,9 @@ static bool pkg_in_list(const char *pkg, char **list, int count) {
 }
 
 /* Collect package names from nodes matching a SQL query (must use ?1 = project). */
-static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project, const char *path,
-                             char **pkgs, int max_pkgs) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project,
+                             const arch_path_scope_t *scope, char **pkgs, int max_pkgs) {
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf), "%s%s", sql, arch_path_scope_sql());
@@ -8944,27 +9488,55 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
         if (stmt) {
             sqlite3_finalize(stmt);
         }
-        return CBM_NOT_FOUND;
+        store_set_error_sqlite(s, "architecture layer package query prepare");
+        return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture layer package query bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
     int count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_pkgs) {
+    int step_rc = SQLITE_OK;
+    while (count < max_pkgs && (step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (!arch_sqlite_text_is_exact_c_string(stmt, 0)) {
+            store_free_strings(pkgs, count);
+            store_set_error(s, "architecture layer package row is malformed");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
-        pkgs[count++] = heap_strdup(cbm_qn_to_package(qn));
+        pkgs[count] = heap_strdup(cbm_qn_to_package(qn));
+        if (!pkgs[count]) {
+            store_free_strings(pkgs, count);
+            store_set_error(s, "architecture layer package allocation failed");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        count++;
     }
-    sqlite3_finalize(stmt);
+    if (count < max_pkgs && step_rc != SQLITE_DONE) {
+        store_free_strings(pkgs, count);
+        store_set_error_sqlite(s, "architecture layer package query step");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int finalize_rc = sqlite3_finalize(stmt);
+    if (finalize_rc != SQLITE_OK) {
+        store_free_strings(pkgs, count);
+        store_set_error_sqlite_code(s, "architecture layer package query finalize", finalize_rc);
+        return CBM_STORE_ERR;
+    }
     return count;
 }
 
-static int arch_layers(cbm_store_t *s, const char *project, const char *path,
+static int arch_layers(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                        cbm_architecture_info_t *out) {
     /* Get boundaries for fan analysis */
     cbm_cross_pkg_boundary_t *boundaries = NULL;
     int bcount = 0;
-    int rc = arch_boundaries(s, project, path, &boundaries, &bcount);
+    int rc = arch_boundaries(s, project, scope, &boundaries, &bcount);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -8973,13 +9545,32 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
     char *route_pkgs[CBM_SZ_32];
     int nrpkgs =
         collect_pkg_names(s, "SELECT qualified_name FROM nodes WHERE project=?1 AND label='Route'",
-                          project, path, route_pkgs, CBM_SZ_32);
+                          project, scope, route_pkgs, CBM_SZ_32);
+    if (nrpkgs < 0) {
+        for (int i = 0; i < bcount; i++) {
+            safe_str_free(&boundaries[i].from);
+            safe_str_free(&boundaries[i].to);
+        }
+        free(boundaries);
+        return CBM_STORE_ERR;
+    }
 
     char *entry_pkgs[CBM_SZ_32];
     int nepkgs = collect_pkg_names(s,
                                    "SELECT qualified_name FROM nodes WHERE project=?1 AND "
                                    "json_extract(properties, '$.is_entry_point') = 1",
-                                   project, path, entry_pkgs, CBM_SZ_32);
+                                   project, scope, entry_pkgs, CBM_SZ_32);
+    if (nepkgs < 0) {
+        for (int i = 0; i < nrpkgs; i++) {
+            free(route_pkgs[i]);
+        }
+        for (int i = 0; i < bcount; i++) {
+            safe_str_free(&boundaries[i].from);
+            safe_str_free(&boundaries[i].to);
+        }
+        free(boundaries);
+        return CBM_STORE_ERR;
+    }
 
     /* Compute fan-in/out per package */
     char *all_pkgs[CBM_SZ_64];
@@ -9049,237 +9640,51 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
     return CBM_STORE_OK;
 }
 
-/* Add a child to a dir entry if not already present. */
-static bool dir_add_child(char ***children, int *child_count, int *child_cap, const char *child) {
-    for (int k = 0; k < *child_count; k++) {
-        if (strcmp((*children)[k], child) == 0) {
-            return true;
-        }
-    }
-    if (!cbm_da_ensure_capacity((void **)children, child_cap, *child_count + 1,
-                                sizeof(**children))) {
-        return false;
-    }
-    char *copy = heap_strdup(child);
-    if (!copy) {
-        return false;
-    }
-    (*children)[(*child_count)++] = copy;
-    return true;
+typedef struct {
+    char *path;
+    bool is_file;
+    int children;
+} arch_tree_candidate_t;
+
+static int arch_tree_candidate_cmp(const void *a, const void *b) {
+    const arch_tree_candidate_t *ea = a;
+    const arch_tree_candidate_t *eb = b;
+    return strcmp(ea->path, eb->path);
 }
 
-/* Find or create a directory entry by path. Returns its index, or -1 if full. */
-static int dir_find_or_create(char **dir_paths, int *dir_child_counts, char ***dir_children,
-                              int *dir_children_caps, int *dn, int dcap, const char *dir) {
-    for (int i = 0; i < *dn; i++) {
-        if (strcmp(dir_paths[i], dir) == 0) {
-            return i;
+static int arch_tree_candidate_find(const arch_tree_candidate_t *entries, int count,
+                                    const char *path) {
+    int lo = 0;
+    int hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(entries[mid].path, path);
+        if (cmp < 0) {
+            lo = mid + 1;
+        } else if (cmp > 0) {
+            hi = mid;
+        } else {
+            return mid;
         }
-    }
-    if (*dn < dcap) {
-        int idx = *dn;
-        dir_paths[idx] = heap_strdup(dir);
-        if (!dir_paths[idx]) {
-            return CBM_NOT_FOUND;
-        }
-        dir_child_counts[idx] = 0;
-        dir_children[idx] = NULL;
-        dir_children_caps[idx] = 0;
-        (*dn)++;
-        return idx;
     }
     return CBM_NOT_FOUND;
 }
 
-/* Create a file tree entry by checking if a path is a file and counting dir children. */
-static cbm_file_tree_entry_t make_tree_entry(const char *path, char **files, int fn,
-                                             char **dir_paths, const int *dir_child_counts,
-                                             int dn) {
-    cbm_file_tree_entry_t e = {0};
-    e.path = heap_strdup(path);
-    bool is_file = false;
-    for (int f = 0; f < fn; f++) {
-        if (strcmp(files[f], path) == 0) {
-            is_file = true;
-            break;
-        }
-    }
-    e.type = heap_strdup(is_file ? "file" : "dir");
-    for (int d = 0; d < dn; d++) {
-        if (strcmp(dir_paths[d], path) == 0) {
-            e.children = dir_child_counts[d];
-            break;
-        }
-    }
-    return e;
-}
-
-/* Split a path by '/' into parts. Returns number of parts. */
-static int split_path_parts(const char *fp, char *buf, int buf_sz, char **parts, int max_parts) {
-    strncpy(buf, fp, buf_sz - SKIP_ONE);
-    buf[buf_sz - SKIP_ONE] = '\0';
-    int nparts = 0;
-    char *p = buf;
-    parts[nparts++] = p;
-    while (*p && nparts < max_parts) {
-        if (*p == '/') {
-            *p = '\0';
-            parts[nparts++] = p + SKIP_ONE;
-        }
-        p++;
-    }
-    return nparts;
-}
-
-/* Register dir hierarchy for one file path. */
-static bool arch_register_file_dirs(const char *fp, char **dir_paths, int *dir_child_counts,
-                                    char ***dir_children, int *dir_children_caps, int *dn,
-                                    int dcap) {
-    char tmp[CBM_SZ_512];
-    char *parts[ST_SEARCH_MAX_BINDS];
-    int nparts = split_path_parts(fp, tmp, (int)sizeof(tmp), parts, ST_SEARCH_MAX_BINDS);
-
-    int ri = dir_find_or_create(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn,
-                                dcap, "");
-    if (ri < 0 || (nparts > 0 && !dir_add_child(&dir_children[ri], &dir_child_counts[ri],
-                                                &dir_children_caps[ri], parts[0]))) {
-        return false;
-    }
-
-    for (int depth = 0; depth < nparts - SKIP_ONE && depth < ST_MAX_PATH_DEPTH; depth++) {
-        char dir[CBM_SZ_512] = "";
-        for (int k = 0; k <= depth; k++) {
-            if (k > 0) {
-                strcat(dir, "/");
-            }
-            strcat(dir, parts[k]);
-        }
-        const char *child = (depth + SKIP_ONE < nparts) ? parts[depth + SKIP_ONE] : NULL;
-        if (!child) {
-            continue;
-        }
-        int di = dir_find_or_create(dir_paths, dir_child_counts, dir_children, dir_children_caps,
-                                    dn, dcap, dir);
-        if (di < 0 || !dir_add_child(&dir_children[di], &dir_child_counts[di],
-                                     &dir_children_caps[di], child)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/* Count the number of '/' in a string. */
-static int count_slashes(const char *s) {
-    int n = 0;
-    for (; *s; s++) {
-        if (*s == '/') {
-            n++;
-        }
-    }
-    return n;
-}
-
-/* Push a tree entry, growing the array if needed. */
-static int push_tree_entry(cbm_store_t *s, cbm_file_tree_entry_t **entries, int *en, int *ecap,
-                           cbm_file_tree_entry_t e) {
-    if (!e.path || !e.type ||
-        store_array_reserve(s, (void **)entries, ecap, *en + 1, sizeof(**entries),
-                            "architecture file tree") != CBM_STORE_OK) {
-        free((void *)e.path);
-        free((void *)e.type);
-        return CBM_STORE_ERR;
-    }
-    (*entries)[(*en)++] = e;
-    return CBM_STORE_OK;
-}
-
-/* Collect tree entries from dir arrays. */
-static int arch_collect_entries(cbm_store_t *s, char **dir_paths, int *dir_child_counts,
-                                char ***dir_children, int dn, char **files, int fn,
-                                cbm_file_tree_entry_t **entries_out, int *en_out) {
-    int ecap = 0;
-    int en = 0;
-    cbm_file_tree_entry_t *entries = NULL;
-
-    /* Root children */
-    for (int i = 0; i < dn; i++) {
-        if (strcmp(dir_paths[i], "") != 0) {
-            continue;
-        }
-        for (int k = 0; k < dir_child_counts[i]; k++) {
-            if (push_tree_entry(s, &entries, &en, &ecap,
-                                make_tree_entry(dir_children[i][k], files, fn, dir_paths,
-                                                dir_child_counts, dn)) != CBM_STORE_OK) {
-                goto failed;
-            }
-        }
-    }
-
-    /* Non-root dir children (depth < ST_COL_3) */
-    for (int i = 0; i < dn; i++) {
-        if (strcmp(dir_paths[i], "") == 0 || count_slashes(dir_paths[i]) >= ST_MAX_PATH_DEPTH) {
-            continue;
-        }
-        for (int k = 0; k < dir_child_counts[i]; k++) {
-            char path[CBM_SZ_512];
-            snprintf(path, sizeof(path), "%s/%s", dir_paths[i], dir_children[i][k]);
-            if (push_tree_entry(s, &entries, &en, &ecap,
-                                make_tree_entry(path, files, fn, dir_paths, dir_child_counts,
-                                                dn)) != CBM_STORE_OK) {
-                goto failed;
-            }
-        }
-    }
-
-    /* Sort by path */
-    for (int i = SKIP_ONE; i < en; i++) {
-        int j = i;
-        while (j > 0 && strcmp(entries[j].path, entries[j - SKIP_ONE].path) < 0) {
-            cbm_file_tree_entry_t tmp = entries[j];
-            entries[j] = entries[j - SKIP_ONE];
-            entries[j - SKIP_ONE] = tmp;
-            j--;
-        }
-    }
-
-    *entries_out = entries;
-    *en_out = en;
-    return CBM_STORE_OK;
-
-failed:
-    for (int i = 0; i < en; i++) {
-        free((void *)entries[i].path);
-        free((void *)entries[i].type);
+static void arch_tree_candidates_free(arch_tree_candidate_t *entries, int count) {
+    for (int i = 0; i < count; i++) {
+        free(entries[i].path);
     }
     free(entries);
-    return CBM_STORE_ERR;
 }
 
-/* Free dir arrays. */
-static void arch_free_dirs(char **dir_paths, int *dir_child_counts, char ***dir_children,
-                           int *dir_children_caps, int dn, char **files, int fn) {
-    for (int i = 0; i < dn; i++) {
-        free(dir_paths[i]);
-        for (int k = 0; k < dir_child_counts[i]; k++) {
-            free(dir_children[i][k]);
-        }
-        free(dir_children[i]);
-    }
-    free(dir_paths);
-    free(dir_child_counts);
-    free(dir_children);
-    free(dir_children_caps);
-    for (int i = 0; i < fn; i++) {
-        free(files[i]);
-    }
-    free(files);
-}
-
-static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
+/* For F selected File rows, P exact file/directory-prefix candidates, and B
+ * bytes across those candidate strings, construction is O(B + P log P) time
+ * and O(B + P) live memory. The normalized literal scope and each complete
+ * persisted file_path remain invariant; production F/P are #1149 observations,
+ * not policy constants (PC-04/07/16/35/37/41). */
+static int arch_file_tree(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
                           cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    bool scoped = scope->scoped;
     char sqlbuf[ST_SQL_BUF];
     const char *base = "SELECT file_path FROM nodes WHERE project=?1 AND label='File'";
     if (scoped) {
@@ -9292,9 +9697,11 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
         store_set_error_sqlite(s, "arch_file_tree");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    if (bind_text(stmt, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(stmt, ST_COL_2, scope->norm) != SQLITE_OK)) {
+        store_set_error_sqlite(s, "architecture file tree bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
     }
 
     int fcap = 0;
@@ -9303,9 +9710,21 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
 
     int step_rc = SQLITE_OK;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (!arch_sqlite_text_is_exact_c_string(stmt, 0)) {
+            store_free_strings(files, fn);
+            store_set_error(s, "architecture file tree path is not an exact C string");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
         const char *fp = (const char *)sqlite3_column_text(stmt, 0);
         if (!fp) {
             continue;
+        }
+        if (fn == INT_MAX) {
+            store_free_strings(files, fn);
+            store_set_error(s, "architecture file path count exceeds exact representation");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
         }
         if (store_array_reserve(s, (void **)&files, &fcap, fn + 1, sizeof(*files),
                                 "architecture file paths") != CBM_STORE_OK) {
@@ -9328,120 +9747,428 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
-    sqlite3_finalize(stmt);
-
-    if ((size_t)fn > ((size_t)INT32_MAX - 1U) / ((size_t)ST_MAX_PATH_DEPTH + 1U)) {
+    if (sqlite3_finalize(stmt) != SQLITE_OK) {
         store_free_strings(files, fn);
-        store_set_error(s, "architecture directory capacity overflow");
+        store_set_error_sqlite(s, "architecture file tree finalize");
         return CBM_STORE_ERR;
     }
-    int dcap = fn * (ST_MAX_PATH_DEPTH + 1) + 1;
-    int dn = 0;
-    char **dir_paths = calloc((size_t)dcap, sizeof(char *));
-    int *dir_child_counts = calloc((size_t)dcap, sizeof(int));
-    char ***dir_children = calloc((size_t)dcap, sizeof(char **));
-    int *dir_children_caps = calloc((size_t)dcap, sizeof(int));
-    if (!dir_paths || !dir_child_counts || !dir_children || !dir_children_caps) {
-        arch_free_dirs(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn, files, fn);
-        store_set_error(s, "architecture directory table allocation failed");
-        return CBM_STORE_ERR;
-    }
+
+    size_t candidate_count = (size_t)fn;
     for (int i = 0; i < fn; i++) {
-        if (!arch_register_file_dirs(files[i], dir_paths, dir_child_counts, dir_children,
-                                     dir_children_caps, &dn, dcap)) {
-            arch_free_dirs(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn, files,
-                           fn);
-            store_set_error(s, "architecture directory registration allocation failed");
+        size_t file_len = strlen(files[i]);
+        if (file_len == 0 || files[i][0] == '/' || files[i][file_len - 1] == '/' ||
+            strstr(files[i], "//")) {
+            store_free_strings(files, fn);
+            store_set_error(s, "architecture file tree contains a non-canonical file path");
+            return CBM_STORE_ERR;
+        }
+        for (const char *p = files[i]; *p; p++) {
+            if (*p == '/') {
+                if (candidate_count == (size_t)INT_MAX) {
+                    store_free_strings(files, fn);
+                    store_set_error(s, "architecture file tree candidate count overflow");
+                    return CBM_STORE_ERR;
+                }
+                candidate_count++;
+            }
+        }
+    }
+    arch_tree_candidate_t *candidates =
+        candidate_count <= SIZE_MAX / sizeof(*candidates)
+            ? calloc(candidate_count > 0 ? candidate_count : 1, sizeof(*candidates))
+            : NULL;
+    if (!candidates) {
+        store_free_strings(files, fn);
+        store_set_error(s, "architecture file tree candidate allocation failed");
+        return CBM_STORE_ERR;
+    }
+    int candidate_fill = 0;
+    for (int i = 0; i < fn; i++) {
+        candidates[candidate_fill].path = heap_strdup(files[i]);
+        candidates[candidate_fill].is_file = true;
+        if (!candidates[candidate_fill].path) {
+            arch_tree_candidates_free(candidates, candidate_fill);
+            store_free_strings(files, fn);
+            store_set_error(s, "architecture file tree file allocation failed");
+            return CBM_STORE_ERR;
+        }
+        candidate_fill++;
+        for (const char *p = files[i]; *p; p++) {
+            if (*p != '/') {
+                continue;
+            }
+            candidates[candidate_fill].path = cbm_strndup(files[i], (size_t)(p - files[i]));
+            candidates[candidate_fill].is_file = false;
+            if (!candidates[candidate_fill].path) {
+                arch_tree_candidates_free(candidates, candidate_fill);
+                store_free_strings(files, fn);
+                store_set_error(s, "architecture file tree directory allocation failed");
+                return CBM_STORE_ERR;
+            }
+            candidate_fill++;
+        }
+    }
+    store_free_strings(files, fn);
+    if ((size_t)candidate_fill != candidate_count) {
+        arch_tree_candidates_free(candidates, candidate_fill);
+        store_set_error(s, "architecture file tree candidate accounting mismatch");
+        return CBM_STORE_ERR;
+    }
+    if (candidate_fill > 1) {
+        qsort(candidates, (size_t)candidate_fill, sizeof(*candidates), arch_tree_candidate_cmp);
+    }
+
+    int unique_count = 0;
+    for (int read = 0; read < candidate_fill; read++) {
+        arch_tree_candidate_t current = candidates[read];
+        candidates[read].path = NULL;
+        if (unique_count > 0 && strcmp(candidates[unique_count - 1].path, current.path) == 0) {
+            if (candidates[unique_count - 1].is_file != current.is_file) {
+                free(current.path);
+                arch_tree_candidates_free(candidates, candidate_fill);
+                store_set_error(s, "architecture path is both a file and a directory");
+                return CBM_STORE_ERR;
+            }
+            free(current.path);
+            continue;
+        }
+        candidates[unique_count++] = current;
+    }
+
+    for (int i = 0; i < unique_count; i++) {
+        const char *slash = strrchr(candidates[i].path, '/');
+        if (!slash) {
+            continue;
+        }
+        char *parent = cbm_strndup(candidates[i].path, (size_t)(slash - candidates[i].path));
+        if (!parent) {
+            arch_tree_candidates_free(candidates, candidate_fill);
+            store_set_error(s, "architecture file tree parent allocation failed");
+            return CBM_STORE_ERR;
+        }
+        int parent_index = arch_tree_candidate_find(candidates, unique_count, parent);
+        free(parent);
+        if (parent_index < 0 || candidates[parent_index].is_file ||
+            candidates[parent_index].children == INT_MAX) {
+            arch_tree_candidates_free(candidates, candidate_fill);
+            store_set_error(s, "architecture file tree parent mapping is invalid");
+            return CBM_STORE_ERR;
+        }
+        candidates[parent_index].children++;
+    }
+
+    cbm_file_tree_entry_t *entries =
+        unique_count > 0 ? calloc((size_t)unique_count, sizeof(*entries)) : NULL;
+    if (unique_count > 0 && !entries) {
+        arch_tree_candidates_free(candidates, candidate_fill);
+        store_set_error(s, "architecture file tree result allocation failed");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < unique_count; i++) {
+        entries[i].path = candidates[i].path;
+        candidates[i].path = NULL;
+        entries[i].type = heap_strdup(candidates[i].is_file ? "file" : "dir");
+        entries[i].children = candidates[i].children;
+        if (!entries[i].type) {
+            for (int j = 0; j <= i; j++) {
+                safe_str_free(&entries[j].path);
+                safe_str_free(&entries[j].type);
+            }
+            free(entries);
+            arch_tree_candidates_free(candidates, candidate_fill);
+            store_set_error(s, "architecture file tree type allocation failed");
             return CBM_STORE_ERR;
         }
     }
-
-    if (arch_collect_entries(s, dir_paths, dir_child_counts, dir_children, dn, files, fn,
-                             &out->file_tree, &out->file_tree_count) != CBM_STORE_OK) {
-        arch_free_dirs(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn, files, fn);
-        return CBM_STORE_ERR;
-    }
-
-    arch_free_dirs(dir_paths, dir_child_counts, dir_children, dir_children_caps, dn, files, fn);
+    arch_tree_candidates_free(candidates, candidate_fill);
+    out->file_tree = entries;
+    out->file_tree_count = unique_count;
     return CBM_STORE_OK;
 }
 
-/* ── Louvain community detection ───────────────────────────────── */
+/* ── Deterministic Leiden community detection ──────────────────── */
 
-/* Build deduplicated, normalized edge weight arrays from raw edges.
- * Returns total number of unique edges in *out_wn. */
-/* Find the index of a node ID in the nodes array, or -1. */
-static int louvain_node_index(const int64_t *nodes, int n, int64_t id) {
-    for (int i = 0; i < n; i++) {
-        if (nodes[i] == id) {
-            return i;
-        }
+/* For the caller-admitted N nodes and E typed edges, projection/preprocessing
+ * costs O(N log N + E log N + E log E). Local-moving work is the sum of
+ * degree(v) over caller-bounded dequeues; refinement makes one node-selection
+ * pass plus two adjacency visits per level; each relabel invocation makes two
+ * node passes; aggregation makes two member/adjacency passes and sorts each
+ * aggregate's distinct neighbours. Complete result materialization adds
+ * O(N log N + E) time. Live memory is O(N+E), including the complete result.
+ * The sorted ID map, edge transform, resolution, and
+ * canonical traversal order remain invariant across every level
+ * (PC-04/07/14/16/24/35/37/38/41/43). Production N/E are observations owned
+ * by #1149, never policy constants; fixture runs are not cost evidence. */
+enum {
+    LEIDEN_ALGORITHM_VERSION = 3,
+};
+
+#define LEIDEN_MAX_EXACT_WEIGHT UINT64_C(9007199254740991)
+
+_Static_assert(FLT_RADIX == 2 && DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024 && FLT_EVAL_METHOD == 0,
+               "deterministic Leiden requires IEEE-754 binary64 doubles");
+
+typedef struct {
+    uint64_t level_count;
+    uint64_t level_bound;
+    uint64_t move_visit_count;
+    uint64_t move_visit_cap;
+    uint64_t refine_visit_count;
+    uint64_t refine_visit_bound;
+    uint64_t refine_merge_count;
+    uint64_t relabel_visit_count;
+    uint64_t aggregate_visit_count;
+    uint64_t allocation_attempt_count;
+    uint64_t canonical_edge_count;
+    uint64_t duplicate_edge_count;
+    uint64_t self_loop_count;
+    bool converged;
+    bool connectivity_verified;
+    bool move_started;
+    bool move_completed;
+    bool refine_started;
+    bool refine_completed;
+    bool relabel_started;
+    bool relabel_completed;
+    bool aggregate_started;
+    bool aggregate_completed;
+    bool readback_started;
+    bool readback_completed;
+    double objective;
+    const char *error_code;
+    const char *error_stage;
+    const char *error_message;
+    const char *error_remediation;
+} leiden_run_receipt_t;
+
+typedef struct {
+    int src;
+    int dst;
+    uint64_t weight;
+} leiden_indexed_edge_t;
+
+static int leiden_fail(leiden_run_receipt_t *receipt, const char *code, const char *stage,
+                       const char *message, const char *remediation) {
+    if (receipt) {
+        receipt->error_code = code;
+        receipt->error_stage = stage;
+        receipt->error_message = message;
+        receipt->error_remediation = remediation;
     }
-    return CBM_NOT_FOUND;
+    cbm_log_error("store.leiden_refused", "code", code, "stage", stage, "message", message,
+                  "remediation", remediation);
+    return CBM_STORE_ERR;
 }
 
-static int louvain_build_weights(const int64_t *nodes, int n, const cbm_louvain_edge_t *edges,
-                                 int edge_count, int **out_wsi, int **out_wdi, double **out_ww,
-                                 int *out_wn) {
-    int wsi_cap = 0;
-    int wdi_cap = 0;
-    int ww_cap = 0;
-    int wn = 0;
-    int *wsi = NULL;
-    int *wdi = NULL;
-    double *ww = NULL;
+static bool leiden_array_bytes(size_t count, size_t width, size_t *out) {
+    if (!out || (width != 0 && count > SIZE_MAX / width)) {
+        return false;
+    }
+    *out = count * width;
+    return true;
+}
 
+static bool leiden_u64_add_scaled(uint64_t *value, uint64_t count, uint64_t scale) {
+    if (!value || (scale != 0 && count > UINT64_MAX / scale)) {
+        return false;
+    }
+    uint64_t increment = count * scale;
+    if (*value > UINT64_MAX - increment) {
+        return false;
+    }
+    *value += increment;
+    return true;
+}
+
+static void *leiden_malloc(size_t count, size_t width, leiden_run_receipt_t *receipt) {
+    size_t bytes = 0;
+    if (receipt) {
+        receipt->allocation_attempt_count++;
+    }
+    if (!leiden_array_bytes(count, width, &bytes)) {
+        return NULL;
+    }
+    return malloc(bytes > 0 ? bytes : 1);
+}
+
+static void *leiden_calloc(size_t count, size_t width, leiden_run_receipt_t *receipt) {
+    size_t bytes = 0;
+    if (receipt) {
+        receipt->allocation_attempt_count++;
+    }
+    if (!leiden_array_bytes(count, width, &bytes)) {
+        return NULL;
+    }
+    return calloc(bytes > 0 ? bytes : 1, 1);
+}
+
+static int leiden_i64_cmp(const void *a, const void *b) {
+    int64_t av = *(const int64_t *)a;
+    int64_t bv = *(const int64_t *)b;
+    return (av > bv) - (av < bv);
+}
+
+static int leiden_int_cmp(const void *a, const void *b) {
+    int av = *(const int *)a;
+    int bv = *(const int *)b;
+    return (av > bv) - (av < bv);
+}
+
+static int leiden_indexed_edge_cmp(const void *a, const void *b) {
+    const leiden_indexed_edge_t *ea = a;
+    const leiden_indexed_edge_t *eb = b;
+    if (ea->src != eb->src) {
+        return (ea->src > eb->src) - (ea->src < eb->src);
+    }
+    return (ea->dst > eb->dst) - (ea->dst < eb->dst);
+}
+
+static int leiden_sorted_node_index(const int64_t *nodes, int n, int64_t id) {
+    const int64_t *hit = bsearch(&id, nodes, (size_t)n, sizeof(*nodes), leiden_i64_cmp);
+    return hit ? (int)(hit - nodes) : CBM_NOT_FOUND;
+}
+
+/* Canonicalize arbitrary input order into a stable sorted node-ID map and one
+ * sorted run per undirected endpoint pair.  Unknown endpoints and duplicate
+ * node IDs are malformed inputs, never silently skipped.  `edge_weights` is
+ * NULL for the public unit-weight API and non-NULL for the typed architecture
+ * projection's run-length weights. */
+static int louvain_build_weights(const int64_t *nodes, int n, const cbm_louvain_edge_t *edges,
+                                 const uint64_t *edge_weights, int edge_count,
+                                 bool endpoints_are_canonical_ordinals, int64_t **out_sorted_nodes,
+                                 int **out_wsi, int **out_wdi, double **out_ww, int *out_wn,
+                                 leiden_run_receipt_t *receipt) {
+    *out_sorted_nodes = NULL;
+    *out_wsi = NULL;
+    *out_wdi = NULL;
+    *out_ww = NULL;
+    *out_wn = 0;
+
+    int64_t *sorted_nodes = leiden_malloc((size_t)n, sizeof(*sorted_nodes), receipt);
+    if (!sorted_nodes) {
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "canonical_nodes",
+                           "Leiden could not allocate its canonical node-ID map",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
+    }
+    memcpy(sorted_nodes, nodes, (size_t)n * sizeof(*sorted_nodes));
+    if (endpoints_are_canonical_ordinals) {
+        for (int i = 0; i < n; i++) {
+            if (sorted_nodes[i] != i) {
+                free(sorted_nodes);
+                return leiden_fail(
+                    receipt, "CBM_LEIDEN_CANONICAL_ORDINAL_INVALID", "canonical_nodes",
+                    "Leiden canonical-ordinal input is not the exact dense range [0,N)",
+                    "repair the prebuilt stable node map before clustering");
+            }
+        }
+    } else {
+        qsort(sorted_nodes, (size_t)n, sizeof(*sorted_nodes), leiden_i64_cmp);
+        for (int i = 1; i < n; i++) {
+            if (sorted_nodes[i - 1] == sorted_nodes[i]) {
+                free(sorted_nodes);
+                return leiden_fail(
+                    receipt, "CBM_LEIDEN_DUPLICATE_NODE_ID", "canonical_nodes",
+                    "Leiden input contains a duplicate node ID",
+                    "repair canonical node identity and retry; no result was returned");
+            }
+        }
+    }
+
+    leiden_indexed_edge_t *indexed = leiden_malloc((size_t)edge_count, sizeof(*indexed), receipt);
+    if (edge_count > 0 && !indexed) {
+        free(sorted_nodes);
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "canonical_edges",
+                           "Leiden could not allocate its canonical edge workspace",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
+    }
     for (int e = 0; e < edge_count; e++) {
-        int si = louvain_node_index(nodes, n, edges[e].src);
-        int di = louvain_node_index(nodes, n, edges[e].dst);
-        if (si < 0 || di < 0 || si == di) {
-            continue;
+        int si = endpoints_are_canonical_ordinals && edges[e].src >= 0 && edges[e].src < n
+                     ? (int)edges[e].src
+                     : leiden_sorted_node_index(sorted_nodes, n, edges[e].src);
+        int di = endpoints_are_canonical_ordinals && edges[e].dst >= 0 && edges[e].dst < n
+                     ? (int)edges[e].dst
+                     : leiden_sorted_node_index(sorted_nodes, n, edges[e].dst);
+        if (si < 0 || di < 0) {
+            free(indexed);
+            free(sorted_nodes);
+            return leiden_fail(receipt, "CBM_LEIDEN_UNKNOWN_ENDPOINT", "canonical_edges",
+                               "Leiden input edge references a node outside the declared roster",
+                               "repair the graph projection so every endpoint resolves exactly");
+        }
+        uint64_t weight = edge_weights ? edge_weights[e] : UINT64_C(1);
+        if (weight == 0 || weight > LEIDEN_MAX_EXACT_WEIGHT) {
+            free(indexed);
+            free(sorted_nodes);
+            return leiden_fail(receipt, "CBM_LEIDEN_EDGE_WEIGHT_INVALID", "canonical_edges",
+                               "Leiden input contains a zero or non-exact edge weight",
+                               "rebuild the canonical edge run with positive exact multiplicities");
         }
         if (si > di) {
             int tmp = si;
             si = di;
             di = tmp;
         }
-        int found = ST_FOUND;
-        for (int i = 0; i < wn; i++) {
-            if (wsi[i] == si && wdi[i] == di) {
-                found = i;
-                break;
-            }
-        }
-        if (found >= 0) {
-            ww[found] += (double)SKIP_ONE;
-        } else {
-            if (!cbm_da_ensure_capacity((void **)&wsi, &wsi_cap, wn + 1, sizeof(*wsi)) ||
-                !cbm_da_ensure_capacity((void **)&wdi, &wdi_cap, wn + 1, sizeof(*wdi)) ||
-                !cbm_da_ensure_capacity((void **)&ww, &ww_cap, wn + 1, sizeof(*ww))) {
+        indexed[e] = (leiden_indexed_edge_t){si, di, weight};
+    }
+    if (edge_count > 1) {
+        qsort(indexed, (size_t)edge_count, sizeof(*indexed), leiden_indexed_edge_cmp);
+    }
+
+    int *wsi = leiden_malloc((size_t)edge_count, sizeof(*wsi), receipt);
+    int *wdi = leiden_malloc((size_t)edge_count, sizeof(*wdi), receipt);
+    double *ww = leiden_malloc((size_t)edge_count, sizeof(*ww), receipt);
+    if (edge_count > 0 && (!wsi || !wdi || !ww)) {
+        free(wsi);
+        free(wdi);
+        free(ww);
+        free(indexed);
+        free(sorted_nodes);
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "canonical_edge_runs",
+                           "Leiden could not allocate its deduplicated edge runs",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
+    }
+
+    int wn = 0;
+    for (int e = 0; e < edge_count;) {
+        int end = e + 1;
+        uint64_t weight = indexed[e].weight;
+        while (end < edge_count && indexed[end].src == indexed[e].src &&
+               indexed[end].dst == indexed[e].dst) {
+            if (indexed[end].weight > LEIDEN_MAX_EXACT_WEIGHT - weight) {
                 free(wsi);
                 free(wdi);
                 free(ww);
-                *out_wsi = NULL;
-                *out_wdi = NULL;
-                *out_ww = NULL;
-                *out_wn = 0;
-                cbm_log_error("store.leiden_weights", "code", "CBM_STORE_RESULT_ALLOCATION_FAILED",
-                              "message", "Leiden weight-array allocation failed", "remediation",
-                              "free memory or reduce the graph scope, then retry; no clustering "
-                              "result was returned");
-                return CBM_STORE_ERR;
+                free(indexed);
+                free(sorted_nodes);
+                return leiden_fail(receipt, "CBM_LEIDEN_EDGE_WEIGHT_OVERFLOW",
+                                   "canonical_edge_runs",
+                                   "Leiden edge multiplicity exceeds exact double representation",
+                                   "repair duplicate-edge cardinality before clustering");
             }
-            wsi[wn] = si;
-            wdi[wn] = di;
-            ww[wn] = (double)SKIP_ONE;
-            wn++;
+            weight += indexed[end].weight;
+            end++;
         }
+        wsi[wn] = indexed[e].src;
+        wdi[wn] = indexed[e].dst;
+        ww[wn] = (double)weight;
+        if (wsi[wn] == wdi[wn] && receipt) {
+            receipt->self_loop_count++;
+        }
+        wn++;
+        e = end;
     }
+    if (receipt) {
+        receipt->canonical_edge_count = (uint64_t)wn;
+        receipt->duplicate_edge_count = (uint64_t)edge_count - (uint64_t)wn;
+    }
+    free(indexed);
+    *out_sorted_nodes = sorted_nodes;
     *out_wsi = wsi;
     *out_wdi = wdi;
     *out_ww = ww;
     *out_wn = wn;
     return CBM_STORE_OK;
 }
-
-enum { LEIDEN_MAX_LEVELS = 64, LEIDEN_MOVE_PASS_CAP = 100 };
 
 /* Weighted undirected graph in CSR form. Each undirected edge is stored as
  * two directed entries; k[i] is the weighted degree of node i. Self-loops are
@@ -9452,10 +10179,10 @@ enum { LEIDEN_MAX_LEVELS = 64, LEIDEN_MOVE_PASS_CAP = 100 };
  * degree but is never mistaken for an edge to another community. */
 typedef struct {
     int n;
-    int *off;  /* CSR offsets, length n + 1 */
-    int *nbr;  /* neighbour indices, length off[n] */
-    double *w; /* edge weights aligned with nbr */
-    double *k; /* weighted degree per node */
+    size_t *off; /* CSR offsets, length n + 1 */
+    int *nbr;    /* neighbour indices, length off[n] */
+    double *w;   /* edge weights aligned with nbr */
+    double *k;   /* weighted degree per node */
 } cbm_lg_t;
 
 static void lg_free(cbm_lg_t *g) {
@@ -9470,46 +10197,93 @@ static void lg_free(cbm_lg_t *g) {
 }
 
 /* Build a CSR graph from a deduplicated undirected edge list. */
-static int lg_build(int n, const int *wsi, const int *wdi, const double *ww, int wn,
-                    cbm_lg_t *out) {
-    int *off = calloc((size_t)n + 1, sizeof(int));
-    double *k = calloc((size_t)n, sizeof(double));
-    int *fill = malloc((size_t)n * sizeof(int));
+static int lg_build(int n, const int *wsi, const int *wdi, const double *ww, int wn, cbm_lg_t *out,
+                    leiden_run_receipt_t *receipt) {
+    memset(out, 0, sizeof(*out));
+    size_t *off = leiden_calloc((size_t)n + 1, sizeof(*off), receipt);
+    double *k = leiden_calloc((size_t)n, sizeof(double), receipt);
+    size_t *fill = leiden_malloc((size_t)n, sizeof(*fill), receipt);
     if (!off || !k || !fill) {
         free(off);
         free(k);
         free(fill);
-        return CBM_NOT_FOUND;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "csr",
+                           "Leiden CSR construction could not allocate node arrays",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     for (int e = 0; e < wn; e++) {
+        if (wsi[e] == wdi[e]) {
+            double degree = ww[e] * 2.0;
+            if (!isfinite(degree) || !isfinite(k[wsi[e]] + degree)) {
+                free(off);
+                free(k);
+                free(fill);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "csr",
+                                   "Leiden self-loop degree is not finitely representable",
+                                   "repair edge multiplicities and retry unchanged");
+            }
+            k[wsi[e]] += degree;
+            continue;
+        }
+        if (off[wsi[e] + 1] == SIZE_MAX || off[wdi[e] + 1] == SIZE_MAX) {
+            free(off);
+            free(k);
+            free(fill);
+            return leiden_fail(receipt, "CBM_LEIDEN_ADJACENCY_OVERFLOW", "csr",
+                               "Leiden adjacency cardinality exceeds its exact representation",
+                               "request a smaller explicit scope; no prefix was clustered");
+        }
         off[wsi[e] + 1]++;
         off[wdi[e] + 1]++;
     }
     for (int i = 0; i < n; i++) {
+        if (off[i] > SIZE_MAX - off[i + 1]) {
+            free(off);
+            free(k);
+            free(fill);
+            return leiden_fail(receipt, "CBM_LEIDEN_ADJACENCY_OVERFLOW", "csr",
+                               "Leiden CSR offset exceeds its exact representation",
+                               "request a smaller explicit scope; no prefix was clustered");
+        }
         off[i + 1] += off[i];
     }
-    int total = off[n];
-    int *nbr = malloc((size_t)(total > 0 ? total : 1) * sizeof(int));
-    double *w = malloc((size_t)(total > 0 ? total : 1) * sizeof(double));
+    size_t total = off[n];
+    int *nbr = leiden_malloc((size_t)total, sizeof(int), receipt);
+    double *w = leiden_malloc((size_t)total, sizeof(double), receipt);
     if (!nbr || !w) {
         free(off);
         free(k);
         free(fill);
         free(nbr);
         free(w);
-        return CBM_NOT_FOUND;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "csr",
+                           "Leiden CSR construction could not allocate adjacency arrays",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
-    memcpy(fill, off, (size_t)n * sizeof(int));
+    memcpy(fill, off, (size_t)n * sizeof(*fill));
     for (int e = 0; e < wn; e++) {
         int a = wsi[e];
         int b = wdi[e];
         double we = ww[e];
+        if (a == b) {
+            continue;
+        }
         nbr[fill[a]] = b;
         w[fill[a]] = we;
         fill[a]++;
         nbr[fill[b]] = a;
         w[fill[b]] = we;
         fill[b]++;
+        if (!isfinite(k[a] + we) || !isfinite(k[b] + we)) {
+            free(off);
+            free(k);
+            free(fill);
+            free(nbr);
+            free(w);
+            return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "csr",
+                               "Leiden weighted degree is not finitely representable",
+                               "repair edge multiplicities and retry unchanged");
+        }
         k[a] += we;
         k[b] += we;
     }
@@ -9526,37 +10300,98 @@ static int lg_build(int n, const int *wsi, const int *wdi, const double *ww, int
  * with the highest modularity gain, using a work queue seeded with every node
  * and re-queueing only the neighbours of a node that actually moved. Mutates
  * comm[] in place. */
-static void leiden_move(const cbm_lg_t *g, int *comm, double gamma, double twom) {
+static int leiden_move(const cbm_lg_t *g, int *comm, double gamma, double twom,
+                       uint64_t global_visit_cap, leiden_run_receipt_t *receipt) {
     int n = g->n;
-    double *stot = calloc((size_t)n, sizeof(double));
-    double *acc = calloc((size_t)n, sizeof(double));
-    int *queue = malloc((size_t)n * sizeof(int));
-    int *dirty = malloc((size_t)n * sizeof(int));
-    bool *inq = calloc((size_t)n, sizeof(bool));
-    if (!stot || !acc || !queue || !dirty || !inq) {
+    double *stot = leiden_calloc((size_t)n, sizeof(double), receipt);
+    double *acc = leiden_calloc((size_t)n, sizeof(double), receipt);
+    int *queue = leiden_malloc((size_t)n, sizeof(int), receipt);
+    int *dirty = leiden_malloc((size_t)n, sizeof(int), receipt);
+    int *community_size = leiden_calloc((size_t)n, sizeof(int), receipt);
+    int *empty_ids = leiden_malloc((size_t)n, sizeof(int), receipt);
+    bool *inq = leiden_calloc((size_t)n, sizeof(bool), receipt);
+    if (receipt) {
+        receipt->move_started = true;
+        receipt->move_completed = false;
+    }
+    if (!stot || !acc || !queue || !dirty || !community_size || !empty_ids || !inq) {
         free(stot);
         free(acc);
         free(queue);
         free(dirty);
+        free(community_size);
+        free(empty_ids);
         free(inq);
-        return;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "move",
+                           "Leiden local moving could not allocate its bounded workspace",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     for (int i = 0; i < n; i++) {
+        if (comm[i] < 0 || comm[i] >= n || community_size[comm[i]] == INT_MAX ||
+            !isfinite(stot[comm[i]] + g->k[i])) {
+            free(stot);
+            free(acc);
+            free(queue);
+            free(dirty);
+            free(community_size);
+            free(empty_ids);
+            free(inq);
+            return leiden_fail(receipt, "CBM_LEIDEN_COMMUNITY_ID_INVALID", "move",
+                               "Leiden local moving received an invalid community seed",
+                               "repair the preceding relabel or aggregate phase and retry");
+        }
         stot[comm[i]] += g->k[i];
+        community_size[comm[i]]++;
         queue[i] = i;
         inq[i] = true;
     }
+    int empty_count = 0;
+    for (int c = 0; c < n; c++) {
+        if (community_size[c] == 0) {
+            empty_ids[empty_count++] = c;
+        }
+    }
     int qhead = 0;
     int qcount = n;
-    long cap = (long)n * LEIDEN_MOVE_PASS_CAP + LEIDEN_MAX_LEVELS;
-    while (qcount > 0 && cap-- > 0) {
+    uint64_t prior_visits = receipt ? receipt->move_visit_count : 0;
+    if (prior_visits > global_visit_cap) {
+        free(stot);
+        free(acc);
+        free(queue);
+        free(dirty);
+        free(community_size);
+        free(empty_ids);
+        free(inq);
+        return leiden_fail(receipt, "CBM_LEIDEN_MOVE_CAP_INVALID", "move",
+                           "Leiden move visits already exceed the caller-owned global cap",
+                           "repair global move-work accounting before retrying");
+    }
+    uint64_t remaining_visits = global_visit_cap - prior_visits;
+    uint64_t visits = 0;
+    while (qcount > 0 && visits < remaining_visits) {
+        visits++;
+        if (receipt) {
+            if (receipt->move_visit_count == UINT64_MAX) {
+                free(stot);
+                free(acc);
+                free(queue);
+                free(dirty);
+                free(community_size);
+                free(empty_ids);
+                free(inq);
+                return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "move",
+                                   "Leiden move visit counter overflowed",
+                                   "request a smaller explicit scope; no result was returned");
+            }
+            receipt->move_visit_count++;
+        }
         int v = queue[qhead];
         qhead = (qhead + 1) % n;
         qcount--;
         inq[v] = false;
         int cv = comm[v];
         int ndirty = 0;
-        for (int e = g->off[v]; e < g->off[v + 1]; e++) {
+        for (size_t e = g->off[v]; e < g->off[v + 1]; e++) {
             int u = g->nbr[e];
             if (u == v) {
                 continue;
@@ -9565,27 +10400,91 @@ static void leiden_move(const cbm_lg_t *g, int *comm, double gamma, double twom)
             if (acc[cu] == 0.0) {
                 dirty[ndirty++] = cu;
             }
+            if (!isfinite(acc[cu] + g->w[e])) {
+                free(stot);
+                free(acc);
+                free(queue);
+                free(dirty);
+                free(community_size);
+                free(empty_ids);
+                free(inq);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "move",
+                                   "Leiden neighbouring-community weight is not finite",
+                                   "repair graph weights and retry unchanged");
+            }
             acc[cu] += g->w[e];
         }
         stot[cv] -= g->k[v];
+        community_size[cv]--;
         double kv = g->k[v];
         int best_c = cv;
         double best_gain = acc[cv] - gamma * kv * stot[cv] / twom;
+        if (!isfinite(best_gain)) {
+            free(stot);
+            free(acc);
+            free(queue);
+            free(dirty);
+            free(community_size);
+            free(empty_ids);
+            free(inq);
+            return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "move",
+                               "Leiden modularity gain is not finite",
+                               "repair graph weights or resolution and retry unchanged");
+        }
+        int empty_c = community_size[cv] == 0
+                          ? cv
+                          : (empty_count > 0 ? empty_ids[empty_count - 1] : CBM_NOT_FOUND);
+        if (empty_c >= 0 && empty_c != cv && 0.0 > best_gain) {
+            best_gain = 0.0;
+            best_c = empty_c;
+        }
         for (int d = 0; d < ndirty; d++) {
             int c = dirty[d];
             double gain = acc[c] - gamma * kv * stot[c] / twom;
-            if (gain > best_gain) {
+            if (!isfinite(gain)) {
+                free(stot);
+                free(acc);
+                free(queue);
+                free(dirty);
+                free(community_size);
+                free(empty_ids);
+                free(inq);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "move",
+                                   "Leiden candidate modularity gain is not finite",
+                                   "repair graph weights or resolution and retry unchanged");
+            }
+            if (gain > best_gain || (gain == best_gain && best_c != cv && c < best_c)) {
                 best_gain = gain;
                 best_c = c;
             }
         }
+        if (best_c != cv && community_size[best_c] == 0) {
+            if (empty_count <= 0 || empty_ids[empty_count - 1] != best_c) {
+                free(stot);
+                free(acc);
+                free(queue);
+                free(dirty);
+                free(community_size);
+                free(empty_ids);
+                free(inq);
+                return leiden_fail(receipt, "CBM_LEIDEN_EMPTY_COMMUNITY_INVALID", "move",
+                                   "Leiden empty-community roster lost canonical ownership",
+                                   "repair deterministic empty-community bookkeeping");
+            }
+            empty_count--;
+        }
+        if (best_c != cv && community_size[cv] == 0) {
+            empty_ids[empty_count++] = cv;
+        }
         stot[best_c] += kv;
+        community_size[best_c]++;
         comm[v] = best_c;
         if (best_c != cv) {
-            for (int e = g->off[v]; e < g->off[v + 1]; e++) {
+            for (size_t e = g->off[v]; e < g->off[v + 1]; e++) {
                 int u = g->nbr[e];
                 if (comm[u] != best_c && !inq[u] && qcount < n) {
-                    queue[(qhead + qcount) % n] = u;
+                    size_t tail = ((size_t)qhead + (size_t)qcount) % (size_t)n;
+                    queue[tail] = u;
                     qcount++;
                     inq[u] = true;
                 }
@@ -9599,65 +10498,186 @@ static void leiden_move(const cbm_lg_t *g, int *comm, double gamma, double twom)
     free(acc);
     free(queue);
     free(dirty);
+    free(community_size);
+    free(empty_ids);
     free(inq);
+    if (qcount > 0) {
+        return leiden_fail(receipt, "CBM_LEIDEN_MOVE_CAP_EXHAUSTED", "move",
+                           "Leiden local moving exhausted its deterministic visit cap",
+                           "request an exact smaller scope or explicitly raise "
+                           "cluster_max_move_visits and retry unchanged");
+    }
+    if (receipt) {
+        receipt->move_completed = true;
+    }
+    return CBM_STORE_OK;
 }
 
 /* Compact community labels in comm[] to the dense range [0, returned count). */
-static int leiden_relabel(int *comm, int n) {
-    int *map = malloc((size_t)n * sizeof(int));
+static int leiden_relabel(int *comm, int n, int *out_count, leiden_run_receipt_t *receipt) {
+    if (receipt) {
+        receipt->relabel_started = true;
+        receipt->relabel_completed = false;
+        uint64_t completed_visits = receipt->relabel_visit_count;
+        if (!leiden_u64_add_scaled(&completed_visits, (uint64_t)n, UINT64_C(2))) {
+            return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "relabel",
+                               "Leiden relabel visit counter overflowed",
+                               "request a smaller explicit scope; no result was returned");
+        }
+    }
+    int *map = leiden_malloc((size_t)n, sizeof(int), receipt);
     if (!map) {
-        return n;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "relabel",
+                           "Leiden relabeling could not allocate its exact label map",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     for (int i = 0; i < n; i++) {
         map[i] = CBM_NOT_FOUND;
     }
+    if (receipt) {
+        receipt->relabel_visit_count += (uint64_t)n;
+    }
     int next = 0;
     for (int i = 0; i < n; i++) {
+        if (receipt) {
+            receipt->relabel_visit_count++;
+        }
         int c = comm[i];
+        if (c < 0 || c >= n) {
+            free(map);
+            return leiden_fail(receipt, "CBM_LEIDEN_COMMUNITY_ID_INVALID", "relabel",
+                               "Leiden relabeling observed an out-of-range community ID",
+                               "repair the preceding phase before publishing any result");
+        }
         if (map[c] == CBM_NOT_FOUND) {
             map[c] = next++;
         }
         comm[i] = map[c];
     }
     free(map);
-    return next;
+    *out_count = next;
+    if (receipt) {
+        receipt->relabel_completed = true;
+    }
+    return CBM_STORE_OK;
 }
 
-/* Refinement phase: within each move-phase community, merge singleton nodes
- * into the best connected sub-community (positive modularity gain, edge must
- * exist). This re-derives communities bottom-up so each one is guaranteed
- * internally connected — the defect single-level Louvain suffers from, which
- * fragments the graph into hundreds of tiny noisy clusters. Writes
- * sub-community labels into refined[] and returns their count. */
+/* Deterministic Leiden refinement variant.  It retains the paper's R/T
+ * well-connectedness gates and non-decreasing modularity eligibility, but
+ * replaces the stochastic weighted choice with maximum gain followed by the
+ * lowest canonical refined-community ID.  The receipt names this variant and
+ * never claims stochastic Leiden's subset-optimality guarantee. */
 static int leiden_refine(const cbm_lg_t *g, const int *comm, double gamma, double twom,
-                         int *refined) {
+                         int *refined, int *out_count, leiden_run_receipt_t *receipt) {
     int n = g->n;
-    double *stot = calloc((size_t)n, sizeof(double));
-    double *acc = calloc((size_t)n, sizeof(double));
-    int *rsize = malloc((size_t)n * sizeof(int));
-    int *dirty = malloc((size_t)n * sizeof(int));
-    if (!stot || !acc || !rsize || !dirty) {
+    double *stot = leiden_calloc((size_t)n, sizeof(double), receipt);
+    double *acc = leiden_calloc((size_t)n, sizeof(double), receipt);
+    double *parent_tot = leiden_calloc((size_t)n, sizeof(double), receipt);
+    double *external = leiden_calloc((size_t)n, sizeof(double), receipt);
+    int *rsize = leiden_malloc((size_t)n, sizeof(int), receipt);
+    int *dirty = leiden_malloc((size_t)n, sizeof(int), receipt);
+    if (receipt) {
+        receipt->refine_started = true;
+        receipt->refine_completed = false;
+        if (UINT64_MAX - receipt->refine_visit_bound < (uint64_t)n) {
+            free(stot);
+            free(acc);
+            free(parent_tot);
+            free(external);
+            free(rsize);
+            free(dirty);
+            return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "refine",
+                               "Leiden derived refinement-visit bound overflowed",
+                               "request a smaller explicit scope; no result was returned");
+        }
+        receipt->refine_visit_bound += (uint64_t)n;
+    }
+    if (!stot || !acc || !parent_tot || !external || !rsize || !dirty) {
         free(stot);
         free(acc);
+        free(parent_tot);
+        free(external);
         free(rsize);
         free(dirty);
-        for (int i = 0; i < n; i++) {
-            refined[i] = i;
-        }
-        return leiden_relabel(refined, n);
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "refine",
+                           "Leiden refinement could not allocate its exact workspace",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     for (int i = 0; i < n; i++) {
+        if (comm[i] < 0 || comm[i] >= n || !isfinite(parent_tot[comm[i]] + g->k[i])) {
+            free(stot);
+            free(acc);
+            free(parent_tot);
+            free(external);
+            free(rsize);
+            free(dirty);
+            return leiden_fail(receipt, "CBM_LEIDEN_COMMUNITY_ID_INVALID", "refine",
+                               "Leiden refinement received an invalid move-phase partition",
+                               "repair local moving and relabeling before refinement");
+        }
         refined[i] = i;
         stot[i] = g->k[i];
+        parent_tot[comm[i]] += g->k[i];
         rsize[i] = 1;
     }
     for (int v = 0; v < n; v++) {
+        for (size_t e = g->off[v]; e < g->off[v + 1]; e++) {
+            int u = g->nbr[e];
+            if (u != v && comm[u] == comm[v]) {
+                if (!isfinite(external[v] + g->w[e])) {
+                    free(stot);
+                    free(acc);
+                    free(parent_tot);
+                    free(external);
+                    free(rsize);
+                    free(dirty);
+                    return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "refine",
+                                       "Leiden refinement connectivity weight is not finite",
+                                       "repair graph weights and retry unchanged");
+                }
+                external[v] += g->w[e];
+            }
+        }
+    }
+    for (int v = 0; v < n; v++) {
+        if (receipt) {
+            if (receipt->refine_visit_count == UINT64_MAX) {
+                free(stot);
+                free(acc);
+                free(parent_tot);
+                free(external);
+                free(rsize);
+                free(dirty);
+                return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "refine",
+                                   "Leiden refinement visit counter overflowed",
+                                   "request a smaller explicit scope; no result was returned");
+            }
+            receipt->refine_visit_count++;
+        }
         if (rsize[refined[v]] != 1) {
             continue; /* only singletons merge, per the refinement rule */
         }
         int cv = comm[v];
+        int rv = refined[v];
+        double kv = g->k[v];
+        double node_rest_degree = parent_tot[cv] - kv;
+        double node_threshold = gamma * kv * node_rest_degree / twom;
+        if (!isfinite(node_threshold)) {
+            free(stot);
+            free(acc);
+            free(parent_tot);
+            free(external);
+            free(rsize);
+            free(dirty);
+            return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "refine",
+                               "Leiden node well-connectedness threshold is not finite",
+                               "repair graph weights or resolution and retry unchanged");
+        }
+        if (external[rv] < node_threshold) {
+            continue; /* v is not in the paper's well-connected node set R */
+        }
         int ndirty = 0;
-        for (int e = g->off[v]; e < g->off[v + 1]; e++) {
+        for (size_t e = g->off[v]; e < g->off[v + 1]; e++) {
             int u = g->nbr[e];
             if (u == v || comm[u] != cv) {
                 continue; /* stay within the move-phase community */
@@ -9666,31 +10686,94 @@ static int leiden_refine(const cbm_lg_t *g, const int *comm, double gamma, doubl
             if (acc[ru] == 0.0) {
                 dirty[ndirty++] = ru;
             }
+            if (!isfinite(acc[ru] + g->w[e])) {
+                free(stot);
+                free(acc);
+                free(parent_tot);
+                free(external);
+                free(rsize);
+                free(dirty);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "refine",
+                                   "Leiden refinement candidate weight is not finite",
+                                   "repair graph weights and retry unchanged");
+            }
             acc[ru] += g->w[e];
         }
-        int rv = refined[v];
-        double kv = g->k[v];
-        stot[rv] -= kv;
-        int best_r = rv;
-        double best_gain = 0.0;
+        int best_r = CBM_NOT_FOUND;
+        double best_gain = -INFINITY;
         for (int d = 0; d < ndirty; d++) {
             int r = dirty[d];
             if (r == rv) {
                 continue;
             }
+            double target_rest_degree = parent_tot[cv] - stot[r];
+            double target_threshold = gamma * stot[r] * target_rest_degree / twom;
+            if (!isfinite(target_threshold)) {
+                free(stot);
+                free(acc);
+                free(parent_tot);
+                free(external);
+                free(rsize);
+                free(dirty);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "refine",
+                                   "Leiden target well-connectedness threshold is not finite",
+                                   "repair graph weights or resolution and retry unchanged");
+            }
+            if (external[r] < target_threshold) {
+                continue; /* target is not in the paper's eligible set T */
+            }
             double gain = acc[r] - gamma * kv * stot[r] / twom;
-            if (gain > best_gain) {
+            if (!isfinite(gain)) {
+                free(stot);
+                free(acc);
+                free(parent_tot);
+                free(external);
+                free(rsize);
+                free(dirty);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "refine",
+                                   "Leiden refinement gain is not finite",
+                                   "repair graph weights or resolution and retry unchanged");
+            }
+            if (gain >= 0.0 && (best_r == CBM_NOT_FOUND || gain > best_gain ||
+                                (gain == best_gain && r < best_r))) {
                 best_gain = gain;
                 best_r = r;
             }
         }
-        if (best_r != rv) {
+        if (best_r != CBM_NOT_FOUND) {
+            double merged_external = external[best_r] + external[rv] - 2.0 * acc[best_r];
+            if (!isfinite(merged_external) || merged_external < 0.0) {
+                free(stot);
+                free(acc);
+                free(parent_tot);
+                free(external);
+                free(rsize);
+                free(dirty);
+                return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "refine",
+                                   "Leiden refined-community connectivity became invalid",
+                                   "repair exact graph weights and refinement accounting");
+            }
             refined[v] = best_r;
             stot[best_r] += kv;
+            stot[rv] = 0.0;
+            external[best_r] = merged_external;
+            external[rv] = 0.0;
             rsize[best_r]++;
-            rsize[rv]--;
-        } else {
-            stot[rv] += kv;
+            rsize[rv] = 0;
+            if (receipt) {
+                if (receipt->refine_merge_count == UINT64_MAX) {
+                    free(stot);
+                    free(acc);
+                    free(parent_tot);
+                    free(external);
+                    free(rsize);
+                    free(dirty);
+                    return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "refine",
+                                       "Leiden refinement merge counter overflowed",
+                                       "request a smaller explicit scope; no result was returned");
+                }
+                receipt->refine_merge_count++;
+            }
         }
         for (int d = 0; d < ndirty; d++) {
             acc[dirty[d]] = 0.0;
@@ -9698,9 +10781,14 @@ static int leiden_refine(const cbm_lg_t *g, const int *comm, double gamma, doubl
     }
     free(stot);
     free(acc);
+    free(parent_tot);
+    free(external);
     free(rsize);
     free(dirty);
-    return leiden_relabel(refined, n);
+    if (receipt) {
+        receipt->refine_completed = true;
+    }
+    return leiden_relabel(refined, n, out_count, receipt);
 }
 
 /* Aggregation phase: collapse each refined sub-community into a single node.
@@ -9708,16 +10796,31 @@ static int leiden_refine(const cbm_lg_t *g, const int *comm, double gamma, doubl
  * move-phase community it belonged to in seed[] so the next level starts from
  * the coarse structure rather than from singletons. */
 static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, const int *comm,
-                            cbm_lg_t *out, int *seed) {
+                            cbm_lg_t *out, int *seed, leiden_run_receipt_t *receipt) {
     int n = g->n;
-    double *k2 = calloc((size_t)r_count, sizeof(double));
-    int *gcount = calloc((size_t)r_count, sizeof(int));
-    int *gstart = malloc(((size_t)r_count + 1) * sizeof(int));
-    int *members = malloc((size_t)n * sizeof(int));
-    int *fill = malloc((size_t)r_count * sizeof(int));
-    double *acc = calloc((size_t)r_count, sizeof(double));
-    int *dirty = malloc((size_t)r_count * sizeof(int));
-    int *off2 = malloc(((size_t)r_count + 1) * sizeof(int));
+    memset(out, 0, sizeof(*out));
+    uint64_t aggregate_visits = 0;
+    if (receipt) {
+        receipt->aggregate_started = true;
+        receipt->aggregate_completed = false;
+        uint64_t adjacency_visits = (uint64_t)g->off[n];
+        if ((size_t)adjacency_visits != g->off[n] ||
+            !leiden_u64_add_scaled(&aggregate_visits, (uint64_t)n, UINT64_C(4)) ||
+            !leiden_u64_add_scaled(&aggregate_visits, (uint64_t)r_count, UINT64_C(2)) ||
+            !leiden_u64_add_scaled(&aggregate_visits, adjacency_visits, UINT64_C(2))) {
+            return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "aggregate",
+                               "Leiden aggregate work is not representable by its receipt",
+                               "request a smaller explicit scope; no result was returned");
+        }
+    }
+    double *k2 = leiden_calloc((size_t)r_count, sizeof(double), receipt);
+    int *gcount = leiden_calloc((size_t)r_count, sizeof(int), receipt);
+    int *gstart = leiden_malloc((size_t)r_count + 1, sizeof(int), receipt);
+    int *members = leiden_malloc((size_t)n, sizeof(int), receipt);
+    int *fill = leiden_malloc((size_t)r_count, sizeof(int), receipt);
+    double *acc = leiden_calloc((size_t)r_count, sizeof(double), receipt);
+    int *dirty = leiden_malloc((size_t)r_count, sizeof(int), receipt);
+    size_t *off2 = leiden_malloc((size_t)r_count + 1, sizeof(*off2), receipt);
     if (!k2 || !gcount || !gstart || !members || !fill || !acc || !dirty || !off2) {
         free(k2);
         free(gcount);
@@ -9727,13 +10830,29 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
         free(acc);
         free(dirty);
         free(off2);
-        return CBM_NOT_FOUND;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "aggregate",
+                           "Leiden aggregation could not allocate its exact workspace",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     for (int r = 0; r < r_count; r++) {
         seed[r] = CBM_NOT_FOUND;
     }
     for (int i = 0; i < n; i++) {
         int r = refined[i];
+        if (r < 0 || r >= r_count || comm[i] < 0 || comm[i] >= n ||
+            (seed[r] != CBM_NOT_FOUND && seed[r] != comm[i]) || !isfinite(k2[r] + g->k[i])) {
+            free(k2);
+            free(gcount);
+            free(gstart);
+            free(members);
+            free(fill);
+            free(acc);
+            free(dirty);
+            free(off2);
+            return leiden_fail(receipt, "CBM_LEIDEN_AGGREGATE_MAPPING_INVALID", "aggregate",
+                               "Leiden aggregate mapping or degree is invalid",
+                               "repair refinement mapping and graph weights before retrying");
+        }
         k2[r] += g->k[i];
         gcount[r]++;
         if (seed[r] == CBM_NOT_FOUND) {
@@ -9742,6 +10861,19 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
     }
     gstart[0] = 0;
     for (int r = 0; r < r_count; r++) {
+        if (gstart[r] > INT_MAX - gcount[r]) {
+            free(k2);
+            free(gcount);
+            free(gstart);
+            free(members);
+            free(fill);
+            free(acc);
+            free(dirty);
+            free(off2);
+            return leiden_fail(receipt, "CBM_LEIDEN_AGGREGATE_OVERFLOW", "aggregate",
+                               "Leiden aggregate member offsets exceed exact representation",
+                               "request a smaller explicit scope; no prefix was clustered");
+        }
         gstart[r + 1] = gstart[r] + gcount[r];
         fill[r] = gstart[r];
     }
@@ -9754,7 +10886,7 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
         int nd = 0;
         for (int m = gstart[r]; m < gstart[r + 1]; m++) {
             int i = members[m];
-            for (int e = g->off[i]; e < g->off[i + 1]; e++) {
+            for (size_t e = g->off[i]; e < g->off[i + 1]; e++) {
                 int rb = refined[g->nbr[e]];
                 if (rb == r || acc[rb] != 0.0) {
                     continue;
@@ -9763,14 +10895,27 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
                 dirty[nd++] = rb;
             }
         }
+        if (off2[r] > SIZE_MAX - (size_t)nd) {
+            free(k2);
+            free(gcount);
+            free(gstart);
+            free(members);
+            free(fill);
+            free(acc);
+            free(dirty);
+            free(off2);
+            return leiden_fail(receipt, "CBM_LEIDEN_AGGREGATE_OVERFLOW", "aggregate",
+                               "Leiden aggregate adjacency exceeds exact representation",
+                               "request a smaller explicit scope; no prefix was clustered");
+        }
         off2[r + 1] = off2[r] + nd;
         for (int d = 0; d < nd; d++) {
             acc[dirty[d]] = 0.0;
         }
     }
-    int total = off2[r_count];
-    int *nbr2 = malloc((size_t)(total > 0 ? total : 1) * sizeof(int));
-    double *w2 = malloc((size_t)(total > 0 ? total : 1) * sizeof(double));
+    size_t total = off2[r_count];
+    int *nbr2 = leiden_malloc((size_t)total, sizeof(int), receipt);
+    double *w2 = leiden_malloc((size_t)total, sizeof(double), receipt);
     if (!nbr2 || !w2) {
         free(k2);
         free(gcount);
@@ -9782,14 +10927,16 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
         free(off2);
         free(nbr2);
         free(w2);
-        return CBM_NOT_FOUND;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "aggregate",
+                           "Leiden aggregation could not allocate canonical adjacency arrays",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     /* Pass 2: accumulate inter-community edge weights. */
     for (int r = 0; r < r_count; r++) {
         int nd = 0;
         for (int m = gstart[r]; m < gstart[r + 1]; m++) {
             int i = members[m];
-            for (int e = g->off[i]; e < g->off[i + 1]; e++) {
+            for (size_t e = g->off[i]; e < g->off[i + 1]; e++) {
                 int rb = refined[g->nbr[e]];
                 if (rb == r) {
                     continue;
@@ -9797,15 +10944,54 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
                 if (acc[rb] == 0.0) {
                     dirty[nd++] = rb;
                 }
+                if (!isfinite(acc[rb] + g->w[e])) {
+                    free(k2);
+                    free(gcount);
+                    free(gstart);
+                    free(members);
+                    free(fill);
+                    free(acc);
+                    free(dirty);
+                    free(off2);
+                    free(nbr2);
+                    free(w2);
+                    return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "aggregate",
+                                       "Leiden aggregate edge weight is not finite",
+                                       "repair graph weights and retry unchanged");
+                }
                 acc[rb] += g->w[e];
             }
         }
-        int base = off2[r];
+        if (nd > 1) {
+            qsort(dirty, (size_t)nd, sizeof(*dirty), leiden_int_cmp);
+        }
+        size_t base = off2[r];
         for (int d = 0; d < nd; d++) {
             nbr2[base + d] = dirty[d];
             w2[base + d] = acc[dirty[d]];
             acc[dirty[d]] = 0.0;
         }
+    }
+    if (receipt) {
+        uint64_t output_adjacency_visits = (uint64_t)total;
+        if ((size_t)output_adjacency_visits != total ||
+            !leiden_u64_add_scaled(&aggregate_visits, output_adjacency_visits, UINT64_C(2)) ||
+            receipt->aggregate_visit_count > UINT64_MAX - aggregate_visits) {
+            free(k2);
+            free(gcount);
+            free(gstart);
+            free(members);
+            free(fill);
+            free(acc);
+            free(dirty);
+            free(off2);
+            free(nbr2);
+            free(w2);
+            return leiden_fail(receipt, "CBM_LEIDEN_COUNTER_OVERFLOW", "aggregate",
+                               "Leiden aggregate visit counter overflowed",
+                               "request a smaller explicit scope; no result was returned");
+        }
+        receipt->aggregate_visit_count += aggregate_visits;
     }
     free(gcount);
     free(gstart);
@@ -9818,138 +11004,304 @@ static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, 
     out->nbr = nbr2;
     out->w = w2;
     out->k = k2;
+    if (receipt) {
+        receipt->aggregate_completed = true;
+    }
     return CBM_STORE_OK;
 }
 
-int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
-               int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count) {
+static int leiden_dsu_find(int *parent, int node) {
+    int root = node;
+    while (parent[root] != root) {
+        root = parent[root];
+    }
+    while (parent[node] != node) {
+        int next = parent[node];
+        parent[node] = root;
+        node = next;
+    }
+    return root;
+}
+
+static void leiden_dsu_union(int *parent, uint8_t *rank, int a, int b) {
+    int ra = leiden_dsu_find(parent, a);
+    int rb = leiden_dsu_find(parent, b);
+    if (ra == rb) {
+        return;
+    }
+    if (rank[ra] < rank[rb] || (rank[ra] == rank[rb] && rb < ra)) {
+        int tmp = ra;
+        ra = rb;
+        rb = tmp;
+    }
+    parent[rb] = ra;
+    if (rank[ra] == rank[rb]) {
+        rank[ra]++;
+    }
+}
+
+static int leiden_validate_connected_partition(int n, const int *wsi, const int *wdi, int wn,
+                                               const int *comm, int community_count,
+                                               leiden_run_receipt_t *receipt) {
+    int *parent = leiden_malloc((size_t)n, sizeof(*parent), receipt);
+    uint8_t *rank = leiden_calloc((size_t)n, sizeof(*rank), receipt);
+    int *community_root = leiden_malloc((size_t)community_count, sizeof(*community_root), receipt);
+    if (!parent || !rank || !community_root) {
+        free(parent);
+        free(rank);
+        free(community_root);
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "connectivity_readback",
+                           "Leiden could not allocate its independent connectivity readback",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
+    }
+    for (int i = 0; i < n; i++) {
+        parent[i] = i;
+    }
+    for (int c = 0; c < community_count; c++) {
+        community_root[c] = CBM_NOT_FOUND;
+    }
+    for (int e = 0; e < wn; e++) {
+        if (wsi[e] != wdi[e] && comm[wsi[e]] == comm[wdi[e]]) {
+            leiden_dsu_union(parent, rank, wsi[e], wdi[e]);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        int c = comm[i];
+        if (c < 0 || c >= community_count) {
+            free(parent);
+            free(rank);
+            free(community_root);
+            return leiden_fail(receipt, "CBM_LEIDEN_COMMUNITY_ID_INVALID", "connectivity_readback",
+                               "Leiden produced a community ID outside its dense result roster",
+                               "repair relabeling before publishing any clustering result");
+        }
+        int root = leiden_dsu_find(parent, i);
+        if (community_root[c] == CBM_NOT_FOUND) {
+            community_root[c] = root;
+        } else if (community_root[c] != root) {
+            free(parent);
+            free(rank);
+            free(community_root);
+            return leiden_fail(receipt, "CBM_LEIDEN_DISCONNECTED_COMMUNITY",
+                               "connectivity_readback",
+                               "Leiden produced a community disconnected in the full projection",
+                               "repair move/refine aggregation; no partial result was returned");
+        }
+    }
+    free(parent);
+    free(rank);
+    free(community_root);
+    receipt->connectivity_verified = true;
+    return CBM_STORE_OK;
+}
+
+static int leiden_compute_objective(const int *wsi, const int *wdi, const double *ww, int wn,
+                                    const int *comm, int community_count, double gamma, double twom,
+                                    leiden_run_receipt_t *receipt) {
+    double *community_degree =
+        leiden_calloc((size_t)community_count, sizeof(*community_degree), receipt);
+    double *community_internal =
+        leiden_calloc((size_t)community_count, sizeof(*community_internal), receipt);
+    if (!community_degree || !community_internal) {
+        free(community_degree);
+        free(community_internal);
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "objective_readback",
+                           "Leiden could not allocate its independent objective readback",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
+    }
+    for (int e = 0; e < wn; e++) {
+        if (wsi[e] == wdi[e]) {
+            community_degree[comm[wsi[e]]] += 2.0 * ww[e];
+        } else {
+            community_degree[comm[wsi[e]]] += ww[e];
+            community_degree[comm[wdi[e]]] += ww[e];
+        }
+        if (comm[wsi[e]] == comm[wdi[e]]) {
+            community_internal[comm[wsi[e]]] += 2.0 * ww[e];
+        }
+    }
+    double objective = 0.0;
+    for (int c = 0; c < community_count; c++) {
+        double fraction = community_degree[c] / twom;
+        objective += community_internal[c] / twom - gamma * fraction * fraction;
+    }
+    free(community_degree);
+    free(community_internal);
+    if (!isfinite(objective)) {
+        return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "objective_readback",
+                           "Leiden objective readback is not finite",
+                           "repair graph weights or resolution and retry unchanged");
+    }
+    receipt->objective = objective;
+    return CBM_STORE_OK;
+}
+
+static int cbm_leiden_weighted(const int64_t *nodes, int node_count,
+                               const cbm_louvain_edge_t *edges, const uint64_t *edge_weights,
+                               int edge_count, bool endpoints_are_canonical_ordinals,
+                               double resolution, uint64_t max_move_visits,
+                               cbm_louvain_result_t **out, int *out_count,
+                               leiden_run_receipt_t *receipt) {
+    if (receipt) {
+        memset(receipt, 0, sizeof(*receipt));
+    }
     if (!out || !out_count || node_count < 0 || edge_count < 0 || (node_count > 0 && !nodes) ||
         (edge_count > 0 && !edges)) {
-        return CBM_STORE_ERR;
+        return leiden_fail(receipt, "CBM_LEIDEN_INVALID_ARGUMENT", "admission",
+                           "Leiden received an invalid pointer or negative count",
+                           "provide exact node/edge arrays and writable result pointers");
     }
     *out = NULL;
     *out_count = 0;
-    if (node_count <= 0) {
+    if (!isfinite(resolution) || resolution <= 0.0) {
+        return leiden_fail(
+            receipt, "CBM_LEIDEN_RESOLUTION_INVALID", "admission",
+            "Leiden resolution must be finite and strictly positive",
+            "provide a finite resolution greater than zero; no default is substituted");
+    }
+    if (max_move_visits == 0) {
+        return leiden_fail(
+            receipt, "CBM_LEIDEN_MOVE_CAP_INVALID", "admission",
+            "Leiden requires a positive caller-owned global move-visit bound",
+            "provide an explicit positive move-visit bound; no default is substituted");
+    }
+    if (receipt) {
+        receipt->move_visit_cap = max_move_visits;
+        receipt->level_bound = (uint64_t)node_count;
+    }
+    if (node_count == 0) {
+        if (edge_count != 0) {
+            return leiden_fail(receipt, "CBM_LEIDEN_UNKNOWN_ENDPOINT", "admission",
+                               "Leiden received edges for an empty node roster",
+                               "repair the graph projection so every endpoint resolves exactly");
+        }
+        if (receipt) {
+            receipt->converged = true;
+            receipt->connectivity_verified = true;
+            receipt->readback_started = true;
+            receipt->readback_completed = true;
+        }
         return CBM_STORE_OK;
     }
+
     int n = node_count;
-    double gamma = resolution > 0.0 ? resolution : 1.0;
-
-    cbm_louvain_result_t *result = malloc((size_t)n * sizeof(*result));
-    if (!result) {
-        cbm_log_error(
-            "store.leiden", "code", "CBM_STORE_RESULT_ALLOCATION_FAILED", "message",
-            "Leiden result allocation failed", "remediation",
-            "free memory or reduce the graph scope, then retry; no clustering result was returned");
+    int64_t *sorted_nodes = NULL;
+    int *wsi = NULL;
+    int *wdi = NULL;
+    double *ww = NULL;
+    int wn = 0;
+    if (louvain_build_weights(nodes, n, edges, edge_weights, edge_count,
+                              endpoints_are_canonical_ordinals, &sorted_nodes, &wsi, &wdi, &ww, &wn,
+                              receipt) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    for (int i = 0; i < n; i++) {
-        result[i].node_id = nodes[i];
-        result[i].community = i;
-    }
 
-    /* Build deduplicated undirected edge weights, then a CSR graph. */
-    int *wsi;
-    int *wdi;
-    double *ww;
-    int wn;
-    if (louvain_build_weights(nodes, n, edges, edge_count, &wsi, &wdi, &ww, &wn) != CBM_STORE_OK) {
-        free(result);
-        return CBM_STORE_ERR;
-    }
-    if (wn == 0) {
+    cbm_lg_t g = {0};
+    if (lg_build(n, wsi, wdi, ww, wn, &g, receipt) != CBM_STORE_OK) {
+        free(sorted_nodes);
         free(wsi);
         free(wdi);
         free(ww);
-        *out = result;
-        *out_count = n;
-        return CBM_STORE_OK;
-    }
-    cbm_lg_t g;
-    int built = lg_build(n, wsi, wdi, ww, wn, &g);
-    free(wsi);
-    free(wdi);
-    free(ww);
-    if (built != CBM_STORE_OK) {
-        free(result);
-        cbm_log_error("store.leiden", "code", "CBM_STORE_RESULT_ALLOCATION_FAILED", "message",
-                      "Leiden CSR graph construction failed", "remediation",
-                      "free memory or reduce the graph scope, then retry; no singleton fallback "
-                      "was returned");
         return CBM_STORE_ERR;
     }
-
     double twom = 0.0;
     for (int i = 0; i < n; i++) {
+        if (!isfinite(twom + g.k[i])) {
+            free(sorted_nodes);
+            free(wsi);
+            free(wdi);
+            free(ww);
+            lg_free(&g);
+            return leiden_fail(receipt, "CBM_LEIDEN_ARITHMETIC_OVERFLOW", "admission",
+                               "Leiden total graph weight is not finite",
+                               "repair graph weights and retry unchanged");
+        }
         twom += g.k[i];
     }
 
-    int *orig = malloc((size_t)n * sizeof(int)); /* original node -> current graph node */
-    int *comm = malloc((size_t)n * sizeof(int));
+    int *orig = leiden_malloc((size_t)n, sizeof(*orig), receipt);
+    int *comm = leiden_malloc((size_t)n, sizeof(*comm), receipt);
     if (!orig || !comm) {
         free(orig);
         free(comm);
+        free(sorted_nodes);
+        free(wsi);
+        free(wdi);
+        free(ww);
         lg_free(&g);
-        free(result);
-        cbm_log_error("store.leiden", "code", "CBM_STORE_RESULT_ALLOCATION_FAILED", "message",
-                      "Leiden community workspace allocation failed", "remediation",
-                      "free memory or reduce the graph scope, then retry; no partial clustering "
-                      "result was returned");
-        return CBM_STORE_ERR;
-    }
-    if (twom <= 0.0) {
-        free(orig);
-        free(comm);
-        lg_free(&g);
-        *out = result;
-        *out_count = n;
-        return CBM_STORE_OK;
+        return leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "levels",
+                           "Leiden could not allocate its level mapping",
+                           "free memory or request a smaller explicit scope, then retry unchanged");
     }
     for (int i = 0; i < n; i++) {
         orig[i] = i;
         comm[i] = i;
     }
 
-    for (int level = 0; level < LEIDEN_MAX_LEVELS; level++) {
-        leiden_move(&g, comm, gamma, twom);
-        int c_count = leiden_relabel(comm, g.n);
-        if (c_count >= g.n) {
-            break; /* every node already isolated — nothing to coarsen */
+    bool converged = false;
+    if (twom == 0.0) {
+        converged = true;
+    }
+    for (int level = 0; !converged && level < n; level++) {
+        if (receipt) {
+            receipt->level_count++;
         }
-        int *refined = malloc((size_t)g.n * sizeof(int));
+        if (leiden_move(&g, comm, resolution, twom, max_move_visits, receipt) != CBM_STORE_OK) {
+            goto algorithm_failed;
+        }
+        int c_count = 0;
+        if (leiden_relabel(comm, g.n, &c_count, receipt) != CBM_STORE_OK) {
+            goto algorithm_failed;
+        }
+        if (c_count == g.n) {
+            converged = true;
+            break;
+        }
+
+        int *refined = leiden_malloc((size_t)g.n, sizeof(*refined), receipt);
         if (!refined) {
-            free(comm);
-            free(orig);
-            lg_free(&g);
-            free(result);
-            cbm_log_error("store.leiden", "code", "CBM_STORE_RESULT_ALLOCATION_FAILED", "message",
-                          "Leiden refinement allocation failed", "remediation",
-                          "free memory or reduce the graph scope, then retry; no earlier-level "
-                          "result was substituted");
-            return CBM_STORE_ERR;
+            leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "refine",
+                        "Leiden could not allocate its refinement result",
+                        "free memory or request a smaller explicit scope, then retry unchanged");
+            goto algorithm_failed;
         }
-        int r_count = leiden_refine(&g, comm, gamma, twom, refined);
-        if (r_count >= g.n) {
+        int r_count = 0;
+        if (leiden_refine(&g, comm, resolution, twom, refined, &r_count, receipt) != CBM_STORE_OK) {
             free(refined);
-            break; /* refinement cannot reduce the graph further */
+            goto algorithm_failed;
+        }
+        if (r_count == g.n) {
+            free(refined);
+            leiden_fail(receipt, "CBM_LEIDEN_REFINEMENT_NO_PROGRESS", "refine",
+                        "deterministic Leiden refinement could not coarsen a non-singleton move "
+                        "partition",
+                        "inspect the well-connectedness and gain receipt; no singleton fallback "
+                        "was published");
+            goto algorithm_failed;
         }
         for (int i = 0; i < n; i++) {
+            if (orig[i] < 0 || orig[i] >= g.n) {
+                free(refined);
+                leiden_fail(receipt, "CBM_LEIDEN_LEVEL_MAPPING_INVALID", "aggregate",
+                            "Leiden level mapping points outside the current graph",
+                            "repair aggregation mapping before publishing any result");
+                goto algorithm_failed;
+            }
             orig[i] = refined[orig[i]];
         }
-        cbm_lg_t g2;
-        int *seed = malloc((size_t)r_count * sizeof(int));
-        if (!seed || leiden_aggregate(&g, refined, r_count, comm, &g2, seed) != CBM_STORE_OK) {
+        cbm_lg_t g2 = {0};
+        int *seed = leiden_malloc((size_t)r_count, sizeof(*seed), receipt);
+        if (!seed) {
+            free(refined);
+            leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "aggregate",
+                        "Leiden could not allocate the aggregate move-partition seed",
+                        "free memory or request a smaller explicit scope, then retry unchanged");
+            goto algorithm_failed;
+        }
+        if (leiden_aggregate(&g, refined, r_count, comm, &g2, seed, receipt) != CBM_STORE_OK) {
             free(seed);
             free(refined);
-            free(comm);
-            free(orig);
-            lg_free(&g);
-            free(result);
-            cbm_log_error("store.leiden", "code", "CBM_STORE_RESULT_ALLOCATION_FAILED", "message",
-                          "Leiden aggregation allocation failed", "remediation",
-                          "free memory or reduce the graph scope, then retry; no earlier-level "
-                          "result was substituted");
-            return CBM_STORE_ERR;
+            goto algorithm_failed;
         }
         free(refined);
         lg_free(&g);
@@ -9957,16 +11309,88 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
         free(comm);
         comm = seed;
     }
-
-    for (int i = 0; i < n; i++) {
-        result[i].community = comm[orig[i]];
+    if (!converged) {
+        leiden_fail(receipt, "CBM_LEIDEN_LEVEL_BOUND_INVARIANT_FAILED", "levels",
+                    "Leiden violated the proven initial-node strict-coarsening level bound",
+                    "repair aggregation progress accounting; every successful level must reduce N");
+        goto algorithm_failed;
     }
+
+    if (receipt) {
+        receipt->readback_started = true;
+        receipt->readback_completed = false;
+    }
+    int *final_comm = leiden_malloc((size_t)n, sizeof(*final_comm), receipt);
+    if (!final_comm) {
+        leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "result_readback",
+                    "Leiden could not allocate its final assignment readback",
+                    "free memory or request a smaller explicit scope, then retry unchanged");
+        goto algorithm_failed;
+    }
+    for (int i = 0; i < n; i++) {
+        if (orig[i] < 0 || orig[i] >= g.n || comm[orig[i]] < 0 || comm[orig[i]] >= g.n) {
+            free(final_comm);
+            leiden_fail(receipt, "CBM_LEIDEN_LEVEL_MAPPING_INVALID", "result_readback",
+                        "Leiden final mapping points outside the converged graph",
+                        "repair aggregation mapping before publishing any result");
+            goto algorithm_failed;
+        }
+        final_comm[i] = comm[orig[i]];
+    }
+    int community_count = 0;
+    if (leiden_relabel(final_comm, n, &community_count, receipt) != CBM_STORE_OK ||
+        leiden_validate_connected_partition(n, wsi, wdi, wn, final_comm, community_count,
+                                            receipt) != CBM_STORE_OK ||
+        (twom > 0.0 && leiden_compute_objective(wsi, wdi, ww, wn, final_comm, community_count,
+                                                resolution, twom, receipt) != CBM_STORE_OK)) {
+        free(final_comm);
+        goto algorithm_failed;
+    }
+
+    cbm_louvain_result_t *result = leiden_malloc((size_t)n, sizeof(*result), receipt);
+    if (!result) {
+        free(final_comm);
+        leiden_fail(receipt, "CBM_LEIDEN_ALLOCATION_FAILED", "result_readback",
+                    "Leiden could not allocate its verified result",
+                    "free memory or request a smaller explicit scope, then retry unchanged");
+        goto algorithm_failed;
+    }
+    for (int i = 0; i < n; i++) {
+        result[i].node_id = sorted_nodes[i];
+        result[i].community = final_comm[i];
+    }
+    free(final_comm);
     free(comm);
     free(orig);
     lg_free(&g);
+    free(sorted_nodes);
+    free(wsi);
+    free(wdi);
+    free(ww);
+    if (receipt) {
+        receipt->converged = true;
+        receipt->readback_completed = true;
+    }
     *out = result;
     *out_count = n;
     return CBM_STORE_OK;
+
+algorithm_failed:
+    free(comm);
+    free(orig);
+    lg_free(&g);
+    free(sorted_nodes);
+    free(wsi);
+    free(wdi);
+    free(ww);
+    return CBM_STORE_ERR;
+}
+
+int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
+               int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count) {
+    leiden_run_receipt_t receipt = {0};
+    return cbm_leiden_weighted(nodes, node_count, edges, NULL, edge_count, false, resolution,
+                               UINT64_MAX, out, out_count, &receipt);
 }
 
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
@@ -9977,49 +11401,308 @@ int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *
 /* ── Architecture: community clusters via Leiden ───────────────── */
 
 enum {
-    CBM_CLUSTER_TOP_N = 12,       /* report at most this many clusters */
-    CBM_CLUSTER_MAX_TOPNODES = 5, /* representative node names per cluster */
-    CBM_CLUSTER_MAX_PKGS = 5,     /* packages listed per cluster */
-    CBM_CLUSTER_MIN_MEMBERS = 2,  /* skip singletons */
-    CBM_CLUSTER_NODE_CAP = 8000   /* bound the work for very large graphs */
+    CBM_CLUSTER_EDGE_CALLS = 0,
+    CBM_CLUSTER_EDGE_IMPORTS = 1,
 };
 
-static int cluster_id_cmp(const void *key, const void *el) {
-    int64_t k = *(const int64_t *)key;
-    int64_t e = *(const int64_t *)el;
-    return (k > e) - (k < e);
+typedef struct {
+    int64_t sqlite_id;
+    char *atom_id;
+    char *label;
+    char *name;
+    char *qualified_name;
+    char *file_path;
+} cluster_node_t;
+
+typedef struct {
+    int64_t sqlite_id;
+    int ordinal;
+} cluster_id_map_t;
+
+typedef struct {
+    int src;
+    int dst;
+    uint8_t kind;
+    uint64_t multiplicity;
+} cluster_typed_edge_t;
+
+typedef struct {
+    int community;
+    char *package;
+} cluster_package_entry_t;
+
+typedef struct {
+    int community;
+    int ordinal;
+    uint64_t degree;
+} cluster_ranked_node_t;
+
+static void cluster_receipt_begin(cbm_store_t *s,
+                                  const cbm_arch_cluster_options_t *cluster_options) {
+    memset(&s->cluster_receipt, 0, sizeof(s->cluster_receipt));
+    s->cluster_receipt.present = true;
+    if (cluster_options) {
+        s->cluster_receipt.resolution = cluster_options->resolution;
+        s->cluster_receipt.node_bound = cluster_options->max_nodes;
+        s->cluster_receipt.edge_bound = cluster_options->max_edges;
+        s->cluster_receipt.move_visit_cap = cluster_options->max_move_visits;
+        s->cluster_receipt.result_byte_bound = cluster_options->max_result_bytes;
+    }
+    snprintf(s->cluster_receipt.status, sizeof(s->cluster_receipt.status), "running");
+    snprintf(s->cluster_receipt.algorithm, sizeof(s->cluster_receipt.algorithm),
+             "deterministic_leiden_variant");
+    snprintf(s->cluster_receipt.algorithm_version, sizeof(s->cluster_receipt.algorithm_version),
+             "%d", LEIDEN_ALGORITHM_VERSION);
+    snprintf(s->cluster_receipt.projection_schema, sizeof(s->cluster_receipt.projection_schema),
+             "cbm.architecture.cluster.v3");
+    snprintf(s->cluster_receipt.result_schema, sizeof(s->cluster_receipt.result_schema),
+             "cbm.architecture.cluster.result.v4");
+    snprintf(s->cluster_receipt.result_byte_bound_scope,
+             sizeof(s->cluster_receipt.result_byte_bound_scope), "c_architecture_payload_utf8");
+    snprintf(s->cluster_receipt.node_label_selection,
+             sizeof(s->cluster_receipt.node_label_selection), "all_indexed_labels");
+    snprintf(s->cluster_receipt.edge_type_roster, sizeof(s->cluster_receipt.edge_type_roster),
+             "CALLS,IMPORTS");
+    snprintf(s->cluster_receipt.seed, sizeof(s->cluster_receipt.seed), "none");
+    snprintf(s->cluster_receipt.objective_function, sizeof(s->cluster_receipt.objective_function),
+             "weighted_modularity_v1");
+    snprintf(s->cluster_receipt.move_rule, sizeof(s->cluster_receipt.move_rule),
+             "strict_gain_current_tie_lifo_empty");
+    snprintf(s->cluster_receipt.refinement_rule, sizeof(s->cluster_receipt.refinement_rule),
+             "well_connected_nonnegative_max_gain");
+    snprintf(s->cluster_receipt.aggregation_rule, sizeof(s->cluster_receipt.aggregation_rule),
+             "refined_graph_move_partition_seed");
+    snprintf(s->cluster_receipt.edge_transform, sizeof(s->cluster_receipt.edge_transform),
+             "typed_directed_runs_to_weighted_undirected_pairs");
+    snprintf(s->cluster_receipt.move_phase_status, sizeof(s->cluster_receipt.move_phase_status),
+             "not_run");
+    snprintf(s->cluster_receipt.refine_phase_status, sizeof(s->cluster_receipt.refine_phase_status),
+             "not_run");
+    snprintf(s->cluster_receipt.relabel_phase_status,
+             sizeof(s->cluster_receipt.relabel_phase_status), "not_run");
+    snprintf(s->cluster_receipt.aggregate_phase_status,
+             sizeof(s->cluster_receipt.aggregate_phase_status), "not_run");
+    snprintf(s->cluster_receipt.readback_phase_status,
+             sizeof(s->cluster_receipt.readback_phase_status), "not_run");
 }
 
-/* Index of node id within the id-sorted ids[], or CBM_NOT_FOUND. */
-static int cluster_id_index(const int64_t *ids, int n, int64_t id) {
-    const int64_t *hit = bsearch(&id, ids, (size_t)n, sizeof(int64_t), cluster_id_cmp);
-    return hit ? (int)(hit - ids) : CBM_NOT_FOUND;
+static void cluster_phase_status(char out[16], bool started, bool completed) {
+    snprintf(out, 16, "%s", !started ? "not_run" : (completed ? "complete" : "refused"));
 }
 
-/* Append `pkg` to a distinct package list (with a per-package count). */
-static bool cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap, const char *pkg) {
-    if (!pkg || !pkg[0]) {
-        return true;
+static void cluster_copy_leiden_receipt(cbm_cluster_receipt_t *out,
+                                        const leiden_run_receipt_t *in) {
+    if (!out || !in) {
+        return;
     }
-    for (int i = 0; i < *count; i++) {
-        if (strcmp(pkgs[i], pkg) == 0) {
-            counts[i]++;
-            return true;
-        }
+    out->converged = in->converged;
+    out->connectivity_verified = in->connectivity_verified;
+    out->weighted_undirected_edge_count = in->canonical_edge_count;
+    if ((out->canonical_typed_edge_count == 0 || in->canonical_edge_count > 0) &&
+        in->canonical_edge_count <= out->canonical_typed_edge_count) {
+        out->undirected_fold_count = out->canonical_typed_edge_count - in->canonical_edge_count;
     }
-    if (*count < cap) {
-        pkgs[*count] = heap_strdup(pkg);
-        if (!pkgs[*count]) {
-            return false;
-        }
-        counts[*count] = 1;
-        (*count)++;
+    out->level_count = in->level_count;
+    out->level_bound = in->level_bound;
+    out->move_visit_count = in->move_visit_count;
+    out->move_visit_cap = in->move_visit_cap;
+    out->refine_visit_count = in->refine_visit_count;
+    out->refine_visit_bound = in->refine_visit_bound;
+    out->refine_merge_count = in->refine_merge_count;
+    out->relabel_visit_count = in->relabel_visit_count;
+    out->aggregate_visit_count = in->aggregate_visit_count;
+    /* Projection/result allocations are counted directly on the public
+     * receipt; add the algorithm workspace attempts without erasing them. The
+     * admitted int-sized graph makes this sum far smaller than UINT64_MAX. */
+    out->allocation_attempt_count += in->allocation_attempt_count;
+    out->objective = in->objective;
+    cluster_phase_status(out->move_phase_status, in->move_started, in->move_completed);
+    cluster_phase_status(out->refine_phase_status, in->refine_started, in->refine_completed);
+    cluster_phase_status(out->relabel_phase_status, in->relabel_started, in->relabel_completed);
+    cluster_phase_status(out->aggregate_phase_status, in->aggregate_started,
+                         in->aggregate_completed);
+    cluster_phase_status(out->readback_phase_status, in->readback_started, in->readback_completed);
+}
+
+static int cluster_receipt_fail(cbm_store_t *s, const char *code, const char *stage,
+                                const char *message, const char *remediation) {
+    cbm_cluster_receipt_t *receipt = &s->cluster_receipt;
+    snprintf(receipt->status, sizeof(receipt->status), "refused");
+    snprintf(receipt->error_code, sizeof(receipt->error_code), "%s", code);
+    snprintf(receipt->error_stage, sizeof(receipt->error_stage), "%s", stage);
+    snprintf(receipt->error_message, sizeof(receipt->error_message), "%s", message);
+    snprintf(receipt->error_remediation, sizeof(receipt->error_remediation), "%s", remediation);
+    char detail[CBM_SZ_512];
+    snprintf(detail, sizeof(detail), "%s: %s; remediation: %s", code, message, remediation);
+    store_set_error(s, detail);
+    cbm_log_error("store.architecture_clusters_refused", "code", code, "stage", stage, "message",
+                  message, "remediation", remediation);
+    return CBM_STORE_ERR;
+}
+
+static int cluster_sqlite_fail(cbm_store_t *s, const char *code, const char *stage,
+                               const char *operation) {
+    int sqlite_code = sqlite3_extended_errcode(s->db);
+    char sqlite_detail[CBM_SZ_256];
+    snprintf(sqlite_detail, sizeof(sqlite_detail), "%s", sqlite3_errmsg(s->db));
+    char message[CBM_SZ_256];
+    snprintf(message, sizeof(message), "%s: %s", operation, sqlite_detail);
+    int rc = cluster_receipt_fail(
+        s, code, stage, message,
+        "repair the SQLite graph row/query failure and retry unchanged; no clusters were returned");
+    s->errcode = sqlite_code != SQLITE_OK ? sqlite_code : SQLITE_ERROR;
+    return rc;
+}
+
+static int cluster_sqlite_fail_captured(cbm_store_t *s, const char *code, const char *stage,
+                                        const char *operation, int sqlite_code,
+                                        const char *sqlite_detail) {
+    char message[CBM_SZ_256];
+    snprintf(message, sizeof(message), "%s: %s", operation,
+             sqlite_detail && sqlite_detail[0] ? sqlite_detail : sqlite3_errstr(sqlite_code));
+    int rc = cluster_receipt_fail(
+        s, code, stage, message,
+        "repair the SQLite graph row/query failure and retry unchanged; no clusters were returned");
+    s->errcode = sqlite_code != SQLITE_OK ? sqlite_code : SQLITE_ERROR;
+    return rc;
+}
+
+int cbm_store_get_cluster_receipt(cbm_store_t *s, cbm_cluster_receipt_t *out) {
+    if (!s || !out) {
+        return CBM_STORE_ERR;
     }
+    *out = s->cluster_receipt;
+    return CBM_STORE_OK;
+}
+
+static void cluster_hash_u64(cbm_sha256_ctx *hash, uint64_t value) {
+    uint8_t bytes[8];
+    for (int i = 0; i < 8; i++) {
+        bytes[7 - i] = (uint8_t)(value >> (i * 8));
+    }
+    cbm_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static void cluster_hash_frame(cbm_sha256_ctx *hash, const void *data, size_t size) {
+    cluster_hash_u64(hash, (uint64_t)size);
+    if (size > 0) {
+        cbm_sha256_update(hash, data, size);
+    }
+}
+
+static void cluster_hash_text(cbm_sha256_ctx *hash, const char *text) {
+    cluster_hash_frame(hash, text ? text : "", text ? strlen(text) : 0);
+}
+
+static void cluster_hash_finish(cbm_sha256_ctx *hash, char out[65]) {
+    static const char HEX[] = "0123456789abcdef";
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(hash, digest);
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = HEX[digest[i] >> 4];
+        out[i * 2 + 1] = HEX[digest[i] & 15];
+    }
+    out[64] = '\0';
+}
+
+static void cluster_hash_double(cbm_sha256_ctx *hash, double value) {
+    _Static_assert(sizeof(double) == sizeof(uint64_t),
+                   "cluster result hashing requires a 64-bit double representation");
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    cluster_hash_u64(hash, bits);
+}
+
+static bool cluster_result_size_add(uint64_t *size, uint64_t increment) {
+    if (UINT64_MAX - *size < increment) {
+        return false;
+    }
+    *size += increment;
     return true;
+}
+
+static bool cluster_result_size_text(uint64_t *size, const char *text) {
+    size_t len = text ? strlen(text) : 0;
+    return len <= UINT64_MAX - UINT64_C(8) &&
+           cluster_result_size_add(size, UINT64_C(8) + (uint64_t)len);
+}
+
+static const char *cluster_edge_type(uint8_t kind) {
+    return kind == CBM_CLUSTER_EDGE_CALLS ? "CALLS" : "IMPORTS";
+}
+
+static int cluster_node_cmp(const void *a, const void *b) {
+    const cluster_node_t *na = a;
+    const cluster_node_t *nb = b;
+    int atom_cmp = strcmp(na->atom_id, nb->atom_id);
+    if (atom_cmp != 0) {
+        return atom_cmp;
+    }
+    return (na->sqlite_id > nb->sqlite_id) - (na->sqlite_id < nb->sqlite_id);
+}
+
+static int cluster_id_map_cmp(const void *a, const void *b) {
+    const cluster_id_map_t *ma = a;
+    const cluster_id_map_t *mb = b;
+    return (ma->sqlite_id > mb->sqlite_id) - (ma->sqlite_id < mb->sqlite_id);
+}
+
+static int cluster_id_map_index(const cluster_id_map_t *map, int n, int64_t sqlite_id) {
+    cluster_id_map_t key = {sqlite_id, 0};
+    const cluster_id_map_t *hit = bsearch(&key, map, (size_t)n, sizeof(*map), cluster_id_map_cmp);
+    return hit ? hit->ordinal : CBM_NOT_FOUND;
+}
+
+static int cluster_typed_edge_cmp(const void *a, const void *b) {
+    const cluster_typed_edge_t *ea = a;
+    const cluster_typed_edge_t *eb = b;
+    if (ea->src != eb->src) {
+        return (ea->src > eb->src) - (ea->src < eb->src);
+    }
+    if (ea->dst != eb->dst) {
+        return (ea->dst > eb->dst) - (ea->dst < eb->dst);
+    }
+    return (ea->kind > eb->kind) - (ea->kind < eb->kind);
+}
+
+static int cluster_package_entry_cmp(const void *a, const void *b) {
+    const cluster_package_entry_t *pa = a;
+    const cluster_package_entry_t *pb = b;
+    if (pa->community != pb->community) {
+        return (pa->community > pb->community) - (pa->community < pb->community);
+    }
+    return strcmp(pa->package, pb->package);
+}
+
+static int cluster_ranked_node_cmp(const void *a, const void *b) {
+    const cluster_ranked_node_t *na = a;
+    const cluster_ranked_node_t *nb = b;
+    if (na->community != nb->community) {
+        return (na->community > nb->community) - (na->community < nb->community);
+    }
+    if (na->degree != nb->degree) {
+        return na->degree < nb->degree ? 1 : -1;
+    }
+    return (na->ordinal > nb->ordinal) - (na->ordinal < nb->ordinal);
+}
+
+static void cluster_nodes_free(cluster_node_t *nodes, int count) {
+    for (int i = 0; i < count; i++) {
+        free(nodes[i].atom_id);
+        free(nodes[i].label);
+        free(nodes[i].name);
+        free(nodes[i].qualified_name);
+        free(nodes[i].file_path);
+    }
+    free(nodes);
 }
 
 static void cluster_info_free(cbm_cluster_info_t *ci) {
     safe_str_free(&ci->label);
+    for (int i = 0; i < ci->member_atom_id_count; i++) {
+        safe_str_free(&ci->member_atom_ids[i]);
+    }
+    free(ci->member_atom_ids);
     for (int i = 0; i < ci->top_node_count; i++) {
         safe_str_free(&ci->top_nodes[i]);
     }
@@ -10035,469 +11718,1382 @@ static void cluster_info_free(cbm_cluster_info_t *ci) {
     memset(ci, 0, sizeof(*ci));
 }
 
-/* Build the cluster_info for one community c into *ci. */
-static int cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
-                             const int *degree, const char **names, const char **qns, int members,
-                             double cohesion) {
-    memset(ci, 0, sizeof(*ci));
-    ci->id = c;
-    ci->members = members;
-    ci->cohesion = cohesion;
-
-    /* Top nodes by degree. */
-    int top_idx[CBM_CLUSTER_MAX_TOPNODES];
-    int top_deg[CBM_CLUSTER_MAX_TOPNODES];
-    int tn = 0;
-    for (int i = 0; i < n; i++) {
-        if (comm[i] != c) {
-            continue;
-        }
-        int d = degree[i];
-        int pos = tn;
-        while (pos > 0 && top_deg[pos - 1] < d) {
-            pos--;
-        }
-        if (pos < CBM_CLUSTER_MAX_TOPNODES) {
-            int last = (tn < CBM_CLUSTER_MAX_TOPNODES) ? tn : CBM_CLUSTER_MAX_TOPNODES - 1;
-            for (int k = last; k > pos; k--) {
-                top_idx[k] = top_idx[k - 1];
-                top_deg[k] = top_deg[k - 1];
-            }
-            top_idx[pos] = i;
-            top_deg[pos] = d;
-            if (tn < CBM_CLUSTER_MAX_TOPNODES) {
-                tn++;
-            }
-        }
+static void cluster_result_clear(cbm_architecture_info_t *out) {
+    if (!out) {
+        return;
     }
-    if (tn > 0) {
-        ci->top_nodes = malloc((size_t)tn * sizeof(char *));
-        if (!ci->top_nodes) {
-            goto allocation_failed;
-        }
-        memset(ci->top_nodes, 0, (size_t)tn * sizeof(char *));
-        for (int i = 0; i < tn; i++) {
-            ci->top_nodes[i] = heap_strdup(names[top_idx[i]]);
-            if (!ci->top_nodes[i]) {
-                ci->top_node_count = tn;
-                goto allocation_failed;
-            }
-        }
-        ci->top_node_count = tn;
+    for (int i = 0; i < out->cluster_count; i++) {
+        cluster_info_free(&out->clusters[i]);
     }
-
-    /* Distinct packages (+ dominant one as the label). */
-    const char *pkgs[CBM_CLUSTER_MAX_PKGS];
-    int pkg_counts[CBM_CLUSTER_MAX_PKGS];
-    int pc = 0;
-    for (int i = 0; i < n; i++) {
-        if (comm[i] == c) {
-            if (!cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
-                                 cbm_qn_to_top_package(qns[i]))) {
-                for (int j = 0; j < pc; j++) {
-                    safe_str_free(&pkgs[j]);
-                }
-                goto allocation_failed;
-            }
-        }
-    }
-    if (pc > 0) {
-        ci->packages = malloc((size_t)pc * sizeof(char *));
-        if (!ci->packages) {
-            for (int i = 0; i < pc; i++) {
-                safe_str_free(&pkgs[i]);
-            }
-            goto allocation_failed;
-        }
-        memset(ci->packages, 0, (size_t)pc * sizeof(char *));
-        int best = 0;
-        for (int i = 0; i < pc; i++) {
-            ci->packages[i] = heap_strdup(pkgs[i]);
-            if (!ci->packages[i]) {
-                ci->package_count = pc;
-                for (int j = 0; j < pc; j++) {
-                    safe_str_free(&pkgs[j]);
-                }
-                goto allocation_failed;
-            }
-            if (pkg_counts[i] > pkg_counts[best]) {
-                best = i;
-            }
-        }
-        ci->package_count = pc;
-        ci->label = heap_strdup(pkgs[best]);
-        for (int i = 0; i < pc; i++) {
-            safe_str_free(&pkgs[i]);
-        }
-    }
-    if (!ci->label) {
-        ci->label = heap_strdup(ci->top_node_count > 0 ? ci->top_nodes[0] : "cluster");
-        if (!ci->label) {
-            goto allocation_failed;
-        }
-    }
-
-    ci->edge_types = malloc(sizeof(char *));
-    if (!ci->edge_types) {
-        goto allocation_failed;
-    }
-    ci->edge_types[0] = heap_strdup("CALLS");
-    if (!ci->edge_types[0]) {
-        goto allocation_failed;
-    }
-    ci->edge_type_count = 1;
-    return CBM_STORE_OK;
-
-allocation_failed:
-    cluster_info_free(ci);
-    return CBM_STORE_ERR;
+    free(out->clusters);
+    out->clusters = NULL;
+    out->cluster_count = 0;
 }
 
-/* Comparator for sorting community indices by descending member count. */
-typedef struct {
-    int comm;
-    int members;
-} cluster_rank_t;
-static int cluster_rank_cmp(const void *a, const void *b) {
-    const cluster_rank_t *ca = a;
-    const cluster_rank_t *cb = b;
-    return cb->members - ca->members;
+static void cluster_package_entries_free(cluster_package_entry_t *entries, int count) {
+    for (int i = 0; i < count; i++) {
+        free(entries[i].package);
+    }
+    free(entries);
 }
 
-static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
-                         cbm_architecture_info_t *out) {
-    char norm[CBM_SZ_512];
-    char like[CBM_SZ_512];
-    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
-    char nsqlbuf[ST_SQL_BUF];
-    const char *nbase = "SELECT id, name, qualified_name, file_path FROM nodes "
-                        "WHERE project=?1 AND label IN ('Function','Method','Class')";
-    if (scoped) {
-        snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", nbase,
-                 arch_path_scope_sql());
-    } else {
-        snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id LIMIT ?2", nbase);
+static void *cluster_malloc(cbm_store_t *s, size_t count, size_t width) {
+    s->cluster_receipt.allocation_attempt_count++;
+    if (width != 0 && count > SIZE_MAX / width) {
+        return NULL;
     }
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, nsqlbuf, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "architecture clusters nodes prepare");
-        return CBM_STORE_ERR;
+    size_t bytes = count * width;
+    return malloc(bytes > 0 ? bytes : 1);
+}
+
+static void *cluster_calloc(cbm_store_t *s, size_t count, size_t width) {
+    s->cluster_receipt.allocation_attempt_count++;
+    if (width != 0 && count > SIZE_MAX / width) {
+        return NULL;
     }
-    bind_text(st, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(st, ST_COL_2, ST_COL_3, norm, like);
-        sqlite3_bind_int(st, ST_COL_4, CBM_CLUSTER_NODE_CAP);
-    } else {
-        sqlite3_bind_int(st, CBM_SZ_2, CBM_CLUSTER_NODE_CAP);
+    return calloc(count > 0 ? count : 1, width > 0 ? width : 1);
+}
+
+static char *cluster_strdup(cbm_store_t *s, const char *value) {
+    if (!value) {
+        return NULL;
     }
-    int ids_cap = 0;
-    int names_cap = 0;
-    int qns_cap = 0;
-    int n = 0;
-    int64_t *ids = NULL;
-    const char **names = NULL;
-    const char **qns = NULL;
-    int step_rc = SQLITE_OK;
-    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (store_array_reserve(s, (void **)&ids, &ids_cap, n + 1, sizeof(*ids),
-                                "architecture cluster node ids") != CBM_STORE_OK ||
-            store_array_reserve(s, (void **)&names, &names_cap, n + 1, sizeof(*names),
-                                "architecture cluster node names") != CBM_STORE_OK ||
-            store_array_reserve(s, (void **)&qns, &qns_cap, n + 1, sizeof(*qns),
-                                "architecture cluster qualified names") != CBM_STORE_OK) {
-            store_free_strings((char **)names, n);
-            store_free_strings((char **)qns, n);
-            free(ids);
-            sqlite3_finalize(st);
-            return CBM_STORE_ERR;
-        }
-        ids[n] = sqlite3_column_int64(st, 0);
-        names[n] = heap_strdup((const char *)sqlite3_column_text(st, SKIP_ONE));
-        qns[n] = heap_strdup((const char *)sqlite3_column_text(st, CBM_SZ_2));
-        if (!names[n] || !qns[n]) {
-            free((void *)names[n]);
-            free((void *)qns[n]);
-            store_free_strings((char **)names, n);
-            store_free_strings((char **)qns, n);
-            free(ids);
-            store_set_error(s, "architecture cluster node row allocation failed");
-            sqlite3_finalize(st);
-            return CBM_STORE_ERR;
-        }
-        n++;
+    size_t length = strlen(value);
+    if (length == SIZE_MAX) {
+        return NULL;
     }
-    if (step_rc != SQLITE_DONE) {
-        store_free_strings((char **)names, n);
-        store_free_strings((char **)qns, n);
-        free(ids);
-        store_set_error_sqlite(s, "architecture clusters nodes step");
-        sqlite3_finalize(st);
-        return CBM_STORE_ERR;
+    char *copy = cluster_malloc(s, length + 1, 1);
+    if (copy) {
+        memcpy(copy, value, length + 1);
     }
-    sqlite3_finalize(st);
-    if (n < CBM_CLUSTER_MIN_MEMBERS) {
-        for (int i = 0; i < n; i++) {
-            safe_str_free(&names[i]);
-            safe_str_free(&qns[i]);
-        }
-        free(ids);
-        free(names);
-        free(qns);
+    return copy;
+}
+
+static char *cluster_strndup(cbm_store_t *s, const char *value, size_t length) {
+    if (!value || length == SIZE_MAX) {
+        return NULL;
+    }
+    char *copy = cluster_malloc(s, length + 1, 1);
+    if (copy) {
+        memcpy(copy, value, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
+
+static int cluster_top_package_alloc(cbm_store_t *s, const char *qualified_name, char **out) {
+    *out = NULL;
+    if (!qualified_name) {
         return CBM_STORE_OK;
     }
-
-    /* 2. Load CALLS edges with both endpoints in the node set (store indices). */
-    cbm_louvain_edge_t *edges = NULL;
-    int *esrc = NULL;
-    int *edst = NULL;
-    int *degree = calloc((size_t)n, sizeof(int));
-    if (!degree) {
-        store_free_strings((char **)names, n);
-        store_free_strings((char **)qns, n);
-        free(ids);
-        store_set_error(s, "architecture cluster degree allocation failed");
-        return CBM_STORE_ERR;
+    const char *first_dot = strchr(qualified_name, '.');
+    if (!first_dot) {
+        return CBM_STORE_OK;
     }
-    int ne = 0;
-    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
-    if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
-        store_free_strings((char **)names, n);
-        store_free_strings((char **)qns, n);
-        free(ids);
-        free(degree);
-        store_set_error_sqlite(s, "architecture clusters edges prepare");
-        return CBM_STORE_ERR;
+    const char *start = first_dot + 1;
+    const char *second_dot = strchr(start, '.');
+    const char *end = second_dot ? second_dot : qualified_name + strlen(qualified_name);
+    if (end == start) {
+        return CBM_STORE_OK;
     }
-    int edges_cap = 0;
-    int esrc_cap = 0;
-    int edst_cap = 0;
-    bind_text(st, SKIP_ONE, project);
-    step_rc = SQLITE_OK;
-    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
-        int si = cluster_id_index(ids, n, sqlite3_column_int64(st, 0));
-        int ti = cluster_id_index(ids, n, sqlite3_column_int64(st, SKIP_ONE));
-        if (si < 0 || ti < 0 || si == ti) {
-            continue;
-        }
-        if (store_array_reserve(s, (void **)&edges, &edges_cap, ne + 1, sizeof(*edges),
-                                "architecture cluster edges") != CBM_STORE_OK ||
-            store_array_reserve(s, (void **)&esrc, &esrc_cap, ne + 1, sizeof(*esrc),
-                                "architecture cluster edge sources") != CBM_STORE_OK ||
-            store_array_reserve(s, (void **)&edst, &edst_cap, ne + 1, sizeof(*edst),
-                                "architecture cluster edge targets") != CBM_STORE_OK) {
-            store_free_strings((char **)names, n);
-            store_free_strings((char **)qns, n);
-            free(ids);
-            free(edges);
-            free(esrc);
-            free(edst);
-            free(degree);
-            sqlite3_finalize(st);
-            return CBM_STORE_ERR;
-        }
-        edges[ne].src = ids[si];
-        edges[ne].dst = ids[ti];
-        esrc[ne] = si;
-        edst[ne] = ti;
-        degree[si]++;
-        degree[ti]++;
-        ne++;
-    }
-    if (step_rc != SQLITE_DONE) {
-        store_free_strings((char **)names, n);
-        store_free_strings((char **)qns, n);
-        free(ids);
-        free(edges);
-        free(esrc);
-        free(edst);
-        free(degree);
-        store_set_error_sqlite(s, "architecture clusters edges step");
-        sqlite3_finalize(st);
-        return CBM_STORE_ERR;
-    }
-    sqlite3_finalize(st);
-
-    /* 3. Community detection. */
-    cbm_louvain_result_t *res = NULL;
-    int rn = 0;
-    int *comm = NULL;
-    int C = 0;
-    if (cbm_leiden(ids, n, edges, ne, 1.0, &res, &rn) != CBM_STORE_OK || !res || rn != n) {
-        free(res);
-        store_free_strings((char **)names, n);
-        store_free_strings((char **)qns, n);
-        free(ids);
-        free(edges);
-        free(esrc);
-        free(edst);
-        free(degree);
-        store_set_error(s, "architecture Leiden clustering failed");
-        return CBM_STORE_ERR;
-    }
-    comm = malloc((size_t)n * sizeof(int));
-    if (!comm) {
-        free(res);
-        store_free_strings((char **)names, n);
-        store_free_strings((char **)qns, n);
-        free(ids);
-        free(edges);
-        free(esrc);
-        free(edst);
-        free(degree);
-        store_set_error(s, "architecture cluster assignment allocation failed");
-        return CBM_STORE_ERR;
-    }
-    for (int i = 0; i < n; i++) {
-        comm[i] = res[i].community;
-        if (comm[i] + 1 > C) {
-            C = comm[i] + 1;
-        }
-    }
-    free(res);
-
-    if (comm && C > 0) {
-        /* 4. Members + cohesion (internal vs boundary edges) per community. */
-        int *members = calloc((size_t)C, sizeof(int));
-        int *internal = calloc((size_t)C, sizeof(int));
-        int *boundary = calloc((size_t)C, sizeof(int));
-        if (!members || !internal || !boundary) {
-            free(members);
-            free(internal);
-            free(boundary);
-            free(comm);
-            store_free_strings((char **)names, n);
-            store_free_strings((char **)qns, n);
-            free(ids);
-            free(edges);
-            free(esrc);
-            free(edst);
-            free(degree);
-            store_set_error(s, "architecture cluster metric allocation failed");
-            return CBM_STORE_ERR;
-        }
-        for (int i = 0; i < n; i++) {
-            members[comm[i]]++;
-        }
-        for (int e = 0; e < ne; e++) {
-            int cs = comm[esrc[e]];
-            int cd = comm[edst[e]];
-            if (cs == cd) {
-                internal[cs]++;
-            } else {
-                boundary[cs]++;
-                boundary[cd]++;
-            }
-        }
-
-        /* 5. Rank communities by size, take the top N non-singletons. */
-        cluster_rank_t *rank = malloc((size_t)C * sizeof(cluster_rank_t));
-        if (!rank) {
-            free(members);
-            free(internal);
-            free(boundary);
-            free(comm);
-            store_free_strings((char **)names, n);
-            store_free_strings((char **)qns, n);
-            free(ids);
-            free(edges);
-            free(esrc);
-            free(edst);
-            free(degree);
-            store_set_error(s, "architecture cluster ranking allocation failed");
-            return CBM_STORE_ERR;
-        }
-        for (int c = 0; c < C; c++) {
-            rank[c] = (cluster_rank_t){c, members[c]};
-        }
-        qsort(rank, (size_t)C, sizeof(cluster_rank_t), cluster_rank_cmp);
-
-        cbm_cluster_info_t *clusters =
-            calloc((size_t)CBM_CLUSTER_TOP_N, sizeof(cbm_cluster_info_t));
-        if (!clusters) {
-            free(members);
-            free(internal);
-            free(boundary);
-            free(rank);
-            free(comm);
-            store_free_strings((char **)names, n);
-            store_free_strings((char **)qns, n);
-            free(ids);
-            free(edges);
-            free(esrc);
-            free(edst);
-            free(degree);
-            store_set_error(s, "architecture cluster result allocation failed");
-            return CBM_STORE_ERR;
-        }
-        int cc = 0;
-        for (int r = 0; r < C && cc < CBM_CLUSTER_TOP_N; r++) {
-            int c = rank[r].comm;
-            if (members[c] < CBM_CLUSTER_MIN_MEMBERS) {
-                break; /* sorted desc — the rest are singletons too */
-            }
-            double denom = internal[c] + boundary[c];
-            double cohesion = denom > 0 ? (double)internal[c] / denom : 0.0;
-            if (cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c],
-                                  cohesion) != CBM_STORE_OK) {
-                for (int i = 0; i < cc; i++) {
-                    cluster_info_free(&clusters[i]);
-                }
-                free(clusters);
-                free(members);
-                free(internal);
-                free(boundary);
-                free(rank);
-                free(comm);
-                store_free_strings((char **)names, n);
-                store_free_strings((char **)qns, n);
-                free(ids);
-                free(edges);
-                free(esrc);
-                free(edst);
-                free(degree);
-                store_set_error(s, "architecture cluster detail allocation failed");
-                return CBM_STORE_ERR;
-            }
-            cc++;
-        }
-        out->clusters = clusters;
-        out->cluster_count = cc;
-
-        free(members);
-        free(internal);
-        free(boundary);
-        free(rank);
-    }
-
-    free(comm);
-    for (int i = 0; i < n; i++) {
-        safe_str_free(&names[i]);
-        safe_str_free(&qns[i]);
-    }
-    free(ids);
-    free(names);
-    free(qns);
-    free(edges);
-    free(esrc);
-    free(edst);
-    free(degree);
-    return CBM_STORE_OK;
+    *out = cluster_strndup(s, start, (size_t)(end - start));
+    return *out ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
+static bool cluster_u64_add(uint64_t *value, uint64_t increment) {
+    if (UINT64_MAX - *value < increment) {
+        return false;
+    }
+    *value += increment;
+    return true;
+}
+
+/* Materialize every community in one node pass, one edge pass, and one sorted
+ * package run.  Removing the old top-12 filter must not expose its hidden
+ * O(communities * N) detail builder (PC-16). */
+static int cluster_build_complete_result(cbm_store_t *s, const cluster_node_t *nodes, int n,
+                                         const cluster_typed_edge_t *edges, int edge_count,
+                                         const int *comm, int community_count,
+                                         cbm_architecture_info_t *out) {
+    if (n == 0 && community_count == 0) {
+        out->clusters = NULL;
+        out->cluster_count = 0;
+        return CBM_STORE_OK;
+    }
+    if (!nodes || !comm || n <= 0 || community_count <= 0 || community_count > n) {
+        return cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ASSIGNMENT_INVALID", "result_readback",
+            "architecture cluster result cardinalities are inconsistent",
+            "repair Leiden assignment generation before returning clusters");
+    }
+    cbm_cluster_info_t *clusters = cluster_calloc(s, (size_t)community_count, sizeof(*clusters));
+    uint64_t *degree = cluster_calloc(s, (size_t)n, sizeof(*degree));
+    uint64_t *internal = cluster_calloc(s, (size_t)community_count, sizeof(*internal));
+    uint64_t *boundary = cluster_calloc(s, (size_t)community_count, sizeof(*boundary));
+    uint8_t *edge_kind_mask = cluster_calloc(s, (size_t)community_count, sizeof(*edge_kind_mask));
+    int *members = cluster_calloc(s, (size_t)community_count, sizeof(*members));
+    cluster_ranked_node_t *ranked = cluster_malloc(s, (size_t)n, sizeof(*ranked));
+    if (!clusters || !degree || !internal || !boundary || !edge_kind_mask || !members || !ranked) {
+        free(clusters);
+        free(degree);
+        free(internal);
+        free(boundary);
+        free(edge_kind_mask);
+        free(members);
+        free(ranked);
+        return cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "result",
+            "architecture clustering could not allocate complete community metrics",
+            "free memory or request a smaller explicit scope, then retry unchanged");
+    }
+    for (int i = 0; i < n; i++) {
+        if (comm[i] < 0 || comm[i] >= community_count || members[comm[i]] == INT_MAX) {
+            goto invalid_assignment;
+        }
+        members[comm[i]]++;
+    }
+    for (int c = 0; c < community_count; c++) {
+        if (members[c] == 0) {
+            goto invalid_assignment;
+        }
+    }
+    /* nodes is already in the canonical atom_id order bound into the
+     * projection hash. Populate every community's complete identity roster in
+     * that single canonical node traversal, preserving the order exactly. */
+    int *member_fill = cluster_calloc(s, (size_t)community_count, sizeof(*member_fill));
+    if (!member_fill) {
+        goto allocation_failed;
+    }
+    for (int c = 0; c < community_count; c++) {
+        cbm_cluster_info_t *ci = &clusters[c];
+        ci->member_atom_ids = cluster_calloc(s, (size_t)members[c], sizeof(*ci->member_atom_ids));
+        if (!ci->member_atom_ids) {
+            free(member_fill);
+            goto allocation_failed;
+        }
+        ci->member_atom_id_count = members[c];
+    }
+    for (int i = 0; i < n; i++) {
+        int c = comm[i];
+        if (member_fill[c] < 0 || member_fill[c] >= members[c]) {
+            free(member_fill);
+            goto invalid_assignment;
+        }
+        int slot = member_fill[c]++;
+        clusters[c].member_atom_ids[slot] = cluster_strdup(s, nodes[i].atom_id);
+        if (!clusters[c].member_atom_ids[slot]) {
+            free(member_fill);
+            goto allocation_failed;
+        }
+    }
+    for (int c = 0; c < community_count; c++) {
+        if (member_fill[c] != members[c]) {
+            free(member_fill);
+            goto invalid_assignment;
+        }
+    }
+    free(member_fill);
+    for (int e = 0; e < edge_count; e++) {
+        int src = edges[e].src;
+        int dst = edges[e].dst;
+        uint64_t weight = edges[e].multiplicity;
+        if (src < 0 || src >= n || dst < 0 || dst >= n || weight == 0 ||
+            edges[e].kind > CBM_CLUSTER_EDGE_IMPORTS) {
+            goto invalid_assignment;
+        }
+        if (src == dst) {
+            if (weight > UINT64_MAX / 2 || !cluster_u64_add(&degree[src], weight * 2)) {
+                goto metric_overflow;
+            }
+        } else if (!cluster_u64_add(&degree[src], weight) ||
+                   !cluster_u64_add(&degree[dst], weight)) {
+            goto metric_overflow;
+        }
+        int cs = comm[src];
+        int cd = comm[dst];
+        edge_kind_mask[cs] |= (uint8_t)(1U << edges[e].kind);
+        edge_kind_mask[cd] |= (uint8_t)(1U << edges[e].kind);
+        if (cs == cd) {
+            if (!cluster_u64_add(&internal[cs], weight)) {
+                goto metric_overflow;
+            }
+        } else if (!cluster_u64_add(&boundary[cs], weight) ||
+                   !cluster_u64_add(&boundary[cd], weight)) {
+            goto metric_overflow;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        ranked[i] = (cluster_ranked_node_t){comm[i], i, degree[i]};
+    }
+    if (n > 1) {
+        qsort(ranked, (size_t)n, sizeof(*ranked), cluster_ranked_node_cmp);
+    }
+
+    cluster_package_entry_t *packages = cluster_calloc(s, (size_t)n, sizeof(*packages));
+    if (!packages) {
+        goto allocation_failed;
+    }
+    int package_entry_count = 0;
+    for (int i = 0; i < n; i++) {
+        char *package = NULL;
+        if (cluster_top_package_alloc(s, nodes[i].qualified_name, &package) != CBM_STORE_OK) {
+            cluster_package_entries_free(packages, package_entry_count);
+            goto allocation_failed;
+        }
+        if (!package) {
+            continue;
+        }
+        packages[package_entry_count].community = comm[i];
+        packages[package_entry_count].package = package;
+        package_entry_count++;
+    }
+    if (package_entry_count > 1) {
+        qsort(packages, (size_t)package_entry_count, sizeof(*packages), cluster_package_entry_cmp);
+    }
+
+    int *package_counts = cluster_calloc(s, (size_t)community_count, sizeof(*package_counts));
+    int *package_fill = cluster_calloc(s, (size_t)community_count, sizeof(*package_fill));
+    int *best_package = cluster_malloc(s, (size_t)community_count, sizeof(*best_package));
+    uint64_t *best_package_members =
+        cluster_calloc(s, (size_t)community_count, sizeof(*best_package_members));
+    if (!package_counts || !package_fill || !best_package || !best_package_members) {
+        free(package_counts);
+        free(package_fill);
+        free(best_package);
+        free(best_package_members);
+        cluster_package_entries_free(packages, package_entry_count);
+        goto allocation_failed;
+    }
+    for (int c = 0; c < community_count; c++) {
+        best_package[c] = CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < package_entry_count;) {
+        int end = i + 1;
+        while (end < package_entry_count && packages[end].community == packages[i].community &&
+               strcmp(packages[end].package, packages[i].package) == 0) {
+            end++;
+        }
+        package_counts[packages[i].community]++;
+        i = end;
+    }
+    for (int c = 0; c < community_count; c++) {
+        cbm_cluster_info_t *ci = &clusters[c];
+        ci->id = c;
+        ci->members = members[c];
+        double denom = (double)internal[c] + (double)boundary[c];
+        ci->cohesion = denom > 0.0 ? (double)internal[c] / denom : 0.0;
+        if (package_counts[c] > 0) {
+            ci->packages = cluster_calloc(s, (size_t)package_counts[c], sizeof(*ci->packages));
+            if (!ci->packages) {
+                cluster_package_entries_free(packages, package_entry_count);
+                free(package_counts);
+                free(package_fill);
+                free(best_package);
+                free(best_package_members);
+                goto allocation_failed;
+            }
+            ci->package_count = package_counts[c];
+        }
+    }
+    for (int i = 0; i < package_entry_count;) {
+        int end = i + 1;
+        while (end < package_entry_count && packages[end].community == packages[i].community &&
+               strcmp(packages[end].package, packages[i].package) == 0) {
+            end++;
+        }
+        int c = packages[i].community;
+        int slot = package_fill[c]++;
+        clusters[c].packages[slot] = cluster_strdup(s, packages[i].package);
+        if (!clusters[c].packages[slot]) {
+            cluster_package_entries_free(packages, package_entry_count);
+            free(package_counts);
+            free(package_fill);
+            free(best_package);
+            free(best_package_members);
+            goto allocation_failed;
+        }
+        uint64_t run_count = (uint64_t)(end - i);
+        if (run_count > best_package_members[c]) {
+            best_package_members[c] = run_count;
+            best_package[c] = slot;
+        }
+        i = end;
+    }
+    cluster_package_entries_free(packages, package_entry_count);
+
+    /* ranked is a complete community-major roster. Retain only the bounded
+     * degree-ranked display prefix here; member_atom_ids above remains the
+     * sole complete identity roster. */
+    int ranked_offset = 0;
+    for (int c = 0; c < community_count; c++) {
+        cbm_cluster_info_t *ci = &clusters[c];
+        if (ranked_offset < 0 || ranked_offset > n || members[c] > n - ranked_offset) {
+            free(package_counts);
+            free(package_fill);
+            free(best_package);
+            free(best_package_members);
+            goto invalid_assignment;
+        }
+        for (int i = 0; i < members[c]; i++) {
+            if (ranked[ranked_offset + i].community != c) {
+                free(package_counts);
+                free(package_fill);
+                free(best_package);
+                free(best_package_members);
+                goto invalid_assignment;
+            }
+        }
+        int top_node_count =
+            members[c] < CBM_CLUSTER_MAX_TOPNODES ? members[c] : CBM_CLUSTER_MAX_TOPNODES;
+        ci->top_nodes = cluster_calloc(s, (size_t)top_node_count, sizeof(*ci->top_nodes));
+        if (top_node_count > 0 && !ci->top_nodes) {
+            free(package_counts);
+            free(package_fill);
+            free(best_package);
+            free(best_package_members);
+            goto allocation_failed;
+        }
+        ci->top_node_count = top_node_count;
+        for (int i = 0; i < top_node_count; i++) {
+            int node = ranked[ranked_offset + i].ordinal;
+            ci->top_nodes[i] = cluster_strdup(s, nodes[node].name);
+            if (!ci->top_nodes[i]) {
+                free(package_counts);
+                free(package_fill);
+                free(best_package);
+                free(best_package_members);
+                goto allocation_failed;
+            }
+        }
+        ranked_offset += members[c];
+        const char *label = best_package[c] >= 0
+                                ? ci->packages[best_package[c]]
+                                : (top_node_count > 0 ? ci->top_nodes[0] : "cluster");
+        ci->label = cluster_strdup(s, label);
+        int edge_type_count = (edge_kind_mask[c] & (1U << CBM_CLUSTER_EDGE_CALLS) ? 1 : 0) +
+                              (edge_kind_mask[c] & (1U << CBM_CLUSTER_EDGE_IMPORTS) ? 1 : 0);
+        if (edge_type_count > 0) {
+            ci->edge_types = cluster_calloc(s, (size_t)edge_type_count, sizeof(*ci->edge_types));
+        }
+        if (!ci->label || (edge_type_count > 0 && !ci->edge_types)) {
+            free(package_counts);
+            free(package_fill);
+            free(best_package);
+            free(best_package_members);
+            goto allocation_failed;
+        }
+        ci->edge_type_count = edge_type_count;
+        int edge_type_slot = 0;
+        if (edge_kind_mask[c] & (1U << CBM_CLUSTER_EDGE_CALLS)) {
+            ci->edge_types[edge_type_slot++] = cluster_strdup(s, "CALLS");
+        }
+        if (edge_kind_mask[c] & (1U << CBM_CLUSTER_EDGE_IMPORTS)) {
+            ci->edge_types[edge_type_slot++] = cluster_strdup(s, "IMPORTS");
+        }
+        bool edge_type_allocation_failed = false;
+        for (int i = 0; i < edge_type_count; i++) {
+            if (!ci->edge_types[i]) {
+                edge_type_allocation_failed = true;
+            }
+        }
+        if (edge_type_allocation_failed) {
+            free(package_counts);
+            free(package_fill);
+            free(best_package);
+            free(best_package_members);
+            goto allocation_failed;
+        }
+    }
+    free(package_counts);
+    free(package_fill);
+    free(best_package);
+    free(best_package_members);
+
+    if (ranked_offset != n) {
+        goto invalid_assignment;
+    }
+    uint64_t covered = 0;
+    for (int c = 0; c < community_count; c++) {
+        if (clusters[c].member_atom_id_count != clusters[c].members ||
+            (clusters[c].member_atom_id_count > 0 && !clusters[c].member_atom_ids)) {
+            goto invalid_assignment;
+        }
+        for (int i = 0; i < clusters[c].member_atom_id_count; i++) {
+            if (!clusters[c].member_atom_ids[i] ||
+                (i > 0 &&
+                 strcmp(clusters[c].member_atom_ids[i - 1], clusters[c].member_atom_ids[i]) >= 0)) {
+                goto invalid_assignment;
+            }
+        }
+        covered += (uint64_t)clusters[c].members;
+    }
+    if (covered != (uint64_t)n) {
+        goto invalid_assignment;
+    }
+    free(degree);
+    free(internal);
+    free(boundary);
+    free(edge_kind_mask);
+    free(members);
+    free(ranked);
+    out->clusters = clusters;
+    out->cluster_count = community_count;
+    return CBM_STORE_OK;
+
+metric_overflow:
+    for (int c = 0; c < community_count; c++) {
+        cluster_info_free(&clusters[c]);
+    }
+    free(clusters);
+    free(degree);
+    free(internal);
+    free(boundary);
+    free(edge_kind_mask);
+    free(members);
+    free(ranked);
+    return cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_METRIC_OVERFLOW", "result",
+                                "architecture cluster metrics exceed exact representation",
+                                "request a smaller explicit scope; no prefix result was returned");
+
+invalid_assignment:
+    for (int c = 0; c < community_count; c++) {
+        cluster_info_free(&clusters[c]);
+    }
+    free(clusters);
+    free(degree);
+    free(internal);
+    free(boundary);
+    free(edge_kind_mask);
+    free(members);
+    free(ranked);
+    return cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_ASSIGNMENT_INVALID", "result_readback",
+                                "architecture cluster assignment failed complete coverage readback",
+                                "repair Leiden assignment generation before returning clusters");
+
+allocation_failed:
+    for (int c = 0; c < community_count; c++) {
+        cluster_info_free(&clusters[c]);
+    }
+    free(clusters);
+    free(degree);
+    free(internal);
+    free(boundary);
+    free(edge_kind_mask);
+    free(members);
+    free(ranked);
+    return cluster_receipt_fail(
+        s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "result",
+        "architecture clustering could not allocate the complete community result",
+        "free memory or request a smaller explicit scope, then retry unchanged");
+}
+
+static int arch_clusters(cbm_store_t *s, const char *project, const arch_path_scope_t *scope,
+                         const cbm_arch_cluster_options_t *cluster_options,
+                         cbm_architecture_info_t *out) {
+    if (!s || !s->db || !project || !project[0] || !scope || !cluster_options || !out) {
+        if (s) {
+            cluster_receipt_begin(s, cluster_options);
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_INVALID_ARGUMENT", "admission",
+                                 "architecture clustering requires a store, project, and output",
+                                 "provide the exact indexed project and retry unchanged");
+        }
+        return CBM_STORE_ERR;
+    }
+    cluster_receipt_begin(s, cluster_options);
+    if (!isfinite(cluster_options->resolution) || cluster_options->resolution <= 0.0 ||
+        cluster_options->max_nodes == 0 || cluster_options->max_nodes > INT_MAX ||
+        cluster_options->max_edges == 0 || cluster_options->max_edges > INT_MAX ||
+        cluster_options->max_move_visits == 0 || cluster_options->max_result_bytes == 0 ||
+        cluster_options->max_result_bytes > (uint64_t)SIZE_MAX) {
+        return cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_OPTIONS_INVALID", "admission",
+            "architecture clustering options are non-finite, zero, or exceed exact representation",
+            "pass a positive finite resolution, positive move/result bounds, and node/edge bounds "
+            "within signed-int representation");
+    }
+    bool scoped = scope->scoped;
+    const char *norm = scoped ? scope->norm : "";
+    sqlite3_stmt *st = NULL;
+    bool snapshot_held = false;
+    cluster_node_t *nodes = NULL;
+    cluster_id_map_t *id_map = NULL;
+    cluster_typed_edge_t *typed_edges = NULL;
+    cbm_louvain_edge_t *leiden_edges = NULL;
+    uint64_t *leiden_weights = NULL;
+    int64_t *leiden_nodes = NULL;
+    cbm_louvain_result_t *leiden_result = NULL;
+    int *comm = NULL;
+    int loaded_nodes = 0;
+    int node_count = 0;
+    sqlite3_int64 requested_edges = 0;
+    int raw_edge_count = 0;
+    int canonical_edge_count = 0;
+    int result_count = 0;
+    int rc = CBM_STORE_ERR;
+    cbm_sha256_ctx source_hash;
+    cbm_sha256_ctx projection_hash;
+    cbm_sha256_ctx label_hash;
+    cbm_sha256_ctx result_hash;
+    cbm_sha256_init(&source_hash);
+    cbm_sha256_init(&projection_hash);
+    cbm_sha256_init(&label_hash);
+    cbm_sha256_init(&result_hash);
+    cluster_hash_text(&source_hash, "cbm.architecture.cluster.source.v3");
+    cluster_hash_text(&source_hash, project ? project : "");
+    cluster_hash_text(&source_hash, scoped ? norm : "");
+    cluster_hash_text(&label_hash, "cbm.architecture.cluster.labels.v3");
+
+    if (sqlite3_exec(s->db, "SAVEPOINT cbm_arch_cluster_snapshot;", NULL, NULL, NULL) !=
+        SQLITE_OK) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_SNAPSHOT_FAILED", "snapshot",
+                            "architecture cluster snapshot acquisition failed");
+        goto cleanup;
+    }
+    snapshot_held = true;
+
+    char node_count_sql[ST_SQL_BUF];
+    const char *node_count_base = "SELECT COUNT(*) FROM nodes WHERE project=?1";
+    int sql_len = scoped ? snprintf(node_count_sql, sizeof(node_count_sql), "%s%s", node_count_base,
+                                    arch_path_scope_sql())
+                         : snprintf(node_count_sql, sizeof(node_count_sql), "%s", node_count_base);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(node_count_sql)) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_QUERY_OVERFLOW", "nodes",
+                             "architecture node-count query exceeds exact representation",
+                             "repair the fixed projection query before retrying");
+        goto cleanup;
+    }
+    if (sqlite3_prepare_v2(s->db, node_count_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK || !st) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_COUNT_FAILED", "nodes",
+                            "architecture node-count query prepare failed");
+        goto cleanup;
+    }
+    if (bind_text(st, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(st, ST_COL_2, norm) != SQLITE_OK)) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_COUNT_FAILED", "nodes",
+                            "architecture node-count query bind failed");
+        goto cleanup;
+    }
+    int step_rc = sqlite3_step(st);
+    if (step_rc != SQLITE_ROW) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_COUNT_FAILED", "nodes",
+                            "architecture node-count query did not return a row");
+        goto cleanup;
+    }
+    if (sqlite3_column_type(st, 0) != SQLITE_INTEGER) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_COUNT_INVALID", "nodes",
+                             "architecture node-count query returned a non-integer value",
+                             "repair the SQLite graph count before clustering");
+        goto cleanup;
+    }
+    sqlite3_int64 requested_nodes = sqlite3_column_int64(st, 0);
+    if (requested_nodes < 0) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_COUNT_INVALID", "nodes",
+                             "architecture node count is negative",
+                             "repair the SQLite graph count before clustering");
+        goto cleanup;
+    }
+    s->cluster_receipt.requested_node_count = (uint64_t)requested_nodes;
+    s->cluster_receipt.level_bound = (uint64_t)requested_nodes;
+    if ((uint64_t)requested_nodes > cluster_options->max_nodes || requested_nodes > INT_MAX) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_NODE_BOUND_EXCEEDED", "nodes",
+            "architecture node count exceeds the accepted per-call or implementation bound",
+            "request an exact smaller scope or explicitly raise cluster_max_nodes; no prefix was "
+            "clustered");
+        goto cleanup;
+    }
+    int node_count_step_rc = sqlite3_step(st);
+    if (node_count_step_rc != SQLITE_DONE) {
+        if (node_count_step_rc == SQLITE_ROW) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_COUNT_INVALID", "nodes",
+                                 "architecture node-count query returned more than one row",
+                                 "repair the fixed count query before clustering");
+        } else {
+            cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_COUNT_FAILED", "nodes",
+                                "architecture node-count query completion failed");
+        }
+        goto cleanup;
+    }
+    int node_count_finalize_rc = sqlite3_finalize(st);
+    if (node_count_finalize_rc != SQLITE_OK) {
+        st = NULL;
+        cluster_sqlite_fail_captured(s, "CBM_ARCH_CLUSTER_NODE_COUNT_FAILED", "nodes",
+                                     "architecture node-count query finalization failed",
+                                     node_count_finalize_rc,
+                                     sqlite3_errstr(node_count_finalize_rc));
+        goto cleanup;
+    }
+    st = NULL;
+    node_count = (int)requested_nodes;
+
+    /* Count both admitted dimensions before allocating either O(N) or O(E)
+     * projection storage. Unscoped admission counts the raw typed edge roster
+     * so a later missing-endpoint refusal cannot hide rows from the caller's
+     * edge bound; scoped admission counts exactly the induced edge roster. */
+    char edge_count_sql[ST_SQL_BUF];
+    const char *edge_count_base = scoped ? "SELECT COUNT(*) FROM edges e "
+                                           "JOIN nodes ns ON ns.id=e.source_id AND "
+                                           "ns.project=e.project "
+                                           "JOIN nodes nt ON nt.id=e.target_id AND "
+                                           "nt.project=e.project "
+                                           "WHERE e.project=?1 AND e.type IN ('CALLS','IMPORTS')"
+                                         : "SELECT COUNT(*) FROM edges e WHERE e.project=?1 AND "
+                                           "e.type IN ('CALLS','IMPORTS')";
+    sql_len = scoped ? snprintf(edge_count_sql, sizeof(edge_count_sql),
+                                "%s AND " ARCH_PATH_PREDICATE(
+                                    "ns.file_path") " AND " ARCH_PATH_PREDICATE("nt.file_path"),
+                                edge_count_base)
+                     : snprintf(edge_count_sql, sizeof(edge_count_sql), "%s", edge_count_base);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(edge_count_sql)) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_QUERY_OVERFLOW", "edges",
+                             "architecture edge-count query exceeds exact representation",
+                             "repair the fixed projection query before retrying");
+        goto cleanup;
+    }
+    if (sqlite3_prepare_v2(s->db, edge_count_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK || !st ||
+        bind_text(st, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(st, ST_COL_2, norm) != SQLITE_OK)) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_EDGE_COUNT_FAILED", "edges",
+                            "architecture edge-count query prepare/bind failed");
+        goto cleanup;
+    }
+    step_rc = sqlite3_step(st);
+    if (step_rc != SQLITE_ROW) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_EDGE_COUNT_FAILED", "edges",
+                            "architecture edge-count query did not return a row");
+        goto cleanup;
+    }
+    if (sqlite3_column_type(st, 0) != SQLITE_INTEGER) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_COUNT_INVALID", "edges",
+                             "architecture edge-count query returned a non-integer value",
+                             "repair the SQLite graph count before clustering");
+        goto cleanup;
+    }
+    requested_edges = sqlite3_column_int64(st, 0);
+    if (requested_edges < 0) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_COUNT_INVALID", "edges",
+                             "architecture edge count is negative",
+                             "repair the SQLite graph count before clustering");
+        goto cleanup;
+    }
+    s->cluster_receipt.requested_edge_count = (uint64_t)requested_edges;
+    if ((uint64_t)requested_edges > cluster_options->max_edges || requested_edges > INT_MAX) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_EDGE_BOUND_EXCEEDED", "edges",
+            "architecture requested CALLS/IMPORTS edge count exceeds the caller or representation "
+            "bound",
+            "request an exact smaller scope or explicitly raise cluster_max_edges; no prefix was "
+            "clustered");
+        goto cleanup;
+    }
+    int edge_count_step_rc = sqlite3_step(st);
+    int edge_count_finalize_rc = sqlite3_finalize(st);
+    st = NULL;
+    if (edge_count_step_rc != SQLITE_DONE || edge_count_finalize_rc != SQLITE_OK) {
+        if (edge_count_step_rc == SQLITE_ROW) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_COUNT_INVALID", "edges",
+                                 "architecture edge-count query returned more than one row",
+                                 "repair the fixed count query before clustering");
+        } else {
+            int edge_count_error =
+                edge_count_step_rc != SQLITE_DONE ? edge_count_step_rc : edge_count_finalize_rc;
+            cluster_sqlite_fail_captured(
+                s, "CBM_ARCH_CLUSTER_EDGE_COUNT_FAILED", "edges",
+                "architecture edge-count query completion/finalization failed", edge_count_error,
+                sqlite3_errstr(edge_count_error));
+        }
+        goto cleanup;
+    }
+
+    nodes = cluster_calloc(s, (size_t)(node_count > 0 ? node_count : 1), sizeof(*nodes));
+    if (!nodes) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "nodes",
+            "architecture clustering could not allocate the complete node roster",
+            "free memory or request a smaller explicit scope, then retry unchanged");
+        goto cleanup;
+    }
+
+    char node_sql[ST_SQL_BUF];
+    const char *node_base = "SELECT id, atom_id, label, name, qualified_name, file_path "
+                            "FROM nodes WHERE project=?1";
+    sql_len = scoped ? snprintf(node_sql, sizeof(node_sql), "%s%s ORDER BY atom_id, id", node_base,
+                                arch_path_scope_sql())
+                     : snprintf(node_sql, sizeof(node_sql), "%s ORDER BY atom_id, id", node_base);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(node_sql)) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_QUERY_OVERFLOW", "nodes",
+                             "architecture node projection query exceeds exact representation",
+                             "repair the fixed projection query before retrying");
+        goto cleanup;
+    }
+    if (sqlite3_prepare_v2(s->db, node_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_READ_FAILED", "nodes",
+                            "architecture node projection prepare failed");
+        goto cleanup;
+    }
+    if (bind_text(st, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(st, ST_COL_2, norm) != SQLITE_OK)) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_READ_FAILED", "nodes",
+                            "architecture node projection bind failed");
+        goto cleanup;
+    }
+    cluster_hash_u64(&source_hash, (uint64_t)node_count);
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (loaded_nodes >= node_count || sqlite3_column_type(st, 0) != SQLITE_INTEGER ||
+            !arch_sqlite_text_is_exact_c_string(st, 1) ||
+            !arch_sqlite_text_is_exact_c_string(st, 2) ||
+            !arch_sqlite_text_is_exact_c_string(st, 3) ||
+            !arch_sqlite_text_is_exact_c_string(st, 4) ||
+            !arch_sqlite_text_is_exact_c_string(st, 5)) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_NODE_ROW_MALFORMED", "nodes",
+                                 "architecture node projection contains a malformed row",
+                                 "rebuild the graph from exact source and retry unchanged");
+            goto cleanup;
+        }
+        const char *atom_id = (const char *)sqlite3_column_text(st, 1);
+        const char *label = (const char *)sqlite3_column_text(st, 2);
+        const char *name = (const char *)sqlite3_column_text(st, 3);
+        const char *qualified_name = (const char *)sqlite3_column_text(st, 4);
+        const char *file_path = (const char *)sqlite3_column_text(st, 5);
+        if (!is_canonical_atom_id(atom_id) || !label || !label[0] || !name || !name[0] ||
+            !qualified_name || !file_path) {
+            cluster_receipt_fail(
+                s, "CBM_ARCH_CLUSTER_NODE_IDENTITY_INVALID", "nodes",
+                "architecture node projection contains a non-canonical stable identity",
+                "rebuild the graph from exact source so every node has one canonical atom ID");
+            goto cleanup;
+        }
+        cluster_node_t *node = &nodes[loaded_nodes];
+        loaded_nodes++;
+        node->sqlite_id = sqlite3_column_int64(st, 0);
+        node->atom_id = cluster_strdup(s, atom_id);
+        node->label = cluster_strdup(s, label);
+        node->name = cluster_strdup(s, name);
+        node->qualified_name = cluster_strdup(s, qualified_name);
+        node->file_path = cluster_strdup(s, file_path);
+        if (!node->atom_id || !node->label || !node->name || !node->qualified_name ||
+            !node->file_path) {
+            cluster_receipt_fail(
+                s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "nodes",
+                "architecture clustering could not retain a complete node row",
+                "free memory or request a smaller explicit scope, then retry unchanged");
+            goto cleanup;
+        }
+        cluster_hash_text(&source_hash, node->atom_id);
+        cluster_hash_text(&source_hash, node->label);
+        cluster_hash_text(&source_hash, node->name);
+        cluster_hash_text(&source_hash, node->qualified_name);
+        cluster_hash_text(&source_hash, node->file_path);
+    }
+    if (step_rc != SQLITE_DONE || loaded_nodes != node_count) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_NODE_READ_FAILED", "nodes",
+                            "architecture node projection changed inside its retained snapshot");
+        goto cleanup;
+    }
+    int node_finalize_rc = sqlite3_finalize(st);
+    if (node_finalize_rc != SQLITE_OK) {
+        st = NULL;
+        cluster_sqlite_fail_captured(s, "CBM_ARCH_CLUSTER_NODE_READ_FAILED", "nodes",
+                                     "architecture node projection finalization failed",
+                                     node_finalize_rc, sqlite3_errstr(node_finalize_rc));
+        goto cleanup;
+    }
+    st = NULL;
+    if (node_count > 1) {
+        qsort(nodes, (size_t)node_count, sizeof(*nodes), cluster_node_cmp);
+    }
+    for (int i = 1; i < node_count; i++) {
+        if (strcmp(nodes[i - 1].atom_id, nodes[i].atom_id) == 0) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_DUPLICATE_NODE_ID", "nodes",
+                                 "architecture projection contains a duplicate canonical atom ID",
+                                 "repair node identity and rebuild before clustering");
+            goto cleanup;
+        }
+    }
+    id_map = cluster_calloc(s, (size_t)(node_count > 0 ? node_count : 1), sizeof(*id_map));
+    if (!id_map) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "node_map",
+            "architecture clustering could not allocate the stable endpoint map",
+            "free memory or request a smaller explicit scope, then retry unchanged");
+        goto cleanup;
+    }
+    for (int i = 0; i < node_count; i++) {
+        id_map[i] = (cluster_id_map_t){nodes[i].sqlite_id, i};
+    }
+    if (node_count > 1) {
+        qsort(id_map, (size_t)node_count, sizeof(*id_map), cluster_id_map_cmp);
+    }
+    for (int i = 1; i < node_count; i++) {
+        if (id_map[i - 1].sqlite_id == id_map[i].sqlite_id) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_DUPLICATE_NODE_ID", "node_map",
+                                 "architecture projection contains a duplicate SQLite node ID",
+                                 "repair node identity and rebuild before clustering");
+            goto cleanup;
+        }
+    }
+    s->cluster_receipt.included_node_count = (uint64_t)node_count;
+    s->cluster_receipt.excluded_node_count = 0;
+
+    char label_sql[ST_SQL_BUF];
+    const char *label_base = "SELECT DISTINCT label FROM nodes WHERE project=?1";
+    sql_len = scoped ? snprintf(label_sql, sizeof(label_sql), "%s%s ORDER BY label", label_base,
+                                arch_path_scope_sql())
+                     : snprintf(label_sql, sizeof(label_sql), "%s ORDER BY label", label_base);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(label_sql) ||
+        sqlite3_prepare_v2(s->db, label_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_LABEL_ROSTER_FAILED", "labels",
+                            "architecture node-label roster prepare failed");
+        goto cleanup;
+    }
+    if (bind_text(st, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(st, ST_COL_2, norm) != SQLITE_OK)) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_LABEL_ROSTER_FAILED", "labels",
+                            "architecture node-label roster bind failed");
+        goto cleanup;
+    }
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (!arch_sqlite_text_is_exact_c_string(st, 0)) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_LABEL_ROSTER_MALFORMED", "labels",
+                                 "architecture node-label roster contains a non-text label",
+                                 "rebuild the malformed graph from exact source");
+            goto cleanup;
+        }
+        const char *label = (const char *)sqlite3_column_text(st, 0);
+        if (!label || !label[0]) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_LABEL_ROSTER_MALFORMED", "labels",
+                                 "architecture node-label roster contains an empty label",
+                                 "rebuild the malformed graph from exact source");
+            goto cleanup;
+        }
+        cluster_hash_text(&label_hash, label);
+        s->cluster_receipt.observed_node_label_count++;
+    }
+    int label_finalize_rc = sqlite3_finalize(st);
+    st = NULL;
+    if (step_rc != SQLITE_DONE || label_finalize_rc != SQLITE_OK) {
+        int label_error = step_rc != SQLITE_DONE ? step_rc : label_finalize_rc;
+        cluster_sqlite_fail_captured(s, "CBM_ARCH_CLUSTER_LABEL_ROSTER_FAILED", "labels",
+                                     "architecture node-label roster read/finalize failed",
+                                     label_error, sqlite3_errstr(label_error));
+        goto cleanup;
+    }
+    cluster_hash_finish(&label_hash, s->cluster_receipt.node_label_roster_sha256);
+
+    /* An unscoped projection admits every CALLS/IMPORTS edge, so missing
+     * endpoints are a hard identity error. A scoped projection is induced by
+     * two exact endpoint predicates; crossing and otherwise out-of-scope rows
+     * are intentionally outside its requested edge roster. */
+    if (!scoped) {
+        const char *unknown_endpoint_sql =
+            "SELECT e.id FROM edges e "
+            "LEFT JOIN nodes ns ON ns.id=e.source_id AND ns.project=e.project "
+            "LEFT JOIN nodes nt ON nt.id=e.target_id AND nt.project=e.project "
+            "WHERE e.project=?1 AND e.type IN ('CALLS','IMPORTS') "
+            "AND (ns.id IS NULL OR nt.id IS NULL) ORDER BY e.id LIMIT 1";
+        if (sqlite3_prepare_v2(s->db, unknown_endpoint_sql, CBM_NOT_FOUND, &st, NULL) !=
+                SQLITE_OK ||
+            bind_text(st, ST_COL_1, project) != SQLITE_OK) {
+            cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_ENDPOINT_CHECK_FAILED", "edges",
+                                "architecture endpoint-completeness query prepare/bind failed");
+            goto cleanup;
+        }
+        step_rc = sqlite3_step(st);
+        if (step_rc == SQLITE_ROW) {
+            cluster_receipt_fail(
+                s, "CBM_ARCH_CLUSTER_UNKNOWN_ENDPOINT", "edges",
+                "architecture CALLS/IMPORTS edge references a missing project node",
+                "repair referential graph identity and rebuild before clustering");
+            goto cleanup;
+        }
+        int endpoint_finalize_rc = sqlite3_finalize(st);
+        st = NULL;
+        if (step_rc != SQLITE_DONE || endpoint_finalize_rc != SQLITE_OK) {
+            int endpoint_error = step_rc != SQLITE_DONE ? step_rc : endpoint_finalize_rc;
+            cluster_sqlite_fail_captured(
+                s, "CBM_ARCH_CLUSTER_ENDPOINT_CHECK_FAILED", "edges",
+                "architecture endpoint-completeness query read/finalize failed", endpoint_error,
+                sqlite3_errstr(endpoint_error));
+            goto cleanup;
+        }
+    }
+    typed_edges = cluster_calloc(s, (size_t)(requested_edges > 0 ? requested_edges : 1),
+                                 sizeof(*typed_edges));
+    if (!typed_edges) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "edges",
+            "architecture clustering could not allocate the complete typed edge roster",
+            "free memory or request a smaller explicit scope, then retry unchanged");
+        goto cleanup;
+    }
+
+    char edge_sql[ST_SQL_BUF];
+    const char *edge_base = "SELECT e.source_id, e.target_id, e.type, ns.atom_id, nt.atom_id "
+                            "FROM edges e "
+                            "JOIN nodes ns ON ns.id=e.source_id AND ns.project=e.project "
+                            "JOIN nodes nt ON nt.id=e.target_id AND nt.project=e.project "
+                            "WHERE e.project=?1 AND e.type IN ('CALLS','IMPORTS')";
+    sql_len =
+        scoped ? snprintf(edge_sql, sizeof(edge_sql),
+                          "%s AND " ARCH_PATH_PREDICATE("ns.file_path") " AND " ARCH_PATH_PREDICATE(
+                              "nt.file_path") " ORDER BY ns.atom_id, nt.atom_id, e.type, e.id",
+                          edge_base)
+               : snprintf(edge_sql, sizeof(edge_sql),
+                          "%s ORDER BY ns.atom_id, nt.atom_id, e.type, e.id", edge_base);
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(edge_sql) ||
+        sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &st, NULL) != SQLITE_OK ||
+        bind_text(st, ST_COL_1, project) != SQLITE_OK ||
+        (scoped && arch_bind_path_scope(st, ST_COL_2, norm) != SQLITE_OK)) {
+        cluster_sqlite_fail(s, "CBM_ARCH_CLUSTER_EDGE_READ_FAILED", "edges",
+                            "architecture typed-edge projection prepare/bind failed");
+        goto cleanup;
+    }
+    uint64_t observed_edges = 0;
+    cluster_hash_u64(&source_hash, (uint64_t)requested_edges);
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        observed_edges++;
+        if (observed_edges > (uint64_t)requested_edges ||
+            sqlite3_column_type(st, 0) != SQLITE_INTEGER ||
+            sqlite3_column_type(st, 1) != SQLITE_INTEGER ||
+            !arch_sqlite_text_is_exact_c_string(st, 2) ||
+            !arch_sqlite_text_is_exact_c_string(st, 3) ||
+            !arch_sqlite_text_is_exact_c_string(st, 4)) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_EDGE_ROW_MALFORMED", "edges",
+                                 "architecture typed-edge projection contains a malformed row",
+                                 "rebuild the graph from exact source and retry unchanged");
+            goto cleanup;
+        }
+        int64_t source_id = sqlite3_column_int64(st, 0);
+        int64_t target_id = sqlite3_column_int64(st, 1);
+        const char *type = (const char *)sqlite3_column_text(st, 2);
+        const char *source_atom = (const char *)sqlite3_column_text(st, 3);
+        const char *target_atom = (const char *)sqlite3_column_text(st, 4);
+        if (!type || (strcmp(type, "CALLS") != 0 && strcmp(type, "IMPORTS") != 0) ||
+            !is_canonical_atom_id(source_atom) || !is_canonical_atom_id(target_atom)) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_EDGE_ROW_MALFORMED", "edges",
+                                 "architecture typed edge has an invalid type or endpoint identity",
+                                 "rebuild the malformed graph from exact source");
+            goto cleanup;
+        }
+        int source = cluster_id_map_index(id_map, node_count, source_id);
+        int target = cluster_id_map_index(id_map, node_count, target_id);
+        cluster_hash_text(&source_hash, source_atom);
+        cluster_hash_text(&source_hash, target_atom);
+        cluster_hash_text(&source_hash, type);
+        if (source < 0 || target < 0) {
+            cluster_receipt_fail(
+                s, "CBM_ARCH_CLUSTER_UNKNOWN_ENDPOINT", "edges",
+                "architecture induced edge is absent from the exact scoped node roster",
+                "repair the shared scope predicate or endpoint identity before clustering");
+            goto cleanup;
+        }
+        if (strcmp(nodes[source].atom_id, source_atom) != 0 ||
+            strcmp(nodes[target].atom_id, target_atom) != 0) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_ENDPOINT_IDENTITY_MISMATCH", "edges",
+                                 "architecture edge endpoint disagrees with the canonical node map",
+                                 "repair SQLite endpoint identity and rebuild before clustering");
+            goto cleanup;
+        }
+        typed_edges[raw_edge_count++] = (cluster_typed_edge_t){
+            source, target,
+            strcmp(type, "CALLS") == 0 ? CBM_CLUSTER_EDGE_CALLS : CBM_CLUSTER_EDGE_IMPORTS,
+            UINT64_C(1)};
+    }
+    if (step_rc != SQLITE_DONE || observed_edges != (uint64_t)requested_edges) {
+        cluster_sqlite_fail(
+            s, "CBM_ARCH_CLUSTER_EDGE_READ_FAILED", "edges",
+            "architecture typed-edge projection changed inside its retained snapshot");
+        goto cleanup;
+    }
+    int edge_finalize_rc = sqlite3_finalize(st);
+    if (edge_finalize_rc != SQLITE_OK) {
+        st = NULL;
+        cluster_sqlite_fail_captured(s, "CBM_ARCH_CLUSTER_EDGE_READ_FAILED", "edges",
+                                     "architecture typed-edge projection finalization failed",
+                                     edge_finalize_rc, sqlite3_errstr(edge_finalize_rc));
+        goto cleanup;
+    }
+    st = NULL;
+    s->cluster_receipt.included_edge_count = (uint64_t)raw_edge_count;
+    s->cluster_receipt.excluded_edge_count = 0;
+    if (s->cluster_receipt.included_edge_count + s->cluster_receipt.excluded_edge_count !=
+        s->cluster_receipt.requested_edge_count) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_EDGE_ACCOUNTING_MISMATCH", "edges",
+                             "architecture edge inclusion accounting is incomplete",
+                             "repair projection accounting before returning clusters");
+        goto cleanup;
+    }
+
+    if (raw_edge_count > 1) {
+        qsort(typed_edges, (size_t)raw_edge_count, sizeof(*typed_edges), cluster_typed_edge_cmp);
+    }
+    for (int read = 0; read < raw_edge_count;) {
+        int end = read + 1;
+        while (end < raw_edge_count && typed_edges[end].src == typed_edges[read].src &&
+               typed_edges[end].dst == typed_edges[read].dst &&
+               typed_edges[end].kind == typed_edges[read].kind) {
+            end++;
+        }
+        typed_edges[canonical_edge_count] = typed_edges[read];
+        typed_edges[canonical_edge_count].multiplicity = (uint64_t)(end - read);
+        if (typed_edges[canonical_edge_count].src == typed_edges[canonical_edge_count].dst) {
+            s->cluster_receipt.self_loop_count++;
+        }
+        canonical_edge_count++;
+        read = end;
+    }
+    s->cluster_receipt.canonical_typed_edge_count = (uint64_t)canonical_edge_count;
+    s->cluster_receipt.duplicate_edge_count =
+        (uint64_t)raw_edge_count - (uint64_t)canonical_edge_count;
+
+    cluster_hash_text(&projection_hash, "cbm.architecture.cluster.projection.v3");
+    cluster_hash_text(&projection_hash, project);
+    cluster_hash_text(&projection_hash, scoped ? norm : "");
+    cluster_hash_u64(&projection_hash, (uint64_t)node_count);
+    for (int i = 0; i < node_count; i++) {
+        cluster_hash_text(&projection_hash, nodes[i].atom_id);
+        cluster_hash_text(&projection_hash, nodes[i].label);
+        cluster_hash_text(&projection_hash, nodes[i].name);
+        cluster_hash_text(&projection_hash, nodes[i].qualified_name);
+        cluster_hash_text(&projection_hash, nodes[i].file_path);
+    }
+    cluster_hash_u64(&projection_hash, (uint64_t)canonical_edge_count);
+    for (int e = 0; e < canonical_edge_count; e++) {
+        cluster_hash_text(&projection_hash, nodes[typed_edges[e].src].atom_id);
+        cluster_hash_text(&projection_hash, nodes[typed_edges[e].dst].atom_id);
+        cluster_hash_text(&projection_hash, cluster_edge_type(typed_edges[e].kind));
+        cluster_hash_u64(&projection_hash, typed_edges[e].multiplicity);
+    }
+    cluster_hash_finish(&projection_hash, s->cluster_receipt.projection_sha256);
+    cluster_hash_finish(&source_hash, s->cluster_receipt.source_sha256);
+
+    leiden_nodes =
+        cluster_calloc(s, (size_t)(node_count > 0 ? node_count : 1), sizeof(*leiden_nodes));
+    leiden_edges = cluster_calloc(s, (size_t)(canonical_edge_count > 0 ? canonical_edge_count : 1),
+                                  sizeof(*leiden_edges));
+    leiden_weights = cluster_calloc(
+        s, (size_t)(canonical_edge_count > 0 ? canonical_edge_count : 1), sizeof(*leiden_weights));
+    if (!leiden_nodes || !leiden_edges || !leiden_weights) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "leiden_input",
+            "architecture clustering could not allocate the canonical Leiden input",
+            "free memory or request a smaller explicit scope, then retry unchanged");
+        goto cleanup;
+    }
+    for (int i = 0; i < node_count; i++) {
+        leiden_nodes[i] = i;
+    }
+    for (int e = 0; e < canonical_edge_count; e++) {
+        leiden_edges[e].src = typed_edges[e].src;
+        leiden_edges[e].dst = typed_edges[e].dst;
+        leiden_weights[e] = typed_edges[e].multiplicity;
+    }
+    leiden_run_receipt_t leiden_receipt = {0};
+    if (cbm_leiden_weighted(leiden_nodes, node_count, leiden_edges, leiden_weights,
+                            canonical_edge_count, true, cluster_options->resolution,
+                            cluster_options->max_move_visits, &leiden_result, &result_count,
+                            &leiden_receipt) != CBM_STORE_OK) {
+        cluster_copy_leiden_receipt(&s->cluster_receipt, &leiden_receipt);
+        cluster_receipt_fail(
+            s, leiden_receipt.error_code ? leiden_receipt.error_code : "CBM_LEIDEN_FAILED",
+            leiden_receipt.error_stage ? leiden_receipt.error_stage : "leiden",
+            leiden_receipt.error_message ? leiden_receipt.error_message
+                                         : "Leiden failed without a complete verified result",
+            leiden_receipt.error_remediation
+                ? leiden_receipt.error_remediation
+                : "inspect the structured Leiden phase log and repair the exact failed phase");
+        goto cleanup;
+    }
+    cluster_copy_leiden_receipt(&s->cluster_receipt, &leiden_receipt);
+    if (s->cluster_receipt.weighted_undirected_edge_count >
+        s->cluster_receipt.canonical_typed_edge_count) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_EDGE_ACCOUNTING_MISMATCH", "result_readback",
+                             "Leiden undirected edge roster exceeds the canonical typed projection",
+                             "repair typed-edge folding before returning any clustering result");
+        goto cleanup;
+    }
+    s->cluster_receipt.undirected_fold_count = s->cluster_receipt.canonical_typed_edge_count -
+                                               s->cluster_receipt.weighted_undirected_edge_count;
+    if (result_count != node_count || (node_count > 0 && !leiden_result)) {
+        cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_RESULT_CARDINALITY_MISMATCH", "result_readback",
+                             "Leiden result cardinality differs from the complete node projection",
+                             "repair Leiden result publication before returning clusters");
+        goto cleanup;
+    }
+    comm = cluster_calloc(s, (size_t)(node_count > 0 ? node_count : 1), sizeof(*comm));
+    if (!comm) {
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_ALLOCATION_FAILED", "result_readback",
+            "architecture clustering could not allocate assignment readback",
+            "free memory or request a smaller explicit scope, then retry unchanged");
+        goto cleanup;
+    }
+    int community_count = 0;
+    for (int i = 0; i < node_count; i++) {
+        if (leiden_result[i].node_id != i || leiden_result[i].community < 0 ||
+            leiden_result[i].community >= node_count) {
+            cluster_receipt_fail(s, "CBM_ARCH_CLUSTER_ASSIGNMENT_INVALID", "result_readback",
+                                 "Leiden returned a non-canonical node or community assignment",
+                                 "repair Leiden result ordering before returning clusters");
+            goto cleanup;
+        }
+        comm[i] = leiden_result[i].community;
+        if (comm[i] + 1 > community_count) {
+            community_count = comm[i] + 1;
+        }
+    }
+    s->cluster_receipt.community_count = (uint64_t)community_count;
+
+    if (cluster_build_complete_result(s, nodes, node_count, typed_edges, canonical_edge_count, comm,
+                                      community_count, out) != CBM_STORE_OK) {
+        goto cleanup;
+    }
+    s->cluster_receipt.complete_coverage_verified = true;
+
+    cluster_hash_text(&result_hash, s->cluster_receipt.result_schema);
+    cluster_hash_text(&result_hash, s->cluster_receipt.algorithm);
+    cluster_hash_text(&result_hash, s->cluster_receipt.algorithm_version);
+    cluster_hash_text(&result_hash, s->cluster_receipt.projection_schema);
+    cluster_hash_text(&result_hash, s->cluster_receipt.node_label_selection);
+    cluster_hash_text(&result_hash, s->cluster_receipt.edge_type_roster);
+    cluster_hash_text(&result_hash, s->cluster_receipt.seed);
+    cluster_hash_text(&result_hash, s->cluster_receipt.objective_function);
+    cluster_hash_text(&result_hash, s->cluster_receipt.move_rule);
+    cluster_hash_text(&result_hash, s->cluster_receipt.refinement_rule);
+    cluster_hash_text(&result_hash, s->cluster_receipt.aggregation_rule);
+    cluster_hash_text(&result_hash, s->cluster_receipt.edge_transform);
+    cluster_hash_double(&result_hash, s->cluster_receipt.resolution);
+    cluster_hash_text(&result_hash, s->cluster_receipt.node_label_roster_sha256);
+    cluster_hash_text(&result_hash, s->cluster_receipt.source_sha256);
+    cluster_hash_text(&result_hash, s->cluster_receipt.projection_sha256);
+    cluster_hash_u64(&result_hash, (uint64_t)node_count);
+    for (int i = 0; i < node_count; i++) {
+        cluster_hash_text(&result_hash, nodes[i].atom_id);
+        cluster_hash_u64(&result_hash, (uint64_t)comm[i]);
+    }
+    cluster_hash_u64(&result_hash, (uint64_t)out->cluster_count);
+    for (int c = 0; c < out->cluster_count; c++) {
+        const cbm_cluster_info_t *cluster = &out->clusters[c];
+        cluster_hash_u64(&result_hash, (uint64_t)cluster->id);
+        cluster_hash_text(&result_hash, cluster->label);
+        cluster_hash_u64(&result_hash, (uint64_t)cluster->members);
+        cluster_hash_double(&result_hash, cluster->cohesion);
+        cluster_hash_u64(&result_hash, (uint64_t)cluster->member_atom_id_count);
+        for (int i = 0; i < cluster->member_atom_id_count; i++) {
+            cluster_hash_text(&result_hash, cluster->member_atom_ids[i]);
+        }
+        cluster_hash_u64(&result_hash, (uint64_t)cluster->top_node_count);
+        for (int i = 0; i < cluster->top_node_count; i++) {
+            cluster_hash_text(&result_hash, cluster->top_nodes[i]);
+        }
+        cluster_hash_u64(&result_hash, (uint64_t)cluster->package_count);
+        for (int i = 0; i < cluster->package_count; i++) {
+            cluster_hash_text(&result_hash, cluster->packages[i]);
+        }
+        cluster_hash_u64(&result_hash, (uint64_t)cluster->edge_type_count);
+        for (int i = 0; i < cluster->edge_type_count; i++) {
+            cluster_hash_text(&result_hash, cluster->edge_types[i]);
+        }
+    }
+    /* The digest binds the complete materialized native result. The shipping
+     * MCP separately enforces the caller-owned byte bound after constructing
+     * the final C architecture payload. */
+    cluster_hash_finish(&result_hash, s->cluster_receipt.result_sha256);
+
+    uint64_t result_bytes = 0;
+    bool result_size_valid =
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.result_schema) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.algorithm) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.algorithm_version) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.projection_schema) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.node_label_selection) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.edge_type_roster) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.seed) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.objective_function) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.move_rule) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.refinement_rule) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.aggregation_rule) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.edge_transform) &&
+        cluster_result_size_add(&result_bytes, UINT64_C(8)) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.node_label_roster_sha256) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.source_sha256) &&
+        cluster_result_size_text(&result_bytes, s->cluster_receipt.projection_sha256) &&
+        cluster_result_size_add(&result_bytes, UINT64_C(8));
+    for (int i = 0; result_size_valid && i < node_count; i++) {
+        result_size_valid = cluster_result_size_text(&result_bytes, nodes[i].atom_id) &&
+                            cluster_result_size_add(&result_bytes, UINT64_C(8));
+    }
+    result_size_valid = result_size_valid && cluster_result_size_add(&result_bytes, UINT64_C(8));
+    for (int c = 0; result_size_valid && c < out->cluster_count; c++) {
+        const cbm_cluster_info_t *cluster = &out->clusters[c];
+        result_size_valid = cluster_result_size_add(&result_bytes, UINT64_C(8)) &&
+                            cluster_result_size_text(&result_bytes, cluster->label) &&
+                            cluster_result_size_add(&result_bytes, UINT64_C(24)) &&
+                            cluster_result_size_add(&result_bytes, UINT64_C(8));
+        for (int i = 0; result_size_valid && i < cluster->member_atom_id_count; i++) {
+            result_size_valid =
+                cluster_result_size_text(&result_bytes, cluster->member_atom_ids[i]);
+        }
+        for (int i = 0; result_size_valid && i < cluster->top_node_count; i++) {
+            result_size_valid = cluster_result_size_text(&result_bytes, cluster->top_nodes[i]);
+        }
+        result_size_valid =
+            result_size_valid && cluster_result_size_add(&result_bytes, UINT64_C(8));
+        for (int i = 0; result_size_valid && i < cluster->package_count; i++) {
+            result_size_valid = cluster_result_size_text(&result_bytes, cluster->packages[i]);
+        }
+        result_size_valid =
+            result_size_valid && cluster_result_size_add(&result_bytes, UINT64_C(8));
+        for (int i = 0; result_size_valid && i < cluster->edge_type_count; i++) {
+            result_size_valid = cluster_result_size_text(&result_bytes, cluster->edge_types[i]);
+        }
+    }
+    if (!result_size_valid) {
+        cluster_result_clear(out);
+        cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_RESULT_SIZE_OVERFLOW", "result",
+            "complete canonical cluster result size exceeds exact uint64 representation",
+            "request an exact smaller scope; no prefix was returned");
+        goto cleanup;
+    }
+    s->cluster_receipt.canonical_result_bytes = result_bytes;
+    rc = CBM_STORE_OK;
+
+cleanup:
+    if (st) {
+        /* sqlite3_finalize() always destroys the statement, and after a failed
+         * step it reports that prior execution code again. Preserve the typed
+         * root refusal instead of mislabelling the repeated code as cleanup. */
+        (void)sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (snapshot_held) {
+        if (rc == CBM_STORE_OK) {
+            if (sqlite3_exec(s->db, "RELEASE cbm_arch_cluster_snapshot;", NULL, NULL, NULL) !=
+                SQLITE_OK) {
+                int snapshot_release_code = sqlite3_extended_errcode(s->db);
+                char snapshot_release_detail[CBM_SZ_256];
+                snprintf(snapshot_release_detail, sizeof(snapshot_release_detail), "%s",
+                         sqlite3_errmsg(s->db));
+                cluster_result_clear(out);
+                rc = CBM_STORE_ERR;
+                int rollback_rc =
+                    sqlite3_exec(s->db, "ROLLBACK TO cbm_arch_cluster_snapshot;", NULL, NULL, NULL);
+                int release_rc =
+                    sqlite3_exec(s->db, "RELEASE cbm_arch_cluster_snapshot;", NULL, NULL, NULL);
+                if (rollback_rc == SQLITE_OK && release_rc == SQLITE_OK) {
+                    cluster_sqlite_fail_captured(
+                        s, "CBM_ARCH_CLUSTER_SNAPSHOT_RELEASE_FAILED", "snapshot",
+                        "architecture cluster snapshot release failed; recovery rollback and "
+                        "release completed",
+                        snapshot_release_code, snapshot_release_detail);
+                } else {
+                    int cleanup_code = rollback_rc != SQLITE_OK ? rollback_rc : release_rc;
+                    char cleanup_detail[CBM_SZ_256];
+                    snprintf(cleanup_detail, sizeof(cleanup_detail),
+                             "initial release code=%d; rollback=%s; recovery release=%s",
+                             snapshot_release_code, sqlite3_errstr(rollback_rc),
+                             sqlite3_errstr(release_rc));
+                    cluster_sqlite_fail_captured(
+                        s, "CBM_ARCH_CLUSTER_SNAPSHOT_CLEANUP_FAILED", "snapshot",
+                        "architecture cluster snapshot release and recovery cleanup failed",
+                        cleanup_code, cleanup_detail);
+                }
+            }
+        } else {
+            char prior_error_code[sizeof(s->cluster_receipt.error_code)];
+            snprintf(prior_error_code, sizeof(prior_error_code), "%s",
+                     s->cluster_receipt.error_code[0] ? s->cluster_receipt.error_code
+                                                      : "CBM_ARCH_CLUSTER_PRIOR_FAILURE");
+            int rollback_rc =
+                sqlite3_exec(s->db, "ROLLBACK TO cbm_arch_cluster_snapshot;", NULL, NULL, NULL);
+            int release_rc =
+                sqlite3_exec(s->db, "RELEASE cbm_arch_cluster_snapshot;", NULL, NULL, NULL);
+            if (rollback_rc != SQLITE_OK || release_rc != SQLITE_OK) {
+                cluster_result_clear(out);
+                int cleanup_code = rollback_rc != SQLITE_OK ? rollback_rc : release_rc;
+                char cleanup_operation[CBM_SZ_256];
+                char cleanup_detail[CBM_SZ_256];
+                snprintf(cleanup_operation, sizeof(cleanup_operation),
+                         "architecture cluster snapshot cleanup after %s failed", prior_error_code);
+                snprintf(cleanup_detail, sizeof(cleanup_detail), "rollback=%s; release=%s",
+                         sqlite3_errstr(rollback_rc), sqlite3_errstr(release_rc));
+                cluster_sqlite_fail_captured(s, "CBM_ARCH_CLUSTER_SNAPSHOT_CLEANUP_FAILED",
+                                             "snapshot", cleanup_operation, cleanup_code,
+                                             cleanup_detail);
+            }
+        }
+    }
+    free(comm);
+    free(leiden_result);
+    free(leiden_nodes);
+    free(leiden_edges);
+    free(leiden_weights);
+    free(typed_edges);
+    free(id_map);
+    cluster_nodes_free(nodes, loaded_nodes);
+    if (rc == CBM_STORE_OK) {
+        snprintf(s->cluster_receipt.status, sizeof(s->cluster_receipt.status), "complete");
+        char nodes_text[CBM_SZ_32];
+        char edges_text[CBM_SZ_32];
+        char communities_text[CBM_SZ_32];
+        snprintf(nodes_text, sizeof(nodes_text), "%llu",
+                 (unsigned long long)s->cluster_receipt.included_node_count);
+        snprintf(edges_text, sizeof(edges_text), "%llu",
+                 (unsigned long long)s->cluster_receipt.canonical_typed_edge_count);
+        snprintf(communities_text, sizeof(communities_text), "%llu",
+                 (unsigned long long)s->cluster_receipt.community_count);
+        cbm_log_info(
+            "store.architecture_clusters_complete", "algorithm", s->cluster_receipt.algorithm,
+            "algorithm_version", s->cluster_receipt.algorithm_version, "nodes", nodes_text,
+            "canonical_typed_edges", edges_text, "communities", communities_text,
+            "projection_sha256", s->cluster_receipt.projection_sha256, "result_sha256",
+            s->cluster_receipt.result_sha256, "converged", "true", "connectivity_verified", "true");
+    }
+    return rc;
+}
 /* ── GetArchitecture dispatch ──────────────────────────────────── */
 
-/* "overview" = compact architecture summary: every aspect EXCEPT the large
- * per-file listing (file_tree), which alone dominates the payload on real
- * repos and can push the MCP response past the output cap. Declared in
+/* "overview" = the narrow architecture summary: every aspect EXCEPT the large
+ * per-file listing (file_tree) and complete O(N+E) clustering projection.
+ * Declared in
  * store.h and shared with aspect_wanted in src/mcp/mcp.c so the store-side
  * DB gate and the MCP-side serialization gate cannot drift. */
 bool cbm_store_arch_aspect_in_overview(const char *name) {
-    return strcmp(name, "file_tree") != 0;
+    static const char *overview[] = {"structure", "dependencies", "routes",
+                                     "languages", "packages",     "entry_points",
+                                     "hotspots",  "boundaries",   "layers"};
+    if (!name) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(overview) / sizeof(overview[0]); i++) {
+        if (strcmp(name, overview[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool arch_aspect_valid(const char *name) {
+    static const char *valid[] = {"all",      "overview",   "structure", "dependencies",
+                                  "routes",   "languages",  "packages",  "entry_points",
+                                  "hotspots", "boundaries", "layers",    "file_tree",
+                                  "clusters"};
+    if (!name) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        if (strcmp(name, valid[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool want_aspect(const char **aspects, int aspect_count, const char *name) {
     if (!aspects || aspect_count == 0) {
-        return true;
+        return cbm_store_arch_aspect_in_overview(name);
     }
     for (int i = 0; i < aspect_count; i++) {
         if (strcmp(aspects[i], "all") == 0) {
@@ -10513,72 +13109,153 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
     return false;
 }
 
-int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
-                               const char **aspects, int aspect_count,
-                               cbm_architecture_info_t *out) {
+int cbm_store_get_architecture_with_options(cbm_store_t *s, const char *project, const char *path,
+                                            const char **aspects, int aspect_count,
+                                            const cbm_arch_cluster_options_t *cluster_options,
+                                            cbm_architecture_info_t *out) {
+    if (!s || !s->db || !out || !project || !project[0] || aspect_count < 0 ||
+        aspect_count > CBM_ARCH_MAX_ASPECTS || (aspect_count > 0 && !aspects)) {
+        if (s) {
+            store_set_error(s, "invalid architecture request arguments");
+        }
+        return CBM_STORE_ERR;
+    }
     memset(out, 0, sizeof(*out));
+    memset(&s->cluster_receipt, 0, sizeof(s->cluster_receipt));
+    bool all_selected = false;
+    for (int i = 0; i < aspect_count; i++) {
+        if (!arch_aspect_valid(aspects[i])) {
+            store_set_error(s, "architecture aspect roster contains an unsupported token");
+            return CBM_STORE_ERR;
+        }
+        all_selected = all_selected || strcmp(aspects[i], "all") == 0;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(aspects[j], aspects[i]) == 0) {
+                store_set_error(s, "architecture aspect roster contains a duplicate token");
+                return CBM_STORE_ERR;
+            }
+        }
+    }
+    if (all_selected && aspect_count != 1) {
+        store_set_error(s, "architecture all aspect must be the sole selector");
+        return CBM_STORE_ERR;
+    }
+    arch_path_scope_t scope = {0};
     int rc;
+    bool clusters_requested = want_aspect(aspects, aspect_count, "clusters");
+    if (!clusters_requested && cluster_options) {
+        store_set_error(s,
+                        "cluster options are invalid unless aspects explicitly selects clusters or "
+                        "all");
+        rc = CBM_STORE_ERR;
+        goto done;
+    }
+    if (clusters_requested &&
+        (!cluster_options || !isfinite(cluster_options->resolution) ||
+         cluster_options->resolution <= 0.0 || cluster_options->max_nodes == 0 ||
+         cluster_options->max_nodes > INT_MAX || cluster_options->max_edges == 0 ||
+         cluster_options->max_edges > INT_MAX || cluster_options->max_move_visits == 0 ||
+         cluster_options->max_result_bytes == 0 ||
+         cluster_options->max_result_bytes > (uint64_t)SIZE_MAX)) {
+        cluster_receipt_begin(s, cluster_options);
+        rc = cluster_receipt_fail(
+            s, "CBM_ARCH_CLUSTER_OPTIONS_REQUIRED", "admission",
+            "explicit clustering requires resolution and all caller-owned positive work bounds",
+            "provide resolution, cluster_max_nodes, cluster_max_edges, cluster_max_move_visits, "
+            "and cluster_max_result_bytes with exactly representable values");
+        goto done;
+    }
+    if (arch_path_prepare(path, &scope) != CBM_STORE_OK) {
+        if (clusters_requested) {
+            cluster_receipt_begin(s, cluster_options);
+            rc = cluster_receipt_fail(
+                s, "CBM_ARCH_CLUSTER_SCOPE_ALLOCATION_FAILED", "admission",
+                "architecture clustering could not retain the exact literal path scope",
+                "free memory and retry the identical request; no truncated or wider scope is "
+                "accepted");
+        } else {
+            store_set_error(s, "architecture path normalization allocation failed");
+            rc = CBM_STORE_ERR;
+        }
+        goto done;
+    }
+    /* Run the explicitly bounded O(N+E) projection before any optional
+     * overview/file-tree materialization. A node, edge, move, or canonical
+     * result refusal therefore cannot be hidden behind unrelated response
+     * allocation or query work. */
+    if (clusters_requested) {
+        rc = arch_clusters(s, project, &scope, cluster_options, out);
+        if (rc != CBM_STORE_OK) {
+            goto done;
+        }
+    }
 
     if (want_aspect(aspects, aspect_count, "languages")) {
-        rc = arch_languages(s, project, path, out);
+        rc = arch_languages(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
     if (want_aspect(aspects, aspect_count, "packages")) {
-        rc = arch_packages(s, project, path, out);
+        rc = arch_packages(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
     if (want_aspect(aspects, aspect_count, "entry_points")) {
-        rc = arch_entry_points(s, project, path, out);
+        rc = arch_entry_points(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
     if (want_aspect(aspects, aspect_count, "routes")) {
-        rc = arch_routes(s, project, path, out);
+        rc = arch_routes(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
     if (want_aspect(aspects, aspect_count, "hotspots")) {
-        rc = arch_hotspots(s, project, path, out);
+        rc = arch_hotspots(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
     if (want_aspect(aspects, aspect_count, "boundaries")) {
         cbm_cross_pkg_boundary_t *barr = NULL;
         int bcount = 0;
-        rc = arch_boundaries(s, project, path, &barr, &bcount);
+        rc = arch_boundaries(s, project, &scope, &barr, &bcount);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
         out->boundaries = barr;
         out->boundary_count = bcount;
     }
     if (want_aspect(aspects, aspect_count, "layers")) {
-        rc = arch_layers(s, project, path, out);
+        rc = arch_layers(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
     if (want_aspect(aspects, aspect_count, "file_tree")) {
-        rc = arch_file_tree(s, project, path, out);
+        rc = arch_file_tree(s, project, &scope, out);
         if (rc != CBM_STORE_OK) {
-            return rc;
+            goto done;
         }
     }
-    if (want_aspect(aspects, aspect_count, "clusters")) {
-        rc = arch_clusters(s, project, path, out);
-        if (rc != CBM_STORE_OK) {
-            return rc;
-        }
+    rc = CBM_STORE_OK;
+done:
+    arch_path_scope_free(&scope);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_architecture_free(out);
     }
+    return rc;
+}
 
-    return CBM_STORE_OK;
+int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
+                               const char **aspects, int aspect_count,
+                               cbm_architecture_info_t *out) {
+    return cbm_store_get_architecture_with_options(s, project, path, aspects, aspect_count, NULL,
+                                                   out);
 }
 
 void cbm_store_architecture_free(cbm_architecture_info_t *out) {
@@ -10628,19 +13305,7 @@ void cbm_store_architecture_free(cbm_architecture_info_t *out) {
     }
     free(out->layers);
     for (int i = 0; i < out->cluster_count; i++) {
-        safe_str_free(&out->clusters[i].label);
-        for (int j = 0; j < out->clusters[i].top_node_count; j++) {
-            safe_str_free(&out->clusters[i].top_nodes[j]);
-        }
-        free(out->clusters[i].top_nodes);
-        for (int j = 0; j < out->clusters[i].package_count; j++) {
-            safe_str_free(&out->clusters[i].packages[j]);
-        }
-        free(out->clusters[i].packages);
-        for (int j = 0; j < out->clusters[i].edge_type_count; j++) {
-            safe_str_free(&out->clusters[i].edge_types[j]);
-        }
-        free(out->clusters[i].edge_types);
+        cluster_info_free(&out->clusters[i]);
     }
     free(out->clusters);
     for (int i = 0; i < out->file_tree_count; i++) {
@@ -11254,10 +13919,9 @@ static int read_vector_aggregate(cbm_store_t *s, const char *project, const char
     }
     int step_rc = sqlite3_step(stmt);
     int64_t exact_count = step_rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
-    int exact_min =
-        step_rc == SQLITE_ROW && sqlite3_column_type(stmt, SKIP_ONE) != SQLITE_NULL
-            ? sqlite3_column_int(stmt, SKIP_ONE)
-            : -1;
+    int exact_min = step_rc == SQLITE_ROW && sqlite3_column_type(stmt, SKIP_ONE) != SQLITE_NULL
+                        ? sqlite3_column_int(stmt, SKIP_ONE)
+                        : -1;
     int exact_max = step_rc == SQLITE_ROW && sqlite3_column_type(stmt, ST_COL_2) != SQLITE_NULL
                         ? sqlite3_column_int(stmt, ST_COL_2)
                         : -1;
@@ -11298,14 +13962,14 @@ int cbm_store_read_vector_state(cbm_store_t *s, const char *project,
             s, project,
             "SELECT count(*), min(length(vector)), max(length(vector)) FROM node_vectors "
             "WHERE project = ?1",
-            "read_node_vector_state", &out->node_vector_count,
-            &out->node_vector_min_dimension, &out->node_vector_max_dimension) != CBM_STORE_OK ||
+            "read_node_vector_state", &out->node_vector_count, &out->node_vector_min_dimension,
+            &out->node_vector_max_dimension) != CBM_STORE_OK ||
         read_vector_aggregate(
             s, project,
             "SELECT count(*), min(length(vector)), max(length(vector)) FROM token_vectors "
             "WHERE project = ?1",
-            "read_token_vector_state", &out->token_vector_count,
-            &out->token_vector_min_dimension, &out->token_vector_max_dimension) != CBM_STORE_OK) {
+            "read_token_vector_state", &out->token_vector_count, &out->token_vector_min_dimension,
+            &out->token_vector_max_dimension) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
@@ -11592,8 +14256,8 @@ static int vs_append_result(cbm_store_t *s, cbm_vector_result_t **results, int *
 }
 
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
-                            int keyword_count, int limit, cbm_vector_result_t **out,
-                            int *out_count, cbm_index_capability_t *observed_capability) {
+                            int keyword_count, int limit, cbm_vector_result_t **out, int *out_count,
+                            cbm_index_capability_t *observed_capability) {
     if (!out || !out_count) {
         return CBM_STORE_ERR;
     }
@@ -11609,9 +14273,8 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     cbm_project_t persisted_project = {0};
     int project_rc = cbm_store_get_project(s, project, &persisted_project);
     if (project_rc != CBM_STORE_OK) {
-        return project_rc == CBM_STORE_SEMANTIC_STATE_INVALID
-                   ? CBM_STORE_SEMANTIC_STATE_INVALID
-                   : CBM_STORE_ERR;
+        return project_rc == CBM_STORE_SEMANTIC_STATE_INVALID ? CBM_STORE_SEMANTIC_STATE_INVALID
+                                                              : CBM_STORE_ERR;
     }
     if (observed_capability) {
         *observed_capability = persisted_project.capability;

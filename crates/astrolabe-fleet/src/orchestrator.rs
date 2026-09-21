@@ -58,7 +58,7 @@
 //!   partial store is **removed and redone**: nothing ever transitioned, so
 //!   nothing is lost, and a torn CBM sqlite is never trusted as a base.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -67,6 +67,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use astrolabe_weave::read_current_kernel_generation;
+use astrolabe_weave::search::SLOT_NAME_SEMANTIC;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, VaultId};
@@ -165,6 +167,15 @@ pub struct RepoStoreIdentity {
     pub kernel_scope: String,
 }
 
+/// One pass-level catalog identity inventory built without display sorting.
+#[derive(Clone, Debug)]
+pub struct CatalogStoreIdentityInventory {
+    /// Requested stable store keys resolved to their exact durable identities.
+    pub identities: HashMap<String, RepoStoreIdentity>,
+    /// Total catalog rows decoded during the single Base-CF scan.
+    pub catalog_rows_scanned: usize,
+}
+
 /// Decodes a kerneled catalog row's exact store/inner identity binding.
 ///
 /// Legacy rows remain explicit rather than guessed: their already-durable
@@ -203,23 +214,63 @@ pub fn catalog_store_identity(
     catalog: &FleetCatalog,
     store_key: &str,
 ) -> Result<RepoStoreIdentity, CalyxError> {
-    let mut matches = catalog
-        .query(None, None)?
+    catalog_store_identities(catalog, [store_key])?
+        .identities
+        .remove(store_key)
+        .ok_or_else(|| {
+            project_identity_error(
+                store_key,
+                "stable store key has no matching fleet catalog row",
+            )
+        })
+}
+
+/// Resolves a requested stable-key roster with one catalog scan.
+///
+/// This is the pass-level counterpart to [`catalog_store_identity`]: callers
+/// verifying `R` repositories must not rescan and resort the whole catalog for
+/// each binding. Unrequested catalog rows may legitimately be pre-kernel and
+/// therefore are not forced through [`repo_store_identity`].
+pub fn catalog_store_identities<'a>(
+    catalog: &FleetCatalog,
+    store_keys: impl IntoIterator<Item = &'a str>,
+) -> Result<CatalogStoreIdentityInventory, CalyxError> {
+    let requested = store_keys
         .into_iter()
-        .filter(|row| project_name(&row.record.full_name) == store_key);
-    let row = matches.next().ok_or_else(|| {
-        project_identity_error(
-            store_key,
-            "stable store key has no matching fleet catalog row",
-        )
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let requested_lookup = requested.iter().cloned().collect::<HashSet<_>>();
+    let mut identities = HashMap::with_capacity(requested.len());
+    let mut catalog_rows_scanned = 0usize;
+    catalog.visit_rows(|row| {
+        catalog_rows_scanned = catalog_rows_scanned.checked_add(1).ok_or_else(|| {
+            project_identity_error("catalog", "pass-level decoded-row count overflowed usize")
+        })?;
+        let store_key = project_name(&row.record.full_name);
+        if !requested_lookup.contains(&store_key) {
+            return Ok(());
+        }
+        let identity = repo_store_identity(&row)?;
+        if identities.insert(store_key.clone(), identity).is_some() {
+            return Err(project_identity_error(
+                &store_key,
+                "stable store key maps to more than one fleet catalog row",
+            ));
+        }
+        Ok(())
     })?;
-    if matches.next().is_some() {
-        return Err(project_identity_error(
-            store_key,
-            "stable store key maps to more than one fleet catalog row",
-        ));
+    for store_key in requested {
+        if !identities.contains_key(&store_key) {
+            return Err(project_identity_error(
+                &store_key,
+                "stable store key has no matching fleet catalog row",
+            ));
+        }
     }
-    repo_store_identity(&row)
+    Ok(CatalogStoreIdentityInventory {
+        identities,
+        catalog_rows_scanned,
+    })
 }
 
 fn valid_index_project(project: &str) -> bool {
@@ -1938,9 +1989,22 @@ struct PersistedPipelineReadback {
 }
 
 /// Independent persisted-state readback: CBM sqlite counts, shadow-vault Base
-/// rows, and the exact persisted Kernel-CF artifact. The artifact's schema,
-/// scope, member cardinality, and members hash are re-derived from the stored
-/// member identities before the fleet transition can use them.
+/// rows, and the exact atomic current composite kernel generation. The
+/// generation's physical Ledger row, source binding, member HNSW, schema,
+/// scope, member cardinality, and members hash are verified before the fleet
+/// transition can use them.
+///
+/// # Cost contract (#1064)
+///
+/// At the measured 2026-08-20 production size `N=192,873`, `E=328,899`, the
+/// existing SQLite/Base census remains `O(N+E)`. The composite read adds one
+/// current `O(N+E)` projection traversal, one anchor/promotion rollup `O(A)`,
+/// `O(B+K)` over checksum-bound generation bytes `B` and member roster `K`, and
+/// current/previous physical Ledger point reads. `A`, `B`, and `K` come from
+/// persisted production state rather than a fixture guess. Project, scope,
+/// retained sequence, current generation, projection, anchor roster, member
+/// roster, and S20 source binding are invariant
+/// across the readback (PC-03/04/07/14/15/28/32/35/37/41/43).
 fn verify_persisted(
     store_dir: &Path,
     project: &str,
@@ -2015,7 +2079,16 @@ fn verify_persisted(
             restore_mvcc_rows: false,
             restore_ledger_hook: false,
             read_only: true,
-            selected_cfs: Some(vec![ColumnFamily::Base, ColumnFamily::Kernel]),
+            selected_cfs: Some(vec![
+                ColumnFamily::Base,
+                ColumnFamily::Graph,
+                ColumnFamily::Anchors,
+                ColumnFamily::Kv,
+                ColumnFamily::Kernel,
+                ColumnFamily::Compression,
+                ColumnFamily::Ledger,
+                ColumnFamily::slot(SLOT_NAME_SEMANTIC),
+            ]),
             ..VaultOptions::default()
         },
     )
@@ -2027,8 +2100,10 @@ fn verify_persisted(
             error.message
         )
     })?;
+    let readback_lease = vault.retain_latest_snapshot();
+    let snapshot = readback_lease.seq();
     let vault_base_rows = vault
-        .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
+        .scan_cf_at(snapshot, ColumnFamily::Base)
         .map_err(|error| {
             format!(
                 "scan shadow vault Base CF: {} — {}",
@@ -2042,15 +2117,94 @@ fn verify_persisted(
             vault_dir.display()
         ));
     }
+    readback_lease.record_progress();
 
-    // (c) Persisted kernel artifact, read back independently of the write
-    // path. Its exact member identities are the source of truth for the hash
-    // and count used by the fleet catalog (PC-32/PC-35/PC-37).
-    let artifact = astrolabe_ingest::read_persisted_kernel_artifact(&vault, scope)
-        .map_err(|error| format!("read persisted kernel artifact for {scope}: {error}"))?
+    if vault.latest_seq() != snapshot {
+        return Err(format!(
+            "shadow vault moved before atomic kernel readback: retained_seq={snapshot}, observed_seq={}",
+            vault.latest_seq()
+        ));
+    }
+
+    // (c) Atomic current composite generation, read back independently of the
+    // write path. The reader checksum-validates every bound row, the complete
+    // member HNSW and S20 source generations, and the current/previous physical
+    // Ledger entries. A fixed kernel.json alias is never a serving source.
+    let generation = read_current_kernel_generation(&vault, project, scope)
+        .map_err(|error| {
+            format!(
+                "read atomic current composite kernel generation for {scope}: {} — {} — remediation: {}",
+                error.code(),
+                error.message(),
+                error.remediation()
+            )
+        })?
         .ok_or_else(|| {
-            format!("no persisted kernel artifact in the Kernel CF for scope {scope}")
+            format!(
+                "no atomic current composite kernel generation in the Kernel CF for scope {scope}; a fixed kernel.json alias is not accepted"
+            )
         })?;
+    readback_lease.record_progress();
+    let projection = astrolabe_ingest::read_graph_projection_csr_bound_at(
+        &vault,
+        astrolabe_ingest::GraphProjectionKind::KernelGraph,
+        snapshot,
+        &astrolabe_ingest::GraphProjectionReadBinding {
+            graph_content_generation: generation
+                .manifest
+                .generation_source_binding
+                .graph_content_generation,
+            manifest: generation
+                .manifest
+                .generation_source_binding
+                .projection_manifest
+                .clone(),
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "read current KernelGraph projection for {scope}: {} — {}",
+            error.code().unwrap_or("ASTRO_INGEST_UNKNOWN"),
+            error.message()
+        )
+    })?;
+    readback_lease.record_progress();
+    let anchor_trust =
+        astrolabe_anchors::effective_anchor_trust_map_at(&vault, snapshot).map_err(|error| {
+            format!(
+                "read current anchor trust roster for {scope}: {} — {}",
+                error.code, error.message
+            )
+        })?;
+    readback_lease.record_progress();
+    let source_graph =
+        astrolabe_ingest::kernel_graph_from_projection_csr(&projection, &anchor_trust).map_err(
+            |error| {
+                format!(
+                    "adapt current KernelGraph projection for {scope}: {} — {}",
+                    error.code().unwrap_or("ASTRO_INGEST_UNKNOWN"),
+                    error.message()
+                )
+            },
+        )?;
+    let observed_source_identity =
+        astrolabe_kernel::kernel_source_identity(&source_graph, &generation.artifact.config)
+            .map_err(|error| {
+                format!(
+                    "recompute current kernel source identity for {scope}: {} — {}",
+                    error.code(),
+                    error.message()
+                )
+            })?;
+    if observed_source_identity != generation.artifact.source_identity {
+        return Err(format!(
+            "atomic current kernel source identity for {scope} differs from its retained projection/anchor/config state: generation={}, expected={}, observed={}",
+            generation.manifest.generation_id,
+            generation.artifact.source_identity.combined_hash,
+            observed_source_identity.combined_hash
+        ));
+    }
+    let artifact = generation.artifact;
     if artifact.schema != astrolabe_kernel::KERNEL_ARTIFACT_SCHEMA {
         return Err(format!(
             "persisted kernel artifact for scope {scope} has schema {:?}, expected {:?}",
@@ -2081,6 +2235,12 @@ fn verify_persisted(
         return Err(format!(
             "persisted kernel members-hash {} != re-derived {} for scope {scope}",
             artifact.members_hash, derived_members_hash
+        ));
+    }
+    if vault.latest_seq() != snapshot {
+        return Err(format!(
+            "shadow vault moved during atomic persisted-state readback: retained_seq={snapshot}, observed_seq={}",
+            vault.latest_seq()
         ));
     }
     Ok(PersistedPipelineReadback {

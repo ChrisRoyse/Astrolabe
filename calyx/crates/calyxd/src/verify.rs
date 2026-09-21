@@ -401,6 +401,13 @@ impl LedgerCfStore for RestoredLedgerRows {
         Ok(self.rows.clone())
     }
 
+    fn read_seq(&self, seq: u64) -> CalyxResult<Option<LedgerRow>> {
+        let Ok(index) = usize::try_from(seq) else {
+            return Ok(None);
+        };
+        Ok(self.rows.get(index).filter(|row| row.seq == seq).cloned())
+    }
+
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> CalyxResult<()> {
         Err(CalyxError::ledger_append_only_violation(format!(
             "verify-restore is read-only; rejected append for seq {seq}"

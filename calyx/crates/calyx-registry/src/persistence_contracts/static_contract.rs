@@ -527,7 +527,7 @@ fn multimodal_adapter_contract(
     })?;
     let config = load_adapter_config(adapter_config, parsed_axis, model_id, Some(dim))?;
     validate_contract_covers_loaded_paths("multimodal-adapter", &config.contract_paths(), files)?;
-    let observed_hash = crate::runtime::common::hash_files(&files.to_vec())?;
+    let observed_hash = crate::runtime::common::hash_files(files)?;
     if observed_hash != spec.weights_sha256 {
         return Err(CalyxError::lens_frozen_violation(format!(
             "multimodal adapter static contract artifact hash drift for {}",

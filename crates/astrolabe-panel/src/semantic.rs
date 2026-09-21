@@ -1739,6 +1739,60 @@ pub const SEMANTIC_RULES: &[SemanticRule] = &[
         Category,
         "sem.edge.resolution_kind"
     ),
+    rule!(
+        174,
+        205,
+        Project,
+        "index_mode",
+        Text,
+        Category,
+        "sem.project.index_mode"
+    ),
+    rule!(
+        175,
+        206,
+        Project,
+        "semantic_state",
+        Text,
+        Category,
+        "sem.project.semantic_state"
+    ),
+    rule!(
+        176,
+        207,
+        Project,
+        "semantic_vector_dimension",
+        Integer,
+        Numeric,
+        "sem.project.semantic_vector_dimension"
+    ),
+    rule!(
+        177,
+        208,
+        Project,
+        "semantic_eligible_node_count",
+        Integer,
+        Numeric,
+        "sem.project.semantic_eligible_node_count"
+    ),
+    rule!(
+        178,
+        209,
+        Project,
+        "node_vector_count",
+        Integer,
+        Numeric,
+        "sem.project.node_vector_count"
+    ),
+    rule!(
+        179,
+        210,
+        Project,
+        "token_vector_count",
+        Integer,
+        Numeric,
+        "sem.project.token_vector_count"
+    ),
 ];
 
 /// Number of rules frozen into the panel-v3/v4 prefix.
@@ -1753,8 +1807,12 @@ pub const SEMANTIC_V5_SLOT_END: u16 = 195;
 pub const SEMANTIC_V6_RULE_COUNT: usize = 169;
 /// Last semantic slot id in the panel-v6 frozen roster.
 pub const SEMANTIC_V6_SLOT_END: u16 = 199;
+/// Number of rules frozen into the panel-v7 prefix.
+pub const SEMANTIC_V7_RULE_COUNT: usize = 174;
+/// Last semantic slot id in the panel-v7 frozen roster.
+pub const SEMANTIC_V7_SLOT_END: u16 = 204;
 /// Last semantic slot id in the current frozen roster.
-pub const SEMANTIC_SLOT_END: u16 = 204;
+pub const SEMANTIC_SLOT_END: u16 = 210;
 
 const PRESENCE_SLOTS: &[PanelSlotSpec] = &[
     presence_slot(24, "sem.presence.project"),
@@ -1832,6 +1890,18 @@ pub static SEMANTIC_SLOT_SPECS_V6: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(
     out
 });
 
+/// Frozen semantic slot specifications used by panel v7. This prefix must
+/// remain byte-identical when later producer atoms append new rules.
+pub static SEMANTIC_SLOT_SPECS_V7: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut out = PRESENCE_SLOTS.to_vec();
+    out.extend(
+        SEMANTIC_RULES[..SEMANTIC_V7_RULE_COUNT]
+            .iter()
+            .map(slot_spec_for_rule),
+    );
+    out
+});
+
 /// Frozen current semantic slot specifications.
 pub static SEMANTIC_SLOT_SPECS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
     let mut out = PRESENCE_SLOTS.to_vec();
@@ -1898,6 +1968,7 @@ pub fn semantic_rule_count_for_family_version(family: SemanticFamily, version: u
         0..=crate::PANEL_V4_VERSION => &SEMANTIC_RULES[..SEMANTIC_V4_RULE_COUNT],
         crate::PANEL_V5_VERSION => &SEMANTIC_RULES[..SEMANTIC_V5_RULE_COUNT],
         crate::PANEL_V6_VERSION => &SEMANTIC_RULES[..SEMANTIC_V6_RULE_COUNT],
+        crate::PANEL_V7_VERSION => &SEMANTIC_RULES[..SEMANTIC_V7_RULE_COUNT],
         _ => SEMANTIC_RULES,
     };
     rules.iter().filter(|rule| rule.family == family).count()
@@ -1928,6 +1999,10 @@ pub fn semantic_registry_sha256_for_panel(version: u32) -> [u8; 32] {
         crate::PANEL_V6_VERSION => (
             SEMANTIC_REGISTRY_SCHEMA_V2,
             &SEMANTIC_RULES[..SEMANTIC_V6_RULE_COUNT],
+        ),
+        crate::PANEL_V7_VERSION => (
+            SEMANTIC_REGISTRY_SCHEMA_V2,
+            &SEMANTIC_RULES[..SEMANTIC_V7_RULE_COUNT],
         ),
         _ => (SEMANTIC_REGISTRY_SCHEMA_V2, SEMANTIC_RULES),
     };

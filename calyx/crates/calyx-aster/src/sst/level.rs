@@ -111,7 +111,7 @@ impl ExactKeyRoutes {
         // Preflight every fallible byte-accounting operation before replacing
         // any route, so an overflow leaves the prior complete index untouched.
         let added_key_bytes = lookup.index.iter().try_fold(0_u64, |total, entry| {
-            if self.routes.get::<[u8]>(entry.key.as_slice()).is_some() {
+            if self.routes.contains::<[u8]>(entry.key.as_slice()) {
                 return Ok(total);
             }
             total

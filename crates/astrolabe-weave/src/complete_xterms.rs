@@ -18,7 +18,7 @@ use astrolabe_domain::fsv::FsvAck;
 use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, KeyRange, prefix_range};
 use calyx_aster::mvcc::{LatestOnlyReadbackStatus, tombstone_value};
-use calyx_aster::vault::encode::BaseRecord;
+use calyx_aster::vault::encode::{BaseRecord, encode_slot_vector};
 use calyx_aster::vault::{
     AsterVault, OrderedCfRead, SstReadSession, VaultOptions, decode_strict_raw_slot_value,
 };
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hex_lower_bytes;
 use crate::sim_rows::ledger_ref_at_commit;
-use crate::slot_source::WeaveSlotSource;
+use crate::slot_source::{WeaveSlotBinding, WeaveSlotSource};
 use crate::xterm_cotenant::{
     XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_BLOCK_MAGIC,
     XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
@@ -46,6 +46,8 @@ const LEGACY_COMPLETE_WITNESS_PREFIX: &[u8] = b"astrolabe:complete-xterm-witness
 pub const COMPLETE_PAIR_BLOCK_SCHEMA: &str = XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA;
 pub const COMPLETE_WITNESS_SCHEMA: &str = "astrolabe.complete_pair_witness.v2";
 pub const COMPLETE_ASSOCIATION_LEDGER_SCHEMA: &str = "astrolabe.complete_association_commit.v2";
+pub const COMPLETE_ASSOCIATION_VERIFIED_STATE_SCHEMA: &str =
+    "astrolabe.complete_association_verified_state.v1";
 pub const COMPLETE_PAIR_BLOCK_PREFIX: &[u8] = b"astrolabe:complete-xterm-block:v2\0";
 pub const COMPLETE_WITNESS_PREFIX: &[u8] = b"astrolabe:complete-xterm-witness:v2\0";
 /// Binary schema discriminator understood by every full-XTerm co-tenant scan.
@@ -390,14 +392,24 @@ pub struct CompleteAssociationSourceReceipt {
     /// inventory. Later bounded hydration sessions may read at newer global
     /// sequences after writes to disjoint derived CFs.
     pub snapshot_seq: u64,
+    pub representation_binding_snapshot_seq: u64,
+    pub representation_final_verification_snapshot_seq: u64,
     pub hydration_snapshot_first: Option<u64>,
     pub hydration_snapshot_last: Option<u64>,
+    pub hydration_snapshots: Vec<u64>,
     pub source_cf_generations: BTreeMap<String, u64>,
+    pub source_cf_generations_after: BTreeMap<String, u64>,
     pub base_rows: usize,
     pub base_scan_pages: usize,
     pub base_page_rows_high_water: usize,
+    /// Maximum Base rows admitted to one ordered inventory page. This is
+    /// distinct from the smaller source-hydration batch bound below.
+    pub source_scan_page_rows_cap: usize,
     pub source_records_loaded: usize,
     pub source_record_batches: usize,
+    /// Maximum source identities admitted to one hydration batch. This is the
+    /// production algorithmic bound, not a measured corpus threshold.
+    pub source_record_batch_cap: usize,
     /// Raw Slot-CF rows covered by Aster ordered physical telemetry.
     pub slot_rows_read: usize,
     /// Raw persisted Slot-CF value bytes covered by that telemetry.
@@ -408,11 +420,26 @@ pub struct CompleteAssociationSourceReceipt {
     pub compressed_slot_batches: usize,
     /// Immutable generation identities bound into every source fingerprint.
     pub compressed_generation_identities: BTreeMap<String, String>,
+    /// Every source slot's exact raw/compressed representation binding. Raw
+    /// manifest absence is recorded explicitly rather than inferred from an
+    /// omitted compressed identity.
+    pub slot_representation_bindings: BTreeMap<String, String>,
+    pub representation_bindings_verified_after: bool,
     pub slot_batch_bytes_high_water: u64,
     pub readback_plan_bytes_high_water: u64,
     pub exact_source_reassemblies: usize,
     pub storage_before: Option<LatestOnlyReadbackStatus>,
     pub storage_after: Option<LatestOnlyReadbackStatus>,
+}
+
+/// Read-only proof that the current Base/Slot/Compression source bytes still
+/// equal every persisted completion witness and decoded XTerm block. Unlike
+/// reconciliation, this operation never repairs or publishes state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedCompleteAssociationState {
+    pub schema: String,
+    pub state: CompleteAssociationState,
+    pub source: CompleteAssociationSourceReceipt,
 }
 
 #[derive(Debug)]
@@ -447,10 +474,10 @@ where
     read_complete_association_state_at(vault, snapshot)
 }
 
-/// Independently reconstructs and verifies the complete Base/Slot/XTerm state
-/// at one caller-retained MVCC sequence.  Discovery callers use this instead of
-/// taking a second snapshot after loading the graph, so every association stage
-/// is provably bound to the same physical source generation.
+/// Independently reconstructs the persisted completion witnesses and XTerm
+/// blocks at one caller-selected MVCC sequence. Call
+/// [`verify_complete_association_state_at`] when current Base/Slot source
+/// equality is also required.
 pub fn read_complete_association_state_at<C>(
     vault: &AsterVault<C>,
     snapshot: u64,
@@ -466,6 +493,271 @@ where
         ));
     }
     Ok(state.public)
+}
+
+/// Independently verifies the complete-association output against every exact
+/// current Base and raw/compressed Slot source row at `snapshot`.
+///
+/// This is the stable cross-process source proof used by association discovery.
+/// Handle-local CF generation counters are retained as diagnostics, while the
+/// witness/source hashes and exact row hydration establish logical identity.
+/// Its deliberate generation-bound cost is O(N+X): every current Base and its
+/// complete Slot/Compression/XTerm derivation is hydrated and byte-compared.
+/// At #1064's 2026-08-08 production inventory N=192,873 while X remains an
+/// explicit measurement gap because the producer has no Merkle manifest. Keep
+/// this proof on prepare/publish/read generation operations, not query paths.
+pub fn verify_complete_association_state_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    vault_panel_root: Option<&Path>,
+) -> calyx_core::Result<VerifiedCompleteAssociationState>
+where
+    C: Clock,
+{
+    let storage_before = vault.latest_only_readback_status();
+    ensure_bounded_source_storage(
+        &storage_before,
+        "complete-association verified read pre-state",
+    )?;
+    let source_binding_lease = vault.retain_latest_snapshot();
+    if source_binding_lease.seq() != snapshot || vault.latest_seq() != snapshot {
+        return Err(source_corrupt(format!(
+            "complete-association verified read requires the exact latest retained snapshot {snapshot}, observed lease={} latest={}",
+            source_binding_lease.seq(),
+            vault.latest_seq(),
+        )));
+    }
+    let source = WeaveSlotSource::open(snapshot, vault_panel_root, None)?;
+    let persisted = read_persisted_state_at(vault, snapshot)?;
+    let legacy = read_legacy_v1_state_at(vault, snapshot)?;
+    if !legacy.witnesses.is_empty() || !legacy.row_owners.is_empty() {
+        return Err(completion_corrupt(
+            "active v1 association rows remain; verified source read requires an exact v2 completion generation",
+        ));
+    }
+
+    let mut roster_cache = BTreeMap::<u32, BTreeSet<SlotId>>::new();
+    let mut slot_representation_ids = BTreeMap::<SlotId, String>::new();
+    let mut slot_bindings = BTreeMap::<SlotId, WeaveSlotBinding>::new();
+    let inventory = inventory_association_sources_at(
+        vault,
+        snapshot,
+        &persisted,
+        &mut roster_cache,
+        &source,
+        &mut slot_representation_ids,
+        &mut slot_bindings,
+    )?;
+    let current_id_set = inventory
+        .current_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let persisted_id_set = persisted.witnesses.keys().copied().collect::<BTreeSet<_>>();
+    if current_id_set != persisted_id_set || !inventory.changed_ids.is_empty() {
+        return Err(completion_corrupt(format!(
+            "complete-association source differs from its persisted witness roster: current_ids={} persisted_ids={} changed_ids={:?}",
+            current_id_set.len(),
+            persisted_id_set.len(),
+            inventory.changed_ids,
+        )));
+    }
+
+    let mut source_receipt = inventory.receipt;
+    source_receipt.representation_binding_snapshot_seq = snapshot;
+    let mut source_cfs = BTreeSet::from([ColumnFamily::Base, ColumnFamily::Compression]);
+    source_cfs.extend(slot_bindings.keys().copied().map(ColumnFamily::slot));
+    let source_cf_generations = source_cfs
+        .iter()
+        .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
+        .collect::<calyx_core::Result<BTreeMap<_, _>>>()?;
+    for binding in slot_bindings.values() {
+        if source_cf_generations.get(&ColumnFamily::slot(binding.slot))
+            != Some(&binding.slot_cf_generation)
+            || source_cf_generations.get(&ColumnFamily::Compression)
+                != Some(&binding.compression_cf_generation)
+        {
+            return Err(source_corrupt(format!(
+                "complete-association verified read S{} binding disagrees with captured source generations: binding={binding:?}, generations={source_cf_generations:?}",
+                binding.slot.get(),
+            )));
+        }
+    }
+    source_receipt.source_cf_generations = source_cf_generations
+        .iter()
+        .map(|(cf, generation)| (cf.name().to_string(), *generation))
+        .collect();
+    ensure_complete_source_generations(
+        vault,
+        &source_cf_generations,
+        "verified-read pre-hydration",
+    )?;
+
+    let source_session = vault.sst_read_session_at(snapshot)?;
+    let mut rederived = CompleteAssociationState {
+        constellation_count: 0,
+        source_slot_count: 0,
+        not_applicable_slot_count: 0,
+        applicable_slot_count: 0,
+        expected_pair_count: 0,
+        computed_pair_count: 0,
+        typed_incompatible_pair_count: 0,
+        completion_row_count: 0,
+        physical_block_count: 0,
+        panel_version_counts: BTreeMap::new(),
+        metric_counts: PairMetricCounts::default(),
+        typed_reason_counts: PairReasonCounts::default(),
+        absent_slot_reason_counts: BTreeMap::new(),
+        witness_state_hash: String::new(),
+        pair_key_stream_hash: String::new(),
+        pair_value_stream_hash: String::new(),
+    };
+    let mut rederived_witness_stream = blake3::Hasher::new();
+    let mut rederived_key_stream = blake3::Hasher::new();
+    let mut rederived_value_stream = blake3::Hasher::new();
+    if !inventory.current_ids.is_empty() {
+        source_receipt.hydration_snapshot_first = Some(snapshot);
+        source_receipt.hydration_snapshot_last = Some(snapshot);
+        source_receipt.hydration_snapshots.push(snapshot);
+    }
+    for source_ids in inventory.current_ids.chunks(SOURCE_RECORD_BATCH) {
+        source_binding_lease.record_progress();
+        let records = load_constellation_batch(ConstellationBatchRequest {
+            vault,
+            source: &source_session,
+            slot_source: &source,
+            cx_ids: source_ids,
+            current_sources: &inventory.current_sources,
+            roster_cache: &mut roster_cache,
+            slot_representation_ids: &slot_representation_ids,
+            slot_bindings: &slot_bindings,
+            receipt: &mut source_receipt,
+        })?;
+        if records.len() != source_ids.len() {
+            return Err(source_corrupt(format!(
+                "complete-association verified read hydrated {} source rows for {} requested identities",
+                records.len(),
+                source_ids.len(),
+            )));
+        }
+        for (expected_cx_id, record) in source_ids.iter().zip(&records) {
+            if record.cx_id != *expected_cx_id {
+                return Err(source_corrupt(format!(
+                    "complete-association verified read hydration order differs: expected Base {} observed {}",
+                    cx_hex(*expected_cx_id),
+                    cx_hex(record.cx_id),
+                )));
+            }
+            let planned = plan_constellation(record)?;
+            let (persisted_witness_bytes, _) =
+                persisted.witnesses.get(expected_cx_id).ok_or_else(|| {
+                    completion_corrupt(format!(
+                        "hydrated Base {} has no persisted completion witness",
+                        cx_hex(*expected_cx_id)
+                    ))
+                })?;
+            if planned.witness_key != witness_key(*expected_cx_id)
+                || planned.witness_bytes != *persisted_witness_bytes
+            {
+                return Err(completion_corrupt(format!(
+                    "hydrated Base {} replans to witness bytes different from the persisted exact witness",
+                    cx_hex(*expected_cx_id)
+                )));
+            }
+            let persisted_block_bytes = vault
+                .read_cf_at(snapshot, ColumnFamily::XTerm, &planned.block_key)?
+                .ok_or_else(|| {
+                    completion_corrupt(format!(
+                        "hydrated Base {} has no persisted exact XTerm block",
+                        cx_hex(*expected_cx_id)
+                    ))
+                })?;
+            if planned.block_key != block_key(*expected_cx_id)
+                || planned.block_bytes != persisted_block_bytes
+            {
+                return Err(completion_corrupt(format!(
+                    "hydrated Base {} replans to XTerm block bytes different from the persisted exact block",
+                    cx_hex(*expected_cx_id)
+                )));
+            }
+            let decoded = decode_pair_block(*expected_cx_id, &planned.block_bytes)?;
+            validate_witness_block(
+                *expected_cx_id,
+                &planned.witness,
+                &planned.block_bytes,
+                &decoded,
+            )?;
+            rederived.constellation_count = checked_add(
+                rederived.constellation_count,
+                1,
+                "source-rederived constellations",
+            )?;
+            rederived.physical_block_count = checked_add(
+                rederived.physical_block_count,
+                1,
+                "source-rederived physical blocks",
+            )?;
+            accumulate_decoded_block(&mut rederived, &decoded)?;
+            update_hash_part(&mut rederived_witness_stream, &planned.witness_key);
+            update_hash_part(&mut rederived_witness_stream, &planned.witness_bytes);
+            rederived_key_stream.update(&decoded.pair_key_stream);
+            rederived_value_stream.update(&decoded.pair_value_stream);
+        }
+        source_binding_lease.record_progress();
+    }
+    drop(source_session);
+    rederived.witness_state_hash = hex_lower_bytes(rederived_witness_stream.finalize().as_bytes());
+    rederived.pair_key_stream_hash = hex_lower_bytes(rederived_key_stream.finalize().as_bytes());
+    rederived.pair_value_stream_hash =
+        hex_lower_bytes(rederived_value_stream.finalize().as_bytes());
+    if rederived != persisted.public {
+        return Err(completion_corrupt(format!(
+            "source-replanned complete-association aggregate differs from the independently decoded persisted aggregate: source={rederived:?} persisted={:?}",
+            persisted.public,
+        )));
+    }
+    if vault.latest_seq() != snapshot {
+        return Err(source_corrupt(format!(
+            "complete-association source changed during verified read: expected snapshot {snapshot}, observed {}",
+            vault.latest_seq(),
+        )));
+    }
+    ensure_complete_source_generations(
+        vault,
+        &source_cf_generations,
+        "verified-read post-hydration",
+    )?;
+    for binding in slot_bindings.values() {
+        source.verify_latest_binding_at(vault, snapshot, binding)?;
+    }
+    let source_cf_generations_after = source_cfs
+        .iter()
+        .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
+        .collect::<calyx_core::Result<BTreeMap<_, _>>>()?;
+    if source_cf_generations_after != source_cf_generations {
+        return Err(source_corrupt(format!(
+            "complete-association source generations changed during verified read: before={source_cf_generations:?}, after={source_cf_generations_after:?}"
+        )));
+    }
+    source_receipt.representation_final_verification_snapshot_seq = snapshot;
+    source_receipt.source_cf_generations_after = source_cf_generations_after
+        .iter()
+        .map(|(cf, generation)| (cf.name().to_string(), *generation))
+        .collect();
+    source_receipt.representation_bindings_verified_after = true;
+    drop(source_binding_lease);
+    let storage_after = vault.latest_only_readback_status();
+    ensure_bounded_source_storage(
+        &storage_after,
+        "complete-association verified read post-state",
+    )?;
+    source_receipt.storage_before = Some(storage_before);
+    source_receipt.storage_after = Some(storage_after);
+    Ok(VerifiedCompleteAssociationState {
+        schema: COMPLETE_ASSOCIATION_VERIFIED_STATE_SCHEMA.to_string(),
+        state: persisted.public,
+        source: source_receipt,
+    })
 }
 
 /// Opens the real durable vault read-only and independently verifies every
@@ -512,8 +804,8 @@ where
     let storage_before = vault.latest_only_readback_status();
     ensure_bounded_source_storage(&storage_before, "complete-association pre-read")?;
     let base_generation_before = vault.cf_content_generation(ColumnFamily::Base)?;
-    let snapshot_lease = vault.retain_latest_snapshot();
-    let snapshot = snapshot_lease.seq();
+    let source_binding_lease = vault.retain_latest_snapshot();
+    let snapshot = source_binding_lease.seq();
     let source = WeaveSlotSource::open(snapshot, vault_panel_root, None)?;
     let persisted = read_persisted_state_at(vault, snapshot)?;
     let legacy = read_legacy_v1_state_at(vault, snapshot)?;
@@ -528,6 +820,7 @@ where
     }
     let mut roster_cache = BTreeMap::<u32, BTreeSet<SlotId>>::new();
     let mut slot_representation_ids = BTreeMap::<SlotId, String>::new();
+    let mut slot_bindings = BTreeMap::<SlotId, WeaveSlotBinding>::new();
     let inventory = inventory_association_sources_at(
         vault,
         snapshot,
@@ -535,6 +828,7 @@ where
         &mut roster_cache,
         &source,
         &mut slot_representation_ids,
+        &mut slot_bindings,
     )?;
     let current_id_set = inventory
         .current_ids
@@ -548,6 +842,7 @@ where
     let pair_outcomes_unchanged = inventory.pair_outcomes_unchanged;
     let blocks_unchanged = inventory.blocks_unchanged;
     let mut source_receipt = inventory.receipt;
+    source_receipt.representation_binding_snapshot_seq = snapshot;
     let base_generation_after_inventory = vault.cf_content_generation(ColumnFamily::Base)?;
     if vault.snapshot() != snapshot || base_generation_after_inventory != base_generation_before {
         return Err(source_corrupt(format!(
@@ -555,27 +850,39 @@ where
             vault.snapshot(),
         )));
     }
-    let mut source_cfs = BTreeSet::from([ColumnFamily::Base]);
-    source_cfs.extend(
-        roster_cache
-            .values()
-            .flat_map(|slots| slots.iter().copied())
-            .map(ColumnFamily::slot),
-    );
-    if slot_representation_ids
-        .values()
-        .any(|identity| identity.starts_with("registry-compressed:"))
-    {
-        source_cfs.insert(ColumnFamily::Compression);
-    }
+    // Compression generation, including manifest absence, is part of every
+    // representation binding. Keep it in the source contract even when every
+    // currently observed slot is raw.
+    let mut source_cfs = BTreeSet::from([ColumnFamily::Base, ColumnFamily::Compression]);
+    source_cfs.extend(slot_bindings.keys().copied().map(ColumnFamily::slot));
     let source_cf_generations = source_cfs
         .iter()
         .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
         .collect::<calyx_core::Result<BTreeMap<_, _>>>()?;
+    for binding in slot_bindings.values() {
+        if source_cf_generations.get(&ColumnFamily::slot(binding.slot))
+            != Some(&binding.slot_cf_generation)
+            || source_cf_generations.get(&ColumnFamily::Compression)
+                != Some(&binding.compression_cf_generation)
+        {
+            return Err(source_corrupt(format!(
+                "complete-association typed S{} binding disagrees with captured source generations: binding={binding:?}, generations={source_cf_generations:?}",
+                binding.slot.get(),
+            )));
+        }
+    }
     source_receipt.source_cf_generations = source_cf_generations
         .iter()
         .map(|(cf, generation)| (cf.name().to_string(), *generation))
         .collect();
+    if vault.latest_seq() != snapshot {
+        return Err(source_corrupt(format!(
+            "complete-association global generation changed while binding source representations: seq_before={snapshot}, seq_after={}",
+            vault.latest_seq(),
+        )));
+    }
+    ensure_complete_source_generations(vault, &source_cf_generations, "post-binding")?;
+    drop(source_binding_lease);
     let removed = persisted
         .witnesses
         .keys()
@@ -604,9 +911,10 @@ where
     let tombstone = tombstone_value();
 
     for source_ids in changed_ids.chunks(SOURCE_RECORD_BATCH) {
-        snapshot_lease.record_progress();
         ensure_complete_source_generations(vault, &source_cf_generations, "pre-hydration")?;
-        let hydration_snapshot = vault.snapshot();
+        let hydration_lease = vault.retain_latest_snapshot();
+        let hydration_snapshot = hydration_lease.seq();
+        source_receipt.hydration_snapshots.push(hydration_snapshot);
         source_receipt
             .hydration_snapshot_first
             .get_or_insert(hydration_snapshot);
@@ -620,16 +928,18 @@ where
             current_sources: &current_sources,
             roster_cache: &mut roster_cache,
             slot_representation_ids: &slot_representation_ids,
+            slot_bindings: &slot_bindings,
             receipt: &mut source_receipt,
         })?;
         drop(source_session);
-        if vault.snapshot() != hydration_snapshot {
+        if vault.latest_seq() != hydration_snapshot {
             return Err(source_corrupt(format!(
                 "complete-association global generation changed during source hydration: seq_before={hydration_snapshot}, seq_after={}",
-                vault.snapshot(),
+                vault.latest_seq(),
             )));
         }
         ensure_complete_source_generations(vault, &source_cf_generations, "post-hydration")?;
+        drop(hydration_lease);
         for record_batch in records.chunks(PLANNING_RECORD_BATCH) {
             let planned_batch = record_batch
                 .par_iter()
@@ -729,9 +1039,7 @@ where
                 }
             }
         }
-        snapshot_lease.record_progress();
     }
-    drop(snapshot_lease);
 
     for cx_id in &removed {
         let mut record_mutations = Vec::new();
@@ -842,9 +1150,33 @@ where
             )));
         }
     }
+    let final_binding_lease = vault.retain_latest_snapshot();
+    let final_binding_snapshot = final_binding_lease.seq();
+    ensure_complete_source_generations(vault, &source_cf_generations, "post-reconciliation")?;
+    for binding in slot_bindings.values() {
+        source.verify_latest_binding_at(vault, final_binding_snapshot, binding)?;
+    }
+    let source_cf_generations_after = source_cfs
+        .iter()
+        .map(|cf| Ok((*cf, vault.cf_content_generation(*cf)?)))
+        .collect::<calyx_core::Result<BTreeMap<_, _>>>()?;
+    if source_cf_generations_after != source_cf_generations
+        || vault.latest_seq() != final_binding_snapshot
+    {
+        return Err(source_corrupt(format!(
+            "complete-association source changed during final representation verification: expected_generations={source_cf_generations:?}, observed_generations={source_cf_generations_after:?}, verification_seq={final_binding_snapshot}, observed_latest_seq={}",
+            vault.latest_seq(),
+        )));
+    }
+    source_receipt.representation_final_verification_snapshot_seq = final_binding_snapshot;
+    source_receipt.source_cf_generations_after = source_cf_generations_after
+        .iter()
+        .map(|(cf, generation)| (cf.name().to_string(), *generation))
+        .collect();
+    source_receipt.representation_bindings_verified_after = true;
+    drop(final_binding_lease);
     let storage_after = vault.latest_only_readback_status();
     ensure_bounded_source_storage(&storage_after, "complete-association post-readback")?;
-    ensure_complete_source_generations(vault, &source_cf_generations, "post-reconciliation")?;
     source_receipt.storage_before = Some(storage_before);
     source_receipt.storage_after = Some(storage_after);
 
@@ -1045,6 +1377,7 @@ fn inventory_association_sources_at<C>(
     roster_cache: &mut BTreeMap<u32, BTreeSet<SlotId>>,
     source: &WeaveSlotSource,
     slot_representation_ids: &mut BTreeMap<SlotId, String>,
+    slot_bindings: &mut BTreeMap<SlotId, WeaveSlotBinding>,
 ) -> calyx_core::Result<AssociationSourceInventory>
 where
     C: Clock,
@@ -1057,6 +1390,8 @@ where
     let mut blocks_unchanged = 0usize;
     let mut receipt = CompleteAssociationSourceReceipt {
         snapshot_seq: snapshot,
+        source_scan_page_rows_cap: SOURCE_SCAN_PAGE_ROWS,
+        source_record_batch_cap: SOURCE_RECORD_BATCH,
         ..CompleteAssociationSourceReceipt::default()
     };
     let range = KeyRange {
@@ -1077,10 +1412,10 @@ where
                 source.ensure_panel_version(record.constellation().panel_version)?;
                 for slot in record.slot_hashes().keys() {
                     if !slot_representation_ids.contains_key(slot) {
-                        let identity = source.compressed_generation_identity(vault, *slot)?;
-                        let binding = match identity {
+                        let slot_binding = source.bind_latest_at(vault, snapshot, *slot)?;
+                        let representation = match &slot_binding.compressed_generation_identity {
                             Some(identity) => {
-                                let bytes = serde_json::to_vec(&identity).map_err(|error| {
+                                let bytes = serde_json::to_vec(identity).map_err(|error| {
                                     source_corrupt(format!(
                                         "encode compressed S{} generation identity: {error}",
                                         slot.get()
@@ -1095,7 +1430,16 @@ where
                             }
                             None => "aster-raw-slot-vector-v1".to_string(),
                         };
-                        slot_representation_ids.insert(*slot, binding);
+                        receipt
+                            .slot_representation_bindings
+                            .insert(format!("S{}", slot.get()), representation.clone());
+                        slot_representation_ids.insert(*slot, representation);
+                        if slot_bindings.insert(*slot, slot_binding).is_some() {
+                            return Err(source_corrupt(format!(
+                                "source binding for S{} was populated more than once",
+                                slot.get()
+                            )));
+                        }
                     }
                 }
                 source.ensure_panel_version(record.constellation().panel_version)?;
@@ -1161,6 +1505,7 @@ where
     current_sources: &'batch BTreeMap<CxId, String>,
     roster_cache: &'batch mut BTreeMap<u32, BTreeSet<SlotId>>,
     slot_representation_ids: &'batch BTreeMap<SlotId, String>,
+    slot_bindings: &'batch BTreeMap<SlotId, WeaveSlotBinding>,
     receipt: &'batch mut CompleteAssociationSourceReceipt,
 }
 
@@ -1178,6 +1523,7 @@ where
         current_sources,
         roster_cache,
         slot_representation_ids,
+        slot_bindings,
         receipt,
     } = request;
     let base_reads = cx_ids
@@ -1324,7 +1670,14 @@ where
             .iter()
             .map(|ordinal| bases[*ordinal].cx_id)
             .collect::<Vec<_>>();
-        let resolved = slot_source.resolve_many(vault, slot, &requested)?;
+        let binding = slot_bindings.get(&slot).ok_or_else(|| {
+            source_corrupt(format!(
+                "Registry compressed S{} route has no operation-wide source binding",
+                slot.get()
+            ))
+        })?;
+        let resolved =
+            slot_source.resolve_many_bound_at(vault, source.snapshot_seq(), binding, &requested)?;
         if resolved.len() != requested.len() {
             return Err(source_corrupt(format!(
                 "Registry compressed S{} batch returned {} rows for {} requested Base identities",
@@ -1349,6 +1702,24 @@ where
                     slot.get()
                 ))
             })?;
+            let encoded = encode_slot_vector(&vector)?;
+            let expected_hash = bases[base_ordinal].slot_hashes.get(&slot).ok_or_else(|| {
+                source_corrupt(format!(
+                    "compressed S{} resolution produced an unrequested Base {} slot",
+                    slot.get(),
+                    cx_hex(expected_cx_id)
+                ))
+            })?;
+            let observed_hash = blake3::hash(&encoded);
+            if observed_hash.as_bytes() != expected_hash {
+                return Err(source_corrupt(format!(
+                    "Base {} compressed S{} hash mismatch: expected={} observed={}",
+                    cx_hex(expected_cx_id),
+                    slot.get(),
+                    hex_lower_bytes(expected_hash),
+                    hex_lower_bytes(observed_hash.as_bytes())
+                )));
+            }
             insert_resolved_slot(&mut records, base_ordinal, slot, vector)?;
         }
         receipt.compressed_rows_read = checked_add(
@@ -1366,6 +1737,11 @@ where
         receipt.source_records_loaded,
         records.len(),
         "source records loaded",
+    )?;
+    receipt.exact_source_reassemblies = checked_add(
+        receipt.exact_source_reassemblies,
+        records.len(),
+        "exact source reassemblies",
     )?;
     receipt.source_record_batches =
         checked_add(receipt.source_record_batches, 1, "source record batches")?;

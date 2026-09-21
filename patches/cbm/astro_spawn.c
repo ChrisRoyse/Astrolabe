@@ -676,7 +676,7 @@ done:
 }
 
 static int spawn_capture_impl(const char *const *argv, const char *working_directory,
-                               char **out_data, size_t *out_len,
+                               char **out_data, size_t *out_len, size_t stdout_limit,
                                size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
                                bool capture_stderr, const char *source_date_epoch,
                                cbm_spawn_stdout_progress_cb on_stdout_progress, void *progress_ud,
@@ -932,6 +932,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     char chunk[SPAWN_READ_CHUNK];
     bool read_ok = true;
     bool progress_ok = true;
+    bool output_limit_exceeded = false;
     int read_failure_code = CBM_SPAWN_OK;
     DWORD read_gle = 0;
     for (;;) {
@@ -946,6 +947,12 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
             break;
         }
         if (got == 0) {
+            break;
+        }
+        if (stdout_limit != 0 &&
+            (buf.len > stdout_limit || (size_t)got > stdout_limit - buf.len)) {
+            output_limit_exceeded = true;
+            (void)TerminateProcess(pi.hProcess, 1);
             break;
         }
         if (!spawn_buf_append(&buf, chunk, (size_t)got)) {
@@ -999,6 +1006,15 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         stderr_reader = NULL;
     }
 
+    if (output_limit_exceeded) {
+        free(buf.data);
+        free(stderr_buf.data);
+        return spawn_fail(err, CBM_SPAWN_E_OUTPUT_LIMIT, "CBM_SPAWN_E_OUTPUT_LIMIT",
+                          "the child stdout exceeded the caller's retained-byte bound",
+                          "raise the explicit operation result bound only when the complete "
+                          "output is intentionally admissible",
+                          0, got_code ? (int)code : -1);
+    }
     if (!progress_ok) {
         free(buf.data);
         free(stderr_buf.data);
@@ -1068,16 +1084,27 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, NULL, NULL,
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, 0, NULL, false, NULL, NULL, NULL,
                               err);
+}
+
+int cbm_spawn_capture_bounded(const char *const *argv, size_t stdout_limit, char **out_data,
+                              size_t *out_len, cbm_spawn_error_t *err) {
+    if (stdout_limit == 0) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "bounded spawn requires a positive stdout byte limit",
+                          "pass the admitted operation result byte bound", 0, -1);
+    }
+    return spawn_capture_impl(argv, NULL, out_data, out_len, stdout_limit, 0, NULL, false, NULL,
+                              NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
                                   size_t stderr_limit,
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, NULL,
-                              NULL, NULL, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, stderr_limit, out_stderr, true,
+                              NULL, NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
@@ -1089,7 +1116,7 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                           "spawn requires an explicit non-empty working directory",
                           "bind the child to its captured compiler working directory", 0, -1);
     }
-    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, 0, stderr_limit,
                               out_stderr, true, NULL, NULL, NULL, err);
 }
 
@@ -1104,7 +1131,7 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch(
                           "bind the child to its captured compiler cwd and Git source epoch", 0,
                           -1);
     }
-    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, 0, stderr_limit,
                               out_stderr, true, source_date_epoch, NULL, NULL, err);
 }
 
@@ -1120,7 +1147,7 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch_progress(
                           "bind the compiler child to its context and semantic progress writer", 0,
                           -1);
     }
-    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, 0, stderr_limit,
                               out_stderr, true, source_date_epoch, on_stdout_progress,
                               progress_ud, err);
 }
@@ -1136,7 +1163,7 @@ static int spawn_file_actions_addclose_nonstandard(posix_spawn_file_actions_t *a
 }
 
 static int spawn_capture_impl(const char *const *argv, const char *working_directory,
-                               char **out_data, size_t *out_len,
+                               char **out_data, size_t *out_len, size_t stdout_limit,
                                size_t stderr_limit, cbm_spawn_bounded_capture_t *out_stderr,
                                bool capture_stderr, const char *source_date_epoch,
                                cbm_spawn_stdout_progress_cb on_stdout_progress, void *progress_ud,
@@ -1299,6 +1326,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
     char chunk[SPAWN_READ_CHUNK];
     bool read_ok = true;
     bool progress_ok = true;
+    bool output_limit_exceeded = false;
     bool stderr_read_ok = true;
     int stdout_failure_code = CBM_SPAWN_OK;
     int stderr_failure_code = CBM_SPAWN_OK;
@@ -1348,7 +1376,13 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
                 ssize_t got = read(streams[stream].fd, chunk, sizeof(chunk));
                 if (got > 0) {
                     if (stream == 0) {
-                        if (read_ok && !spawn_buf_append(&buf, chunk, (size_t)got)) {
+                        if (stdout_limit != 0 &&
+                            (buf.len > stdout_limit ||
+                             (size_t)got > stdout_limit - buf.len)) {
+                            output_limit_exceeded = true;
+                            (void)kill(pid, SIGKILL);
+                            break;
+                        } else if (read_ok && !spawn_buf_append(&buf, chunk, (size_t)got)) {
                             read_ok = false;
                             stdout_failure_code = CBM_SPAWN_E_NOMEM;
                             if (read_errno == 0) {
@@ -1416,7 +1450,7 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
             }
             streams[stream].revents = 0;
         }
-        if (!progress_ok) {
+        if (!progress_ok || output_limit_exceeded) {
             break;
         }
     }
@@ -1432,6 +1466,15 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
         waited = waitpid(pid, &status, 0);
     } while (waited < 0 && errno == EINTR);
 
+    if (output_limit_exceeded) {
+        free(buf.data);
+        free(stderr_buf.data);
+        return spawn_fail(err, CBM_SPAWN_E_OUTPUT_LIMIT, "CBM_SPAWN_E_OUTPUT_LIMIT",
+                          "the child stdout exceeded the caller's retained-byte bound",
+                          "raise the explicit operation result bound only when the complete "
+                          "output is intentionally admissible",
+                          0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
     if (!progress_ok) {
         free(buf.data);
         free(stderr_buf.data);
@@ -1502,16 +1545,27 @@ static int spawn_capture_impl(const char *const *argv, const char *working_direc
 
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, NULL, false, NULL, NULL, NULL,
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, 0, NULL, false, NULL, NULL, NULL,
                               err);
+}
+
+int cbm_spawn_capture_bounded(const char *const *argv, size_t stdout_limit, char **out_data,
+                              size_t *out_len, cbm_spawn_error_t *err) {
+    if (stdout_limit == 0) {
+        return spawn_fail(err, CBM_SPAWN_E_INVALID_ARGV, "CBM_SPAWN_E_INVALID_ARGV",
+                          "bounded spawn requires a positive stdout byte limit",
+                          "pass the admitted operation result byte bound", 0, -1);
+    }
+    return spawn_capture_impl(argv, NULL, out_data, out_len, stdout_limit, 0, NULL, false, NULL,
+                              NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr(const char *const *argv, char **out_data, size_t *out_len,
                                   size_t stderr_limit,
                                   cbm_spawn_bounded_capture_t *out_stderr,
                                   cbm_spawn_error_t *err) {
-    return spawn_capture_impl(argv, NULL, out_data, out_len, stderr_limit, out_stderr, true, NULL,
-                              NULL, NULL, err);
+    return spawn_capture_impl(argv, NULL, out_data, out_len, 0, stderr_limit, out_stderr, true,
+                              NULL, NULL, NULL, err);
 }
 
 int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *working_directory,
@@ -1523,7 +1577,7 @@ int cbm_spawn_capture_with_stderr_cwd(const char *const *argv, const char *worki
                           "spawn requires an explicit non-empty working directory",
                           "bind the child to its captured compiler working directory", 0, -1);
     }
-    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, 0, stderr_limit,
                               out_stderr, true, NULL, NULL, NULL, err);
 }
 
@@ -1538,7 +1592,7 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch(
                           "bind the child to its captured compiler cwd and Git source epoch", 0,
                           -1);
     }
-    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, 0, stderr_limit,
                               out_stderr, true, source_date_epoch, NULL, NULL, err);
 }
 
@@ -1554,7 +1608,7 @@ int cbm_spawn_capture_with_stderr_cwd_source_epoch_progress(
                           "bind the compiler child to its context and semantic progress writer", 0,
                           -1);
     }
-    return spawn_capture_impl(argv, working_directory, out_data, out_len, stderr_limit,
+    return spawn_capture_impl(argv, working_directory, out_data, out_len, 0, stderr_limit,
                               out_stderr, true, source_date_epoch, on_stdout_progress,
                               progress_ud, err);
 }

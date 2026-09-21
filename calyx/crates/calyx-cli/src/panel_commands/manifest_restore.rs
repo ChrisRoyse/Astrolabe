@@ -53,9 +53,10 @@ fn restore_manifest_from_assets(
     registry_asset: &str,
 ) -> CliResult<ManifestRestoreReport> {
     let store = ManifestStore::open(vault);
-    let before = store.load_current()?;
-    let old_panel_ref = before.panel_ref.logical_path.clone();
-    let old_registry_ref = before
+    let observed = store.load_current_snapshot()?;
+    let old_panel_ref = observed.manifest.panel_ref.logical_path.clone();
+    let old_registry_ref = observed
+        .manifest
         .registry_ref
         .as_ref()
         .map(|reference| reference.logical_path.clone());
@@ -78,8 +79,11 @@ fn restore_manifest_from_assets(
             remediation: "supply a real registry snapshot asset with persisted lens contracts",
         }));
     }
-    let after = manifest_with_assets(before, panel_ref.clone(), registry_ref.clone())?;
-    let write = store.write_current(&after)?;
+    let update = store.transact_current_if_identity(&observed.identity, |manifest| {
+        manifest_with_assets(manifest, panel_ref.clone(), registry_ref.clone())
+    })?;
+    let write = update.write;
+    let after = update.after.manifest;
     let reloaded = load_vault_panel_state(vault)?;
     if reloaded.panel != panel {
         return Err(CliError::from(CalyxError {
@@ -118,12 +122,7 @@ fn manifest_with_assets(
     mut manifest: VaultManifest,
     panel_ref: ImmutableRef,
     registry_ref: ImmutableRef,
-) -> CliResult<VaultManifest> {
-    manifest.manifest_seq = manifest.manifest_seq.checked_add(1).ok_or_else(|| {
-        CliError::from(CalyxError::ledger_chain_broken(
-            "manifest sequence exhausted",
-        ))
-    })?;
+) -> calyx_core::Result<VaultManifest> {
     manifest.panel_ref = panel_ref;
     manifest.registry_ref = Some(registry_ref);
     manifest.validate()?;

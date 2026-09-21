@@ -41,7 +41,7 @@ impl<'a, C: Clock> TimeTravelSnapshot<'a, C> {
     /// Opens a snapshot as of `t_millis`. Returns `CALYX_TIMETRAVEL_NO_DATA` if
     /// the vault has no write at or before `t`.
     pub fn open(vault: &'a AsterVault<C>, t_millis: u64) -> Result<Self> {
-        let horizon = vault.retention_horizon();
+        let horizon = vault.retention_horizon()?;
         retention::check_horizon_at(&horizon, t_millis, vault.clock_now())?;
         let seqno = time_index::resolve(vault, t_millis)?;
         let lease_id = vault.pin_reader_at(seqno, TIMETRAVEL_LEASE_MS);

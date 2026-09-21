@@ -849,8 +849,8 @@ fn build_queries(vault: &AsterVault<SystemClock>) -> Vec<CompressionQuery> {
     // A mixture query: strictly decreasing weight per stored one-hot bucket, so
     // ranking is strict and the query shares no positive ray with any row.
     let mut values = vec![0.0_f32; DIM as usize];
-    for index in 0..ROWS {
-        values[index] = 1.0 / (1 << index) as f32;
+    for (index, value) in values.iter_mut().take(ROWS).enumerate() {
+        *value = 1.0 / (1 << index) as f32;
     }
     let cx_id = vault.cx_id_for_input(b"w26-tq-fsv-query-0", PANEL_VERSION);
     vec![CompressionQuery { cx_id, values }]

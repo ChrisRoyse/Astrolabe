@@ -60,9 +60,11 @@ pub trait LedgerCfStore {
     fn scan(&self) -> Result<Vec<LedgerRow>>;
 
     /// Reads one ledger row by sequence number.
-    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
-        Ok(self.scan()?.into_iter().find(|row| row.seq == seq))
-    }
+    ///
+    /// Implementors must provide an actual point lookup. A scan-backed default
+    /// makes a bounded verifier silently materialize the complete ledger once
+    /// per requested row (PC-43).
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>>;
 
     /// Writes a new row. Implementations must reject overwrites.
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()>;

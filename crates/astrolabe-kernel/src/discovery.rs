@@ -5,22 +5,23 @@
 //! evidence is discarded from the persisted artifact.  Discovery is deliberately
 //! two-phase: [`prepare_association_discovery`] constructs candidates and the
 //! exact evidence packet an evaluator may cite, while
-//! [`finalize_association_discovery`] accepts only independent, citation-valid
-//! evaluator receipts and combines them with leakage-free held-out evidence.
+//! [`finalize_association_discovery`] accepts only citation-valid receipts with
+//! unique caller-attested external invocation identities and combines them with
+//! leakage-free held-out evidence. Local code binds capture bytes but cannot
+//! prove that a remote provider call occurred.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write as IoWrite};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use astrolabe_domain::calyx::CxId;
 use astrolabe_domain::{DomainError, Result, TrustTag};
-pub use calyx_lodestar::EvaluatorRun;
 use calyx_lodestar::{
     ChainWalkParams, ChainWalkReport, ChainWalkSeed, ChainWalkSeedKind, DiscoveryChainParams,
     DiscoveryGateVerdict, HypothesisEvaluationInput, HypothesisEvaluationParams,
     HypothesisEvaluationReport, HypothesisEvaluationVerdict, RankedHypothesisParams,
-    RankedHypothesisReport, RetrievedEvidence, SpectralCommunityParams, SpectralCommunityReport,
-    TraceableHypothesisInput, aggregate_hypothesis_evaluations, rank_traceable_hypotheses,
-    run_chain_walks_with_gate, spectral_community_report,
+    RetrievedEvidence, SpectralCommunityParams, SpectralCommunityReport,
+    aggregate_hypothesis_evaluations, run_chain_walks_with_gate, spectral_community_report,
 };
 use calyx_paths::AssocGraph;
 use rayon::prelude::*;
@@ -28,25 +29,48 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    KernelBuildConfig, KernelGraph, KernelGraphEdge, KernelGraphNode, LatentConfig,
+    KernelArtifact, KernelBuildConfig, KernelGraph, KernelGraphEdge, KernelGraphNode, LatentConfig,
     LatentDiscoveryReport, LatentPair, LatentRelation, build_kernel, latent_corpus_sweep,
 };
 
 /// Schema for the prepared, evaluator-independent discovery generation.
-pub const DISCOVERY_PREPARED_SCHEMA: &str = "astrolabe.association_discovery.prepared.v2";
+pub const DISCOVERY_PREPARED_SCHEMA: &str = "astrolabe.association_discovery.prepared.v4";
 /// Schema for the finalized reasoning generation.
-pub const DISCOVERY_FINAL_SCHEMA: &str = "astrolabe.association_discovery.final.v1";
+pub const DISCOVERY_FINAL_SCHEMA: &str = "astrolabe.association_discovery.final.v4";
+/// Canonical source-manifest schema.
+pub const DISCOVERY_SOURCE_MANIFEST_SCHEMA: &str =
+    "astrolabe.association_discovery.source_manifest.v3";
+/// Exact evaluator-binding roster schema.
+pub const DISCOVERY_EVALUATION_ROSTER_SCHEMA: &str =
+    "astrolabe.association_discovery.evaluation_roster.v2";
+/// Exact evaluator request schema emitted by preparation.
+pub const DISCOVERY_EVALUATOR_REQUEST_SCHEMA: &str =
+    "astrolabe.association_discovery.evaluator_request.v1";
+/// Strict evaluator response schema accepted by finalization.
+pub const DISCOVERY_EVALUATOR_RESPONSE_SCHEMA: &str =
+    "astrolabe.association_discovery.evaluator_response.v1";
+/// Evaluator receipt schema persisted in the final generation.
+pub const DISCOVERY_EVALUATOR_RECEIPT_SCHEMA: &str =
+    "astrolabe.association_discovery.evaluator_receipt.v2";
+/// Caller-attested capture metadata for the trusted single-operator external
+/// evaluator boundary. The bytes are identity-bound and auditable; this local
+/// code does not claim it can prove that a remote provider call occurred.
+pub const DISCOVERY_EXTERNAL_CAPTURE_SCHEMA: &str =
+    "astrolabe.association_discovery.trusted_external_capture.v1";
 /// Refusal raised for incomplete or internally inconsistent source state.
 pub const ASTRO_DISCOVERY_SOURCE_INCOMPLETE: &str = "ASTRO_DISCOVERY_SOURCE_INCOMPLETE";
 /// Refusal raised for a graph that cannot support the requested mathematics.
 pub const ASTRO_DISCOVERY_GRAPH_INVALID: &str = "ASTRO_DISCOVERY_GRAPH_INVALID";
 /// Refusal raised when evaluator evidence is absent, mismatched, or invalid.
 pub const ASTRO_DISCOVERY_EVALUATOR_INVALID: &str = "ASTRO_DISCOVERY_EVALUATOR_INVALID";
+/// Refusal raised when the retained source no longer matches its manifest.
+pub const ASTRO_DISCOVERY_SOURCE_CHANGED: &str = "ASTRO_DISCOVERY_SOURCE_CHANGED";
 /// Refusal raised when bounded worker-pool construction fails.
 pub const ASTRO_DISCOVERY_WORKERS_INVALID: &str = "ASTRO_DISCOVERY_WORKERS_INVALID";
 
 /// Exact physical-completeness proof produced by assay/loom/weave reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssociationCompletenessWitness {
     pub constellation_count: u64,
     pub source_slot_count: u64,
@@ -54,6 +78,79 @@ pub struct AssociationCompletenessWitness {
     pub completion_witness_state_hash: String,
     pub xterm_key_stream_hash: String,
     pub xterm_value_stream_hash: String,
+}
+
+/// Physical source observations and frozen completion semantics. Every column
+/// family named here is consumed, directly or transitively, by discovery. The
+/// generation values diagnose the retained physical read but are not logical
+/// source identity. Later admission rederives the exact logical graph and
+/// verified Base/Slot/Compression/XTerm source instead of trusting handle
+/// bookkeeping as a substitute for the source bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssociationSourcePhysicalBinding {
+    pub retained_snapshot_seq: u64,
+    pub projection_source_fingerprint_blake3: String,
+    pub graph_cf_generation: u64,
+    pub anchors_cf_generation: u64,
+    pub base_cf_generation: u64,
+    pub xterm_cf_generation: u64,
+    pub completion_witness_cf_generation: u64,
+    pub compression_cf_generation: u64,
+    pub slot_cf_generations: BTreeMap<u16, u64>,
+    pub panel_schema_ids: BTreeMap<u32, String>,
+    pub panel_manifest_sha256: BTreeMap<u32, String>,
+    pub completion_pair_block_schema: String,
+    pub completion_witness_schema: String,
+    pub completion_ledger_schema: String,
+    pub completion_metric_contract: Vec<String>,
+    pub completion_incompatibility_contract: Vec<String>,
+}
+
+/// Canonical manifest for every field consumed by one discovery preparation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssociationSourceManifest {
+    pub schema: String,
+    pub project: String,
+    pub source_seq: u64,
+    pub physical: AssociationSourcePhysicalBinding,
+    pub completeness: AssociationCompletenessWitness,
+    pub concept_count: usize,
+    pub concept_stream_sha256: String,
+    pub typed_edge_count: usize,
+    pub typed_edge_stream_sha256: String,
+    pub discovery_prepared_schema: String,
+    pub discovery_final_schema: String,
+    pub discovery_config_sha256: String,
+}
+
+#[derive(Serialize)]
+struct StableAssociationSourcePhysicalIdentity<'a> {
+    projection_source_fingerprint_blake3: &'a str,
+    panel_schema_ids: &'a BTreeMap<u32, String>,
+    panel_manifest_sha256: &'a BTreeMap<u32, String>,
+    completion_pair_block_schema: &'a str,
+    completion_witness_schema: &'a str,
+    completion_ledger_schema: &'a str,
+    completion_metric_contract: &'a [String],
+    completion_incompatibility_contract: &'a [String],
+}
+
+#[derive(Serialize)]
+struct StableAssociationSourceIdentity<'a> {
+    schema: &'static str,
+    source_manifest_schema: &'a str,
+    project: &'a str,
+    physical: StableAssociationSourcePhysicalIdentity<'a>,
+    completeness: &'a AssociationCompletenessWitness,
+    concept_count: usize,
+    concept_stream_sha256: &'a str,
+    typed_edge_count: usize,
+    typed_edge_stream_sha256: &'a str,
+    discovery_prepared_schema: &'a str,
+    discovery_final_schema: &'a str,
+    discovery_config_sha256: &'a str,
 }
 
 /// One exact source concept.  Normalization is an additional deterministic
@@ -96,6 +193,7 @@ pub struct AssociationDiscoveryInput {
     pub project: String,
     pub source_seq: u64,
     pub source_generation_sha256: String,
+    pub source_manifest: AssociationSourceManifest,
     pub concepts: Vec<DiscoveryConceptInput>,
     pub typed_edges: Vec<DiscoveryTypedEdgeInput>,
     pub completeness: AssociationCompletenessWitness,
@@ -104,6 +202,7 @@ pub struct AssociationDiscoveryInput {
 /// All measured limits and thresholds used by discovery.  They are serialized
 /// into every generation so no cap or score boundary is hidden.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssociationDiscoveryConfig {
     pub max_intermediary_degree: u64,
     pub min_shared_intermediaries: u64,
@@ -128,6 +227,12 @@ pub struct AssociationDiscoveryConfig {
     pub cross_validation_folds: usize,
     pub cross_validation_top_k: usize,
     pub workers: usize,
+    /// Caller-owned hard limits. `None` is always refused; no evaluator or
+    /// persistence budget is inferred from the machine or corpus.
+    pub budgets: Option<AssociationDiscoveryBudgets>,
+    /// Exact evaluator/model/prompt variants to expand across every prepared
+    /// hypothesis. Empty declarations are a refusal, never an implicit model.
+    pub evaluator_declarations: Vec<EvaluatorDeclaration>,
     pub evaluator: HypothesisEvaluationParams,
     pub ranking: RankedHypothesisParams,
     pub reasoning_kernel: KernelBuildConfig,
@@ -168,11 +273,64 @@ impl Default for AssociationDiscoveryConfig {
                 .map(usize::from)
                 .unwrap_or(1)
                 .clamp(1, 16),
+            budgets: None,
+            evaluator_declarations: Vec::new(),
             evaluator: HypothesisEvaluationParams::default(),
             ranking: RankedHypothesisParams::default(),
             reasoning_kernel: KernelBuildConfig::with_registry_defaults(),
         }
     }
+}
+
+/// Mandatory evaluator and durable-generation budgets. They are serialized
+/// into the discovery configuration and therefore source/artifact identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssociationDiscoveryBudgets {
+    pub max_evaluation_bindings: usize,
+    pub max_request_bytes_per_binding: usize,
+    pub max_request_bytes_total: usize,
+    pub max_response_bytes_per_binding: usize,
+    pub max_response_bytes_total: usize,
+    /// Maximum discovery-owned Kernel/Assay physical rows in one publication,
+    /// including pointer, manifest, and retention tombstones. Ledger/TimeIndex
+    /// protocol rows are owned and bounded by Aster's ledger configuration.
+    pub max_generation_rows: usize,
+    /// Maximum discovery key+value bytes plus exact Ledger payload bytes in one
+    /// publication, before Aster's fixed ledger/time-index framing.
+    pub max_generation_bytes: usize,
+}
+
+/// One evaluator variant declared before candidate preparation. The prompt is
+/// retained as exact UTF-8 bytes; no server-side template or default is used.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatorDeclaration {
+    pub evaluator_id: String,
+    pub model_id: String,
+    pub prompt_id: String,
+    pub temperature_x100: u16,
+    pub prompt_utf8: String,
+}
+
+/// Typed availability of one source field. Missing source state is evidence of
+/// absence, not permission to manufacture a path, excerpt, signature, or hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StructuralEvidenceField {
+    Available { value: String },
+    Unavailable { reason: String },
+}
+
+/// Exact structural evidence inventory for a source concept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConceptStructuralEvidence {
+    pub cx_id: CxId,
+    pub language: StructuralEvidenceField,
+    pub signature_or_shape: StructuralEvidenceField,
+    pub file_path: StructuralEvidenceField,
+    pub source_sha256: StructuralEvidenceField,
+    pub source_excerpt: StructuralEvidenceField,
 }
 
 /// Deterministic semantic view of an exact concept.
@@ -200,6 +358,8 @@ pub struct NormalizedConcept {
     pub qualified_name: String,
     pub file_path: String,
     pub source_sha256: String,
+    pub source_excerpt: String,
+    pub frequency: u64,
     pub anchor_trust: Option<TrustTag>,
 }
 
@@ -254,9 +414,140 @@ pub struct DiscoveryHypothesisCandidate {
     pub cross_community: bool,
     pub grounded_confidence: f32,
     pub claim: String,
+    /// Typed source-field availability for A/B/C. This remains separate from
+    /// retrieved evaluator evidence so an unavailable excerpt cannot become
+    /// fabricated prose.
+    pub structural_evidence: Vec<ConceptStructuralEvidence>,
     pub evidence: Vec<RetrievedEvidence>,
     pub evidence_ids: Vec<String>,
     pub provenance: Vec<String>,
+}
+
+/// One exact evaluator invocation prepared for one exact hypothesis.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationBinding {
+    pub invocation_id: String,
+    pub source_generation_sha256: String,
+    pub hypothesis_id: String,
+    pub hypothesis_content_sha256: String,
+    pub evaluator_id: String,
+    pub model_id: String,
+    pub prompt_id: String,
+    pub temperature_x100: u16,
+    pub prompt_utf8: String,
+    pub prompt_sha256: String,
+    pub request_utf8: String,
+    pub request_sha256: String,
+}
+
+/// Exact Cartesian product of prepared hypotheses and declared evaluator
+/// variants. Finalization accepts exactly this roster, neither a subset nor a
+/// structurally plausible superset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationRoster {
+    pub schema: String,
+    pub hypothesis_count: usize,
+    pub evaluator_declaration_count: usize,
+    pub binding_count: usize,
+    pub request_bytes_total: usize,
+    pub bindings_sha256: String,
+    pub bindings: Vec<EvaluationBinding>,
+}
+
+/// Strict JSON object parsed from exact evaluator response bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatorResponseParseResult {
+    pub schema: String,
+    pub plausible_score: f32,
+    pub novelty_score: f32,
+    pub testability_score: f32,
+    pub falsifiability_score: f32,
+    pub justification: String,
+    pub falsification_test: String,
+    pub cited_evidence_ids: Vec<String>,
+}
+
+/// Durable receipt for one real external evaluator invocation. All scores and
+/// prose below are checked against `response_utf8`; caller-supplied parsed data
+/// can never override the exact response bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluatorReceipt {
+    pub schema: String,
+    pub invocation_id: String,
+    /// Caller-attested unique identity returned by, or assigned to, the
+    /// external call. Local code binds but cannot independently prove it. It
+    /// must not recur anywhere else in the generation.
+    pub external_invocation_id: String,
+    /// Exact provider-side response identity captured by the trusted operator.
+    pub provider_response_id: String,
+    /// Explicit boundary contract plus operator-owned capture provenance. These
+    /// fields are attestations, not proof manufactured by local code.
+    pub capture_schema: String,
+    pub capture_provenance: Vec<String>,
+    pub prepared_artifact_sha256: String,
+    pub source_generation_sha256: String,
+    pub hypothesis_id: String,
+    pub hypothesis_content_sha256: String,
+    pub evaluator_id: String,
+    pub model_id: String,
+    pub prompt_id: String,
+    pub temperature_x100: u16,
+    pub prompt_utf8: String,
+    pub prompt_sha256: String,
+    pub request_utf8: String,
+    pub request_sha256: String,
+    pub response_utf8: String,
+    pub response_sha256: String,
+    pub parse_result: EvaluatorResponseParseResult,
+}
+
+/// Cross-domain distance is not inferred from a constant. Until a persisted
+/// domain-distance measurement exists, ranking records its absence and excludes
+/// the term from the score.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CrossDomainMeasurement {
+    Measured {
+        distance: usize,
+        evidence_ids: Vec<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationRankedHypothesis {
+    pub rank: usize,
+    pub hypothesis_id: String,
+    pub a: CxId,
+    pub b: CxId,
+    pub c: CxId,
+    pub claim: String,
+    pub novelty_score: f32,
+    pub grounded_confidence: f32,
+    pub cross_domain: CrossDomainMeasurement,
+    pub evaluator_plausibility_score: f32,
+    pub evaluator_aggregate_score: f32,
+    pub rank_score: f32,
+    pub score_semantics: String,
+    pub human_review_flag: bool,
+    pub sufficiency_proof: String,
+    pub provenance: Vec<String>,
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationRankedHypothesisReport {
+    pub schema: String,
+    pub input_count: usize,
+    pub ranked_count: usize,
+    pub human_review_count: usize,
+    pub hypotheses: Vec<AssociationRankedHypothesis>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,6 +631,7 @@ pub struct CrossValidationStability {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrossValidationReport {
     pub split_kind: String,
+    pub temporal_evidence: TemporalEvidenceStatus,
     pub folds: Vec<ValidationFold>,
     pub usable_fold_count: usize,
     pub mean_precision_at_k: f64,
@@ -355,6 +647,22 @@ pub struct CrossValidationReport {
     pub validated_pair_ids: Vec<String>,
 }
 
+/// Whether temporal ordering was measured from every persisted relationship or
+/// was unavailable and therefore excluded from the validation claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TemporalEvidenceStatus {
+    Measured {
+        timestamped_edge_count: usize,
+        relationship_edge_count: usize,
+    },
+    Unavailable {
+        timestamped_edge_count: usize,
+        relationship_edge_count: usize,
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryGateCounts {
     pub accepted: usize,
@@ -368,11 +676,13 @@ pub struct DiscoveryGateCounts {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedAssociationDiscovery {
     pub schema: String,
     pub project: String,
     pub source_seq: u64,
     pub source_generation_sha256: String,
+    pub source_manifest: AssociationSourceManifest,
     pub config: AssociationDiscoveryConfig,
     pub completeness: AssociationCompletenessWitness,
     pub normalized_concepts: Vec<NormalizedConcept>,
@@ -383,40 +693,68 @@ pub struct PreparedAssociationDiscovery {
     pub walks: ChainWalkReport,
     pub gate_counts: DiscoveryGateCounts,
     pub candidates: Vec<DiscoveryHypothesisCandidate>,
+    pub evaluation_roster: EvaluationRoster,
     pub validation: CrossValidationReport,
     pub graph_compile_count: usize,
-    pub worker_pool_reused: bool,
     pub trust: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreparedAssociationDiscoveryTelemetry {
+    pub worker_pool_reused: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedAssociationDiscoveryEnvelope {
     pub artifact_sha256: String,
     pub artifact: PreparedAssociationDiscovery,
+    /// Truthful process-local history. It is deliberately excluded from JSON
+    /// and therefore from prepared artifact identity and persistence.
+    #[serde(skip)]
+    pub telemetry: PreparedAssociationDiscoveryTelemetry,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactReasoningKernel {
     pub schema: String,
     pub trust: String,
+    /// Exact post-pruning kernel roster. Every retained typed edge endpoint
+    /// belongs to this set.
     pub member_ids: Vec<CxId>,
     pub members_hash: String,
+    /// Retained hypothesis endpoints not selected into the compact kernel.
+    pub support_ids: Vec<CxId>,
+    /// Hash of the complete member-plus-support reasoning roster.
+    pub reasoning_roster_hash: String,
     pub hypothesis_ids: Vec<String>,
     pub evidence_ids: Vec<String>,
-    pub retained_typed_edges: Vec<String>,
+    /// Complete retained typed rows whose endpoints are both in `member_ids`.
+    pub retained_typed_edges: Vec<DiscoveryTypedEdgeInput>,
+    pub retained_typed_edges_sha256: String,
+    /// SHA-256 of the canonical complete kernel artifact bytes below.
+    pub kernel_artifact_sha256: String,
+    /// Complete scores/config/source/FVS/coverage/compactness evidence. It is
+    /// retained rather than collapsed to a member hash.
+    pub kernel_artifact: KernelArtifact,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FinalAssociationDiscovery {
     pub schema: String,
     pub prepared_artifact_sha256: String,
+    pub source_manifest: AssociationSourceManifest,
+    pub evaluation_roster: EvaluationRoster,
+    pub evaluator_receipts: Vec<EvaluatorReceipt>,
     pub evaluator: HypothesisEvaluationReport,
-    pub ranked: RankedHypothesisReport,
+    pub ranked: AssociationRankedHypothesisReport,
     pub reasoning_kernel: CompactReasoningKernel,
     pub trust: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FinalAssociationDiscoveryEnvelope {
     pub artifact_sha256: String,
     pub artifact: FinalAssociationDiscovery,
@@ -459,6 +797,136 @@ fn worker_pool(workers: usize) -> Result<(Arc<rayon::ThreadPool>, bool)> {
     Ok((pool, false))
 }
 
+/// Builds the canonical, complete source manifest and its generation SHA-256.
+/// The edge-local `source_generation_sha256` field is deliberately excluded
+/// because it is the redundant backlink populated from the returned hash; all
+/// evidence fields actually consumed by discovery are framed below.
+pub fn derive_association_source_manifest(
+    project: &str,
+    source_seq: u64,
+    physical: &AssociationSourcePhysicalBinding,
+    concepts: &[DiscoveryConceptInput],
+    typed_edges: &[DiscoveryTypedEdgeInput],
+    completeness: &AssociationCompletenessWitness,
+    config: &AssociationDiscoveryConfig,
+) -> Result<(AssociationSourceManifest, String)> {
+    let mut concept_digest = Sha256::new();
+    update_framed_digest(
+        &mut concept_digest,
+        b"astrolabe.association_discovery.concept_stream.v1",
+    );
+    let mut ordered_concepts = concepts.iter().collect::<Vec<_>>();
+    ordered_concepts.sort_by_key(|concept| concept.cx_id);
+    for concept in ordered_concepts {
+        update_framed_digest(&mut concept_digest, concept.cx_id.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.symbol_kind.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.language.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.qualified_name.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.signature_or_shape.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.file_path.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.source_sha256.as_bytes());
+        update_framed_digest(&mut concept_digest, concept.source_excerpt.as_bytes());
+        update_framed_digest(&mut concept_digest, &concept.frequency.to_be_bytes());
+        update_framed_digest(
+            &mut concept_digest,
+            concept
+                .anchor_trust
+                .map(TrustTag::as_str)
+                .unwrap_or("absent")
+                .as_bytes(),
+        );
+    }
+    let mut edge_digest = Sha256::new();
+    update_framed_digest(
+        &mut edge_digest,
+        b"astrolabe.association_discovery.typed_edge_stream.v1",
+    );
+    let mut ordered_edges = typed_edges.iter().collect::<Vec<_>>();
+    ordered_edges.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
+    for edge in ordered_edges {
+        update_framed_digest(&mut edge_digest, edge.evidence_id.as_bytes());
+        update_framed_digest(&mut edge_digest, edge.src.as_bytes());
+        update_framed_digest(&mut edge_digest, edge.dst.as_bytes());
+        update_framed_digest(&mut edge_digest, &edge.edge_type_code.to_be_bytes());
+        update_framed_digest(&mut edge_digest, edge.edge_type_name.as_bytes());
+        update_framed_digest(&mut edge_digest, edge.family.as_bytes());
+        update_framed_digest(&mut edge_digest, &edge.weight.to_bits().to_be_bytes());
+        update_framed_digest(&mut edge_digest, edge.trust.as_str().as_bytes());
+        update_optional_str(&mut edge_digest, edge.temporal_direction.as_deref());
+        match edge.observed_at_millis {
+            Some(value) => {
+                update_framed_digest(&mut edge_digest, b"observed_at:present");
+                update_framed_digest(&mut edge_digest, &value.to_be_bytes());
+            }
+            None => update_framed_digest(&mut edge_digest, b"observed_at:unavailable"),
+        }
+        update_framed_digest(&mut edge_digest, edge.ledger_ref.as_bytes());
+        update_framed_digest(
+            &mut edge_digest,
+            &(edge.provenance.len() as u64).to_be_bytes(),
+        );
+        for provenance in &edge.provenance {
+            update_framed_digest(&mut edge_digest, provenance.as_bytes());
+        }
+    }
+    let config_sha256 = sha256_hex(&canonical_json_bytes(config)?);
+    let manifest = AssociationSourceManifest {
+        schema: DISCOVERY_SOURCE_MANIFEST_SCHEMA.to_string(),
+        project: project.to_string(),
+        source_seq,
+        physical: physical.clone(),
+        completeness: completeness.clone(),
+        concept_count: concepts.len(),
+        concept_stream_sha256: digest_hex(&concept_digest.finalize()),
+        typed_edge_count: typed_edges.len(),
+        typed_edge_stream_sha256: digest_hex(&edge_digest.finalize()),
+        discovery_prepared_schema: DISCOVERY_PREPARED_SCHEMA.to_string(),
+        discovery_final_schema: DISCOVERY_FINAL_SCHEMA.to_string(),
+        discovery_config_sha256: config_sha256,
+    };
+    let generation_sha256 = association_source_generation_sha256(&manifest)?;
+    Ok((manifest, generation_sha256))
+}
+
+/// Stable logical identity of every source byte and schema/config contract
+/// consumed by discovery. MVCC sequence/generation observations remain
+/// persisted in the manifest for physical diagnostics, but are deliberately
+/// not logical identity. Current-source admission must re-run the exact graph
+/// and complete Base/Slot/XTerm verification before comparing this hash.
+pub fn association_source_generation_sha256(
+    manifest: &AssociationSourceManifest,
+) -> Result<String> {
+    validate_source_manifest_contract(manifest)?;
+    let identity = StableAssociationSourceIdentity {
+        schema: "astrolabe.association_discovery.source_identity.v2",
+        source_manifest_schema: &manifest.schema,
+        project: &manifest.project,
+        physical: StableAssociationSourcePhysicalIdentity {
+            projection_source_fingerprint_blake3: &manifest
+                .physical
+                .projection_source_fingerprint_blake3,
+            panel_schema_ids: &manifest.physical.panel_schema_ids,
+            panel_manifest_sha256: &manifest.physical.panel_manifest_sha256,
+            completion_pair_block_schema: &manifest.physical.completion_pair_block_schema,
+            completion_witness_schema: &manifest.physical.completion_witness_schema,
+            completion_ledger_schema: &manifest.physical.completion_ledger_schema,
+            completion_metric_contract: &manifest.physical.completion_metric_contract,
+            completion_incompatibility_contract: &manifest
+                .physical
+                .completion_incompatibility_contract,
+        },
+        completeness: &manifest.completeness,
+        concept_count: manifest.concept_count,
+        concept_stream_sha256: &manifest.concept_stream_sha256,
+        typed_edge_count: manifest.typed_edge_count,
+        typed_edge_stream_sha256: &manifest.typed_edge_stream_sha256,
+        discovery_prepared_schema: &manifest.discovery_prepared_schema,
+        discovery_final_schema: &manifest.discovery_final_schema,
+        discovery_config_sha256: &manifest.discovery_config_sha256,
+    };
+    Ok(sha256_hex(&canonical_json_bytes(&identity)?))
+}
+
 /// Prepares every deterministic discovery stage over one exact source.
 pub fn prepare_association_discovery(
     input: &AssociationDiscoveryInput,
@@ -466,6 +934,38 @@ pub fn prepare_association_discovery(
 ) -> Result<PreparedAssociationDiscoveryEnvelope> {
     validate_config(config)?;
     validate_input(input)?;
+    let (source_manifest, source_generation_sha256) = derive_association_source_manifest(
+        &input.project,
+        input.source_seq,
+        &input.source_manifest.physical,
+        &input.concepts,
+        &input.typed_edges,
+        &input.completeness,
+        config,
+    )?;
+    if source_manifest != input.source_manifest
+        || source_generation_sha256 != input.source_generation_sha256
+    {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_SOURCE_CHANGED,
+            format!(
+                "association source manifest mismatch: declared={} rederived={source_generation_sha256}",
+                input.source_generation_sha256
+            ),
+            "reload Graph/Base/Slot/Compression/XTerm source generations and prepare from their exact canonical manifest",
+        ));
+    }
+    if input
+        .typed_edges
+        .iter()
+        .any(|edge| edge.source_generation_sha256 != source_generation_sha256)
+    {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_SOURCE_CHANGED,
+            "one or more typed evidence rows do not backlink to the exact canonical source generation",
+            "rebuild every typed evidence row from the same source manifest before preparation",
+        ));
+    }
     let (pool, worker_pool_reused) = worker_pool(config.workers)?;
     // The typed edge sort is already required for canonical artifact bytes.
     // Reuse that one order for association-aware normalization rather than
@@ -564,6 +1064,12 @@ pub fn prepare_association_discovery(
     )?;
     let candidates = merge_walk_candidates(input, &evidence_index, candidates, &walks);
     let validation = cross_validate(input, config, &pool)?;
+    let evaluation_roster = build_evaluation_roster(
+        &source_generation_sha256,
+        &candidates,
+        &config.evaluator_declarations,
+        required_budgets(config)?,
+    )?;
     let cross_ids = candidates
         .iter()
         .filter(|candidate| candidate.cross_community)
@@ -587,7 +1093,8 @@ pub fn prepare_association_discovery(
         schema: DISCOVERY_PREPARED_SCHEMA.to_string(),
         project: input.project.clone(),
         source_seq: input.source_seq,
-        source_generation_sha256: input.source_generation_sha256.clone(),
+        source_generation_sha256,
+        source_manifest,
         config: config.clone(),
         completeness: input.completeness.clone(),
         normalized_concepts,
@@ -598,23 +1105,24 @@ pub fn prepare_association_discovery(
         walks,
         gate_counts,
         candidates,
+        evaluation_roster,
         validation,
         graph_compile_count: 1,
-        worker_pool_reused,
-        trust: "provisional_pending_independent_evaluator".to_string(),
+        trust: "provisional_pending_trusted_operator_external_capture".to_string(),
     };
     let artifact_sha256 = sha256_hex(&canonical_json_bytes(&artifact)?);
     Ok(PreparedAssociationDiscoveryEnvelope {
         artifact_sha256,
         artifact,
+        telemetry: PreparedAssociationDiscoveryTelemetry { worker_pool_reused },
     })
 }
 
 /// Finalizes a prepared artifact only when evaluator receipts cite its exact
-/// evidence and satisfy Lodestar's independent-run contract.
+/// evidence and satisfy the trusted single-operator capture contract.
 pub fn finalize_association_discovery(
     prepared: &PreparedAssociationDiscoveryEnvelope,
-    evaluator_runs: &BTreeMap<String, Vec<EvaluatorRun>>,
+    evaluator_receipts: &[EvaluatorReceipt],
 ) -> Result<FinalAssociationDiscoveryEnvelope> {
     let rederived = sha256_hex(&canonical_json_bytes(&prepared.artifact)?);
     if rederived != prepared.artifact_sha256 {
@@ -634,31 +1142,62 @@ pub fn finalize_association_discovery(
             "repair the association source or discovery gates before attempting publication",
         ));
     }
-    if evaluator_runs.is_empty() {
+    let (source_manifest, source_generation_sha256) = derive_association_source_manifest(
+        &prepared.artifact.project,
+        prepared.artifact.source_seq,
+        &prepared.artifact.source_manifest.physical,
+        &prepared
+            .artifact
+            .normalized_concepts
+            .iter()
+            .map(discovery_concept_from_normalized)
+            .collect::<Vec<_>>(),
+        &prepared.artifact.typed_edges,
+        &prepared.artifact.completeness,
+        &prepared.artifact.config,
+    )?;
+    if source_manifest != prepared.artifact.source_manifest
+        || source_generation_sha256 != prepared.artifact.source_generation_sha256
+    {
         return Err(DomainError::new(
-            ASTRO_DISCOVERY_EVALUATOR_INVALID,
-            "no independent evaluator receipts were supplied",
-            "evaluate at least one prepared hypothesis with the required independent prompt and temperature variants",
+            ASTRO_DISCOVERY_SOURCE_CHANGED,
+            format!(
+                "prepared source manifest mismatch during evaluator admission: declared={} rederived={source_generation_sha256}",
+                prepared.artifact.source_generation_sha256
+            ),
+            "discard the stale prepared generation and prepare again from the current exact source",
         ));
     }
+    let expected_roster = build_evaluation_roster(
+        &prepared.artifact.source_generation_sha256,
+        &prepared.artifact.candidates,
+        &prepared.artifact.config.evaluator_declarations,
+        required_budgets(&prepared.artifact.config)?,
+    )?;
+    if expected_roster != prepared.artifact.evaluation_roster {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "prepared evaluation roster does not exactly rederive from its hypotheses and evaluator declarations",
+            "preserve the prepared bytes and regenerate the exact evaluator roster before invoking any evaluator",
+        ));
+    }
+    let (evaluator_runs, evaluator_receipts) =
+        validate_evaluator_receipts(prepared, evaluator_receipts)?;
     let candidates = prepared
         .artifact
         .candidates
         .iter()
         .map(|candidate| (candidate.hypothesis_id.as_str(), candidate))
         .collect::<BTreeMap<_, _>>();
-    let mut inputs = Vec::with_capacity(evaluator_runs.len());
-    for (hypothesis_id, runs) in evaluator_runs {
-        let candidate = candidates
-            .get(hypothesis_id.as_str())
-            .copied()
-            .ok_or_else(|| {
-                DomainError::new(
-                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
-                    format!("evaluator receipt names unknown hypothesis {hypothesis_id}"),
-                    "cite a hypothesis_id from the exact hash-bound prepared artifact",
-                )
-            })?;
+    let mut inputs = Vec::with_capacity(candidates.len());
+    for (hypothesis_id, candidate) in &candidates {
+        let runs = evaluator_runs.get(*hypothesis_id).ok_or_else(|| {
+            DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!("exact receipt validation produced no evaluator runs for hypothesis {hypothesis_id}"),
+                "submit exactly one receipt for every prepared evaluator binding",
+            )
+        })?;
         inputs.push(HypothesisEvaluationInput {
             hypothesis_id: candidate.hypothesis_id.clone(),
             a: candidate.a,
@@ -686,46 +1225,20 @@ pub fn finalize_association_discovery(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut rank_inputs = Vec::new();
-    for evaluation in &evaluator.evaluations {
-        if evaluation.verdict != HypothesisEvaluationVerdict::RetainForRanking {
-            continue;
-        }
-        let candidate = by_id[&evaluation.hypothesis_id.as_str()];
-        rank_inputs.push(TraceableHypothesisInput {
-            hypothesis_id: evaluation.hypothesis_id.clone(),
-            a: evaluation.a,
-            b: evaluation.b,
-            c: evaluation.c,
-            claim: evaluation.claim.clone(),
-            novelty_score: evaluation.novelty_mean,
-            grounded_confidence: evaluation.grounded_confidence,
-            cross_domain_distance: 2,
-            evaluator_plausibility_score: evaluation.plausible_mean,
-            evaluator_aggregate_score: evaluation.aggregate_score,
-            sufficiency_proof: if validated.contains(&pair_id(evaluation.a, evaluation.c)) {
-                "held_out_endpoint_pair_predicted_without_training_pair_leakage".to_string()
-            } else {
-                "independent_evaluator_only; held_out_support_absent".to_string()
-            },
-            provenance: candidate.provenance.clone(),
-            evidence_ids: candidate.evidence_ids.clone(),
-        });
-    }
-    if rank_inputs.is_empty() {
-        return Err(DomainError::new(
-            ASTRO_DISCOVERY_EVALUATOR_INVALID,
-            "no evaluator-scored hypothesis passed the declared retention floor",
-            "supply more grounded evidence or retain the prepared generation as explicitly provisional",
-        ));
-    }
-    let ranked = rank_traceable_hypotheses(&rank_inputs, &prepared.artifact.config.ranking)
-        .map_err(map_evaluator_lodestar)?;
+    let ranked = rank_evaluated_hypotheses(
+        &evaluator,
+        &by_id,
+        &validated,
+        &prepared.artifact.config.ranking,
+    )?;
     let reasoning_kernel = compact_reasoning_kernel(prepared, &evaluator, &ranked, &validated)?;
     let trust = reasoning_kernel.trust.clone();
     let artifact = FinalAssociationDiscovery {
         schema: DISCOVERY_FINAL_SCHEMA.to_string(),
         prepared_artifact_sha256: prepared.artifact_sha256.clone(),
+        source_manifest: prepared.artifact.source_manifest.clone(),
+        evaluation_roster: prepared.artifact.evaluation_roster.clone(),
+        evaluator_receipts,
         evaluator,
         ranked,
         reasoning_kernel,
@@ -738,9 +1251,641 @@ pub fn finalize_association_discovery(
     })
 }
 
+#[derive(Serialize)]
+struct PreparedEvaluatorRequest<'a> {
+    schema: &'static str,
+    source_generation_sha256: &'a str,
+    hypothesis_id: &'a str,
+    hypothesis_content_sha256: &'a str,
+    evaluator_id: &'a str,
+    model_id: &'a str,
+    prompt_id: &'a str,
+    temperature_x100: u16,
+    prompt_utf8: &'a str,
+    hypothesis: &'a DiscoveryHypothesisCandidate,
+}
+
+fn build_evaluation_roster(
+    source_generation_sha256: &str,
+    candidates: &[DiscoveryHypothesisCandidate],
+    declarations: &[EvaluatorDeclaration],
+    budgets: &AssociationDiscoveryBudgets,
+) -> Result<EvaluationRoster> {
+    if candidates.is_empty() || declarations.is_empty() {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "an exact evaluation roster requires non-empty hypotheses and evaluator declarations",
+            "prepare candidates and explicitly declare every evaluator/model/prompt variant before invocation",
+        ));
+    }
+    let binding_count = candidates
+        .len()
+        .checked_mul(declarations.len())
+        .ok_or_else(|| {
+            DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                "evaluation binding count overflow",
+                "partition discovery into smaller source scopes without omitting a declared evaluator binding",
+            )
+        })?;
+    if binding_count > budgets.max_evaluation_bindings {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            format!(
+                "evaluation binding count {binding_count} exceeds caller budget {}",
+                budgets.max_evaluation_bindings
+            ),
+            "raise the explicit binding budget with measured evidence or narrow the hypothesis/evaluator roster",
+        ));
+    }
+    let mut candidates = candidates.iter().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.hypothesis_id.cmp(&right.hypothesis_id));
+    let mut declarations = declarations.iter().collect::<Vec<_>>();
+    declarations.sort_by(|left, right| {
+        left.evaluator_id
+            .cmp(&right.evaluator_id)
+            .then_with(|| left.model_id.cmp(&right.model_id))
+            .then_with(|| left.prompt_id.cmp(&right.prompt_id))
+            .then_with(|| left.temperature_x100.cmp(&right.temperature_x100))
+            .then_with(|| left.prompt_utf8.cmp(&right.prompt_utf8))
+    });
+    let mut bindings = Vec::with_capacity(binding_count);
+    let mut request_bytes_total = 0usize;
+    for candidate in candidates {
+        let hypothesis_content_sha256 = sha256_hex(&canonical_json_bytes(candidate)?);
+        for declaration in &declarations {
+            let prompt_sha256 = sha256_hex(declaration.prompt_utf8.as_bytes());
+            let request = PreparedEvaluatorRequest {
+                schema: DISCOVERY_EVALUATOR_REQUEST_SCHEMA,
+                source_generation_sha256,
+                hypothesis_id: &candidate.hypothesis_id,
+                hypothesis_content_sha256: &hypothesis_content_sha256,
+                evaluator_id: &declaration.evaluator_id,
+                model_id: &declaration.model_id,
+                prompt_id: &declaration.prompt_id,
+                temperature_x100: declaration.temperature_x100,
+                prompt_utf8: &declaration.prompt_utf8,
+                hypothesis: candidate,
+            };
+            let request_byte_count = canonical_json_byte_count(&request)?;
+            if request_byte_count > budgets.max_request_bytes_per_binding {
+                return Err(DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "evaluator request for hypothesis {} is {} bytes, exceeding caller per-binding budget {}",
+                        candidate.hypothesis_id,
+                        request_byte_count,
+                        budgets.max_request_bytes_per_binding
+                    ),
+                    "raise the explicit per-binding request budget with measured evidence or reduce the exact evidence packet",
+                ));
+            }
+            request_bytes_total = request_bytes_total
+                .checked_add(request_byte_count)
+                .ok_or_else(|| {
+                    DomainError::new(
+                        ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                        "total evaluator request bytes overflow usize",
+                        "narrow the exact evaluator roster before preparing requests",
+                    )
+                })?;
+            if request_bytes_total > budgets.max_request_bytes_total {
+                return Err(DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "total evaluator request bytes {request_bytes_total} exceed caller budget {}",
+                        budgets.max_request_bytes_total
+                    ),
+                    "raise the explicit total request budget with measured evidence or narrow the hypothesis/evaluator roster",
+                ));
+            }
+            let request_bytes = canonical_json_bytes(&request)?;
+            if request_bytes.len() != request_byte_count {
+                return Err(DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    "evaluator request allocation differs from its preallocation byte count",
+                    "repair the canonical serializer before invoking an evaluator",
+                ));
+            }
+            let request_sha256 = sha256_hex(&request_bytes);
+            let request_utf8 = String::from_utf8(request_bytes).map_err(|error| {
+                DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!("prepared evaluator request is not UTF-8: {error}"),
+                    "repair the canonical evaluator request serializer before invoking a model",
+                )
+            })?;
+            let mut invocation_digest = Sha256::new();
+            update_framed_digest(
+                &mut invocation_digest,
+                b"astrolabe.association_discovery.evaluator_invocation.v1",
+            );
+            let temperature_bytes = declaration.temperature_x100.to_be_bytes();
+            for bytes in [
+                source_generation_sha256.as_bytes(),
+                candidate.hypothesis_id.as_bytes(),
+                hypothesis_content_sha256.as_bytes(),
+                declaration.evaluator_id.as_bytes(),
+                declaration.model_id.as_bytes(),
+                declaration.prompt_id.as_bytes(),
+                &temperature_bytes,
+                prompt_sha256.as_bytes(),
+                request_sha256.as_bytes(),
+            ] {
+                update_framed_digest(&mut invocation_digest, bytes);
+            }
+            bindings.push(EvaluationBinding {
+                invocation_id: digest_hex(&invocation_digest.finalize()),
+                source_generation_sha256: source_generation_sha256.to_string(),
+                hypothesis_id: candidate.hypothesis_id.clone(),
+                hypothesis_content_sha256: hypothesis_content_sha256.clone(),
+                evaluator_id: declaration.evaluator_id.clone(),
+                model_id: declaration.model_id.clone(),
+                prompt_id: declaration.prompt_id.clone(),
+                temperature_x100: declaration.temperature_x100,
+                prompt_utf8: declaration.prompt_utf8.clone(),
+                prompt_sha256,
+                request_utf8,
+                request_sha256,
+            });
+        }
+    }
+    let unique = bindings
+        .iter()
+        .map(|binding| binding.invocation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if unique.len() != binding_count {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "deterministic evaluator invocation identities collided",
+            "preserve the prepared inputs and repair the exact evaluator declaration identity",
+        ));
+    }
+    let bindings_sha256 = sha256_hex(&canonical_json_bytes(&bindings)?);
+    Ok(EvaluationRoster {
+        schema: DISCOVERY_EVALUATION_ROSTER_SCHEMA.to_string(),
+        hypothesis_count: candidates_len_from_bindings(&bindings),
+        evaluator_declaration_count: declarations.len(),
+        binding_count,
+        request_bytes_total,
+        bindings_sha256,
+        bindings,
+    })
+}
+
+fn candidates_len_from_bindings(bindings: &[EvaluationBinding]) -> usize {
+    bindings
+        .iter()
+        .map(|binding| binding.hypothesis_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn validate_evaluator_receipts(
+    prepared: &PreparedAssociationDiscoveryEnvelope,
+    receipts: &[EvaluatorReceipt],
+) -> Result<(
+    BTreeMap<String, Vec<calyx_lodestar::EvaluatorRun>>,
+    Vec<EvaluatorReceipt>,
+)> {
+    let budgets = required_budgets(&prepared.artifact.config)?;
+    if receipts.len() > budgets.max_evaluation_bindings {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            format!(
+                "receipt count {} exceeds caller binding budget {}",
+                receipts.len(),
+                budgets.max_evaluation_bindings
+            ),
+            "submit only the exact prepared roster within its identity-bound caller budget",
+        ));
+    }
+    let mut request_bytes_total = 0usize;
+    let mut response_bytes_total = 0usize;
+    for receipt in receipts {
+        let request_bytes = receipt.request_utf8.len();
+        let response_bytes = receipt.response_utf8.len();
+        if request_bytes > budgets.max_request_bytes_per_binding
+            || response_bytes > budgets.max_response_bytes_per_binding
+        {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "receipt {} exceeds a caller per-binding byte budget: request={request_bytes}/{} response={response_bytes}/{}",
+                    receipt.invocation_id,
+                    budgets.max_request_bytes_per_binding,
+                    budgets.max_response_bytes_per_binding,
+                ),
+                "preserve the exact receipt and explicitly raise the relevant measured budget before preparing a new generation",
+            ));
+        }
+        request_bytes_total = request_bytes_total
+            .checked_add(request_bytes)
+            .ok_or_else(|| evaluator_budget_overflow("request"))?;
+        response_bytes_total = response_bytes_total
+            .checked_add(response_bytes)
+            .ok_or_else(|| evaluator_budget_overflow("response"))?;
+        if request_bytes_total > budgets.max_request_bytes_total
+            || response_bytes_total > budgets.max_response_bytes_total
+        {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "receipt bytes exceed caller totals: request={request_bytes_total}/{} response={response_bytes_total}/{}",
+                    budgets.max_request_bytes_total, budgets.max_response_bytes_total,
+                ),
+                "preserve the receipts and explicitly raise the measured total budget before preparing a new generation",
+            ));
+        }
+    }
+    if request_bytes_total != prepared.artifact.evaluation_roster.request_bytes_total {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            format!(
+                "receipt request-byte total {request_bytes_total} differs from prepared roster total {}",
+                prepared.artifact.evaluation_roster.request_bytes_total
+            ),
+            "submit every exact prepared request byte once, with no replacement or omission",
+        ));
+    }
+    let expected = prepared
+        .artifact
+        .evaluation_roster
+        .bindings
+        .iter()
+        .map(|binding| (binding.invocation_id.as_str(), binding))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed = BTreeMap::new();
+    let mut duplicate_ids = BTreeSet::new();
+    for receipt in receipts {
+        if observed
+            .insert(receipt.invocation_id.as_str(), receipt)
+            .is_some()
+        {
+            duplicate_ids.insert(receipt.invocation_id.as_str());
+        }
+    }
+    let missing = expected
+        .keys()
+        .filter(|identity| !observed.contains_key(**identity))
+        .copied()
+        .collect::<Vec<_>>();
+    let extra = observed
+        .keys()
+        .filter(|identity| !expected.contains_key(**identity))
+        .copied()
+        .collect::<Vec<_>>();
+    if !duplicate_ids.is_empty()
+        || !missing.is_empty()
+        || !extra.is_empty()
+        || receipts.len() != expected.len()
+    {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            format!(
+                "evaluator receipt roster mismatch: expected={} observed={} missing={missing:?} extra={extra:?} duplicate={duplicate_ids:?}",
+                expected.len(),
+                receipts.len(),
+            ),
+            "submit one and only one receipt for every exact invocation in the prepared evaluation roster",
+        ));
+    }
+    let candidates = prepared
+        .artifact
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.hypothesis_id.as_str(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut external_invocation_ids = BTreeSet::new();
+    let mut runs = BTreeMap::<String, Vec<calyx_lodestar::EvaluatorRun>>::new();
+    let mut ordered_receipts = Vec::with_capacity(expected.len());
+    for binding in &prepared.artifact.evaluation_roster.bindings {
+        let receipt = observed
+            .get(binding.invocation_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "prepared evaluator binding {} has no receipt after exact roster validation",
+                        binding.invocation_id
+                    ),
+                    "preserve the prepared artifact and repair receipt roster validation",
+                )
+            })?;
+        if receipt.schema != DISCOVERY_EVALUATOR_RECEIPT_SCHEMA
+            || receipt.prepared_artifact_sha256 != prepared.artifact_sha256
+            || receipt.source_generation_sha256 != prepared.artifact.source_generation_sha256
+            || receipt.invocation_id != binding.invocation_id
+            || receipt.hypothesis_id != binding.hypothesis_id
+            || receipt.hypothesis_content_sha256 != binding.hypothesis_content_sha256
+            || receipt.evaluator_id != binding.evaluator_id
+            || receipt.model_id != binding.model_id
+            || receipt.prompt_id != binding.prompt_id
+            || receipt.temperature_x100 != binding.temperature_x100
+            || receipt.prompt_utf8 != binding.prompt_utf8
+            || receipt.prompt_sha256 != binding.prompt_sha256
+            || receipt.request_utf8 != binding.request_utf8
+            || receipt.request_sha256 != binding.request_sha256
+        {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "evaluator receipt {} disagrees with its prepared/source/hypothesis/evaluator/model/prompt/request binding",
+                    binding.invocation_id
+                ),
+                "use the exact prepared binding bytes for the real evaluator call and return them unchanged",
+            ));
+        }
+        if sha256_hex(receipt.prompt_utf8.as_bytes()) != receipt.prompt_sha256
+            || sha256_hex(receipt.request_utf8.as_bytes()) != receipt.request_sha256
+            || sha256_hex(receipt.response_utf8.as_bytes()) != receipt.response_sha256
+        {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "evaluator receipt {} has a byte/hash mismatch",
+                    binding.invocation_id
+                ),
+                "preserve and resubmit the exact prompt, request, and response bytes with their rederived SHA-256 values",
+            ));
+        }
+        if receipt.external_invocation_id.trim().is_empty()
+            || !external_invocation_ids.insert(receipt.external_invocation_id.as_str())
+        {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "evaluator receipt {} has an absent or replayed external invocation identity {:?}",
+                    binding.invocation_id, receipt.external_invocation_id
+                ),
+                "retain the unique identity of each genuine external evaluator call; never reuse one invocation across bindings",
+            ));
+        }
+        if receipt.capture_schema != DISCOVERY_EXTERNAL_CAPTURE_SCHEMA
+            || receipt.provider_response_id.trim().is_empty()
+            || receipt.capture_provenance.is_empty()
+            || receipt
+                .capture_provenance
+                .iter()
+                .any(|item| item.trim().is_empty())
+        {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "evaluator receipt {} lacks the exact trusted external-capture schema, provider response identity, or non-empty capture provenance",
+                    receipt.invocation_id
+                ),
+                "record the provider response identity and truthful operator-owned capture provenance; local validation binds these bytes but does not prove a remote call occurred",
+            ));
+        }
+        let parsed: EvaluatorResponseParseResult =
+            serde_json::from_slice(receipt.response_utf8.as_bytes()).map_err(|error| {
+                DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "evaluator response {} does not parse under the strict response schema: {error}",
+                        binding.invocation_id
+                    ),
+                    "return one exact strict evaluator response JSON object with no extra or missing fields",
+                )
+            })?;
+        if parsed != receipt.parse_result || parsed.schema != DISCOVERY_EVALUATOR_RESPONSE_SCHEMA {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "evaluator response {} parse result does not equal the result persisted in its receipt",
+                    binding.invocation_id
+                ),
+                "derive scores and prose only by parsing the exact response bytes",
+            ));
+        }
+        let candidate = candidates
+            .get(binding.hypothesis_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "prepared evaluator binding {} names absent hypothesis {}",
+                        binding.invocation_id, binding.hypothesis_id
+                    ),
+                    "preserve the prepared artifact and rebuild its exact candidate/evaluator roster",
+                )
+            })?;
+        validate_parsed_evaluator_response(&parsed, candidate)?;
+        runs.entry(binding.hypothesis_id.clone())
+            .or_default()
+            .push(calyx_lodestar::EvaluatorRun {
+                prompt_id: binding.prompt_id.clone(),
+                temperature_x100: binding.temperature_x100,
+                plausible_score: parsed.plausible_score,
+                novelty_score: parsed.novelty_score,
+                testability_score: parsed.testability_score,
+                falsifiability_score: parsed.falsifiability_score,
+                justification: parsed.justification.clone(),
+                falsification_test: parsed.falsification_test.clone(),
+                cited_evidence_ids: parsed.cited_evidence_ids.clone(),
+            });
+        ordered_receipts.push(receipt.clone());
+    }
+    Ok((runs, ordered_receipts))
+}
+
+fn validate_parsed_evaluator_response(
+    parsed: &EvaluatorResponseParseResult,
+    candidate: &DiscoveryHypothesisCandidate,
+) -> Result<()> {
+    if parsed.justification.trim().is_empty()
+        || parsed.falsification_test.trim().is_empty()
+        || parsed.cited_evidence_ids.is_empty()
+        || [
+            parsed.plausible_score,
+            parsed.novelty_score,
+            parsed.testability_score,
+            parsed.falsifiability_score,
+        ]
+        .into_iter()
+        .any(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+    {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "parsed evaluator response requires finite [0,1] scores, prose, a falsification test, and citations",
+            "repair the real evaluator response and invoke the exact binding again",
+        ));
+    }
+    let mut canonical_citations = parsed.cited_evidence_ids.clone();
+    canonical_citations.sort();
+    canonical_citations.dedup();
+    if canonical_citations != parsed.cited_evidence_ids {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "evaluator citations must be unique and in canonical byte order",
+            "emit each prepared evidence id once in ascending byte order",
+        ));
+    }
+    let available = candidate
+        .evidence_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if let Some(unknown) = parsed
+        .cited_evidence_ids
+        .iter()
+        .find(|identity| !available.contains(identity.as_str()))
+    {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            format!("evaluator response cites unavailable evidence {unknown:?}"),
+            "cite only evidence ids present in the exact prepared hypothesis request",
+        ));
+    }
+    Ok(())
+}
+
+fn rank_evaluated_hypotheses(
+    evaluator: &HypothesisEvaluationReport,
+    candidates: &BTreeMap<&str, &DiscoveryHypothesisCandidate>,
+    validated: &BTreeSet<String>,
+    params: &RankedHypothesisParams,
+) -> Result<AssociationRankedHypothesisReport> {
+    if params.max_ranked == 0
+        || !params.min_review_score.is_finite()
+        || !(0.0..=1.0).contains(&params.min_review_score)
+    {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "ranking requires positive max_ranked and a finite review floor in [0,1]",
+            "repair the exact prepared ranking configuration before evaluator invocation",
+        ));
+    }
+    let mut hypotheses = Vec::new();
+    for evaluation in &evaluator.evaluations {
+        if evaluation.verdict != HypothesisEvaluationVerdict::RetainForRanking {
+            continue;
+        }
+        let candidate = candidates
+            .get(evaluation.hypothesis_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "evaluator report names absent prepared hypothesis {}",
+                        evaluation.hypothesis_id
+                    ),
+                    "preserve the prepared artifact and rebuild the exact candidate/evaluator roster",
+                )
+            })?;
+        let rank_score = (evaluation.novelty_mean * 0.25
+            + evaluation.grounded_confidence * 0.30
+            + evaluation.plausible_mean * 0.25)
+            / 0.80;
+        if !rank_score.is_finite() || !(0.0..=1.0).contains(&rank_score) {
+            return Err(DomainError::new(
+                ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                format!(
+                    "hypothesis {} produced invalid rank score {rank_score}",
+                    evaluation.hypothesis_id
+                ),
+                "repair the parsed evaluator scores; unmeasured cross-domain evidence remains excluded",
+            ));
+        }
+        hypotheses.push(AssociationRankedHypothesis {
+            rank: 0,
+            hypothesis_id: evaluation.hypothesis_id.clone(),
+            a: evaluation.a,
+            b: evaluation.b,
+            c: evaluation.c,
+            claim: evaluation.claim.clone(),
+            novelty_score: evaluation.novelty_mean,
+            grounded_confidence: evaluation.grounded_confidence,
+            cross_domain: CrossDomainMeasurement::Unavailable {
+                reason: "no persisted cross-domain distance measurement exists; the distance term is excluded from rank_score".to_string(),
+            },
+            evaluator_plausibility_score: evaluation.plausible_mean,
+            evaluator_aggregate_score: evaluation.aggregate_score,
+            rank_score,
+            score_semantics: "renormalized_novelty_0.25_grounding_0.30_evaluator_plausibility_0.25; cross_domain_unavailable_excluded; uncalibrated_ranking_score".to_string(),
+            human_review_flag: false,
+            sufficiency_proof: if validated.contains(&pair_id(evaluation.a, evaluation.c)) {
+                "held_out_endpoint_pair_predicted_without_training_pair_leakage".to_string()
+            } else {
+                "trusted_operator_evaluator_capture_only; held_out_support_absent".to_string()
+            },
+            provenance: candidate.provenance.clone(),
+            evidence_ids: candidate.evidence_ids.clone(),
+        });
+    }
+    if hypotheses.is_empty() {
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_EVALUATOR_INVALID,
+            "no evaluator-scored hypothesis passed the declared retention floor",
+            "supply more grounded evidence; a prepared generation is never promoted with an empty ranked roster",
+        ));
+    }
+    hypotheses.sort_by(|left, right| {
+        right
+            .rank_score
+            .total_cmp(&left.rank_score)
+            .then_with(|| {
+                right
+                    .grounded_confidence
+                    .total_cmp(&left.grounded_confidence)
+            })
+            .then_with(|| left.hypothesis_id.cmp(&right.hypothesis_id))
+    });
+    hypotheses.truncate(params.max_ranked);
+    for (index, hypothesis) in hypotheses.iter_mut().enumerate() {
+        hypothesis.rank = index + 1;
+        hypothesis.human_review_flag =
+            index < params.review_top_n && hypothesis.rank_score >= params.min_review_score;
+    }
+    Ok(AssociationRankedHypothesisReport {
+        schema: "astrolabe.association_discovery.ranked.v1".to_string(),
+        input_count: evaluator.retained_count,
+        ranked_count: hypotheses.len(),
+        human_review_count: hypotheses
+            .iter()
+            .filter(|hypothesis| hypothesis.human_review_flag)
+            .count(),
+        hypotheses,
+    })
+}
+
+fn discovery_concept_from_normalized(concept: &NormalizedConcept) -> DiscoveryConceptInput {
+    DiscoveryConceptInput {
+        cx_id: concept.cx_id,
+        symbol_kind: concept.symbol_kind.clone(),
+        language: concept.language.clone(),
+        qualified_name: concept.qualified_name.clone(),
+        signature_or_shape: concept.signature_or_shape.clone(),
+        file_path: concept.file_path.clone(),
+        source_sha256: concept.source_sha256.clone(),
+        source_excerpt: concept.source_excerpt.clone(),
+        frequency: concept.frequency,
+        anchor_trust: concept.anchor_trust,
+    }
+}
+
 fn validate_config(config: &AssociationDiscoveryConfig) -> Result<()> {
     latent_config(config).validate()?;
     config.reasoning_kernel.validate()?;
+    let budgets = required_budgets(config)?;
+    if budgets.max_evaluation_bindings == 0
+        || budgets.max_request_bytes_per_binding == 0
+        || budgets.max_request_bytes_total == 0
+        || budgets.max_response_bytes_per_binding == 0
+        || budgets.max_response_bytes_total == 0
+        || budgets.max_generation_rows == 0
+        || budgets.max_generation_bytes == 0
+        || budgets.max_request_bytes_total < budgets.max_request_bytes_per_binding
+        || budgets.max_response_bytes_total < budgets.max_response_bytes_per_binding
+    {
+        return invalid_graph(
+            "every caller-owned evaluator/persistence budget must be positive and each total byte budget must cover at least one per-binding budget",
+        );
+    }
     if config.spectral_eigen_k < 3
         || config.spectral_eigen_max_iter == 0
         || config.spectral_centrality_max_iter == 0
@@ -756,9 +1901,43 @@ fn validate_config(config: &AssociationDiscoveryConfig) -> Result<()> {
         || config.cross_validation_folds > 32
         || config.cross_validation_top_k == 0
         || config.allowed_walk_edge_families.is_empty()
+        || config.evaluator_declarations.is_empty()
     {
         return invalid_graph(
             "one or more declared discovery limits are zero or mathematically insufficient",
+        );
+    }
+    let mut declaration_ids = BTreeSet::new();
+    let mut prompt_variants = BTreeSet::new();
+    let mut temperature_variants = BTreeSet::new();
+    for declaration in &config.evaluator_declarations {
+        if declaration.evaluator_id.trim().is_empty()
+            || declaration.model_id.trim().is_empty()
+            || declaration.prompt_id.trim().is_empty()
+            || declaration.prompt_utf8.trim().is_empty()
+        {
+            return invalid_graph(
+                "every evaluator declaration requires explicit evaluator/model/prompt identity and non-empty exact prompt bytes",
+            );
+        }
+        let identity = (
+            declaration.evaluator_id.as_str(),
+            declaration.model_id.as_str(),
+            declaration.prompt_id.as_str(),
+            declaration.temperature_x100,
+        );
+        if !declaration_ids.insert(identity) {
+            return invalid_graph("evaluator declarations must have unique exact identities");
+        }
+        prompt_variants.insert(declaration.prompt_id.as_str());
+        temperature_variants.insert(declaration.temperature_x100);
+    }
+    if config.evaluator_declarations.len() < config.evaluator.min_runs_per_hypothesis
+        || prompt_variants.len() < config.evaluator.min_prompt_variants
+        || temperature_variants.len() < config.evaluator.min_temperature_variants
+    {
+        return invalid_graph(
+            "declared evaluator roster cannot satisfy its exact run, prompt-variant, and temperature-variant contract",
         );
     }
     for score in [
@@ -775,9 +1954,31 @@ fn validate_config(config: &AssociationDiscoveryConfig) -> Result<()> {
     Ok(())
 }
 
+fn required_budgets(config: &AssociationDiscoveryConfig) -> Result<&AssociationDiscoveryBudgets> {
+    config.budgets.as_ref().ok_or_else(|| {
+        DomainError::new(
+            ASTRO_DISCOVERY_GRAPH_INVALID,
+            "association discovery requires explicit caller-owned evaluator and persistence budgets; no defaults are permitted",
+            "set max binding, per/total request, per/total response, and generation row/byte budgets before preparation",
+        )
+    })
+}
+
+fn evaluator_budget_overflow(kind: &str) -> DomainError {
+    DomainError::new(
+        ASTRO_DISCOVERY_EVALUATOR_INVALID,
+        format!("total evaluator {kind} bytes overflow usize"),
+        "narrow the exact evaluator roster before submitting receipts",
+    )
+}
+
 fn validate_input(input: &AssociationDiscoveryInput) -> Result<()> {
     if input.project.trim().is_empty()
-        || input.source_generation_sha256.trim().is_empty()
+        || !is_canonical_hash(&input.source_generation_sha256)
+        || input.source_manifest.schema != DISCOVERY_SOURCE_MANIFEST_SCHEMA
+        || input.source_manifest.project != input.project
+        || input.source_manifest.source_seq != input.source_seq
+        || input.source_manifest.completeness != input.completeness
         || input.concepts.len() < 3
         || input.typed_edges.is_empty()
     {
@@ -789,27 +1990,68 @@ fn validate_input(input: &AssociationDiscoveryInput) -> Result<()> {
     if witness.constellation_count == 0
         || witness.source_slot_count == 0
         || witness.pair_count == 0
-        || witness.completion_witness_state_hash.is_empty()
-        || witness.xterm_key_stream_hash.is_empty()
-        || witness.xterm_value_stream_hash.is_empty()
+        || !is_canonical_hash(&witness.completion_witness_state_hash)
+        || !is_canonical_hash(&witness.xterm_key_stream_hash)
+        || !is_canonical_hash(&witness.xterm_value_stream_hash)
     {
         return incomplete(
             "complete Base/Slot/XTerm physical witness counts and hashes are required",
+        );
+    }
+    let physical = &input.source_manifest.physical;
+    if physical.retained_snapshot_seq == 0
+        || !is_canonical_hash(&physical.projection_source_fingerprint_blake3)
+        || physical.slot_cf_generations.is_empty()
+        || physical.panel_schema_ids.is_empty()
+        || physical.panel_manifest_sha256.is_empty()
+        || physical.panel_schema_ids.keys().collect::<Vec<_>>()
+            != physical.panel_manifest_sha256.keys().collect::<Vec<_>>()
+        || physical
+            .panel_schema_ids
+            .values()
+            .any(|schema| schema.trim().is_empty())
+        || physical
+            .panel_manifest_sha256
+            .values()
+            .any(|hash| !is_canonical_hash(hash))
+        || physical.completion_pair_block_schema != "astrolabe.complete_pair_block.v2"
+        || physical.completion_witness_schema != "astrolabe.complete_pair_witness.v2"
+        || physical.completion_ledger_schema != "astrolabe.complete_association_commit.v2"
+        || physical
+            .completion_metric_contract
+            .iter()
+            .map(String::as_str)
+            .ne(["cosine", "symmetric_mean_maxsim_cosine"])
+        || physical
+            .completion_incompatibility_contract
+            .iter()
+            .map(String::as_str)
+            .ne(["absent_slot", "shape_mismatch", "zero_norm"])
+    {
+        return incomplete(
+            "source manifest requires retained snapshot, projection identity, every consumed slot generation, panel schema/config identities, and complete-association schema/config",
         );
     }
     let mut concepts = BTreeSet::new();
     for concept in &input.concepts {
         if !concepts.insert(concept.cx_id)
             || concept.symbol_kind.trim().is_empty()
-            || concept.language.trim().is_empty()
             || concept.qualified_name.trim().is_empty()
-            || concept.file_path.trim().is_empty()
-            || concept.source_sha256.trim().is_empty()
-            || concept.source_excerpt.trim().is_empty()
             || concept.frequency == 0
         {
             return incomplete(
-                "concept identities must be unique and every concept must carry kind, language, name, file, source hash/excerpt, and positive frequency",
+                "concept identities must be unique and every concept must carry kind, name, and positive frequency; absent language/signature/file/hash/excerpt fields remain explicitly unavailable",
+            );
+        }
+        if !concept.source_sha256.is_empty()
+            && (concept.source_sha256.len() != 64
+                || !concept
+                    .source_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return incomplete(
+                "available concept source_sha256 values must be canonical SHA-256 hex",
             );
         }
     }
@@ -825,7 +2067,7 @@ fn validate_input(input: &AssociationDiscoveryInput) -> Result<()> {
             || !evidence.insert(edge.evidence_id.as_str())
             || edge.edge_type_name.trim().is_empty()
             || edge.family.trim().is_empty()
-            || edge.ledger_ref.trim().is_empty()
+            || !is_canonical_ledger_ref(&edge.ledger_ref)
             || edge.provenance.is_empty()
             || edge.source_generation_sha256 != input.source_generation_sha256
         {
@@ -842,6 +2084,78 @@ fn validate_input(input: &AssociationDiscoveryInput) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_source_manifest_contract(manifest: &AssociationSourceManifest) -> Result<()> {
+    let physical = &manifest.physical;
+    let completeness = &manifest.completeness;
+    if manifest.schema != DISCOVERY_SOURCE_MANIFEST_SCHEMA
+        || manifest.project.trim().is_empty()
+        || manifest.source_seq == 0
+        || manifest.physical.retained_snapshot_seq == 0
+        || manifest.source_seq != manifest.physical.retained_snapshot_seq
+        || manifest.concept_count == 0
+        || manifest.typed_edge_count == 0
+        || manifest.discovery_prepared_schema != DISCOVERY_PREPARED_SCHEMA
+        || manifest.discovery_final_schema != DISCOVERY_FINAL_SCHEMA
+        || !is_canonical_hash(&manifest.concept_stream_sha256)
+        || !is_canonical_hash(&manifest.typed_edge_stream_sha256)
+        || !is_canonical_hash(&manifest.discovery_config_sha256)
+        || !is_canonical_hash(&physical.projection_source_fingerprint_blake3)
+        || physical.slot_cf_generations.is_empty()
+        || physical.panel_schema_ids.is_empty()
+        || physical.panel_schema_ids.keys().collect::<Vec<_>>()
+            != physical.panel_manifest_sha256.keys().collect::<Vec<_>>()
+        || physical
+            .panel_schema_ids
+            .values()
+            .any(|schema| schema.trim().is_empty())
+        || physical
+            .panel_manifest_sha256
+            .values()
+            .any(|hash| !is_canonical_hash(hash))
+        || physical.completion_pair_block_schema != "astrolabe.complete_pair_block.v2"
+        || physical.completion_witness_schema != "astrolabe.complete_pair_witness.v2"
+        || physical.completion_ledger_schema != "astrolabe.complete_association_commit.v2"
+        || physical
+            .completion_metric_contract
+            .iter()
+            .map(String::as_str)
+            .ne(["cosine", "symmetric_mean_maxsim_cosine"])
+        || physical
+            .completion_incompatibility_contract
+            .iter()
+            .map(String::as_str)
+            .ne(["absent_slot", "shape_mismatch", "zero_norm"])
+        || completeness.constellation_count == 0
+        || completeness.source_slot_count == 0
+        || completeness.pair_count == 0
+        || !is_canonical_hash(&completeness.completion_witness_state_hash)
+        || !is_canonical_hash(&completeness.xterm_key_stream_hash)
+        || !is_canonical_hash(&completeness.xterm_value_stream_hash)
+    {
+        return incomplete(
+            "association source manifest violates its exact schema, source, or canonical SHA-256 contract",
+        );
+    }
+    Ok(())
+}
+
+fn is_canonical_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_canonical_ledger_ref(value: &str) -> bool {
+    let Some((seq, hash)) = value.split_once(':') else {
+        return false;
+    };
+    !seq.is_empty()
+        && !seq.starts_with('0')
+        && seq.parse::<u64>().is_ok_and(|seq| seq > 0)
+        && is_canonical_hash(hash)
 }
 
 struct ConceptAssociationAccumulator {
@@ -954,6 +2268,8 @@ fn normalize_concepts(
                 qualified_name: concept.qualified_name.clone(),
                 file_path: concept.file_path.clone(),
                 source_sha256: concept.source_sha256.clone(),
+                source_excerpt: concept.source_excerpt.clone(),
+                frequency: concept.frequency,
                 anchor_trust: concept.anchor_trust,
             }
         })
@@ -1154,6 +2470,12 @@ fn build_candidates(
                     concepts[&pair.c].qualified_name,
                     concepts[&intermediary.id].qualified_name,
                     report.relation
+                ),
+                structural_evidence: structural_evidence_for_abc(
+                    evidence_index,
+                    pair.a,
+                    intermediary.id,
+                    pair.c,
                 ),
                 evidence,
                 evidence_ids,
@@ -1388,6 +2710,12 @@ fn merge_walk_candidates(
                 cross_community: false,
                 grounded_confidence: hypothesis.terminal_confidence,
                 claim: hypothesis.testable_claim.clone(),
+                structural_evidence: structural_evidence_for_abc(
+                    evidence_index,
+                    hypothesis.a,
+                    hypothesis.b,
+                    hypothesis.c,
+                ),
                 evidence,
                 evidence_ids,
                 provenance: hypothesis.provenance.clone(),
@@ -1423,6 +2751,24 @@ fn cross_validate(
     });
     let folds = collect_domain_results(folds)?;
     let usable = folds.iter().filter(|fold| fold.usable).collect::<Vec<_>>();
+    if usable.is_empty() {
+        let reasons = folds
+            .iter()
+            .map(|fold| {
+                format!(
+                    "fold={} reason={}",
+                    fold.fold,
+                    fold.unusable_reason.as_deref().unwrap_or("unreported")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(DomainError::new(
+            ASTRO_DISCOVERY_GRAPH_INVALID,
+            format!("cross-validation produced zero usable folds: {reasons}"),
+            "supply enough real endpoint-pair evidence for at least one leakage-free training/held-out fold; zero aggregates are never published",
+        ));
+    }
     let mut validated = usable
         .iter()
         .flat_map(|fold| fold.validated_pair_ids.iter().cloned())
@@ -1477,6 +2823,7 @@ fn cross_validate(
     let mean_null_hits_at_k = null_hits_at_k.as_ref().map_or(0.0, |row| row.mean);
     Ok(CrossValidationReport {
         split_kind: plan.split_kind.to_string(),
+        temporal_evidence: plan.temporal_evidence,
         usable_fold_count: usable.len(),
         mean_precision_at_k,
         mean_recall_at_k,
@@ -1546,6 +2893,7 @@ fn metric_stability(
 #[derive(Debug)]
 struct ValidationPlan {
     split_kind: &'static str,
+    temporal_evidence: TemporalEvidenceStatus,
     folds: Vec<ValidationFoldPlan>,
 }
 
@@ -1557,12 +2905,12 @@ struct ValidationFoldPlan {
 }
 
 fn validation_plan(input: &AssociationDiscoveryInput, fold_count: usize) -> ValidationPlan {
-    let concepts = input
-        .concepts
-        .iter()
-        .map(|concept| (concept.cx_id, concept.file_path.as_str()))
-        .collect::<BTreeMap<_, _>>();
     let mut pair_timestamps = BTreeMap::<(CxId, CxId), Option<u64>>::new();
+    let timestamped_edge_count = input
+        .typed_edges
+        .iter()
+        .filter(|edge| edge.observed_at_millis.is_some())
+        .count();
     for edge in &input.typed_edges {
         let pair = canonical_pair(edge.src, edge.dst);
         pair_timestamps
@@ -1574,7 +2922,9 @@ fn validation_plan(input: &AssociationDiscoveryInput, fold_count: usize) -> Vali
             })
             .or_insert(edge.observed_at_millis);
     }
-    if pair_timestamps.values().all(Option::is_some) {
+    if timestamped_edge_count == input.typed_edges.len()
+        && pair_timestamps.values().all(Option::is_some)
+    {
         let mut ordered = pair_timestamps
             .into_iter()
             .map(|(pair, timestamp)| (timestamp.expect("all timestamps checked"), pair))
@@ -1605,13 +2955,17 @@ fn validation_plan(input: &AssociationDiscoveryInput, fold_count: usize) -> Vali
             .collect();
         return ValidationPlan {
             split_kind: "temporal_forward_endpoint_pair_group",
+            temporal_evidence: TemporalEvidenceStatus::Measured {
+                timestamped_edge_count,
+                relationship_edge_count: input.typed_edges.len(),
+            },
             folds,
         };
     }
 
     let mut buckets = vec![BTreeSet::new(); fold_count];
     for pair in pair_timestamps.keys().copied() {
-        let fold = deterministic_pair_fold(pair, &concepts, fold_count);
+        let fold = deterministic_pair_fold(pair, fold_count);
         buckets[fold].insert(pair);
     }
     let all_pairs = pair_timestamps.keys().copied().collect::<BTreeSet<_>>();
@@ -1624,7 +2978,12 @@ fn validation_plan(input: &AssociationDiscoveryInput, fold_count: usize) -> Vali
         })
         .collect();
     ValidationPlan {
-        split_kind: "deterministic_file_endpoint_pair_group",
+        split_kind: "deterministic_endpoint_pair_group_temporal_unavailable",
+        temporal_evidence: TemporalEvidenceStatus::Unavailable {
+            timestamped_edge_count,
+            relationship_edge_count: input.typed_edges.len(),
+            reason: "at least one persisted relationship has no observed timestamp; temporal ordering was excluded from validation".to_string(),
+        },
         folds,
     }
 }
@@ -1806,7 +3165,7 @@ fn validation_fold(
 fn compact_reasoning_kernel(
     prepared: &PreparedAssociationDiscoveryEnvelope,
     evaluator: &HypothesisEvaluationReport,
-    ranked: &RankedHypothesisReport,
+    ranked: &AssociationRankedHypothesisReport,
     validated: &BTreeSet<String>,
 ) -> Result<CompactReasoningKernel> {
     let retained = evaluator
@@ -1828,7 +3187,19 @@ fn compact_reasoning_kernel(
         if !retained.contains(hypothesis.hypothesis_id.as_str()) {
             continue;
         }
-        let candidate = candidates[&hypothesis.hypothesis_id.as_str()];
+        let candidate = candidates
+            .get(hypothesis.hypothesis_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_DISCOVERY_EVALUATOR_INVALID,
+                    format!(
+                        "ranked report names absent prepared hypothesis {}",
+                        hypothesis.hypothesis_id
+                    ),
+                    "preserve the prepared artifact and rebuild the exact candidate/evaluator roster",
+                )
+            })?;
         member_ids.extend([candidate.a, candidate.b, candidate.c]);
         hypothesis_ids.push(candidate.hypothesis_id.clone());
         evidence_ids.extend(candidate.evidence_ids.iter().cloned());
@@ -1854,13 +3225,49 @@ fn compact_reasoning_kernel(
         &format!("discovery:{}", prepared.artifact_sha256),
         &prepared.artifact.config.reasoning_kernel,
     )?;
-    let retained_typed_edges = prepared
+    let compact_member_ids = compact
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<BTreeSet<_>>();
+    if !compact_member_ids.is_subset(&member_ids) {
+        let unexpected = compact_member_ids
+            .difference(&member_ids)
+            .next()
+            .expect("non-subset has an unexpected member");
+        return invalid_graph(format!(
+            "compact reasoning kernel selected member {unexpected} outside the retained hypothesis endpoint roster"
+        ));
+    }
+    let support_ids = member_ids
+        .difference(&compact_member_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    let reasoning_roster = compact_member_ids
+        .union(&member_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let reasoning_roster_ids = reasoning_roster.iter().copied().collect::<Vec<_>>();
+    let reasoning_roster_hash = discovery_member_roster_hash(&reasoning_roster_ids);
+    let final_member_ids = compact_member_ids.iter().copied().collect::<Vec<_>>();
+    let mut retained_typed_edges = prepared
         .artifact
         .typed_edges
         .iter()
-        .filter(|edge| member_ids.contains(&edge.src) && member_ids.contains(&edge.dst))
-        .map(|edge| edge.evidence_id.clone())
+        .filter(|edge| {
+            compact_member_ids.contains(&edge.src) && compact_member_ids.contains(&edge.dst)
+        })
+        .cloned()
         .collect::<Vec<_>>();
+    retained_typed_edges.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
+    if retained_typed_edges.iter().any(|edge| {
+        !compact_member_ids.contains(&edge.src) || !compact_member_ids.contains(&edge.dst)
+    }) {
+        return invalid_graph(
+            "compact reasoning kernel retained a typed edge outside its final member roster",
+        );
+    }
+    let retained_typed_edges_sha256 = sha256_hex(&canonical_json_bytes(&retained_typed_edges)?);
     let all_validated = ranked
         .hypotheses
         .iter()
@@ -1870,18 +3277,24 @@ fn compact_reasoning_kernel(
             .get(row.hypothesis_id.as_str())
             .is_some_and(|candidate| candidate.grounded_confidence >= 1.0)
     });
+    let kernel_artifact_sha256 = sha256_hex(&compact.kernel_json_bytes());
     Ok(CompactReasoningKernel {
-        schema: "astrolabe.discovery_reasoning_kernel.v1".to_string(),
+        schema: "astrolabe.discovery_reasoning_kernel.v2".to_string(),
         trust: if all_validated && all_fully_grounded {
-            "grounded_evaluator_and_held_out".to_string()
+            "grounded_source_held_out_with_trusted_operator_evaluator_capture".to_string()
         } else {
-            "provisional_evaluator_grounded_held_out_incomplete".to_string()
+            "provisional_trusted_operator_evaluator_capture_held_out_incomplete".to_string()
         },
-        member_ids: compact.members.iter().map(|member| member.id).collect(),
-        members_hash: compact.members_hash,
+        member_ids: final_member_ids,
+        members_hash: compact.members_hash.clone(),
+        support_ids,
+        reasoning_roster_hash,
         hypothesis_ids,
         evidence_ids: evidence_ids.into_iter().collect(),
         retained_typed_edges,
+        retained_typed_edges_sha256,
+        kernel_artifact_sha256,
+        kernel_artifact: compact,
     })
 }
 
@@ -1895,6 +3308,9 @@ fn evidence_for_abc(
     let mut rows = Vec::new();
     for id in [a, b, c] {
         if let Some(concept) = evidence_index.concepts.get(&id) {
+            if concept.source_excerpt.is_empty() {
+                continue;
+            }
             rows.push(RetrievedEvidence {
                 evidence_id: format!("source:{}", concept.cx_id),
                 source_cx_id: concept.cx_id,
@@ -1906,12 +3322,20 @@ fn evidence_for_abc(
                     0.5
                 },
                 provenance: vec![
-                    format!("source_sha256={}", concept.source_sha256),
+                    if concept.source_sha256.is_empty() {
+                        "source_sha256=unavailable:persisted_source_hash_absent".to_string()
+                    } else {
+                        format!("source_sha256={}", concept.source_sha256)
+                    },
                     format!(
                         "source_generation_sha256={}",
                         input.source_generation_sha256
                     ),
-                    format!("file={}", concept.file_path),
+                    if concept.file_path.is_empty() {
+                        "file=unavailable:persisted_file_path_absent".to_string()
+                    } else {
+                        format!("file={}", concept.file_path)
+                    },
                 ],
             });
         }
@@ -1946,6 +3370,47 @@ fn evidence_for_abc(
     rows
 }
 
+fn structural_evidence_for_abc(
+    evidence_index: &DiscoveryEvidenceIndex<'_>,
+    a: CxId,
+    b: CxId,
+    c: CxId,
+) -> Vec<ConceptStructuralEvidence> {
+    [a, b, c]
+        .into_iter()
+        .filter_map(|cx_id| evidence_index.concepts.get(&cx_id).copied())
+        .map(|concept| ConceptStructuralEvidence {
+            cx_id: concept.cx_id,
+            language: structural_field(&concept.language, "persisted file language is unavailable"),
+            signature_or_shape: structural_field(
+                &concept.signature_or_shape,
+                "persisted signature or shape is unavailable",
+            ),
+            file_path: structural_field(&concept.file_path, "persisted file path is unavailable"),
+            source_sha256: structural_field(
+                &concept.source_sha256,
+                "persisted source hash is unavailable",
+            ),
+            source_excerpt: structural_field(
+                &concept.source_excerpt,
+                "persisted source excerpt is unavailable",
+            ),
+        })
+        .collect()
+}
+
+fn structural_field(value: &str, reason: &str) -> StructuralEvidenceField {
+    if value.is_empty() {
+        StructuralEvidenceField::Unavailable {
+            reason: reason.to_string(),
+        }
+    } else {
+        StructuralEvidenceField::Available {
+            value: value.to_string(),
+        }
+    }
+}
+
 fn grounded_confidence(
     concepts: &BTreeMap<CxId, &DiscoveryConceptInput>,
     a: CxId,
@@ -1965,16 +3430,21 @@ fn sorted_typed_edges(edges: &[DiscoveryTypedEdgeInput]) -> Vec<DiscoveryTypedEd
     edges
 }
 
-fn deterministic_pair_fold(
-    pair: (CxId, CxId),
-    concepts: &BTreeMap<CxId, &str>,
-    fold_count: usize,
-) -> usize {
+fn deterministic_pair_fold(pair: (CxId, CxId), fold_count: usize) -> usize {
     let (left, right) = pair;
-    let mut parts = [concepts[&left], concepts[&right]];
-    parts.sort_unstable();
-    let digest = Sha256::digest(format!("{}\0{}", parts[0], parts[1]).as_bytes());
+    let digest = Sha256::digest(pair_id(left, right).as_bytes());
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")) as usize % fold_count
+}
+
+/// Canonical SHA-256 for an exact sorted unique discovery member roster.
+pub fn discovery_member_roster_hash(ids: &[CxId]) -> String {
+    let mut digest = Sha256::new();
+    update_framed_digest(&mut digest, b"astrolabe.discovery.reasoning_roster.v1");
+    update_framed_digest(&mut digest, &(ids.len() as u64).to_be_bytes());
+    for id in ids {
+        update_framed_digest(&mut digest, id.as_bytes());
+    }
+    digest_hex(&digest.finalize())
 }
 
 fn direct_pairs_iter<'a>(
@@ -2015,9 +3485,55 @@ fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+struct DiscoveryByteCounter {
+    bytes: usize,
+}
+
+impl IoWrite for DiscoveryByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("association discovery byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_json_byte_count<T: Serialize>(value: &T) -> Result<usize> {
+    let mut counter = DiscoveryByteCounter { bytes: 0 };
+    serde_json::to_writer_pretty(&mut counter, value).map_err(|error| {
+        DomainError::new(
+            ASTRO_DISCOVERY_SOURCE_INCOMPLETE,
+            format!("association discovery artifact sizing failed: {error}"),
+            "repair non-serializable or non-finite discovery state before allocation",
+        )
+    })?;
+    counter.bytes.checked_add(1).ok_or_else(|| {
+        DomainError::new(
+            ASTRO_DISCOVERY_SOURCE_INCOMPLETE,
+            "association discovery artifact size overflow",
+            "narrow the exact discovery generation before allocation",
+        )
+    })
+}
+
 fn update_framed_digest(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
+}
+
+fn update_optional_str(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            update_framed_digest(digest, b"present");
+            update_framed_digest(digest, value.as_bytes());
+        }
+        None => update_framed_digest(digest, b"unavailable"),
+    }
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -2061,7 +3577,7 @@ fn map_evaluator_lodestar(error: calyx_lodestar::LodestarError) -> DomainError {
     DomainError::new(
         ASTRO_DISCOVERY_EVALUATOR_INVALID,
         error.to_string(),
-        "repair the independent evaluator receipts against the exact prepared generation and retry publication",
+        "repair the trusted operator-captured evaluator receipts against the exact prepared generation and retry publication",
     )
 }
 

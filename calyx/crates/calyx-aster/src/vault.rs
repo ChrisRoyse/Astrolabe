@@ -89,9 +89,10 @@ pub use ledger_bound_group_batch::{
 pub use physical_inventory::{
     CALYX_ASTER_PHYSICAL_COMMIT_INVENTORY_INVALID, PhysicalCommitComponent,
     PhysicalCommitComponentRole, PhysicalCommitContainer, PhysicalCommitInventory,
-    PhysicalCommitRowDigest,
+    PhysicalCommitRowDigest, PhysicalWalCommitInventory,
 };
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
+pub use seq_readback::{CALYX_LEDGER_RANGE_SNAPSHOT_INVALID, LedgerRangeSnapshot};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
     read_materialized_slot_column,

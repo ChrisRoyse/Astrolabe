@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{VaultId, VaultStore};
+use calyx_core::VaultId;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

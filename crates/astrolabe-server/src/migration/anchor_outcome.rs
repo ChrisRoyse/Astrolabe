@@ -87,7 +87,7 @@ pub(crate) fn anchor_outcome_json_at(
         }
     };
 
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
@@ -95,6 +95,7 @@ pub(crate) fn anchor_outcome_json_at(
             ColumnFamily::Ledger,
             ColumnFamily::Anchors,
             ColumnFamily::Graph,
+            ColumnFamily::TimeIndex,
         ],
     )?;
     // Subject -> CxId resolution against the persisted node map; unresolved

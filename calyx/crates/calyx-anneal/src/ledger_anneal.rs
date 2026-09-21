@@ -251,6 +251,17 @@ where
             .collect())
     }
 
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        Ok(self
+            .vault
+            .read_cf_at(
+                self.vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(seq),
+            )?
+            .map(|bytes| LedgerRow { seq, bytes }))
+    }
+
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {
         let key = ledger_key(seq);
         if self

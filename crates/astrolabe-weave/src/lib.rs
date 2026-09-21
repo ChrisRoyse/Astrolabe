@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod kernel_generation;
 pub mod kernel_index;
 pub mod knobs;
 pub mod search;
@@ -55,12 +56,14 @@ pub use ann::{
 pub use complete_xterms::{
     ASTRO_XTERM_COMPLETION_CORRUPT, ASTRO_XTERM_COMPLETION_OVERFLOW,
     ASTRO_XTERM_COMPLETION_RESOURCE_EXHAUSTED, ASTRO_XTERM_SOURCE_CORRUPT,
-    ASTRO_XTERM_SOURCE_UNBOUNDED, COMPLETE_PAIR_BLOCK_MAGIC, COMPLETE_PAIR_BLOCK_PREFIX,
-    COMPLETE_PAIR_BLOCK_SCHEMA, COMPLETE_WITNESS_PREFIX, COMPLETE_WITNESS_SCHEMA,
-    CompleteAssociationPersistReport, CompleteAssociationSourceReceipt, CompleteAssociationState,
-    PairMetricCounts, PairReasonCounts, read_complete_association_state,
-    read_complete_association_state_at, read_complete_association_state_vault_path,
-    reconcile_complete_associations, reconcile_complete_associations_with_panel_root,
+    ASTRO_XTERM_SOURCE_UNBOUNDED, COMPLETE_ASSOCIATION_LEDGER_SCHEMA,
+    COMPLETE_ASSOCIATION_VERIFIED_STATE_SCHEMA, COMPLETE_PAIR_BLOCK_MAGIC,
+    COMPLETE_PAIR_BLOCK_PREFIX, COMPLETE_PAIR_BLOCK_SCHEMA, COMPLETE_WITNESS_PREFIX,
+    COMPLETE_WITNESS_SCHEMA, CompleteAssociationPersistReport, CompleteAssociationSourceReceipt,
+    CompleteAssociationState, PairMetricCounts, PairReasonCounts, VerifiedCompleteAssociationState,
+    read_complete_association_state, read_complete_association_state_at,
+    read_complete_association_state_vault_path, reconcile_complete_associations,
+    reconcile_complete_associations_with_panel_root, verify_complete_association_state_at,
 };
 pub use drift_producer::{
     DRIFT_REFERENCE_CHUNK_BUDGET_KNOB, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
@@ -75,17 +78,42 @@ pub use drift_producer::{
     read_slot_samples_from_vault_with_panel_root, run_index_time_drift,
     run_index_time_drift_with_panel_root,
 };
+pub use kernel_generation::{
+    ASTRO_KERNEL_ADMISSION_REQUIRED, ASTRO_KERNEL_GENERATION_CORRUPT,
+    ASTRO_KERNEL_GENERATION_INCOMPLETE, ASTRO_KERNEL_GENERATION_PERSIST, CurrentKernelGeneration,
+    CurrentKernelGenerationArtifact, CurrentKernelGenerationDescriptor,
+    CurrentKernelGenerationHeader, KERNEL_GENERATION_ACTOR, KERNEL_GENERATION_CF_PREFIX,
+    KERNEL_GENERATION_CURRENT_PREFIX, KERNEL_GENERATION_GENESIS_PREVIOUS_ID,
+    KERNEL_GENERATION_LEDGER_SCHEMA, KERNEL_GENERATION_MANIFEST_SCHEMA,
+    KERNEL_GENERATION_POINTER_SCHEMA, KERNEL_GENERATION_SOURCE_BINDING_SCHEMA,
+    KERNEL_GRAPH_ROUTED_REPORT_PREFIX, KERNEL_RECALL_QUERY_CORPUS_PREFIX,
+    KERNEL_RECALL_QUERY_CORPUS_SCHEMA, KERNEL_RECALL_QUERY_ENCODER_SCHEMA,
+    KERNEL_RECALL_QUERY_INPUT_SEMANTICS, KernelGenerationManifest, KernelGenerationPersistReport,
+    KernelGenerationPointer, KernelGenerationPointerTarget, KernelGenerationPublishRequest,
+    KernelGenerationReadbackRow, KernelGenerationRowBinding, KernelGenerationSourceBinding,
+    KernelRecallEncodedQuery, KernelRecallQueryCorpus, KernelRecallQueryEncoderIdentity,
+    KernelRecallQueryInput, KernelRecallQueryRecord, build_kernel_recall_query_corpus,
+    encode_kernel_recall_query, kernel_recall_query_encoder_identity,
+    persist_complete_kernel_generation, read_current_kernel_generation,
+    read_current_kernel_generation_artifact, read_current_kernel_generation_artifact_at,
+    read_current_kernel_generation_descriptor, read_current_kernel_generation_header,
+    validate_kernel_recall_query_corpus_encoder,
+};
 pub use kernel_index::{
-    ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_CORRUPT, ASTRO_KERNEL_INDEX_MEMBER_ABSENT,
-    ASTRO_KERNEL_INDEX_NO_MEMBERS, ASTRO_KERNEL_INDEX_PERSIST, ASTRO_KERNEL_INDEX_STALE,
-    ASTRO_KERNEL_INDEX_VAULT, ASTRO_KERNEL_QUERY_UNRESOLVED, KERNEL_INDEX_RECALL_GATE_PERMILLE,
-    KERNEL_MEMBER_INDEX_CF_PREFIX, KERNEL_MEMBER_INDEX_SCHEMA, KernelIndexKind,
-    KernelMemberBinding, KernelMemberIndex, KernelMemberIndexDescriptor,
-    KernelMemberIndexPersistReport, KernelQueryMatch, KernelQueryResult, KernelRecallMeasurement,
-    LoadedKernelMemberIndex, build_kernel_member_index, kernel_query_loaded_members,
-    kernel_query_members, kernel_scoped_semantic_query, measure_kernel_index_recall,
-    persist_kernel_member_index, read_persisted_kernel_member_index,
-    read_persisted_kernel_member_index_descriptor,
+    ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_CORRUPT, ASTRO_KERNEL_INDEX_MEASUREMENT_OVERFLOW,
+    ASTRO_KERNEL_INDEX_MEMBER_ABSENT, ASTRO_KERNEL_INDEX_NO_MEMBERS, ASTRO_KERNEL_INDEX_PERSIST,
+    ASTRO_KERNEL_INDEX_SOURCE_CHANGED, ASTRO_KERNEL_INDEX_STALE, ASTRO_KERNEL_INDEX_VAULT,
+    ASTRO_KERNEL_INDEX_VECTOR_INCOMPLETE, ASTRO_KERNEL_QUERY_UNRESOLVED,
+    KERNEL_INDEX_PARITY_GATE_PERMILLE, KERNEL_MEMBER_INDEX_CF_PREFIX, KERNEL_MEMBER_INDEX_SCHEMA,
+    KernelIndexKind, KernelIndexParityMeasurement, KernelMemberBinding, KernelMemberIndex,
+    KernelMemberIndexDescriptor, KernelMemberIndexPersistReport,
+    KernelMemberIndexSourceVerification, KernelQueryMatch, KernelQueryResult,
+    LoadedKernelMemberIndex, PreparedKernelMemberIndexRows, build_kernel_member_index,
+    build_kernel_member_index_at, kernel_query_loaded_members, kernel_query_members,
+    kernel_scoped_semantic_query, measure_kernel_index_parity, persist_kernel_member_index,
+    prepare_kernel_member_index_rows, read_complete_kernel_s20_vectors_at,
+    read_persisted_kernel_member_index, read_persisted_kernel_member_index_descriptor,
+    verify_kernel_member_index_source_at_latest,
 };
 pub use ordered_parallel::ParallelScheduleTelemetry;
 pub use signal_cards::{
@@ -103,7 +131,10 @@ pub use sim_rows::{
     persist_similarity_family_run, persist_similarity_family_run_delta, plan_similarity_family_run,
     read_similarity_edge_rows, scan_similarity_physical_state, sim_edge_graph_key,
 };
-pub use slot_source::{ASTRO_WEAVE_SLOT_CONTEXT_REQUIRED, WeaveSlotSource};
+pub use slot_source::{
+    ASTRO_WEAVE_SLOT_BINDING_CHANGED, ASTRO_WEAVE_SLOT_CONTEXT_REQUIRED, WeaveSlotBinding,
+    WeaveSlotSource,
+};
 pub use xterm_cotenant::{
     XTERM_COMPLETE_PAIR_BLOCK_COTENANT_SCHEMA, XTERM_COMPLETE_PAIR_COTENANT_SCHEMA,
     XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA, accepted_xterm_cotenant_schemas,
@@ -132,19 +163,19 @@ pub fn parent_system() -> astrolabe_domain::ParentSystem {
 ///
 /// The lowered artifact's content fingerprint moves whenever the vault content
 /// it derives from — the persisted Graph/XTerm rows and the ledger head — moves.
-/// A weave commit that actually wrote or tombstoned rows (or drained reactive
-/// events) is such a change; a no-delta audit re-run that only re-appends an
-/// idempotent ledger record is not a content change and must not trigger a
-/// regeneration, or every re-run would rewrite the lowered artifact.
+/// A weave commit that wrote or tombstoned rows, published a previously absent
+/// terminal SIM-family attestation, or drained reactive events is such a
+/// change. A true no-delta SIM run strictly reuses an already-validated terminal
+/// marker/LedgerRef and must not trigger regeneration.
 pub trait WeaveMutation {
-    /// True when this commit changed derived vault content (rows written or
-    /// tombstoned, or reactive events acknowledged), false for a no-delta run.
+    /// True when this operation changed derived vault content; false only for a
+    /// true no-delta SIM run that reused its validated terminal state.
     fn changed_lowered_inputs(&self) -> bool;
 }
 
 impl WeaveMutation for SimilarityPersistReport {
     fn changed_lowered_inputs(&self) -> bool {
-        self.rows_written > 0 || self.rows_tombstoned > 0
+        self.rows_written > 0 || self.rows_tombstoned > 0 || self.terminal_attestation_published
     }
 }
 
@@ -163,7 +194,8 @@ impl WeaveMutation for ReactiveAckReport {
 /// Trigger plumbing from a weave mutation path: after a weave persistence commit,
 /// ask the lowering coordinator to schedule a debounced lowered-SQLite
 /// regeneration — but only when the commit actually changed derived vault
-/// content. A no-delta audit re-run never schedules a regeneration.
+/// content. A true no-delta SIM re-run with a strictly reused terminal marker
+/// never schedules a regeneration.
 ///
 /// Returns whether a regeneration was requested, so callers can surface the
 /// scheduling decision. The scheduling itself is debounced by the trigger

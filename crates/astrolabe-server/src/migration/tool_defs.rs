@@ -208,25 +208,100 @@ pub(crate) fn discover_associations_tool_definition() -> Value {
     json!({
         "name": "discover_associations",
         "title": "Discover Grounded Associations",
-        "description": "Runs Astrolabe's complete retained-generation discovery pipeline: deterministic concept normalization contextualized by every incident typed association without identity merging; the full typed structural/semantic/temporal relationship multigraph; Swanson corpus mining with Resource Allocation, Adamic-Adar, direct-link exclusion and disclosed hub gates; sparse spectral community and cross-community bridge measurement; bounded cycle-safe typed multi-hop walks; citation-bound independent AI evaluation; leakage-free grouped held-out validation with precision/recall/MRR, separate candidate and held-out coverage, complete-universe binary Brier@K, cross-fold stability, and null evidence; and a separately fingerprinted compact reasoning kernel. Resource Allocation is disclosed as an uncalibrated rank score, never a probability. prepare persists exact provisional candidate/evidence stages. publish requires independent evaluator receipts tied to that physical hash and atomically publishes every Assay/Kernel stage plus a ledger record. read independently decodes and hashes the physical generation. No stage silently falls back or reconstructs per query.",
+        "description": "Runs Astrolabe's complete retained-generation discovery pipeline. Explicit prepare, publish, and read generation operations reverify the full logical source in O(N+E+X): production N=192873 and E=328899, while production X is not yet measured because no producer Merkle manifest exists. This work is kept off ordinary query paths. prepare binds every consumed byte/schema/config, exact hypothesis/evaluator roster, and mandatory caller-owned evaluator/persistence budgets. publish accepts exactly one receipt per prepared binding, replays strict parsing from the exact request/response bytes, and treats provider capture metadata honestly as a trusted single-operator attestation rather than code-level proof of a remote call. External invocation identities remain unique; identical response bytes from genuine calls are valid. Final manifest/current+previous pointer/Ledger publication is atomic and retired rows are tombstoned in that transaction. Missing structural/temporal/cross-domain evidence is typed unavailable and excluded; zero usable validation folds refuse. read physically revalidates immutable rows, point-reads Ledger, re-runs finalization, and requires exact byte parity. No fallback, fabricated evaluator run, constant distance boost, or zero-fold aggregate is accepted.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string", "description": "Exact indexed project name."},
-                "mode": {"type": "string", "enum": ["prepare", "publish", "read"], "description": "prepare mines/persists provisional evidence; publish validates evaluator receipts and publishes a compact kernel; read physically reads a published generation."},
+                "mode": {"type": "string", "enum": ["prepare", "publish", "read"], "description": "Explicit operation; no default. prepare mines and persists exact requests, publish validates the exact receipt roster, read physically reads a published generation."},
                 "prepared_artifact_sha256": {"type": "string", "description": "prepare hash required by publish; for read, omit to follow the current final pointer or pass a final artifact hash."},
-                "section": {"type": "string", "enum": ["all", "manifest", "evaluator", "ranked", "kernel"], "description": "Focused physical read section."},
+                "section": {"type": "string", "enum": ["all", "manifest", "source", "roster", "receipts", "evaluator", "ranked", "kernel"], "description": "Focused physical read section."},
                 "workers": {"type": "integer", "minimum": 1, "maximum": 256},
                 "cross_validation_folds": {"type": "integer", "minimum": 2, "maximum": 32},
                 "top_k": {"type": "integer", "minimum": 1},
                 "max_intermediary_degree": {"type": "integer", "minimum": 2},
                 "min_shared_intermediaries": {"type": "integer", "minimum": 1},
-                "evaluator_runs": {
+                "budgets": {
                     "type": "object",
-                    "description": "publish only: map hypothesis_id to independent evaluator run arrays. Every run scores plausibility, novelty, testability, falsifiability, supplies a falsification test, and cites prepared evidence ids."
+                    "description": "prepare only: mandatory caller-owned hard limits, serialized and hashed into the discovery configuration; no defaults.",
+                    "properties": {
+                        "max_evaluation_bindings": {"type": "integer", "minimum": 1},
+                        "max_request_bytes_per_binding": {"type": "integer", "minimum": 1},
+                        "max_request_bytes_total": {"type": "integer", "minimum": 1},
+                        "max_response_bytes_per_binding": {"type": "integer", "minimum": 1},
+                        "max_response_bytes_total": {"type": "integer", "minimum": 1},
+                        "max_generation_rows": {"type": "integer", "minimum": 1, "description": "Discovery-owned Kernel/Assay rows including pointer, manifest, and tombstones; Aster bounds its own Ledger/TimeIndex protocol rows."},
+                        "max_generation_bytes": {"type": "integer", "minimum": 1, "description": "Discovery key+value bytes plus exact Ledger payload bytes before Aster's fixed protocol framing."}
+                    },
+                    "required": ["max_evaluation_bindings", "max_request_bytes_per_binding", "max_request_bytes_total", "max_response_bytes_per_binding", "max_response_bytes_total", "max_generation_rows", "max_generation_bytes"],
+                    "additionalProperties": false
+                },
+                "evaluator_declarations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "prepare only: exact evaluator/model/prompt/temperature variants expanded across every hypothesis.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "evaluator_id": {"type": "string", "minLength": 1},
+                            "model_id": {"type": "string", "minLength": 1},
+                            "prompt_id": {"type": "string", "minLength": 1},
+                            "temperature_x100": {"type": "integer", "minimum": 0, "maximum": 65535},
+                            "prompt_utf8": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["evaluator_id", "model_id", "prompt_id", "temperature_x100", "prompt_utf8"],
+                        "additionalProperties": false
+                    }
+                },
+                "evaluator_receipts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "publish only: exact one-per-binding real evaluator receipts. Parsed fields must reproduce from response_utf8.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "schema": {"type": "string", "const": "astrolabe.association_discovery.evaluator_receipt.v2"},
+                            "invocation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "external_invocation_id": {"type": "string", "minLength": 1},
+                            "provider_response_id": {"type": "string", "minLength": 1},
+                            "capture_schema": {"type": "string", "const": "astrolabe.association_discovery.trusted_external_capture.v1"},
+                            "capture_provenance": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                            "prepared_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "source_generation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "hypothesis_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "hypothesis_content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "evaluator_id": {"type": "string", "minLength": 1},
+                            "model_id": {"type": "string", "minLength": 1},
+                            "prompt_id": {"type": "string", "minLength": 1},
+                            "temperature_x100": {"type": "integer", "minimum": 0, "maximum": 65535},
+                            "prompt_utf8": {"type": "string", "minLength": 1},
+                            "prompt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "request_utf8": {"type": "string", "minLength": 1},
+                            "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "response_utf8": {"type": "string", "minLength": 1},
+                            "response_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "parse_result": {
+                                "type": "object",
+                                "properties": {
+                                    "schema": {"type": "string", "const": "astrolabe.association_discovery.evaluator_response.v1"},
+                                    "plausible_score": {"type": "number", "minimum": 0, "maximum": 1},
+                                    "novelty_score": {"type": "number", "minimum": 0, "maximum": 1},
+                                    "testability_score": {"type": "number", "minimum": 0, "maximum": 1},
+                                    "falsifiability_score": {"type": "number", "minimum": 0, "maximum": 1},
+                                    "justification": {"type": "string", "minLength": 1},
+                                    "falsification_test": {"type": "string", "minLength": 1},
+                                    "cited_evidence_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+                                },
+                                "required": ["schema", "plausible_score", "novelty_score", "testability_score", "falsifiability_score", "justification", "falsification_test", "cited_evidence_ids"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["schema", "invocation_id", "external_invocation_id", "provider_response_id", "capture_schema", "capture_provenance", "prepared_artifact_sha256", "source_generation_sha256", "hypothesis_id", "hypothesis_content_sha256", "evaluator_id", "model_id", "prompt_id", "temperature_x100", "prompt_utf8", "prompt_sha256", "request_utf8", "request_sha256", "response_utf8", "response_sha256", "parse_result"],
+                        "additionalProperties": false
+                    }
                 }
             },
-            "required": ["project"],
+            "required": ["project", "mode"],
             "additionalProperties": false
         }
     })
@@ -297,7 +372,7 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
     json!({
         "name": "get_kernel",
         "title": "Get Kernel",
-        "description": "Serve the persisted kernel for a shadow-indexed project. Four modes over the persisted kernel context (scope-summary members: qualified name, kernel weight/score in permille, grounded flag, provenance, recall metrics). mode=\"read\" (default) serves every kernel member per scope with recall metrics and grounded fraction. mode=\"gaps\" serves the \"here be dragons\" grounding-gap report — kernel members whose persisted grounded flag is false — ranked by persisted kernel weight (importance), with a labeled degradation because the change-frequency churn term and the exact 3-hop grounding boundary live in the persisted kernel artifact, not this metadata surface. mode=\"quadrant\" serves the coverage-vs-importance scatter, classifying every member into critical/peripheral × verified/unverified with the kernel crate's registry-knob split; the critical-and-unverified quadrant is the actionable QA target that feeds readiness and the UI overlay. mode=\"build\" recomputes the anchor-trust-grounded feedback-vertex-set kernel over the vault association graph on demand — opening the shadow vault read-write and running the same build_and_persist_kernel the shadow import runs at index time — and persists the KernelArtifact + projection into the vault Kernel CF, serving status=\"built\" with the measured member/node counts, recall, and readback/ledger evidence; a graph that yields no kernel (empty graph, no typed edges, an unreachable recall gate) fails closed with ASTRO_KERNEL_BUILD_UNAVAILABLE and the real reason. Optionally scoped by scope id. Every response carries trust/freshness/provenance and fails closed with {code,message,remediation} when the project is not shadow-indexed, its kernel context is unavailable, the scope is absent, or the mode is unknown.",
+        "description": "Serve an atomically selected complete project or fleet kernel generation. Project modes expose the generation-bound source identity, deterministic full-graph FVS/residual-DAG proof, strict compactness, universal S20 member index, genuine external-query corpus, graph-routed recall admission, content-addressed manifest/current pointer, and physical Ledger/readback evidence. Fleet read/gaps/quadrant additionally revalidate every exact current repository generation and serve only the immutable fleet artifact/index/provenance/query/report generation selected by its atomic pointer; historical fixed-row fleet artifacts remain history only. mode=\"build\" is project-only and requires explicit kernel_admission. Missing source state, drift, work-budget failure, or corrupt/incomplete generation refuses without a legacy alias, synthesized query, partial index, or fallback.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -308,16 +383,21 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
                 "mode": {
                     "type": "string",
                     "enum": ["read", "gaps", "quadrant", "build"],
-                    "description": "read (default): kernel members + recall per scope. gaps: ranked grounding-gap report of ungrounded kernel members. quadrant: coverage-vs-importance scatter with per-quadrant counts. build: recompute the anchor-trust-grounded FVS kernel over the vault association graph on demand and persist the KernelArtifact + projection into the vault Kernel CF, serving status:\"built\" (or a coded fail-closed refusal when the graph yields no kernel)."
+                    "description": "read (default): kernel members plus complete-generation evidence. gaps: ranked grounding-gap report. quadrant: coverage-vs-importance scatter. build: requires kernel_admission, recomputes the deterministic full-graph FVS kernel and universal S20 member index, evaluates real external-query graph-routed recall, and atomically publishes one manifest/pointer/Ledger-bound generation only after independent readback."
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Optional scope id to restrict the kernel to (read/gaps modes). Omit for every persisted scope. An unknown scope refuses fail-closed. A fleet scope (e.g. \"fleet:rust:v1\") serves the composed fleet kernel from the fleet catalog vault with per-repo provenance citations (#459); project is not required for fleet scopes."
+                    "description": "Optional exact scope id. A fleet scope (for example fleet:rust:v1) selects the atomic fleet catalog generation for read/gaps/quadrant and does not require project. Unknown, historical-only, stale, or corrupt scopes refuse."
                 },
                 "fleet_catalog_root": {
                     "type": "string",
                     "description": "Fleet catalog vault root for fleet scopes. Defaults to the declared production catalog root."
                 },
+                "fleet_store_root": {
+                    "type": "string",
+                    "description": "Per-repository vault root used to independently revalidate every source generation of a fleet scope. Defaults to the declared production fleet store root."
+                },
+                (KERNEL_ADMISSION_ARG): kernel_admission_property_schema(),
             },
             "required": [],
             "additionalProperties": false
@@ -329,7 +409,7 @@ pub(crate) fn kernel_answer_tool_definition() -> Value {
     json!({
         "name": "kernel_answer",
         "title": "Kernel Answer",
-        "description": "Grounded kernel-first Q&A for a shadow-indexed project: kernel-first search resolves an anchored (Trusted-grounded) entry point, then a hop-attenuated answer path walks association edges outward with hop_score = edge_weight * 0.9^hop, every hop carrying its ledger reference and every node its provenance. The answer is assembled from the path nodes with a total score, ordered provenance, and a rolled-up trust tag; an ungrounded scope or an unanswerable query refuses with a per-lens deficit rather than an empty answer, and a multi-hop answer without complete ledger wiring fails closed with CALYX_KERNEL_ANSWER_LEDGER_REQUIRED (never served unprovenanced). The answer-path algorithm is implemented in astrolabe_kernel::answer; the association graph is assembled from the persisted GraphProjectionCsr->KernelGraph projection and kernel artifact read back out of the vault. When neither is persisted the tool fails closed and directs the caller to build the kernel first with get_kernel mode=\"build\". Fails closed with {code,message,remediation} on a missing project/query or a non-shadow project. A fleet scope (fleet:*) serves cross-repo exemplar citations from the composed fleet kernel instead (see scope).",
+        "description": "Grounded kernel-first Q&A for an atomic project or fleet generation. The actual caller query is encoded with the generation-bound S20 identity and ranked by its immutable member HNSW; no graph-derived query, exemplar, lexical/global-weight fallback, or partial index is used. A grounded entry then walks ledger-wired association edges with the pinned hop attenuation, returning exact node provenance. Fleet requests revalidate every current repository source identity and the atomic fleet pointer before serving. Missing/ungrounded matches, encoder drift, stale source state, incomplete provenance, or corrupt generations return a coded refusal rather than an empty or provisional answer.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -343,15 +423,15 @@ pub(crate) fn kernel_answer_tool_definition() -> Value {
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Optional scope id to restrict the kernel-first search to. A fleet scope (e.g. \"fleet:rust:v1\") answers from the composed fleet kernel via declared token-containment exemplar retrieval with per-repo citations, refusing with a structured deficit when no member grounds the query (#459); project is not required for fleet scopes."
+                    "description": "Optional exact project scope or fleet scope. A fleet scope selects its atomic fleet generation and does not require project."
                 },
                 "fleet_catalog_root": {
                     "type": "string",
                     "description": "Fleet catalog vault root for fleet scopes. Defaults to the declared production catalog root."
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Fleet scopes only: maximum citations served (declared bounds 1..=64, default 8)."
+                "fleet_store_root": {
+                    "type": "string",
+                    "description": "Per-repository vault root used to independently revalidate every source generation of a fleet scope. Defaults to the declared production fleet store root."
                 }
             },
             "required": ["query"],
@@ -648,7 +728,7 @@ pub(crate) fn predict_impact_tool_definition() -> Value {
     json!({
         "name": "predict_impact",
         "title": "Predict Impact",
-        "description": "\"If I change X, what breaks?\" — a grounded change-impact prediction for a shadow-indexed project, answered from the persisted change→outcome corpus (astrolabe_oracle), never from raw topology. Builds a composite consequence graph from the persisted CBM graph edges (CALLS/DATA_FLOWS/service/TESTS, direction-corrected to impact flow) and grounds each node in the vault's occurrence rows; a cycle-guarded butterfly walk (×0.7 per hop, prune <0.05, depth ≤4) expands the tree, three independent ceilings keep every probability strictly below 1.0, and consequences that intersect TESTS edges become a ranked test-selection set. Grounded confidence is advertised ONLY when this repo's persisted backtest gate passed; otherwise every consequence is labeled provisional (never a silent grounded default). When the seeds carry no grounded history the tool refuses with a per-sensor deficit card rather than guessing. mode=\"backtest\" runs the grounded-vs-topology backtest over cases derived from the corpus and persists (with FSV readback) the per-repo gate.",
+        "description": "\"If I change X, what breaks?\" — a grounded change-impact prediction for a shadow-indexed project, answered from the persisted change→outcome corpus (astrolabe_oracle), never from raw topology. Builds a composite consequence graph from the persisted CBM graph edges (CALLS/DATA_FLOWS/service/TESTS, direction-corrected to impact flow) and grounds each node in the vault's occurrence rows; a cycle-guarded butterfly walk (×0.7 per hop, prune <0.05, depth ≤4) expands the tree, three independent ceilings keep every probability strictly below 1.0, and consequences that intersect TESTS edges become a ranked test-selection set. Grounded serving requires the exact passing gate attestation created automatically inside the shadow-generation transaction from chronological held-out CI/test identities; an absent, failed, corrupt, or stale attestation refuses without fallback. When the seeds carry no grounded history the tool refuses with a per-sensor deficit card rather than guessing. mode=\"backtest\" reads that current generation-owned attestation and its exact cases; it never runs or manually persists a gate.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -664,7 +744,7 @@ pub(crate) fn predict_impact_tool_definition() -> Value {
                 "mode": {
                     "type": "string",
                     "enum": ["predict", "backtest"],
-                    "description": "predict (default): ranked consequences + test-selection, or an Insufficient deficit card. backtest: run the grounded-vs-topology backtest and persist this repo's grounded-mode gate."
+                    "description": "predict (default): ranked consequences + test-selection, or a coded refusal/Insufficient deficit card. backtest: read the exact automatically persisted chronological gate attestation for the current corpus/graph/kernel generation."
                 }
             },
             "required": ["project"],

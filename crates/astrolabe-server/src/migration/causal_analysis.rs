@@ -356,7 +356,17 @@ fn persist_generation(
     let manifest_key = generation_key("manifest", &artifact_sha256);
     let current_key = current_pointer_key(project);
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
-    let vault = open_shadow_vault_writable(&vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    let vault = open_shadow_vault_writable_latest_selected(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![
+            ColumnFamily::Assay,
+            ColumnFamily::Kernel,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
+    )?;
     let snapshot = vault.latest_seq();
     let existing_assay = vault.read_cf_at(snapshot, ColumnFamily::Assay, &assay_key)?;
     let existing_kernel = vault.read_cf_at(snapshot, ColumnFamily::Kernel, &kernel_key)?;

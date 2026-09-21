@@ -38,6 +38,14 @@ pub const CALYX_ASTER_CF_NOT_SELECTED: &str = "CALYX_ASTER_CF_NOT_SELECTED";
 /// A full historical restore was attempted against a latest-router handle.
 pub const CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE: &str = "CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE";
 
+pub(crate) struct LatestRouterRecoveryState {
+    pub expected_current: Seq,
+    pub recovered_seq: Seq,
+    pub content_generation_floor_seq: Seq,
+    pub content_generations: BTreeMap<ColumnFamily, Seq>,
+    pub derived_content_floor_seq: Seq,
+}
+
 /// Exact readback of the storage preconditions required by a bounded
 /// latest-state analytical scan.
 ///
@@ -64,6 +72,7 @@ struct VersionedValue {
 type CfKey = (ColumnFamily, Vec<u8>);
 type VersionChain = Vec<VersionedValue>;
 type RowTable = BTreeMap<CfKey, VersionChain>;
+type RecoveredMvccBatch = (Seq, Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>);
 
 fn sequence_conflict(expected: Seq, current: Seq) -> CalyxError {
     CalyxError {
@@ -287,16 +296,19 @@ pub fn is_tombstone_value(value: &[u8]) -> bool {
 #[derive(Debug)]
 pub struct VersionedCfStore {
     seqs: SeqAllocator,
-    /// Conservative handle-local generation for recovered CF content. Durable
-    /// latest-only recovery does not materialize historical row seqnos, so every
-    /// CF starts in the exact generation at which this handle opened. A live
-    /// write to one CF advances only that CF's generation.
+    /// Durable conservative floor for per-CF content generations. Legacy
+    /// manifests that predate exact CF provenance use their durable tip as the
+    /// floor; current manifests persist the exact floor across reopen.
     content_generation_floor_seq: AtomicU64,
-    /// Latest handle-local generation that mutated each column family. This is
-    /// deliberately separate from the vault-global sequence: a write to a
-    /// derived CF must not invalidate a latest-only reader of an unchanged
-    /// source CF.
+    /// Latest durable generation that mutated each column family above the
+    /// floor. This is deliberately separate from the vault-global sequence: a
+    /// write to a derived CF must not invalidate a reader of an unchanged source
+    /// CF, including after a process reopen.
     cf_content_generations: RwLock<BTreeMap<ColumnFamily, Seq>>,
+    /// Post-WAL failure that could not be reconciled. Every subsequent read or
+    /// write refuses. Caller-held Ledger guards make in-place reconstruction
+    /// unsafe, so only a fresh handle may recover the durable generation.
+    terminal_durable_fault: RwLock<Option<CalyxError>>,
     /// Max committed seq whose batch wrote at least one row in a CF that
     /// feeds derived search content (issue #1100). Advances inside the row
     /// write lock *before* the seq becomes visible, so any reader that
@@ -344,6 +356,7 @@ impl VersionedCfStore {
             seqs: SeqAllocator::new(start_seq),
             content_generation_floor_seq: AtomicU64::new(start_seq),
             cf_content_generations: RwLock::new(BTreeMap::new()),
+            terminal_durable_fault: RwLock::new(None),
             derived_content_seq: AtomicU64::new(0),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
@@ -365,6 +378,7 @@ impl VersionedCfStore {
             seqs: SeqAllocator::new(start_seq),
             content_generation_floor_seq: AtomicU64::new(start_seq),
             cf_content_generations: RwLock::new(BTreeMap::new()),
+            terminal_durable_fault: RwLock::new(None),
             derived_content_seq: AtomicU64::new(0),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
@@ -383,6 +397,125 @@ impl VersionedCfStore {
         let store = Self::new_with_router(start_seq, router);
         store.router_latest_readback.store(true, Ordering::Release);
         store
+    }
+
+    /// Installs manifest-backed per-CF content generations while a recovered
+    /// store is still private to its opener. The supplied map is complete above
+    /// `floor`; WAL-tail rows are already folded into it by durable recovery.
+    pub(crate) fn install_recovered_cf_content_generations(
+        &self,
+        floor: Seq,
+        generations: BTreeMap<ColumnFamily, Seq>,
+    ) -> Result<()> {
+        let current = self.current_seq();
+        if floor > current
+            || generations
+                .values()
+                .any(|generation| *generation <= floor || *generation > current)
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "recovered CF content generations are outside canonical bounds: floor={floor}, current={current}, generations={generations:?}"
+            )));
+        }
+        self.content_generation_floor_seq
+            .store(floor, Ordering::Release);
+        *self
+            .cf_content_generations
+            .write()
+            .expect("CF content generations poisoned") = generations;
+        Ok(())
+    }
+
+    /// Publishes a completely restored full-MVCC generation as one observable
+    /// state transition. Durable rows at future sequences may already be staged
+    /// in the private version table, but readers cannot observe them until the
+    /// sequence is advanced last with Release ordering.
+    pub(crate) fn publish_recovered_full_mvcc_state(
+        &self,
+        expected_current: Seq,
+        recovered_seq: Seq,
+        recovered_derived_seq: Seq,
+        floor: Seq,
+        generations: BTreeMap<ColumnFamily, Seq>,
+        batches: Vec<RecoveredMvccBatch>,
+    ) -> Result<()> {
+        let mut table = self.rows.write().expect("mvcc row table poisoned");
+        if self.uses_latest_router() {
+            return Err(CalyxError {
+                code: CALYX_ASTER_LATEST_ONLY_MVCC_RESTORE,
+                message: "full-MVCC recovery publication was requested from a latest-router handle"
+                    .to_string(),
+                remediation: "publish latest-router recovery through replace_latest_recovered_router",
+            });
+        }
+        let current = self.current_seq();
+        if current != expected_current {
+            return Err(sequence_conflict(expected_current, current));
+        }
+        if recovered_seq < current
+            || recovered_derived_seq > recovered_seq
+            || floor > recovered_seq
+            || generations
+                .values()
+                .any(|generation| *generation <= floor || *generation > recovered_seq)
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "full-MVCC recovery publication is outside canonical bounds: current={current}, recovered={recovered_seq}, derived={recovered_derived_seq}, floor={floor}, generations={generations:?}"
+            )));
+        }
+        let mut previous_seq = current;
+        for (batch_seq, rows) in &batches {
+            if *batch_seq <= previous_seq || *batch_seq > recovered_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "full-MVCC recovery batches are not a strict ordered suffix: previous={previous_seq}, batch={batch_seq}, recovered={recovered_seq}"
+                )));
+            }
+            for (cf, _key, _value) in rows {
+                self.ensure_cf_selected(*cf)?;
+            }
+            previous_seq = *batch_seq;
+        }
+        // All fallible validation precedes mutation. Future versions, their
+        // provenance metadata, and the visible sequence are then installed
+        // under one row-table write lock, so an explicit future-sequence pin
+        // cannot observe a partially restored generation.
+        for (batch_seq, rows) in batches {
+            for (cf, key, value) in rows {
+                table.entry((cf, key)).or_default().push(VersionedValue {
+                    seq: batch_seq,
+                    value,
+                });
+            }
+        }
+        self.content_generation_floor_seq
+            .store(floor, Ordering::Release);
+        *self
+            .cf_content_generations
+            .write()
+            .expect("CF content generations poisoned") = generations;
+        self.derived_content_seq
+            .store(recovered_derived_seq, Ordering::Release);
+        self.seqs.advance_to_at_least(recovered_seq);
+        Ok(())
+    }
+
+    pub(crate) fn latch_terminal_durable_fault_requires_reopen(&self, error: CalyxError) {
+        *self
+            .terminal_durable_fault
+            .write()
+            .expect("terminal durable fault poisoned") = Some(error);
+    }
+
+    pub(crate) fn ensure_no_terminal_durable_fault(&self) -> Result<()> {
+        match self
+            .terminal_durable_fault
+            .read()
+            .expect("terminal durable fault poisoned")
+            .as_ref()
+        {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn uses_latest_router(&self) -> bool {
@@ -416,25 +549,32 @@ impl VersionedCfStore {
     /// visible sequence before releasing either lock.
     pub(crate) fn replace_latest_recovered_router<I>(
         &self,
-        expected_current: Seq,
-        recovered_seq: Seq,
-        manifested_floor_seq: Seq,
-        derived_floor_seq: Seq,
+        state: LatestRouterRecoveryState,
         recovered_rows: I,
         mut candidate: CfRouter,
     ) -> Result<()>
     where
         I: IntoIterator<Item = (Seq, ColumnFamily)>,
     {
+        let LatestRouterRecoveryState {
+            expected_current,
+            recovered_seq,
+            content_generation_floor_seq: manifested_content_floor_seq,
+            content_generations: manifested_generations,
+            derived_content_floor_seq: derived_floor_seq,
+        } = state;
         if recovered_seq < expected_current
-            || manifested_floor_seq > recovered_seq
+            || manifested_content_floor_seq > recovered_seq
             || derived_floor_seq > recovered_seq
+            || manifested_generations.values().any(|generation| {
+                *generation <= manifested_content_floor_seq || *generation > recovered_seq
+            })
         {
             return Err(CalyxError::aster_corrupt_shard(format!(
-                "latest-router replacement sequence tuple is invalid: expected_current={expected_current}, recovered={recovered_seq}, manifested_floor={manifested_floor_seq}, derived_floor={derived_floor_seq}"
+                "latest-router replacement sequence tuple is invalid: expected_current={expected_current}, recovered={recovered_seq}, manifested_content_floor={manifested_content_floor_seq}, manifested_generations={manifested_generations:?}, derived_floor={derived_floor_seq}"
             )));
         }
-        let mut recovered_generations = BTreeMap::<ColumnFamily, Seq>::new();
+        let mut recovered_generations = manifested_generations;
         let mut recovered_derived_seq = derived_floor_seq;
         for (seq, cf) in recovered_rows {
             if seq > recovered_seq {
@@ -442,10 +582,12 @@ impl VersionedCfStore {
                     "latest-router replacement row sequence {seq} exceeds recovered tip {recovered_seq}"
                 )));
             }
-            recovered_generations
-                .entry(cf)
-                .and_modify(|generation| *generation = (*generation).max(seq))
-                .or_insert(seq);
+            if seq > manifested_content_floor_seq {
+                recovered_generations
+                    .entry(cf)
+                    .and_modify(|generation| *generation = (*generation).max(seq))
+                    .or_insert(seq);
+            }
             if cf.feeds_derived_search_content() {
                 recovered_derived_seq = recovered_derived_seq.max(seq);
             }
@@ -493,20 +635,15 @@ impl VersionedCfStore {
         candidate.bind_resource_counters(Arc::clone(&self.resource_counters));
         *live_router = Some(candidate);
 
+        // Recovery is a complete durable view, not a delta. Replacing both the
+        // floor and exact overrides prevents unrelated foreign derived writes
+        // from conservatively advancing every source CF after refresh.
         self.content_generation_floor_seq
-            .fetch_max(manifested_floor_seq, Ordering::AcqRel);
-        {
-            let mut generations = self
-                .cf_content_generations
-                .write()
-                .expect("CF content generations poisoned");
-            for (cf, seq) in recovered_generations {
-                generations
-                    .entry(cf)
-                    .and_modify(|generation| *generation = (*generation).max(seq))
-                    .or_insert(seq);
-            }
-        }
+            .store(manifested_content_floor_seq, Ordering::Release);
+        *self
+            .cf_content_generations
+            .write()
+            .expect("CF content generations poisoned") = recovered_generations;
         self.derived_content_seq
             .fetch_max(recovered_derived_seq, Ordering::AcqRel);
         self.seqs.advance_to_at_least(recovered_seq);
@@ -518,24 +655,22 @@ impl VersionedCfStore {
         self.seqs.current()
     }
 
-    pub fn set_start_seq(&self, seq: Seq) -> Result<()> {
+    pub(crate) fn set_start_seq(&self, seq: Seq) -> Result<()> {
+        let _table = self.rows.write().expect("mvcc row table poisoned");
         self.seqs.set_start_seq(seq)?;
-        self.content_generation_floor_seq
-            .fetch_max(seq, Ordering::AcqRel);
         Ok(())
     }
 
-    pub fn advance_to_at_least(&self, seq: Seq) {
+    pub(crate) fn advance_to_at_least(&self, seq: Seq) {
+        let _table = self.rows.write().expect("mvcc row table poisoned");
         self.seqs.advance_to_at_least(seq);
     }
 
-    /// Returns the handle-local content generation for one column family.
+    /// Returns the durable content generation for one column family.
     ///
-    /// The generation is initialized conservatively to the durable sequence at
-    /// open and advances before every later commit that touches this CF becomes
-    /// globally visible. It therefore answers the question latest-only readers
-    /// actually need: "has this source CF changed?" A vault-global sequence
-    /// cannot answer that after writes to disjoint derived CFs.
+    /// Current manifests persist exact per-CF provenance across reopen; legacy
+    /// manifests conservatively floor every CF at their durable sequence. Live
+    /// writes advance the exact touched CF before the commit becomes visible.
     pub fn cf_content_generation(&self, cf: ColumnFamily) -> Result<Seq> {
         self.ensure_cf_selected(cf)?;
         let floor = self.content_generation_floor_seq.load(Ordering::Acquire);
@@ -731,6 +866,7 @@ impl VersionedCfStore {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
+        self.ensure_no_terminal_durable_fault()?;
         self.router
             .read()
             .expect("mvcc router poisoned")
@@ -894,6 +1030,7 @@ impl VersionedCfStore {
     where
         R: CommitRow,
     {
+        self.ensure_no_terminal_durable_fault()?;
         if rows.is_empty() {
             let current = self.current_seq();
             if let Some(expected) = expected_seq
@@ -911,6 +1048,13 @@ impl VersionedCfStore {
         {
             return Err(sequence_conflict(expected, current));
         }
+        let commit_seq = current.checked_add(1).ok_or_else(|| CalyxError {
+            code: crate::mvcc::CALYX_ASTER_MVCC_SEQUENCE_EXHAUSTED,
+            message: format!(
+                "MVCC sequence is exhausted at {current}; no router or row state was mutated"
+            ),
+            remediation: "preserve the vault and migrate it to a wider sequence representation before any further write",
+        })?;
         let borrowed: Vec<CompressionGuardRow<'_>> = rows
             .iter()
             .map(|row| (row.cf(), row.key(), row.value()))
@@ -925,12 +1069,10 @@ impl VersionedCfStore {
             // held here). A memtable flush triggered by these puts must carry
             // that commit watermark so the flush SST orders correctly against
             // durable batches (issue #1138).
-            let commit_watermark = self.current_seq() + 1;
             for row in &rows {
-                router.put_at(row.cf(), row.key(), row.value(), commit_watermark)?;
+                router.put_at(row.cf(), row.key(), row.value(), commit_seq)?;
             }
         }
-        let commit_seq = self.current_seq() + 1;
         {
             let mut generations = self
                 .cf_content_generations
@@ -956,8 +1098,14 @@ impl VersionedCfStore {
             self.derived_content_seq
                 .fetch_max(commit_seq, Ordering::AcqRel);
         }
-        let seq = self.seqs.allocate();
-        debug_assert_eq!(seq, commit_seq);
+        let seq = self.seqs.allocate()?;
+        if seq != commit_seq {
+            let error = CalyxError::aster_corrupt_shard(format!(
+                "MVCC sequence allocation drifted after guarded preflight: expected {commit_seq}, observed {seq}"
+            ));
+            self.latch_terminal_durable_fault_requires_reopen(error.clone());
+            return Err(error);
+        }
         if !self.router_latest_readback.load(Ordering::Acquire) {
             for row in rows {
                 let (cf, key, value) = row.into_owned();
@@ -992,24 +1140,6 @@ impl VersionedCfStore {
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
         let mut table = self.rows.write().expect("mvcc row table poisoned");
-        {
-            let mut generations = self
-                .cf_content_generations
-                .write()
-                .expect("CF content generations poisoned");
-            for (cf, _, _) in &rows {
-                generations
-                    .entry(*cf)
-                    .and_modify(|generation| *generation = (*generation).max(seq))
-                    .or_insert(seq);
-            }
-        }
-        if rows
-            .iter()
-            .any(|(cf, _, _)| cf.feeds_derived_search_content())
-        {
-            self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
-        }
         for (cf, key, value) in rows {
             table
                 .entry((cf, key))

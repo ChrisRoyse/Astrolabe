@@ -35,20 +35,19 @@ impl StreamingChainVerifier {
                 range.start, range.end
             )));
         }
-        if range.start == range.end {
-            return Ok(StreamingStart::Complete(VerifyResult::Intact { count: 0 }));
-        }
-        if range.start == 0
-            && let Some(anchor) = &anchor
-            && range.end != anchor.height
+        if let Some(anchor) = &anchor
+            && range.end > anchor.height
         {
             return Ok(StreamingStart::Complete(corrupt_result(
-                range.end.min(anchor.height),
+                anchor.height,
                 format!(
-                    "ledger head anchor mismatch: requested head {}, anchored head {}",
+                    "ledger range end {} exceeds anchored head {}",
                     range.end, anchor.height
                 ),
             )));
+        }
+        if range.start == range.end {
+            return Ok(StreamingStart::Complete(VerifyResult::Intact { count: 0 }));
         }
         let expected_prev = expected_prev_hash(range.start, previous)?;
         Ok(StreamingStart::Ready(Self {
@@ -117,8 +116,7 @@ impl StreamingChainVerifier {
     }
 
     fn finish(&self) -> VerifyResult {
-        if self.range.start == 0
-            && let Some(anchor) = &self.anchor
+        if let Some(anchor) = &self.anchor
             && self.range.end == anchor.height
             && self.expected_prev != anchor.tip_hash
         {

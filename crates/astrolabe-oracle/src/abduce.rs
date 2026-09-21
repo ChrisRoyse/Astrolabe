@@ -21,7 +21,7 @@
 //!
 //! A candidate cause `C` reachable at reverse depth `d` from the failure `F`:
 //!
-//! * **grounded** when `C` carries failing occurrences preceding the observation
+//! * **grounded** when `C` carries distinct failing outcomes preceding the observation
 //!   (`outcome_ts ≤ observed_ts`). Its *fail support* is the recency- and
 //!   credit-weighted mass of those failures,
 //!   `s = Σ credit · 0.5^((observed − outcome_ts)/half_life)`; its base
@@ -41,7 +41,7 @@
 //! covering the candidate whose passing would refute the hypothesis.
 //!
 //! When the failure's reverse-reachable region carries fewer than
-//! [`AbductionConfig::evidence_floor`] failing occurrences in total, the tool
+//! [`AbductionConfig::evidence_floor`] distinct failing outcomes in total, the tool
 //! refuses with a per-sensor deficit ([`AbductionOutcome::Insufficient`]) rather
 //! than abducing from a coincidence.
 
@@ -53,6 +53,7 @@ use astrolabe_domain::rollup_trust;
 use calyx_core::{CxId, Ts};
 
 use crate::corpus::{OccurrenceRecord, OracleError};
+use crate::gate::{ValidatedOutcomeGroup, validated_outcome_groups};
 use crate::predict::{
     ASTRO_ORACLE_GRAPH_INVALID, ConsequenceEdge, ConsequenceEdgeKind, InsufficientReport,
     SensorDeficit,
@@ -84,7 +85,7 @@ pub const ORACLE_ABDUCE_INSUFFICIENT_REMEDIATION: &str = "No grounded failing hi
 // ---------------------------------------------------------------------------
 
 /// Registry version tag for the root-cause abduction knobs (#51).
-pub const ORACLE_ABDUCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-oracle-abduce-knobs-v1";
+pub const ORACLE_ABDUCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-oracle-abduce-knobs-v2";
 
 /// Name of the reverse-walk max-depth knob (hops).
 pub const ORACLE_ABDUCE_MAX_DEPTH_KNOB: &str = "oracle_abduce_max_depth";
@@ -106,7 +107,7 @@ pub const ORACLE_ABDUCE_MAX_CONFIDENCE_PERMILLE_KNOB: &str =
     "oracle_abduce_max_confidence_permille";
 /// Name of the prune-floor knob (permille).
 pub const ORACLE_ABDUCE_PRUNE_FLOOR_PERMILLE_KNOB: &str = "oracle_abduce_prune_floor_permille";
-/// Name of the grounded-evidence floor knob (occurrences).
+/// Name of the grounded-evidence floor knob (distinct outcomes).
 pub const ORACLE_ABDUCE_EVIDENCE_FLOOR_KNOB: &str = "oracle_abduce_evidence_floor";
 
 /// The root-cause abduction knob registry (#51).
@@ -206,9 +207,9 @@ pub const ORACLE_ABDUCE_KNOBS: &[U64KnobDeclaration] = &[
         default: 3,
         min: 1,
         max: 1_000_000,
-        unit: "occurrences",
-        source: "ASTROLABE #49 corpus min-edge-support floor (3) reused as the abduction grounded-speech floor",
-        rationale: "abduce_cause refuses (Insufficient, per-sensor deficit) unless the failure's reverse-reachable region carries at least this many grounded failing occurrences, so it never abduces a cause from one or two coincidences; matches the corpus edge-support floor; replace with a measured value once refusal precision is benchmarked",
+        unit: "distinct_outcomes",
+        source: "ASTROLABE #49 corpus distinct-outcome min-edge-support floor (3) reused as the abduction grounded-speech floor",
+        rationale: "abduce_cause refuses (Insufficient, per-sensor deficit) unless the failure's reverse-reachable region carries at least this many distinct source-backed failing outcomes; candidate-pair fan-out never increases the count, so it never abduces a cause from one or two outcomes; matches the corpus edge-support floor; replace with a measured value once refusal precision is benchmarked",
     },
 ];
 
@@ -368,7 +369,7 @@ pub struct CauseHypothesis {
     /// Whether the candidate carries grounded failing history (`false` =
     /// structural-only provisional leaf).
     pub grounded: bool,
-    /// Recency- and credit-weighted failing-occurrence mass (`0.0` = structural).
+    /// Recency-weighted distinct-failing-outcome mass (`0.0` = structural).
     pub fail_support: f64,
     /// Trust of the hypothesis.
     pub trust: TrustTag,
@@ -412,7 +413,7 @@ pub enum AbductionOutcome {
 /// history at depth 0 — against the recency- and credit-weighted failing
 /// occurrences it has preceded. Returns [`AbductionOutcome::Insufficient`] when
 /// the reverse-reachable region carries fewer than the declared evidence floor of
-/// failing occurrences (a labeled refusal, not an error); structural errors (bad
+/// distinct failing outcomes (a labeled refusal, not an error); structural errors (bad
 /// config, a self-loop edge, a zero observation instant) fail closed with a coded
 /// [`OracleError`].
 pub fn abduce_cause(
@@ -480,18 +481,20 @@ pub fn abduce_cause(
         frontier = next;
     }
 
-    // --- Index failing occurrences preceding the observation, by subject. ---
-    let mut failing_by_subject: BTreeMap<CxId, Vec<&OccurrenceRecord>> = BTreeMap::new();
-    for record in records {
-        if !record.passed && record.outcome_ts <= request.observed_ts {
+    // --- Validate candidate-pair groups once, then index distinct failing
+    //     outcomes preceding the observation by subject. ---
+    let outcomes = validated_outcome_groups(records)?;
+    let mut failing_by_subject: BTreeMap<CxId, Vec<&ValidatedOutcomeGroup>> = BTreeMap::new();
+    for outcome in &outcomes {
+        if !outcome.passed && outcome.outcome_ts <= request.observed_ts {
             failing_by_subject
-                .entry(record.subject)
+                .entry(outcome.subject)
                 .or_default()
-                .push(record);
+                .push(outcome);
         }
     }
 
-    // --- Honesty gate: total grounded failing occurrences in the region. ---
+    // --- Honesty gate: total distinct grounded failing outcomes in the region. ---
     let mut grounded_fail_count = 0usize;
     for &node in depth.keys() {
         if let Some(fails) = failing_by_subject.get(&node) {
@@ -518,15 +521,17 @@ pub fn abduce_cause(
     for (&node, &node_depth) in &depth {
         let atten = config.depth_attenuation().powi(node_depth as i32);
 
-        // Recency- and credit-weighted failing support.
+        // Recency- and credit-weighted failing support. The group validator has
+        // proved that every distinct outcome's positive fixed-point candidate
+        // credits sum to exactly one ORACLE_ATTRIBUTION_SCALE, so its subject
+        // receives one recency-weighted unit regardless of candidate fan-out.
         let (fail_support, trusts): (f64, Vec<TrustTag>) = match failing_by_subject.get(&node) {
             Some(fails) => {
                 let mut support = 0.0f64;
                 let mut trusts = Vec::with_capacity(fails.len());
-                for rec in fails {
-                    support +=
-                        rec.credit * recency_weight(request.observed_ts, rec.outcome_ts, config);
-                    trusts.push(rec.trust);
+                for outcome in fails {
+                    support += recency_weight(request.observed_ts, outcome.outcome_ts, config);
+                    trusts.push(outcome.trust);
                 }
                 (support, trusts)
             }

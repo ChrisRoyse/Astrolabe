@@ -142,13 +142,15 @@ where
     match decision {
         DedupDecision::NoMatch => store_new(
             vault,
-            new_cx,
-            at,
-            policy,
-            "NoMatch",
-            Vec::new(),
-            recurrence_retention,
-            snapshot,
+            StoreNewRequest {
+                new_cx,
+                at,
+                policy,
+                decision: "NoMatch",
+                online_rows: Vec::new(),
+                recurrence_retention,
+                snapshot,
+            },
         ),
         DedupDecision::AnchorConflict { existing } => {
             let existing_cx = matched.ok_or_else(|| {
@@ -165,20 +167,24 @@ where
             let online_rows = contested_rows(&new_cx, &existing_cx)?;
             store_new(
                 vault,
-                new_cx,
-                at,
-                policy,
-                "AnchorConflict",
-                online_rows,
-                recurrence_retention,
-                snapshot,
+                StoreNewRequest {
+                    new_cx,
+                    at,
+                    policy,
+                    decision: "AnchorConflict",
+                    online_rows,
+                    recurrence_retention,
+                    snapshot,
+                },
             )
         }
         DedupDecision::Match {
             existing,
             per_slot_cos,
         } => match policy {
-            DedupPolicy::Exact => exact_duplicate(vault, &new_cx, at, existing, per_slot_cos),
+            DedupPolicy::Exact => {
+                exact_duplicate(vault, &new_cx, at, existing, per_slot_cos, snapshot)
+            }
             DedupPolicy::TctCosine(config) => {
                 if matched.as_ref().is_some_and(|cx| cx.cx_id != existing) {
                     return Err(CalyxError::aster_corrupt_shard(format!(
@@ -186,7 +192,7 @@ where
                     )));
                 }
                 if same_event_exact(new_cx.cx_id, existing, at, matched.as_ref())? {
-                    exact_duplicate(vault, &new_cx, at, existing, per_slot_cos)
+                    exact_duplicate(vault, &new_cx, at, existing, per_slot_cos, snapshot)
                 } else if config.action == DedupAction::RecurrenceSeries {
                     recurrence_match(
                         vault,
@@ -227,13 +233,15 @@ where
             }
             DedupPolicy::Off => store_new(
                 vault,
-                new_cx,
-                at,
-                policy,
-                "NoMatch",
-                Vec::new(),
-                recurrence_retention,
-                snapshot,
+                StoreNewRequest {
+                    new_cx,
+                    at,
+                    policy,
+                    decision: "NoMatch",
+                    online_rows: Vec::new(),
+                    recurrence_retention,
+                    snapshot,
+                },
             ),
         },
     }
@@ -271,19 +279,29 @@ where
     ingest_at_resolved(vault, input, EpochSecs(now_secs), guard_profile, resolver)
 }
 
-fn store_new<C>(
-    vault: &AsterVault<C>,
-    mut new_cx: Constellation,
+struct StoreNewRequest<'a> {
+    new_cx: Constellation,
     at: EpochSecs,
-    policy: &DedupPolicy,
+    policy: &'a DedupPolicy,
     decision: &'static str,
-    mut online_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    online_rows: Vec<(Vec<u8>, Vec<u8>)>,
     recurrence_retention: RetentionPolicy,
     snapshot: calyx_core::Seq,
-) -> Result<DedupResult>
+}
+
+fn store_new<C>(vault: &AsterVault<C>, request: StoreNewRequest<'_>) -> Result<DedupResult>
 where
     C: Clock,
 {
+    let StoreNewRequest {
+        mut new_cx,
+        at,
+        policy,
+        decision,
+        mut online_rows,
+        recurrence_retention,
+        snapshot,
+    } = request;
     let is_recurrence_series = matches!(
         policy,
         DedupPolicy::TctCosine(config) if config.action == DedupAction::RecurrenceSeries
@@ -326,6 +344,7 @@ where
     })?;
     let id = new_cx.cx_id;
     vault.commit_dedup_ingest(
+        snapshot,
         Some(new_cx),
         None,
         online_rows,
@@ -342,6 +361,7 @@ fn exact_duplicate<C>(
     at: EpochSecs,
     existing: CxId,
     per_slot_cos: Vec<(SlotId, f32)>,
+    snapshot: calyx_core::Seq,
 ) -> Result<DedupResult>
 where
     C: Clock,
@@ -358,7 +378,15 @@ where
         recurrence_signature: None,
         restore: None,
     })?;
-    vault.commit_dedup_ingest(None, None, Vec::new(), Vec::new(), existing, payload)?;
+    vault.commit_dedup_ingest(
+        snapshot,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        existing,
+        payload,
+    )?;
     Ok(DedupResult::ExactDuplicate(existing))
 }
 
@@ -405,7 +433,7 @@ where
         record
             .scalars_mut()
             .clone_from(&append.updated_base.scalars);
-        updated_base = Some((matched.snapshot, record));
+        updated_base = Some(record);
         recurrence_rows = append.recurrence_rows;
         recurrence_tombstones.push(append.occurrence_id);
         append.occurrence_id
@@ -443,6 +471,7 @@ where
     let candidate = (matched.action == DedupAction::Link).then_some(matched.new_cx);
     let subject = candidate.as_ref().map_or(matched.existing, |cx| cx.cx_id);
     vault.commit_dedup_ingest(
+        matched.snapshot,
         candidate,
         updated_base,
         online_rows,
@@ -518,16 +547,19 @@ where
             matched.at,
             matched.existing,
             matched.per_slot_cos,
+            matched.snapshot,
         ),
         SignatureResult::NewContent | SignatureResult::ContentMismatch => store_new(
             vault,
-            matched.new_cx,
-            matched.at,
-            &DedupPolicy::TctCosine(matched.config.clone()),
-            "ContentMismatch",
-            Vec::new(),
-            matched.retention,
-            matched.snapshot,
+            StoreNewRequest {
+                new_cx: matched.new_cx,
+                at: matched.at,
+                policy: &DedupPolicy::TctCosine(matched.config.clone()),
+                decision: "ContentMismatch",
+                online_rows: Vec::new(),
+                recurrence_retention: matched.retention,
+                snapshot: matched.snapshot,
+            },
         ),
     }
 }

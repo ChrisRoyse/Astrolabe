@@ -21,7 +21,7 @@ use crate::compaction::TieringPolicy;
 use crate::sst::SstReader;
 use crate::storage_names::{SstName, classify_sst, parse_cf_dir_name};
 use calyx_core::{CalyxError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -42,11 +42,15 @@ pub(in crate::vault) struct RouterOnlyCf {
 pub(in crate::vault) fn router_only_rows(
     root: &Path,
     tiering_policy: Option<&TieringPolicy>,
+    selected_cfs: Option<&BTreeSet<ColumnFamily>>,
     covered: impl Fn(ColumnFamily, &[u8]) -> bool,
 ) -> Result<Vec<RouterOnlyCf>> {
     let mut by_cf = BTreeMap::<ColumnFamily, RouterOnlyCf>::new();
     for cf_root in tiered_cf_roots(root, tiering_policy) {
-        if !cf_root.exists() {
+        if !cf_root
+            .try_exists()
+            .map_err(|error| storage_error("probe CF root", error))?
+        {
             continue;
         }
         for entry in fs::read_dir(&cf_root).map_err(|error| storage_error("read CF root", error))? {
@@ -60,6 +64,9 @@ pub(in crate::vault) fn router_only_rows(
             }
             let cf_name = cf_dir.file_name().to_string_lossy().to_string();
             let cf = parse_cf_dir_name(&cf_name)?;
+            if selected_cfs.is_some_and(|selected| !selected.contains(&cf)) {
+                continue;
+            }
             for file in
                 fs::read_dir(cf_dir.path()).map_err(|error| storage_error("read CF dir", error))?
             {

@@ -202,11 +202,11 @@ pub(crate) fn guard_check_at(
         );
     }
     let payload = verdict_ledger_payload_bytes(&report, &target_cx_hex);
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Ledger],
+        vec![ColumnFamily::Ledger, ColumnFamily::TimeIndex],
     )?;
     let ledger_ref = vault.append_ledger_entry(
         calyx_ledger::EntryKind::Guard,

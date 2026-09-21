@@ -902,7 +902,7 @@ fn validate_scale(
             )));
         }
         let raw = read_slice(access)?;
-        if raw.len() % 4 != 0 {
+        if !raw.len().is_multiple_of(4) {
             return Err(invalid(format!(
                 "node {} scale {} external payload length {} is not float32-aligned",
                 node_label(node, index),

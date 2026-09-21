@@ -157,16 +157,16 @@ fn finalize_admission(
         SystemClock,
     >,
 ) -> ToolResult<Option<FinalizedAdmission>> {
+    let candidate_state = VaultPanelState::from_parts(
+        inputs.controller.panel().clone(),
+        inputs.registry.clone(),
+        inputs.ctx.state.registry_snapshot.clone(),
+    )?;
     let Some(candidate_backfill) = inputs.live_state.take_backfill() else {
         return Err(proposal_error("admitted proposal is missing candidate backfill").into());
     };
     let (backfill, undo) =
         apply_slot_backfill(&inputs.ctx.vault, inputs.docs, &candidate_backfill)?;
-    let candidate_state = VaultPanelState {
-        panel: inputs.controller.panel().clone(),
-        registry: inputs.registry.clone(),
-        registry_snapshot: inputs.ctx.state.registry_snapshot.clone(),
-    };
     let reloaded = load_docs_with_state(&inputs.ctx.vault, &candidate_state)?;
     let after = metrics::bits(
         inputs.controller.panel(),

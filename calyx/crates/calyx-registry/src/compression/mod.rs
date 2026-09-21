@@ -26,6 +26,7 @@ pub use codec::inspect_unbound_stored_slot_envelope;
 use codec::{
     CodecContext, EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows, parse_compression_manifest,
 };
+pub(crate) use index::generation_identity_without_codec_at;
 pub use index::{
     CompressedGenerationIdentity, CompressedSlotHit, CompressedSlotIndex,
     CompressionReconstructionObservation,
@@ -170,10 +171,20 @@ pub struct SlotCompressionReport {
 /// durable generation commit and admission evaluation (#1064 PC-04/13).
 pub(super) struct CompressionBuildProduct {
     pub(super) report: SlotCompressionReport,
-    pub(super) codec: CodecContext,
+    pub(in crate::compression) codec: CodecContext,
     /// Exact sequence guarded by the durable full-column rewrite. Pure
     /// compression products carry `None`; persisted products carry `Some`.
     pub(super) source_seq: Option<Seq>,
+}
+
+struct CompressedSlotBatchWriteRequest<'a> {
+    slot: &'a Slot,
+    lens: &'a LensSpec,
+    rows: &'a [(CxId, Vec<f32>)],
+    queries: &'a [CompressionQuery],
+    k: usize,
+    mxfp4_evidence: Option<&'a MxFp4AssayEvidence>,
+    require_fresh_create: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -691,13 +702,15 @@ fn write_compressed_slot_batch_with_context_and_assay_evidence<C: Clock>(
 ) -> Result<CompressionBuildProduct> {
     write_compressed_slot_batch_with_context_and_assay_evidence_inner(
         vault,
-        slot,
-        lens,
-        rows,
-        queries,
-        k,
-        mxfp4_evidence,
-        false,
+        CompressedSlotBatchWriteRequest {
+            slot,
+            lens,
+            rows,
+            queries,
+            k,
+            mxfp4_evidence,
+            require_fresh_create: false,
+        },
     )
 }
 
@@ -712,26 +725,31 @@ pub(super) fn write_fresh_compressed_slot_batch_with_context_and_assay_evidence<
 ) -> Result<CompressionBuildProduct> {
     write_compressed_slot_batch_with_context_and_assay_evidence_inner(
         vault,
+        CompressedSlotBatchWriteRequest {
+            slot,
+            lens,
+            rows,
+            queries,
+            k,
+            mxfp4_evidence,
+            require_fresh_create: true,
+        },
+    )
+}
+
+fn write_compressed_slot_batch_with_context_and_assay_evidence_inner<C: Clock>(
+    vault: &AsterVault<C>,
+    request: CompressedSlotBatchWriteRequest<'_>,
+) -> Result<CompressionBuildProduct> {
+    let CompressedSlotBatchWriteRequest {
         slot,
         lens,
         rows,
         queries,
         k,
         mxfp4_evidence,
-        true,
-    )
-}
-
-fn write_compressed_slot_batch_with_context_and_assay_evidence_inner<C: Clock>(
-    vault: &AsterVault<C>,
-    slot: &Slot,
-    lens: &LensSpec,
-    rows: &[(CxId, Vec<f32>)],
-    queries: &[CompressionQuery],
-    k: usize,
-    mxfp4_evidence: Option<&MxFp4AssayEvidence>,
-    require_fresh_create: bool,
-) -> Result<CompressionBuildProduct> {
+        require_fresh_create,
+    } = request;
     reject_dense_codec_for_multivector(slot.shape, lens.quant_default)?;
     let (expected_seq, transition) = validate_full_column_rewrite(vault, slot, lens, rows)?;
     if require_fresh_create && transition != GenerationTransition::Create {

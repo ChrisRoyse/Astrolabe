@@ -124,15 +124,18 @@ pub struct FleetCatalog {
 }
 
 impl FleetCatalog {
-    /// The underlying catalog vault — the persistence root for fleet-scope
-    /// kernel artifacts (#456): `persist_kernel_artifact` writes its Kernel CF
-    /// rows and paired Kernel ledger entry here, and `kernel-read` reads them
-    /// back independently.
+    /// The underlying catalog vault — the persistence root for the atomic,
+    /// content-addressed fleet generation. Publication writes its immutable
+    /// Kernel rows, manifest, current/previous pointer, tombstones, and paired
+    /// physical Ledger entry in one conditional transaction; production
+    /// readers resolve and strictly verify that generation here.
     pub fn vault(&self) -> &AsterVault {
         &self.vault
     }
 
-    /// Creates or opens the fleet catalog vault rooted at `root`.
+    /// Creates or opens the writable fleet catalog over its exact mutation
+    /// roster: Base, Blob, Kernel, Ledger, and TimeIndex. No fleet operation
+    /// owns any other column family or requires historical MVCC row restore.
     pub fn open(root: &Path) -> Result<Self, CalyxError> {
         std::fs::create_dir_all(root).map_err(|error| CalyxError {
             code: "ASTRO_FLEET_ROOT_UNAVAILABLE",
@@ -152,8 +155,17 @@ impl FleetCatalog {
             vault_id,
             FLEET_VAULT_SALT.to_vec(),
             VaultOptions {
+                restore_mvcc_rows: false,
                 read_only: false,
                 restore_ledger_hook: true,
+                writable_selected_cfs: true,
+                selected_cfs: Some(vec![
+                    ColumnFamily::Base,
+                    ColumnFamily::Blob,
+                    ColumnFamily::Kernel,
+                    ColumnFamily::Ledger,
+                    ColumnFamily::TimeIndex,
+                ]),
                 ..VaultOptions::default()
             },
         )?;
@@ -166,14 +178,37 @@ impl FleetCatalog {
         root: &Path,
         selected_cfs: Vec<ColumnFamily>,
     ) -> Result<Self, CalyxError> {
-        if !root.is_dir() {
+        let metadata = match std::fs::metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CalyxError {
+                    code: "ASTRO_FLEET_ROOT_UNAVAILABLE",
+                    message: format!(
+                        "fleet catalog root {} is absent; refusing to create it for a read",
+                        root.display()
+                    ),
+                    remediation: "initialize the catalog with catalog-init before using read-only verbs",
+                });
+            }
+            Err(error) => {
+                return Err(CalyxError {
+                    code: "ASTRO_FLEET_ROOT_UNREADABLE",
+                    message: format!(
+                        "fleet catalog root {} could not be inspected: {error}",
+                        root.display()
+                    ),
+                    remediation: "repair the catalog path or filesystem read fault before retrying",
+                });
+            }
+        };
+        if !metadata.is_dir() {
             return Err(CalyxError {
-                code: "ASTRO_FLEET_ROOT_UNAVAILABLE",
+                code: "ASTRO_FLEET_ROOT_NOT_DIRECTORY",
                 message: format!(
-                    "fleet catalog root {} is absent; refusing to create it for a read",
+                    "fleet catalog root {} exists but is not a directory",
                     root.display()
                 ),
-                remediation: "initialize the catalog with catalog-init before using read-only verbs",
+                remediation: "pass the exact existing fleet catalog directory",
             });
         }
         let vault_id = VaultId::from_str(FLEET_VAULT_ID).map_err(|error| CalyxError {
@@ -592,6 +627,8 @@ impl FleetCatalog {
             "fleet_scope": retirement.fleet_scope,
             "fleet_compose_input_hash": retirement.fleet_compose_input_hash,
             "fleet_members_hash": retirement.fleet_members_hash,
+            "fleet_generation_id": retirement.fleet_generation_id,
+            "fleet_source_generation_identity": retirement.fleet_source_generation_identity,
         }))
         .expect("source retirement intent serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
@@ -726,6 +763,8 @@ impl FleetCatalog {
             "fleet_scope": retirement.fleet_scope,
             "fleet_compose_input_hash": retirement.fleet_compose_input_hash,
             "fleet_members_hash": retirement.fleet_members_hash,
+            "fleet_generation_id": retirement.fleet_generation_id,
+            "fleet_source_generation_identity": retirement.fleet_source_generation_identity,
         }))
         .expect("source retirement finalization serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
@@ -841,24 +880,43 @@ impl FleetCatalog {
         state: Option<RepoState>,
         language: Option<&str>,
     ) -> Result<Vec<FleetRepoRow>, CalyxError> {
-        let snapshot = self.vault.latest_seq();
         let mut rows = Vec::new();
-        for (_key, bytes) in self.vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-            let row = decode_repo_constellation(&decode_constellation_base(&bytes)?)?;
+        self.visit_rows(|row| {
             if let Some(state) = state
                 && row.state != state
             {
-                continue;
+                return Ok(());
             }
             if let Some(language) = language
                 && !row.record.language.eq_ignore_ascii_case(language)
             {
-                continue;
+                return Ok(());
             }
             rows.push(row);
-        }
+            Ok(())
+        })?;
         rows.sort_by(|left, right| left.record.full_name.cmp(&right.record.full_name));
         Ok(rows)
+    }
+
+    /// Visits every decoded catalog row at one retained latest snapshot without
+    /// imposing the display sort used by [`Self::query`]. Pass-level identity
+    /// verification uses this seam to remain one ordered catalog scan rather
+    /// than rescanning it for each requested repository. Aster's canonical
+    /// latest-row merge is `O(C log C)` and materializes `O(C)` rows; this seam
+    /// removes the prior multiplicative `R` factor but does not relabel that
+    /// storage cost as linear.
+    pub(crate) fn visit_rows(
+        &self,
+        mut visitor: impl FnMut(FleetRepoRow) -> Result<(), CalyxError>,
+    ) -> Result<(), CalyxError> {
+        let snapshot = self.vault.latest_seq();
+        for (_key, bytes) in self.vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
+            visitor(decode_repo_constellation(&decode_constellation_base(
+                &bytes,
+            )?)?)?;
+        }
+        Ok(())
     }
 
     /// Per-state record counts with an explicit zero for every state.

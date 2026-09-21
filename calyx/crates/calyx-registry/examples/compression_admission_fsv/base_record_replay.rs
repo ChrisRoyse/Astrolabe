@@ -1366,7 +1366,7 @@ fn validate_identity_clone_seed_delta(
         .rows
         .last()
         .ok_or("identity-clone appended Ledger row is absent")?;
-    let expected_rows = vec![
+    let expected_rows = [
         WalRowEvidence {
             column_family: ColumnFamily::Base.name().to_string(),
             key_hex: hex(&base_key(batch_cx_id)),
@@ -2077,9 +2077,9 @@ fn compression_evidence<C: calyx_core::Clock>(
         let vector = state
             .resolve_slot_vector_at(vault, snapshot, *cx_id, slot.slot_id)?
             .ok_or("compressed resolver returned no vector")?;
-        let resolved = resolved_vector_evidence(vault, snapshot, *role, *cx_id, vector)?;
+        let resolved = resolved_vector_evidence(vault, snapshot, role, *cx_id, vector)?;
         rows.push(CompressedRowEvidence {
-            role: (*role).to_string(),
+            role: role.to_string(),
             cx_id: cx_id.to_string(),
             primary_key_hex: hex(&primary_key),
             primary: value_identity(&primary),
@@ -2277,7 +2277,7 @@ fn validate_write_batch_time_index(seq: Seq, rows: &[WriteRow]) -> AnyResult<u64
                 .iter()
                 .all(|row| row.cf != ColumnFamily::TimeIndex)
             && time_index.key.len() == 16
-            && time_index.value.as_slice() == &[0_u8],
+            && time_index.value.as_slice() == [0_u8],
         format!("WAL commit {seq} does not end in exactly one canonical time-index row"),
     )?;
     let millis = u64::from_be_bytes(time_index.key[..8].try_into()?);
@@ -2371,8 +2371,7 @@ fn validate_ledger_suffix<C: calyx_core::Clock>(
         "cli-idempotent-ingest-batch",
     ];
     let mut evidence = Vec::with_capacity(5);
-    for ordinal in 0..5 {
-        let row = &suffix[ordinal];
+    for (ordinal, row) in suffix.iter().enumerate() {
         let entry = decode_ledger_row(vault, row.seq)?;
         require(
             entry.seq == row.seq
@@ -2460,7 +2459,7 @@ fn validate_wal_suffix(
             )?;
             continue;
         }
-        let expected = vec![
+        let expected = [
             WalRowEvidence {
                 column_family: ColumnFamily::Base.name().to_string(),
                 key_hex: hex(&base_key(batch_base.cx_id.parse()?)),

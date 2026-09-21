@@ -270,10 +270,10 @@ pub(crate) fn coverage_ingest_json_at(
     };
 
     // --- Assemble the graph slice from persisted state ------------------------
-    // A writable open exposes every column family (including Base, which
-    // read_cbm_graph_snapshot needs to decode constellation metadata), so one
-    // handle serves both the graph read and the anchor ingest below.
-    let vault = open_shadow_vault_writable(
+    // The retained graph read consumes only the exact source families below;
+    // the same latest-state handle then commits Anchors with its Ledger/TimeIndex
+    // rows, without restoring unrelated MVCC history.
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
@@ -282,6 +282,10 @@ pub(crate) fn coverage_ingest_json_at(
             ColumnFamily::Anchors,
             ColumnFamily::Graph,
             ColumnFamily::Base,
+            ColumnFamily::Blob,
+            ColumnFamily::Kv,
+            ColumnFamily::Recurrence,
+            ColumnFamily::TimeIndex,
         ],
     )?;
     let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;

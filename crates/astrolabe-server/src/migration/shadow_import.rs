@@ -409,6 +409,540 @@ pub(crate) struct WeaveDelta {
     pub(crate) removed_cx_ids: BTreeSet<calyx_core::CxId>,
 }
 
+struct LiveWeaveRequest<'a> {
+    run_parent: &'a Path,
+    vault_panel_root: &'a Path,
+    project: &'a str,
+    import_changed: bool,
+    delta: Option<&'a WeaveDelta>,
+    snapshot: Option<&'a CbmCompactGraphSnapshot>,
+    similarity_config: &'a SimilarityPlannerConfig,
+}
+
+#[cfg(feature = "manual-fsv")]
+const MANUAL_FSV_WEAVE_BARRIER_ENV: &str = "ASTRO_MANUAL_FSV_WEAVE_BINDING_BARRIER";
+#[cfg(feature = "manual-fsv")]
+const MANUAL_FSV_WEAVE_BARRIER_ARM_SCHEMA: &str =
+    "astrolabe.manual-fsv.weave-source-barrier-arm.v1";
+#[cfg(feature = "manual-fsv")]
+const MANUAL_FSV_WEAVE_BARRIER_READY_SCHEMA: &str =
+    "astrolabe.manual-fsv.weave-source-barrier-ready.v1";
+#[cfg(feature = "manual-fsv")]
+const MANUAL_FSV_WEAVE_BARRIER_ACK_SCHEMA: &str =
+    "astrolabe.manual-fsv.weave-source-barrier-ack.v1";
+#[cfg(feature = "manual-fsv")]
+const MANUAL_FSV_WEAVE_BARRIER_MAX_WAIT_MS: u64 = 20 * 60 * 1_000;
+#[cfg(feature = "manual-fsv")]
+const MANUAL_FSV_WEAVE_BARRIER_POLL_MS: u64 = 25;
+
+#[cfg(feature = "manual-fsv")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualFsvWeaveBarrierArm {
+    schema: String,
+    project: String,
+    barrier_root: PathBuf,
+    payload_root: PathBuf,
+    barrier_id: String,
+    target_slot: u16,
+    source_delta_sha256: String,
+    wait_timeout_ms: u64,
+}
+
+#[cfg(feature = "manual-fsv")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualFsvWeaveBarrierAck {
+    schema: String,
+    barrier_id: String,
+    project: String,
+    ready_sha256: String,
+    status: String,
+    publication_generation: String,
+    stage_cache: PathBuf,
+    vault_path: PathBuf,
+    slot: Option<u16>,
+    commit_seq: Option<u64>,
+    ledger_ref: Option<LedgerRef>,
+    mutation_payload_sha256: Option<String>,
+    mutation_receipt_bytes: Option<u64>,
+    mutation_receipt_sha256: Option<String>,
+    data_key_hex: Option<String>,
+    data_value_sha256: Option<String>,
+    data_row_blake3: Option<String>,
+    error_sha256: Option<String>,
+}
+
+#[cfg(feature = "manual-fsv")]
+fn manual_fsv_weave_barrier_root_is_ordinary(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_dir() && !metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(feature = "manual-fsv")]
+fn manual_fsv_write_new_readback(path: &Path, bytes: &[u8]) -> Result<(), DynError> {
+    let mut pending_name = path.as_os_str().to_os_string();
+    pending_name.push(".pending");
+    let pending_path = PathBuf::from(pending_name);
+    if path.try_exists()? || pending_path.try_exists()? {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_WRITE_PREEXISTS: final_present={} pending_present={}; remediation: use one fresh issue-scoped barrier root",
+            path.try_exists()?,
+            pending_path.try_exists()?,
+        )
+        .into());
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)
+        .map_err(|error| -> DynError {
+            format!(
+                "ASTRO_MANUAL_FSV_WEAVE_BARRIER_WRITE_FAILED: create-new {} failed: {error}; remediation: preserve the barrier root and inspect the exact FSV owner",
+                pending_path.display(),
+            )
+            .into()
+        })?;
+    output.write_all(bytes)?;
+    output.sync_all()?;
+    drop(output);
+    let observed = fs::read(&pending_path)?;
+    if observed != bytes {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_READBACK_MISMATCH: {} did not read back byte-identically; remediation: preserve the barrier root and staged generation",
+            pending_path.display(),
+        )
+        .into());
+    }
+    let pending_metadata = fs::symlink_metadata(&pending_path)?;
+    if !pending_metadata.is_file()
+        || !manual_fsv_weave_barrier_root_is_ordinary_file(&pending_metadata)
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_FILE_INVALID: {} is not one ordinary non-reparse file; remediation: preserve the barrier root and inspect the exact namespace object",
+            pending_path.display(),
+        )
+        .into());
+    }
+    publish_file_no_replace_write_through(&pending_path, path)?;
+    let final_metadata = fs::symlink_metadata(path)?;
+    let final_bytes = fs::read(path)?;
+    if !final_metadata.is_file()
+        || !manual_fsv_weave_barrier_root_is_ordinary_file(&final_metadata)
+        || final_bytes != bytes
+        || pending_path.try_exists()?
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_PUBLICATION_MISMATCH: final={} pending={} final_bytes={}; remediation: preserve the barrier root and staged generation",
+            path.display(),
+            pending_path.display(),
+            final_bytes.len(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "manual-fsv")]
+fn manual_fsv_weave_barrier_root_is_ordinary_file(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_file() && !metadata.file_type().is_symlink()
+    }
+}
+
+/// Manual-FSV-only two-way synchronization immediately after the complete
+/// Slot/Compression binding and before the first bound Slot materialization or
+/// derived write.
+///
+/// The feature is absent from ordinary shipping builds. When explicitly armed,
+/// this writes one O(K) binding receipt, performs W bounded control-file polls
+/// (`W <= 48,000` for the closed protocol maximum), and holds no snapshot or
+/// commit lock while waiting. It then performs one hoisted latest-router
+/// recovery: with `B_wal` retained WAL bytes, `B_sst` immutable SST bytes, `K_sst`
+/// SST index keys/routes, `R` recovered tail rows, and `H_ledger` bounded Ledger
+/// hydration, that pass costs `O(B_wal + B_sst + K_sst log K_sst + R log R +
+/// H_ledger)` time and `O(K_sst + R + differing-tail bytes + H_ledger)` memory.
+/// Production values are unmeasured; this manual fixture supplies correctness
+/// evidence only. Cost-hypothesis owner: #1147; expires at the first
+/// production-sized barrier refresh receipt (PC-04, PC-07, PC-18, PC-38,
+/// PC-41, PC-43).
+#[cfg(feature = "manual-fsv")]
+fn manual_fsv_weave_source_binding_barrier<C>(
+    vault: &AsterVault<C>,
+    run_parent: &Path,
+    vault_panel_root: &Path,
+    project: &str,
+    source_binding_snapshot_seq: u64,
+    source_compression_generation: u64,
+    source_slot_bindings: &BTreeMap<SlotId, WeaveSlotBinding>,
+) -> Result<(), DynError>
+where
+    C: Clock,
+{
+    let Some(root) = std::env::var_os(MANUAL_FSV_WEAVE_BARRIER_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    if !root.is_absolute() {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ROOT_INVALID: {} is not absolute; remediation: pass one absolute ordinary issue-scoped barrier root",
+            root.display(),
+        )
+        .into());
+    }
+    let root_metadata = fs::symlink_metadata(&root).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ROOT_UNREADABLE: {}: {error}; remediation: preserve the staged generation and restore the exact armed barrier root",
+            root.display(),
+        )
+        .into()
+    })?;
+    if !manual_fsv_weave_barrier_root_is_ordinary(&root_metadata) {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ROOT_INVALID: {} is not one ordinary non-reparse directory; remediation: preserve the namespace and use an ordinary issue-scoped root",
+            root.display(),
+        )
+        .into());
+    }
+    let arm_path = root.join("arm.json");
+    if !arm_path.try_exists()? {
+        return Ok(());
+    }
+    let arm_metadata = fs::symlink_metadata(&arm_path)?;
+    if !manual_fsv_weave_barrier_root_is_ordinary_file(&arm_metadata) {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ARM_INVALID: {} is not one ordinary non-reparse file; remediation: preserve the exact arm namespace",
+            arm_path.display(),
+        )
+        .into());
+    }
+    let arm_bytes = fs::read(&arm_path)?;
+    let arm: ManualFsvWeaveBarrierArm = serde_json::from_slice(&arm_bytes).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ARM_INVALID: {} bytes={} sha256={} parse_error={error}; remediation: preserve the exact arm file and repair its closed schema",
+                arm_path.display(),
+                arm_bytes.len(),
+                hex_lower(&Sha256::digest(&arm_bytes)),
+            )
+            .into()
+        },
+    )?;
+    let lowercase_sha = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if arm.schema != MANUAL_FSV_WEAVE_BARRIER_ARM_SCHEMA
+        || arm.project != project
+        || arm.barrier_root != root
+        || arm.wait_timeout_ms == 0
+        || arm.wait_timeout_ms > MANUAL_FSV_WEAVE_BARRIER_MAX_WAIT_MS
+        || !arm.payload_root.is_absolute()
+        || !lowercase_sha(&arm.barrier_id)
+        || !lowercase_sha(&arm.source_delta_sha256)
+        || !source_slot_bindings.contains_key(&SlotId::new(arm.target_slot))
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ARM_MISMATCH: schema={:?} project={:?} root={} payload_root={} barrier_id={:?} target_slot={} source_delta_sha256={:?} timeout_ms={}; remediation: preserve the exact arm file and bind it to this project/root with a finite positive observer budget",
+            arm.schema,
+            arm.project,
+            arm.barrier_root.display(),
+            arm.payload_root.display(),
+            arm.barrier_id,
+            arm.target_slot,
+            arm.source_delta_sha256,
+            arm.wait_timeout_ms,
+        )
+        .into());
+    }
+    if !run_parent.is_absolute() || !vault_panel_root.is_absolute() {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_STAGE_PATH_INVALID: stage_cache={} vault_path={}; remediation: preserve the transaction and repair the staged publication path authority",
+            run_parent.display(),
+            vault_panel_root.display(),
+        )
+        .into());
+    }
+    let canonical_root = root.canonicalize()?;
+    let canonical_payload = arm.payload_root.canonicalize()?;
+    let canonical_stage = run_parent.canonicalize()?;
+    let canonical_vault = vault_panel_root.canonicalize()?;
+    if !canonical_root.starts_with(&canonical_payload)
+        || canonical_root.starts_with(&canonical_stage)
+        || canonical_stage.starts_with(&canonical_root)
+        || canonical_root.starts_with(&canonical_vault)
+        || canonical_vault.starts_with(&canonical_root)
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_PATH_OVERLAP: root={} payload={} stage={} vault={}; remediation: keep the ordinary barrier root beneath the issue payload and disjoint from staged publication state",
+            canonical_root.display(),
+            canonical_payload.display(),
+            canonical_stage.display(),
+            canonical_vault.display(),
+        )
+        .into());
+    }
+    let generation_dir = run_parent.parent().ok_or_else(|| -> DynError {
+        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_TRANSACTION_ROOT_MISSING: stage cache has no generation parent; remediation: preserve the staged generation".into()
+    })?;
+    let journal_path = generation_dir.join("transaction.json");
+    let journal_bytes = fs::read(&journal_path)?;
+    let journal: Value = serde_json::from_slice(&journal_bytes)?;
+    let publication_generation = generation_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_GENERATION_INVALID: transaction generation is not UTF-8; remediation: preserve the staged generation".into()
+        })?;
+    if journal["schema"] != "astrolabe.shadow-publication.v3"
+        || journal["project"] != project
+        || journal["generation"] != publication_generation
+        || journal["stage_cache"] != json!(run_parent)
+        || journal["owner"]["pid"].as_u64().is_none_or(|pid| pid == 0)
+        || journal["owner"]["process_start_utc_ticks"]
+            .as_u64()
+            .is_none_or(|ticks| ticks == 0)
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_TRANSACTION_MISMATCH: journal={journal}; remediation: preserve the staged generation and repair its transaction identity"
+        )
+        .into());
+    }
+    let ready_path = root.join("ready.json");
+    let ack_path = root.join("ack.json");
+    if ready_path.try_exists()? || ack_path.try_exists()? {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_PREEXISTS: ready_present={} ack_present={}; remediation: use one fresh issue-scoped barrier root per staged generation",
+            ready_path.try_exists()?,
+            ack_path.try_exists()?,
+        )
+        .into());
+    }
+    let ready = json!({
+        "schema": MANUAL_FSV_WEAVE_BARRIER_READY_SCHEMA,
+        "barrier_id": arm.barrier_id,
+        "project": project,
+        "target_slot": arm.target_slot,
+        "arm_sha256": hex_lower(&Sha256::digest(&arm_bytes)),
+        "worker_pid": std::process::id(),
+        "publication_generation": publication_generation,
+        "transaction_journal_sha256": hex_lower(&Sha256::digest(&journal_bytes)),
+        "publication_owner": &journal["owner"],
+        "stage_cache": run_parent,
+        "vault_path": vault_panel_root,
+        "compact_graph_snapshot_seq": source_binding_snapshot_seq,
+        "source_binding_snapshot_seq": source_binding_snapshot_seq,
+        "vault_latest_seq": vault.latest_seq(),
+        "source_compression_generation": source_compression_generation,
+        "slot_bindings": source_slot_bindings.values().collect::<Vec<_>>(),
+        "phase": "all_source_bindings_complete_lease_dropped_before_first_bound_slot_materialization",
+    });
+    let ready_bytes = serde_json::to_vec(&ready)?;
+    let ready_sha256 = hex_lower(&Sha256::digest(&ready_bytes));
+    manual_fsv_write_new_readback(&ready_path, &ready_bytes)?;
+
+    let timeout = Duration::from_millis(arm.wait_timeout_ms);
+    let started = Instant::now();
+    let ack_bytes = loop {
+        match fs::read(&ack_path) {
+            Ok(bytes) => {
+                let metadata = fs::symlink_metadata(&ack_path)?;
+                if !manual_fsv_weave_barrier_root_is_ordinary_file(&metadata) {
+                    return Err(format!(
+                        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_INVALID: {} is not one ordinary non-reparse file; remediation: preserve the exact ack namespace",
+                        ack_path.display(),
+                    )
+                    .into());
+                }
+                break bytes;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_TIMEOUT: no ack for ready_sha256={ready_sha256} after {} ms; remediation: preserve the barrier and staged generation and inspect the external mutator",
+                        arm.wait_timeout_ms,
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(MANUAL_FSV_WEAVE_BARRIER_POLL_MS));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let ack: ManualFsvWeaveBarrierAck = serde_json::from_slice(&ack_bytes).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_INVALID: {} bytes={} sha256={} parse_error={error}; remediation: preserve the exact ack and staged generation",
+                ack_path.display(),
+                ack_bytes.len(),
+                hex_lower(&Sha256::digest(&ack_bytes)),
+            )
+            .into()
+        },
+    )?;
+    let mutation_sha_valid = ack
+        .mutation_payload_sha256
+        .as_deref()
+        .is_some_and(lowercase_sha);
+    if ack.schema != MANUAL_FSV_WEAVE_BARRIER_ACK_SCHEMA
+        || ack.barrier_id != arm.barrier_id
+        || ack.project != project
+        || ack.ready_sha256 != ready_sha256
+        || ack.publication_generation != publication_generation
+        || ack.stage_cache != run_parent
+        || ack.vault_path != vault_panel_root
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_MISMATCH: schema={:?} project={:?} ready_sha256={:?} stage_cache={} vault_path={}; remediation: preserve the exact ack and bind it to the ready receipt",
+            ack.schema,
+            ack.project,
+            ack.ready_sha256,
+            ack.stage_cache.display(),
+            ack.vault_path.display(),
+        )
+        .into());
+    }
+    if ack.status != "source_mutation_committed_and_handle_closed" {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_MUTATION_FAILED: status={:?} error_sha256={:?}; remediation: preserve the barrier and staged generation and inspect the external mutator's first physical failure",
+            ack.status, ack.error_sha256,
+        )
+        .into());
+    }
+    let slot = ack.slot.ok_or_else(|| -> DynError {
+        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_SLOT_MISSING: successful ack omitted the mutated Slot; remediation: preserve the exact ack and staged generation".into()
+    })?;
+    let commit_seq = ack.commit_seq.ok_or_else(|| -> DynError {
+        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_COMMIT_MISSING: successful ack omitted the Aster commit sequence; remediation: preserve the exact ack and staged generation".into()
+    })?;
+    let target_slot = SlotId::new(slot);
+    let target_binding = source_slot_bindings.get(&target_slot).ok_or_else(|| -> DynError {
+        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_SLOT_UNBOUND: successful ack names an unbound Slot; remediation: preserve the exact ack and staged generation".into()
+    })?;
+    let expected_commit_seq = source_binding_snapshot_seq.checked_add(1).ok_or_else(|| -> DynError {
+        "ASTRO_MANUAL_FSV_WEAVE_BARRIER_SEQUENCE_OVERFLOW: binding sequence cannot advance; remediation: preserve the staged generation".into()
+    })?;
+    let receipt_sha_valid = ack
+        .mutation_receipt_sha256
+        .as_deref()
+        .is_some_and(lowercase_sha);
+    let data_value_sha_valid = ack.data_value_sha256.as_deref().is_some_and(lowercase_sha);
+    let data_blake3_valid = ack.data_row_blake3.as_deref().is_some_and(lowercase_sha);
+    let data_key_valid = ack.data_key_hex.as_deref().is_some_and(|value| {
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if slot != arm.target_slot
+        || commit_seq != expected_commit_seq
+        || ack.ledger_ref.is_none()
+        || !mutation_sha_valid
+        || ack.mutation_receipt_bytes.is_none_or(|bytes| bytes == 0)
+        || !receipt_sha_valid
+        || !data_key_valid
+        || !data_value_sha_valid
+        || !data_blake3_valid
+        || ack.error_sha256.is_some()
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_EVIDENCE_INVALID: slot={slot} commit_seq={commit_seq} binding_seq={source_binding_snapshot_seq} ledger_ref={:?} mutation_sha256={:?} error_sha256={:?}; remediation: preserve the exact ack and prove one later real source mutation with its Ledger reference",
+            ack.ledger_ref, ack.mutation_payload_sha256, ack.error_sha256,
+        )
+        .into());
+    }
+    let mutation_receipt_path = root.join("mutation-receipt.json");
+    let mutation_receipt_metadata = fs::symlink_metadata(&mutation_receipt_path)?;
+    let mutation_receipt_bytes = fs::read(&mutation_receipt_path)?;
+    let mutation_receipt_sha256 = hex_lower(&Sha256::digest(&mutation_receipt_bytes));
+    if !manual_fsv_weave_barrier_root_is_ordinary_file(&mutation_receipt_metadata)
+        || u64::try_from(mutation_receipt_bytes.len()).ok() != ack.mutation_receipt_bytes
+        || ack.mutation_receipt_sha256.as_deref() != Some(mutation_receipt_sha256.as_str())
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_MUTATION_RECEIPT_MISMATCH: path={} bytes={} sha256={}; remediation: preserve the barrier and staged generation and repair the durable mutator receipt",
+            mutation_receipt_path.display(),
+            mutation_receipt_bytes.len(),
+            mutation_receipt_sha256,
+        )
+        .into());
+    }
+    let mutation_receipt: Value = serde_json::from_slice(&mutation_receipt_bytes).map_err(
+        |error| -> DynError {
+            format!(
+                "ASTRO_MANUAL_FSV_WEAVE_BARRIER_MUTATION_RECEIPT_INVALID: path={} bytes={} sha256={} parse_error={error}; remediation: preserve the exact mutation receipt and staged generation",
+                mutation_receipt_path.display(),
+                mutation_receipt_bytes.len(),
+                mutation_receipt_sha256,
+            )
+            .into()
+        },
+    )?;
+    let ack_ledger_ref = ack
+        .ledger_ref
+        .as_ref()
+        .ok_or_else(|| -> DynError {
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_ACK_LEDGER_REF_MISSING: successful ack omitted the Ledger reference; remediation: preserve the exact ack and mutation receipt"
+                .into()
+        })?;
+    if mutation_receipt["schema"]
+        != "astrolabe.issue-1147.staged-slot-generation-mutation-receipt.v1"
+        || mutation_receipt["generation"] != publication_generation
+        || mutation_receipt["stage_cache"] != json!(run_parent)
+        || mutation_receipt["vault_path"] != json!(vault_panel_root)
+        || mutation_receipt["commit_seq"] != commit_seq
+        || mutation_receipt["ledger_ref"] != serde_json::to_value(ack_ledger_ref)?
+        || mutation_receipt["payload_sha256"].as_str() != ack.mutation_payload_sha256.as_deref()
+        || mutation_receipt["data_row_blake3"].as_str() != ack.data_row_blake3.as_deref()
+        || mutation_receipt["before"]["row"]["key_hex"].as_str() != ack.data_key_hex.as_deref()
+        || mutation_receipt["before"]["row"]["sha256"].as_str() != ack.data_value_sha256.as_deref()
+        || mutation_receipt["after"]["snapshot_seq"] != commit_seq
+        || mutation_receipt["after"]["slot"] != slot
+        || mutation_receipt["after"]["physical_wal_commit_inventory"]["commit_seq"] != commit_seq
+        || mutation_receipt["after"]["physical_wal_commit_inventory"]["uncheckpointed_wal_tail"]
+            != true
+        || mutation_receipt["barrier"]["ready"]["ready_sha256"] != ready_sha256
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_MUTATION_RECEIPT_MISMATCH: receipt={mutation_receipt}; remediation: preserve the exact receipt/ack and bind one real WAL-tail Slot/Ledger/TimeIndex commit to this ready generation"
+        )
+        .into());
+    }
+    let refreshed_seq = vault.refresh_latest_from_durable()?;
+    let refreshed_slot_generation = vault.cf_content_generation(ColumnFamily::slot(target_slot))?;
+    let refreshed_compression_generation =
+        vault.cf_content_generation(ColumnFamily::Compression)?;
+    if refreshed_seq != commit_seq
+        || refreshed_slot_generation != commit_seq
+        || refreshed_compression_generation != target_binding.compression_cf_generation
+    {
+        return Err(format!(
+            "ASTRO_MANUAL_FSV_WEAVE_BARRIER_REFRESH_MISMATCH: refreshed_seq={refreshed_seq} commit_seq={commit_seq} slot=S{slot} refreshed_slot_generation={refreshed_slot_generation} expected_slot_generation={commit_seq} refreshed_compression_generation={refreshed_compression_generation} expected_compression_generation={}; remediation: preserve the barrier and staged generation and inspect the exact foreign commit",
+            target_binding.compression_cf_generation,
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn snapshot_cx_by_atom(
     snapshot: &CbmCompactGraphSnapshot,
     phase: &str,
@@ -865,7 +1399,7 @@ pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::CURRENT_SEMANTIC_P
 /// substrate carries no token-multi source, so it stays a labeled `LensUnavailable`
 /// absence rather than a measured row). S23 (`layer_role`) IS included so the
 /// directory-role layout frames can be built (#336). Applicability is still enforced
-/// per class by the panel driver, while S24-S204 are dispatched only from exact
+/// per class by the panel driver, while S24-S210 are dispatched only from exact
 /// typed semantic source values.
 pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
     astrolabe_panel::slots_for_version(SHADOW_PANEL_VERSION)
@@ -1586,7 +2120,8 @@ pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
 /// Complete input/producer identity for the pre-seed unchanged-repository gate (#858).
 /// The record is committed in the same SQLite transaction as the artifacts it names.
 pub(crate) const SHADOW_INDEX_ADMISSION_IDENTITY_KEY: &str = "index_admission_identity_json";
-pub(crate) const SHADOW_INDEX_ADMISSION_SCHEMA: &str = "astrolabe.shadow_index_admission.v2";
+pub(crate) const SHADOW_INDEX_ADMISSION_SCHEMA: &str = "astrolabe.shadow_index_admission.v3";
+const SHADOW_INDEX_ADMISSION_SCHEMA_V2: &str = "astrolabe.shadow_index_admission.v2";
 const SHADOW_INDEX_ADMISSION_SCHEMA_V1: &str = "astrolabe.shadow_index_admission.v1";
 pub(crate) const GIT_ARCHAEOLOGY_HEAD_KEY: &str = "git_archaeology_head";
 
@@ -1647,12 +2182,123 @@ impl ShadowIndexAdmissionIdentity {
                 "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: admission inputs have no effective weave-similarity plan; remediation: preserve the generation and rebuild from authoritative source"
                     .into()
             })?;
+        let kernel_admission = inputs
+            .get("kernel_admission")
+            .ok_or_else(|| -> DynError {
+                "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: admission inputs have no complete kernel-admission identity; remediation: rebuild from an explicit real query corpus before admitting no-op reuse"
+                    .into()
+            })?;
         Ok(json!({
             "contracts": contracts,
             "effective_weave_similarity": effective_weave_similarity,
+            "kernel_admission": kernel_admission,
             "producer_executable_sha256": self.producer_executable_sha256,
         }))
     }
+
+    fn kernel_admission_action_identity(&self) -> Result<&Value, DynError> {
+        self.record
+            .get("inputs")
+            .and_then(Value::as_object)
+            .and_then(|inputs| inputs.get("kernel_admission"))
+            .ok_or_else(|| {
+                "ASTRO_SHADOW_ADMISSION_IDENTITY_INVALID: current admission record has no kernel_admission identity; remediation: rebuild from an explicit real query corpus before admitting no-op reuse"
+                    .into()
+            })
+    }
+}
+
+/// Derives an omitted admission from the immutable live composite generation.
+///
+/// A direct `get_kernel mode="build"` can advance the corpus while project
+/// config still describes an older index operation. The caller holds the
+/// per-project import lock across this read, no-op admission, and stage seeding,
+/// so only the physically verified current pointer/corpus may authorize reuse.
+pub(crate) fn reusable_kernel_admission_action_identity(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    match vault_dir.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "ASTRO_KERNEL_ADMISSION_REQUIRED: project={project:?} has no live vault/current real-query corpus; remediation: retry index_repository with one explicit complete kernel_admission object containing independently authored real queries and every graph-routed control"
+            )
+            .into());
+        }
+        Err(error) => {
+            return Err(format!(
+                "ASTRO_KERNEL_ADMISSION_VAULT_STATE_UNREADABLE: project={project:?} cannot classify live vault {}: {error}; remediation: repair the named vault path so its physical presence can be read exactly, then retry the unchanged admission",
+                vault_dir.display()
+            )
+            .into());
+        }
+    }
+    let vault = open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![
+            ColumnFamily::Graph,
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Kernel,
+            ColumnFamily::Ledger,
+            ColumnFamily::Compression,
+            ColumnFamily::Slot(astrolabe_weave::search::SLOT_NAME_SEMANTIC),
+        ],
+    )?;
+    let scope_id = kernel_artifact_scope_id(project);
+    let Some(current) =
+        astrolabe_weave::read_current_kernel_generation(&vault, project, &scope_id)
+    .map_err(|error| -> DynError {
+        format!(
+            "ASTRO_KERNEL_ADMISSION_CURRENT_GENERATION_INVALID: project={project:?} scope={scope_id:?} code={} message={:?} remediation={:?}",
+            error.code(),
+            error.message(),
+            error.remediation()
+        )
+        .into()
+    })?
+    else {
+        return Err(format!(
+            "ASTRO_KERNEL_ADMISSION_REQUIRED: project={project:?} scope={scope_id:?} has no current complete kernel generation/query corpus; remediation: retry index_repository with one explicit complete kernel_admission object containing independently authored real queries and every graph-routed control"
+        )
+        .into());
+    };
+    if current.manifest.project != project
+        || current.manifest.scope_id != scope_id
+        || current.artifact.scope_id != scope_id
+    {
+        return Err(format!(
+            "ASTRO_KERNEL_ADMISSION_CURRENT_GENERATION_IDENTITY_MISMATCH: requested_project={project:?} requested_scope={scope_id:?} observed_project={:?} observed_scope={:?}; remediation: preserve the live vault and repair or rebuild its composite kernel current pointer",
+            current.manifest.project, current.artifact.scope_id
+        )
+        .into());
+    }
+    if current.query_corpus.project != project || current.query_corpus.scope_id != scope_id {
+        return Err(format!(
+            "ASTRO_KERNEL_ADMISSION_CURRENT_CORPUS_IDENTITY_MISMATCH: requested_project={project:?} requested_scope={scope_id:?} observed_project={:?} observed_scope={:?}; remediation: preserve the live vault and rebuild one complete atomic kernel generation from explicit real queries",
+            current.query_corpus.project, current.query_corpus.scope_id
+        )
+        .into());
+    }
+    astrolabe_weave::verify_kernel_member_index_source_at_latest(
+        &vault,
+        &vault_dir,
+        &current.index.descriptor,
+    )
+    .map_err(|error| -> DynError {
+        format!(
+            "ASTRO_KERNEL_ADMISSION_CURRENT_SOURCE_INVALID: project={project:?} scope={scope_id:?} code={} message={:?} remediation={:?}",
+            error.code(),
+            error.message(),
+            error.remediation()
+        )
+        .into()
+    })?;
+    persisted_kernel_admission_action_identity(&current.query_corpus)
 }
 
 pub(crate) fn shadow_index_action_policy(
@@ -1668,15 +2314,17 @@ pub(crate) fn shadow_index_action_policy(
     };
     let persisted_identity =
         parse_shadow_index_admission_identity(project, &identity_key, &persisted_identity_raw)?;
-    if persisted_identity
+    let persisted_schema = persisted_identity
         .record
         .get("schema")
-        .and_then(Value::as_str)
-        == Some(SHADOW_INDEX_ADMISSION_SCHEMA_V1)
+        .and_then(Value::as_str);
+    if persisted_schema == Some(SHADOW_INDEX_ADMISSION_SCHEMA_V1)
+        || persisted_schema == Some(SHADOW_INDEX_ADMISSION_SCHEMA_V2)
     {
         return Ok(ShadowIndexActionPolicy::RebuildDerived {
             reason: format!(
-                "admission_contract_upgrade:{SHADOW_INDEX_ADMISSION_SCHEMA_V1}->{SHADOW_INDEX_ADMISSION_SCHEMA}"
+                "admission_contract_upgrade:{}->{SHADOW_INDEX_ADMISSION_SCHEMA}",
+                persisted_schema.unwrap_or("unknown")
             ),
         });
     }
@@ -1759,6 +2407,7 @@ pub(crate) fn shadow_index_admission_identity(
     search_scale: &SearchScaleSettings,
     skills: &SkillDiscoveryConfig,
     similarity: &SimilarityPlannerConfig,
+    kernel_admission_action: &Value,
 ) -> Result<ShadowIndexAdmissionIdentity, DynError> {
     let sanitized_index_args: Value = serde_json::from_str(sanitized_index_args).map_err(
         |error| -> DynError {
@@ -1795,6 +2444,7 @@ pub(crate) fn shadow_index_admission_identity(
             "knob_registry_version": SKILL_DISCOVERY_KNOB_REGISTRY_VERSION,
         },
         "effective_weave_similarity": &similarity.runtime,
+        "kernel_admission": kernel_admission_action,
         "contracts": {
             "panel_version": SHADOW_PANEL_VERSION,
             "symbol_canonical_schema": SYMBOL_CANONICAL_TAG,
@@ -2080,6 +2730,7 @@ pub(crate) struct ShadowImportRequest<'a> {
     pub(crate) repo: Option<&'a Path>,
     pub(crate) action_policy: &'a ShadowIndexActionPolicy,
     pub(crate) generation_clock: GenerationClock,
+    pub(crate) kernel_admission: Option<&'a KernelAdmissionRequest>,
 }
 
 pub(crate) fn import_shadow_vault_with_archaeology_at(
@@ -2094,6 +2745,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         repo,
         action_policy,
         generation_clock,
+        kernel_admission,
     } = request;
     fs::create_dir_all(cache_dir)?;
     let sqlite_path = sqlite_path(cache_dir, project);
@@ -2332,6 +2984,11 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // closed below instead of being silently treated as a fresh import.
     let prior_generation_observed =
         !before_cx_by_atom.is_empty() || persisted_content_watermark.is_some();
+    let oracle_generation_current = if prior_generation_observed && !import_changed {
+        oracle_generation_is_current(&vault, project)?
+    } else {
+        false
+    };
     // Content identity alone cannot authorize discarding the stage: a recognized
     // legacy generation with no symbol-canonical marker must pass through the
     // normal full publication transaction once so the current marker, artifacts,
@@ -2342,6 +2999,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         && git_source_identity_unchanged
         && symbol_canonical_contract_current
         && persisted_generation_clock.is_some()
+        && oracle_generation_current
         && action_policy.permits_content_noop();
     if exact_noop {
         let persisted_generation_clock = persisted_generation_clock.ok_or_else(|| -> DynError {
@@ -2528,7 +3186,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             git_source_root_identity,
         });
     }
-    let git_archaeology = match git_repo {
+    let (git_archaeology, oracle_archaeology) = match git_repo {
         Some(repo) => {
             let mode = match git_history_state.as_ref() {
                 Some(GitHistoryState::Unborn { .. }) => {
@@ -2554,7 +3212,14 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
                             cache_dir,
                             &metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
                         )?;
+                        let oracle_base_current =
+                            astrolabe_oracle::try_read_oracle_corpus_binding_at(
+                                &vault,
+                                vault.latest_seq(),
+                            )?
+                            .is_some();
                         if persisted_convention.as_deref() == Some(GIT_ARCHAEOLOGY_PATH_CONVENTION)
+                            && oracle_base_current
                         {
                             astrolabe_anchors::archaeology::GitMineMode::Since { previous_head }
                         } else {
@@ -2579,7 +3244,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
                 "ASTRO_GIT_HISTORY_STATE_INVALID: a Git repository reached archaeology without a typed source history state; remediation: preserve the staged generation and inspect source observation wiring"
                     .into()
             })?;
-            git_archaeology_summary(&run_git_archaeology(
+            let report = run_git_archaeology(
                 repo,
                 project,
                 cache_dir,
@@ -2587,14 +3252,18 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
                 mode,
                 history,
                 generation_clock.observed_at_seconds(),
-            )?)?
+            )?;
+            (git_archaeology_summary(&report)?, Some(report))
         }
-        None => json!({
-            "status": "unavailable",
-            "reason": "repository path is unavailable on this recovery import",
-            "trust": "provisional",
-            "provenance": "unavailable",
-        }),
+        None => (
+            json!({
+                "status": "unavailable",
+                "reason": "repository path is unavailable on this recovery import",
+                "trust": "provisional",
+                "provenance": "unavailable",
+            }),
+            None,
+        ),
     };
     shadow_phase!("git_archaeology");
     // Read only the live identity/topology projection. Exact source, properties,
@@ -2635,13 +3304,15 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     shadow_phase!("weave_delta_prepare");
     let mut weave = run_live_weave_with_snapshot(
         &vault,
-        cache_dir,
-        &vault_dir,
-        project,
-        derived_changed,
-        derived_delta,
-        Some(&after_snapshot),
-        similarity_config,
+        LiveWeaveRequest {
+            run_parent: cache_dir,
+            vault_panel_root: &vault_dir,
+            project,
+            import_changed: derived_changed,
+            delta: derived_delta,
+            snapshot: Some(&after_snapshot),
+            similarity_config,
+        },
     )?;
     shadow_phase!("weave");
     let invalidations = persist_delta_invalidations_with_snapshot(
@@ -2657,16 +3328,19 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     shadow_phase!("layout_frames");
     let drift = index_time_drift_summary(&vault, project, &vault_dir);
     shadow_phase!("drift");
-    // #365 index-time hook (lane F): persist the real KernelArtifact for this
-    // project into the vault Kernel CF via build_and_persist_kernel, grounded on
-    // the promotion-aware anchor trust map (#352). Single post-import call — placed
-    // after the graph import and weave (so S18 vectors and the composite kernel
-    // projection are materialized) and before ledger verification (so the artifact
-    // write is inside the verified chain). Best-effort: a scope that cannot yet
-    // build a kernel is a labeled surface, never an index failure. (Overlaps lane
-    // A's shadow_import.rs — keep this to exactly this one call.)
-    let kernel_artifact = persist_index_time_kernel_artifact(&vault, &vault_dir, project);
-    shadow_phase!("kernel_artifact");
+    // Prepare the expensive kernel artifact/HNSW/query evaluation once from the
+    // exact post-weave projection. Label propagation consumes these bytes before
+    // final publication; the final publisher then rebinds the post-label Graph
+    // generation and revalidates the unchanged projection/S20/Anchors identities
+    // without repeating N/E or Q*N*D work (PC-04/PC-16/PC-38/PC-43).
+    let prepared_kernel = prepare_index_time_kernel_artifact(
+        &vault,
+        &vault_dir,
+        project,
+        kernel_admission,
+        KernelAdmissionContract::ReuseCurrentExact,
+    )?;
+    shadow_phase!("kernel_prepare");
     // #379 index-time hook (lane A/w15): produce and persist the per-axis
     // signal-ranking cards the get_architecture signal_ranking aspect reads, so
     // that aspect serves real measured bits instead of labeled-unavailable
@@ -2679,19 +3353,41 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     shadow_phase!("signal_cards");
     // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
     // propagation. ── EXACT INSERTION POINT ── one post-import call, placed
-    // immediately AFTER the kernel artifact persist above (its members are the
-    // primary grounded seed source) and before ledger verification (so the seed
+    // immediately AFTER kernel preparation above (its members are the primary
+    // grounded seed source) and before final publication (so the kernel source
+    // binding captures the label-owned Graph generation). The seed
     // graph + propagation writes are inside the verified chain). Overlaps lanes
     // A/D on this file — keep this to exactly this one call. It rebuilds the
     // served kernel_context.label_propagation from the independently read-back
     // persisted propagated-label rows so a real corpus (cbm/) serves label data
     // instead of the starved zero_seed_scope.
-    let index_time_label_propagation = persist_index_time_label_propagation(&vault, project);
+    let index_time_label_propagation = persist_index_time_label_propagation(
+        &vault,
+        project,
+        prepared_kernel.artifact(),
+        prepared_kernel.projection(),
+    )?;
     shadow_phase!("label_propagation");
+    // Corpus generation now observes the post-label Graph generation and lands
+    // its Oracle-owned Kv rows before final kernel publication. The prepared
+    // kernel is unaffected by those co-tenant rows; final publication rechecks
+    // the exact effective anchor map and projection, then binds the new Kv
+    // generation without recomputing the expensive artifact.
+    let prepared_oracle = persist_oracle_corpus_generation(
+        &vault,
+        project,
+        &after_snapshot,
+        oracle_archaeology.as_ref(),
+        generation_clock,
+    )?;
+    shadow_phase!("oracle_corpus");
+    let kernel_publication =
+        persist_prepared_index_time_kernel_artifact(&vault, project, prepared_kernel)?;
+    shadow_phase!("kernel_artifact");
     let kernel_context = kernel_context_with_persisted_labels(
         shadow_import.kernel_context,
         index_time_label_propagation,
-    );
+    )?;
     // #400 index-time hook: the served `kernel_context.scope_summaries` was derived
     // from the CBM row-sink node properties (`kernel_scopes`/`summary_scopes`/
     // `scopes`), which a real corpus like `cbm/` never emits — so it stayed the
@@ -2699,18 +3395,29 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // `grounding_gaps` architecture aspect refused fail-closed even on a fully
     // indexed corpus. Rebuild scope_summaries from the persisted KernelArtifact
     // members (persisted immediately above), read back independently, so those two
-    // surfaces serve grounded scope data. A scope-less corpus (no artifact / no
-    // members) keeps the honest `unavailable` refusal.
+    // surfaces serve grounded scope data. A missing or empty artifact is a hard
+    // staged-publication refusal, never an `unavailable` substitute.
     let index_time_scope_summaries =
-        scope_summaries_from_persisted_kernel_artifact(&vault, project);
+        scope_summaries_from_kernel_artifact(&vault, project, &kernel_publication.artifact)?;
     shadow_phase!("scope_summaries");
     let kernel_context =
-        kernel_context_with_persisted_scope_summaries(kernel_context, index_time_scope_summaries);
+        kernel_context_with_persisted_scope_summaries(kernel_context, index_time_scope_summaries)?;
+    // Oracle admission is the final vault mutation: its source-bound corpus,
+    // projection, and completed post-label kernel identities cannot be made stale
+    // by a later Graph/Kv/Anchors/Kernel producer in this transaction.
+    let oracle_generation = persist_oracle_gate_generation(
+        &vault,
+        project,
+        prepared_oracle,
+        &kernel_publication.receipt,
+    )?;
+    shadow_phase!("oracle_gate");
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
         object.insert("layout_frames".to_string(), layout_frames);
         object.insert("drift".to_string(), drift);
-        object.insert("kernel_artifact".to_string(), kernel_artifact);
+        object.insert("kernel_artifact".to_string(), kernel_publication.receipt);
+        object.insert("oracle_generation".to_string(), oracle_generation);
         object.insert("signal_cards".to_string(), signal_cards);
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
@@ -2819,6 +3526,7 @@ struct WeaveSlotScanReceipt {
     physical_accounting_complete: bool,
     read_snapshot_seq: u64,
     source_cf_generation_seq: u64,
+    compression_cf_generation_seq: u64,
     content_sha256: String,
     pages: u64,
     page_high_water_rows: u64,
@@ -2893,17 +3601,33 @@ fn slot_vector_owned_bytes(vector: &SlotVector) -> u64 {
     }
 }
 
+fn weave_source_fault(
+    code: &'static str,
+    message: impl Into<String>,
+    remediation: &'static str,
+) -> DynError {
+    calyx_core::CalyxError {
+        code,
+        message: message.into(),
+        remediation,
+    }
+    .into()
+}
+
 fn load_weave_slot_latest<C>(
     vault: &AsterVault<C>,
     slot_source: &WeaveSlotSource,
-    expected_source_cf_generation: u64,
-    slot: SlotId,
+    binding: &WeaveSlotBinding,
     node_by_cx: &BTreeMap<calyx_core::CxId, usize>,
     nodes: &mut [SimilarityNode],
 ) -> Result<WeaveSlotScanReceipt, DynError>
 where
     C: Clock,
 {
+    let slot = binding.slot;
+    let expected_source_cf_generation = binding.slot_cf_generation;
+    let expected_compression_cf_generation = binding.compression_cf_generation;
+    let expected_compression_identity = &binding.compressed_generation_identity;
     if let Some(node) = nodes.iter().find(|node| node.slots.contains_key(&slot)) {
         return Err(format!(
             "ASTRO_WEAVE_SLOT_ALREADY_LIVE: refusing to cold-load S{} while symbol {:?} still owns that decoded vector; remediation: release the exact prior slot family before loading it again",
@@ -2914,33 +3638,67 @@ where
     let source_cf = ColumnFamily::slot(slot);
     let storage_before = vault.latest_only_readback_status();
     ensure_bounded_weave_storage(&storage_before, &format!("S{} pre-scan", slot.get()))?;
+    let read_snapshot_lease = vault.retain_latest_snapshot();
+    let read_snapshot_seq = read_snapshot_lease.seq();
+    slot_source.verify_latest_binding_at(vault, read_snapshot_seq, binding)?;
     let source_cf_generation_before = vault.cf_content_generation(source_cf)?;
-    if source_cf_generation_before != expected_source_cf_generation {
-        return Err(format!(
-            "ASTRO_WEAVE_SOURCE_CF_CHANGED: S{} source generation changed before its latest-only scan: expected={}, observed={}; remediation: preserve the staged generation and identify the write that mutated the source Slot CF",
-            slot.get(), expected_source_cf_generation, source_cf_generation_before,
-        )
-        .into());
+    let compression_cf_generation_before =
+        vault.cf_content_generation(ColumnFamily::Compression)?;
+    if source_cf_generation_before != expected_source_cf_generation
+        || compression_cf_generation_before != expected_compression_cf_generation
+    {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_CF_CHANGED",
+            format!(
+                "S{} source generation changed before its latest-only scan: expected_slot={}, observed_slot={}, expected_compression={}, observed_compression={}",
+                slot.get(),
+                expected_source_cf_generation,
+                source_cf_generation_before,
+                expected_compression_cf_generation,
+                compression_cf_generation_before,
+            ),
+            "preserve the staged generation and identify the write that mutated the source Slot or Compression CF",
+        ));
     }
-    let read_snapshot_seq = vault.latest_seq();
-    if source_cf_generation_before > read_snapshot_seq {
-        return Err(format!(
-            "ASTRO_WEAVE_SOURCE_GENERATION_AHEAD: S{} source generation {} is ahead of latest vault seq {}; remediation: preserve the staged generation and inspect commit-generation publication ordering",
-            slot.get(), source_cf_generation_before, read_snapshot_seq,
-        )
-        .into());
+    if source_cf_generation_before > read_snapshot_seq
+        || compression_cf_generation_before > read_snapshot_seq
+    {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_GENERATION_AHEAD",
+            format!(
+                "S{} source generation slot={} compression={} is ahead of latest vault seq {}",
+                slot.get(),
+                source_cf_generation_before,
+                compression_cf_generation_before,
+                read_snapshot_seq,
+            ),
+            "preserve the staged generation and inspect commit-generation publication ordering",
+        ));
     }
-    if let Some(identity) = slot_source.compressed_generation_identity(vault, slot)? {
+    let observed_compression_identity =
+        slot_source.compressed_generation_identity_at(vault, read_snapshot_seq, slot)?;
+    if &observed_compression_identity != expected_compression_identity {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_REPRESENTATION_CHANGED",
+            format!(
+                "S{} representation changed before its latest-only scan: expected={expected_compression_identity:?}, observed={observed_compression_identity:?}",
+                slot.get(),
+            ),
+            "preserve the staged generation and identify the Compression lifecycle write instead of changing representation during derived reconciliation",
+        ));
+    }
+    if let Some(identity) = observed_compression_identity {
         return load_weave_compressed_slot_latest(
             vault,
             slot_source,
             identity,
-            expected_source_cf_generation,
-            slot,
-            node_by_cx,
-            nodes,
-            storage_before,
-            read_snapshot_seq,
+            CompressedSlotLoadRequest {
+                binding,
+                node_by_cx,
+                nodes,
+                storage_before,
+                read_snapshot_seq,
+            },
         );
     }
     let process_before = vault.process_usage_snapshot()?;
@@ -3018,20 +3776,40 @@ where
     ensure_bounded_weave_storage(&storage_after, &format!("S{} post-scan", slot.get()))?;
     let read_snapshot_seq_after = vault.latest_seq();
     let source_cf_generation_after = vault.cf_content_generation(source_cf)?;
+    let compression_cf_generation_after = vault.cf_content_generation(ColumnFamily::Compression)?;
     if storage_after != storage_before
         || read_snapshot_seq_after != read_snapshot_seq
         || source_cf_generation_after != expected_source_cf_generation
+        || compression_cf_generation_after != expected_compression_cf_generation
     {
-        return Err(format!(
-            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN: S{} storage generation changed during a read-only source scan: seq_before={}, seq_after={}, expected_cf_generation={}, cf_generation_after={}, status_before={storage_before:?}, status_after={storage_after:?}; remediation: preserve the staged generation and inspect the exact source-CF writer before retrying",
-            slot.get(),
-            read_snapshot_seq,
-            read_snapshot_seq_after,
-            expected_source_cf_generation,
-            source_cf_generation_after,
-        )
-        .into());
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN",
+            format!(
+                "S{} storage generation changed during a read-only source scan: seq_before={}, seq_after={}, expected_slot_generation={}, slot_generation_after={}, expected_compression_generation={}, compression_generation_after={}, status_before={storage_before:?}, status_after={storage_after:?}",
+                slot.get(),
+                read_snapshot_seq,
+                read_snapshot_seq_after,
+                expected_source_cf_generation,
+                source_cf_generation_after,
+                expected_compression_cf_generation,
+                compression_cf_generation_after,
+            ),
+            "preserve the staged generation and inspect the exact source-CF writer before retrying",
+        ));
     }
+    let compression_identity_after =
+        slot_source.compressed_generation_identity_at(vault, read_snapshot_seq, slot)?;
+    if &compression_identity_after != expected_compression_identity {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_REPRESENTATION_CHANGED",
+            format!(
+                "S{} representation changed during its latest-only scan: expected={expected_compression_identity:?}, observed_after={compression_identity_after:?}",
+                slot.get(),
+            ),
+            "preserve the staged generation and identify the Compression lifecycle writer",
+        ));
+    }
+    slot_source.verify_latest_binding_at(vault, read_snapshot_seq, binding)?;
     Ok(WeaveSlotScanReceipt {
         slot: slot.get(),
         representation: "aster_raw_slot_vector".to_string(),
@@ -3039,6 +3817,7 @@ where
         physical_accounting_complete: true,
         read_snapshot_seq,
         source_cf_generation_seq: expected_source_cf_generation,
+        compression_cf_generation_seq: expected_compression_cf_generation,
         content_sha256: hex_lower(&content_hasher.finalize()),
         pages,
         page_high_water_rows,
@@ -3055,21 +3834,34 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+struct CompressedSlotLoadRequest<'load> {
+    binding: &'load WeaveSlotBinding,
+    node_by_cx: &'load BTreeMap<calyx_core::CxId, usize>,
+    nodes: &'load mut [SimilarityNode],
+    storage_before: calyx_aster::mvcc::LatestOnlyReadbackStatus,
+    read_snapshot_seq: u64,
+}
+
 fn load_weave_compressed_slot_latest<C>(
     vault: &AsterVault<C>,
     slot_source: &WeaveSlotSource,
     identity: calyx_registry::CompressedGenerationIdentity,
-    expected_source_cf_generation: u64,
-    slot: SlotId,
-    node_by_cx: &BTreeMap<calyx_core::CxId, usize>,
-    nodes: &mut [SimilarityNode],
-    storage_before: calyx_aster::mvcc::LatestOnlyReadbackStatus,
-    operation_seq_before: u64,
+    request: CompressedSlotLoadRequest<'_>,
 ) -> Result<WeaveSlotScanReceipt, DynError>
 where
     C: Clock,
 {
+    let CompressedSlotLoadRequest {
+        binding,
+        node_by_cx,
+        nodes,
+        storage_before,
+        read_snapshot_seq: operation_seq_before,
+    } = request;
+    let slot = binding.slot;
+    let expected_source_cf_generation = binding.slot_cf_generation;
+    let expected_compression_cf_generation = binding.compression_cf_generation;
+    let expected_compression_identity = &binding.compressed_generation_identity;
     let process_before = vault.process_usage_snapshot()?;
     let identity_bytes = serde_json::to_vec(&identity)?;
     let identity_sha256 = hex_lower(&Sha256::digest(&identity_bytes));
@@ -3081,7 +3873,7 @@ where
     hash_u64(&mut content_hasher, slot.get() as u64);
     hash_u64(&mut content_hasher, identity_bytes.len() as u64);
     content_hasher.update(&identity_bytes);
-    let rows = slot_source.resolve_column(vault, slot)?;
+    let rows = slot_source.resolve_column_bound_at(vault, operation_seq_before, binding)?;
     let mut rows_loaded = 0u64;
     let mut rows_for_other_constellations = 0u64;
     let mut rows_absent = 0u64;
@@ -3119,23 +3911,42 @@ where
     )?;
     let read_snapshot_seq_after = vault.latest_seq();
     let source_cf_generation_after = vault.cf_content_generation(ColumnFamily::slot(slot))?;
+    let compression_cf_generation_after = vault.cf_content_generation(ColumnFamily::Compression)?;
     if storage_after != storage_before
         || read_snapshot_seq_after != operation_seq_before
         || source_cf_generation_after != expected_source_cf_generation
+        || compression_cf_generation_after != expected_compression_cf_generation
     {
-        return Err(format!(
-            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN: Registry compressed S{} generation changed during authenticated materialization: operation_seq_before={operation_seq_before}, seq_after={read_snapshot_seq_after}, expected_cf_generation={expected_source_cf_generation}, cf_generation_after={source_cf_generation_after}; remediation: preserve the staged generation and inspect the exact source writer",
-            slot.get()
-        )
-        .into());
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_SCAN",
+            format!(
+                "Registry compressed S{} generation changed during authenticated materialization: operation_seq_before={operation_seq_before}, seq_after={read_snapshot_seq_after}, expected_slot_generation={expected_source_cf_generation}, slot_generation_after={source_cf_generation_after}, expected_compression_generation={expected_compression_cf_generation}, compression_generation_after={compression_cf_generation_after}",
+                slot.get()
+            ),
+            "preserve the staged generation and inspect the exact source writer",
+        ));
     }
+    let compression_identity_after =
+        slot_source.compressed_generation_identity_at(vault, operation_seq_before, slot)?;
+    if &compression_identity_after != expected_compression_identity {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_REPRESENTATION_CHANGED",
+            format!(
+                "Registry compressed S{} identity changed during authenticated materialization: expected={expected_compression_identity:?}, observed_after={compression_identity_after:?}",
+                slot.get(),
+            ),
+            "preserve the staged generation and identify the Compression lifecycle writer",
+        ));
+    }
+    slot_source.verify_latest_binding_at(vault, operation_seq_before, binding)?;
     Ok(WeaveSlotScanReceipt {
         slot: slot.get(),
         representation: "registry_authenticated_compressed".to_string(),
         compression_generation_identity_sha256: Some(identity_sha256),
         physical_accounting_complete: false,
-        read_snapshot_seq: slot_source.snapshot(),
+        read_snapshot_seq: operation_seq_before,
         source_cf_generation_seq: expected_source_cf_generation,
+        compression_cf_generation_seq: expected_compression_cf_generation,
         content_sha256: hex_lower(&content_hasher.finalize()),
         pages: 0,
         page_high_water_rows: 0,
@@ -3174,19 +3985,22 @@ fn eager_kind_index(kind: EagerAgreementKind) -> usize {
 /// path at M scale. `snapshot` must be the current live graph for `project`
 /// (read at a seq with no intervening node/edge mutation); `None` preserves the
 /// self-reading behavior.
-pub(crate) fn run_live_weave_with_snapshot<C>(
+fn run_live_weave_with_snapshot<C>(
     vault: &AsterVault<C>,
-    run_parent: &Path,
-    vault_panel_root: &Path,
-    project: &str,
-    import_changed: bool,
-    delta: Option<&WeaveDelta>,
-    snapshot: Option<&CbmCompactGraphSnapshot>,
-    similarity_config: &SimilarityPlannerConfig,
+    request: LiveWeaveRequest<'_>,
 ) -> Result<Value, DynError>
 where
     C: Clock,
 {
+    let LiveWeaveRequest {
+        run_parent,
+        vault_panel_root,
+        project,
+        import_changed,
+        delta,
+        snapshot,
+        similarity_config,
+    } = request;
     if !import_changed {
         return Ok(json!({
             "status": "unchanged",
@@ -3209,12 +4023,22 @@ where
         .expect("weave snapshot present by construction");
     let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
     let source_snapshot_seq = snapshot.receipt.snapshot_seq;
-    let slot_snapshot_lease = vault.retain_latest_snapshot();
+    let source_binding_lease = vault.retain_latest_snapshot();
+    let source_binding_snapshot_seq = source_binding_lease.seq();
     let slot_source = WeaveSlotSource::open(
-        slot_snapshot_lease.seq(),
+        source_binding_snapshot_seq,
         Some(vault_panel_root),
         Some(SHADOW_PANEL_VERSION),
     )?;
+    if source_snapshot_seq != source_binding_snapshot_seq {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_COMPACT_SOURCE_GENERATION_MISMATCH",
+            format!(
+                "compact graph snapshot seq {source_snapshot_seq} does not equal Slot/Compression binding seq {source_binding_snapshot_seq}"
+            ),
+            "preserve the staged generation and recapture the compact graph plus source representations from one exact pre-write generation",
+        ));
+    }
     let t_slot_load = std::time::Instant::now();
     let mut nodes = Vec::with_capacity(snapshot.nodes.len());
     let mut node_by_cx = BTreeMap::new();
@@ -3264,6 +4088,64 @@ where
         })
         .collect::<Result<BTreeMap<_, _>, DynError>>()?;
     let source_compression_generation = vault.cf_content_generation(ColumnFamily::Compression)?;
+    let source_slot_bindings = slots
+        .iter()
+        .map(|slot| {
+            Ok((
+                *slot,
+                slot_source.bind_latest_at(vault, source_binding_snapshot_seq, *slot)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<SlotId, WeaveSlotBinding>, DynError>>()?;
+    for binding in source_slot_bindings.values() {
+        if source_slot_generations.get(&binding.slot) != Some(&binding.slot_cf_generation)
+            || binding.compression_cf_generation != source_compression_generation
+        {
+            return Err(weave_source_fault(
+                "ASTRO_WEAVE_SOURCE_BINDING_MISMATCH",
+                format!(
+                    "S{} typed binding disagrees with the operation source generations: binding={binding:?}, slot_generations={source_slot_generations:?}, compression_generation={source_compression_generation}",
+                    binding.slot.get(),
+                ),
+                "preserve the staged generation and recapture all source identities from one exact pre-write generation",
+            ));
+        }
+    }
+    let source_slot_generations_after_binding = source_slot_generations
+        .keys()
+        .map(|slot| {
+            Ok((
+                *slot,
+                vault.cf_content_generation(ColumnFamily::slot(*slot))?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    let source_compression_generation_after_binding =
+        vault.cf_content_generation(ColumnFamily::Compression)?;
+    if vault.latest_seq() != source_binding_snapshot_seq
+        || source_slot_generations_after_binding != source_slot_generations
+        || source_compression_generation_after_binding != source_compression_generation
+    {
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_CHANGED_DURING_BINDING",
+            format!(
+                "source identity changed while binding representations before derived writes: seq_before={source_binding_snapshot_seq}, seq_after={}, slot_generations_before={source_slot_generations:?}, slot_generations_after={source_slot_generations_after_binding:?}, compression_generation_before={source_compression_generation}, compression_generation_after={source_compression_generation_after_binding}",
+                vault.latest_seq(),
+            ),
+            "preserve the staged generation and identify the source writer before retrying",
+        ));
+    }
+    drop(source_binding_lease);
+    #[cfg(feature = "manual-fsv")]
+    manual_fsv_weave_source_binding_barrier(
+        vault,
+        run_parent,
+        vault_panel_root,
+        project,
+        source_binding_snapshot_seq,
+        source_compression_generation,
+        &source_slot_bindings,
+    )?;
     let mut slot_scans = Vec::<WeaveSlotScanReceipt>::new();
     let mut slot_content_witnesses = BTreeMap::<SlotId, (u64, u64, String)>::new();
     let mut similarity_prepass_slot_scan_count = 0usize;
@@ -3271,12 +4153,11 @@ where
     let mut decoded_slot_bytes_high_water = 0u64;
     macro_rules! load_slot {
         ($slot:expr) => {{
-            slot_snapshot_lease.record_progress();
-            let expected_source_cf_generation = *source_slot_generations
+            let binding = source_slot_bindings
                 .get(&$slot)
                 .ok_or_else(|| -> DynError {
                     format!(
-                        "ASTRO_WEAVE_SOURCE_GENERATION_MISSING: S{} was not captured before derived writes",
+                        "ASTRO_WEAVE_SOURCE_REPRESENTATION_MISSING: S{} was not bound before derived writes",
                         $slot.get()
                     )
                     .into()
@@ -3284,8 +4165,7 @@ where
             let receipt = load_weave_slot_latest(
                 vault,
                 &slot_source,
-                expected_source_cf_generation,
-                $slot,
+                binding,
                 &node_by_cx,
                 &mut nodes,
             )?;
@@ -3313,7 +4193,6 @@ where
             decoded_slot_bytes_high_water =
                 decoded_slot_bytes_high_water.max(decoded_slot_bytes_live);
             slot_scans.push(receipt);
-            slot_snapshot_lease.record_progress();
         }};
     }
     macro_rules! release_slot {
@@ -3481,7 +4360,6 @@ where
                 "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
-            slot_snapshot_lease.record_progress();
         }};
     }
 
@@ -3625,7 +4503,6 @@ where
                 "bounded_run": report.run,
                 "process": process_phase_usage_value(usage),
             }));
-            slot_snapshot_lease.record_progress();
         }};
     }
 
@@ -3676,7 +4553,6 @@ where
         release_slot!(right);
         release_slot!(left);
     }
-    drop(slot_snapshot_lease);
     let xterm_physical_scan = if delta.is_some() {
         xterm_scalar_bits.fill([None; 6]);
         Some(stream_eager_cross_term_rows(
@@ -3827,19 +4703,52 @@ where
         })
         .collect::<Result<BTreeMap<_, _>, DynError>>()?;
     if source_slot_generations_after != source_slot_generations {
-        return Err(format!(
-            "ASTRO_WEAVE_SOURCE_CF_CHANGED: source Slot-CF generations changed across derived reconciliation: before={source_slot_generations:?}, after={source_slot_generations_after:?}; remediation: preserve the staged generation and identify the source Slot writer"
-        )
-        .into());
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_CF_CHANGED",
+            format!(
+                "source Slot-CF generations changed across derived reconciliation: before={source_slot_generations:?}, after={source_slot_generations_after:?}"
+            ),
+            "preserve the staged generation and identify the source Slot writer",
+        ));
     }
     let source_compression_generation_after =
         vault.cf_content_generation(ColumnFamily::Compression)?;
     if source_compression_generation_after != source_compression_generation {
-        return Err(format!(
-            "ASTRO_WEAVE_SOURCE_CF_CHANGED: Compression generation changed across derived reconciliation: before={source_compression_generation}, after={source_compression_generation_after}; remediation: preserve the staged generation and identify the compression lifecycle writer"
-        )
-        .into());
+        return Err(weave_source_fault(
+            "ASTRO_WEAVE_SOURCE_CF_CHANGED",
+            format!(
+                "Compression generation changed across derived reconciliation: before={source_compression_generation}, after={source_compression_generation_after}"
+            ),
+            "preserve the staged generation and identify the compression lifecycle writer",
+        ));
     }
+    let source_final_lease = vault.retain_latest_snapshot();
+    let source_final_snapshot_seq = source_final_lease.seq();
+    for binding in source_slot_bindings.values() {
+        slot_source.verify_latest_binding_at(vault, source_final_snapshot_seq, binding)?;
+    }
+    drop(source_final_lease);
+    let source_slot_representation_receipts = source_slot_bindings
+        .iter()
+        .map(|(slot, binding)| -> Result<Value, DynError> {
+            let identity_sha256 = binding
+                .compressed_generation_identity
+                .as_ref()
+                .map(|identity| {
+                    serde_json::to_vec(identity).map(|bytes| hex_lower(&Sha256::digest(&bytes)))
+                })
+                .transpose()?;
+            Ok(json!({
+                "slot": slot.get(),
+                "representation": if binding.compressed_generation_identity.is_some() {
+                    "registry_authenticated_compressed"
+                } else {
+                    "aster_raw_slot_vector"
+                },
+                "compression_generation_identity_sha256": identity_sha256,
+            }))
+        })
+        .collect::<Result<Vec<_>, DynError>>()?;
     let absent_by_kind = xterm_absent_by_kind
         .iter()
         .map(|(kind, count)| (kind.wire_name(), *count))
@@ -3881,6 +4790,8 @@ where
         },
         "weave_source": {
             "compact_graph": &snapshot.receipt,
+            "representation_binding_snapshot_seq": source_binding_snapshot_seq,
+            "representation_final_verification_snapshot_seq": source_final_snapshot_seq,
             "slot_cf_generations": source_slot_generations
                 .iter()
                 .map(|(slot, generation)| json!({
@@ -3888,7 +4799,17 @@ where
                     "generation_seq": generation,
                 }))
                 .collect::<Vec<_>>(),
+            "slot_cf_generations_after": source_slot_generations_after
+                .iter()
+                .map(|(slot, generation)| json!({
+                    "slot": slot.get(),
+                    "generation_seq": generation,
+                }))
+                .collect::<Vec<_>>(),
             "compression_cf_generation": source_compression_generation,
+            "compression_cf_generation_after": source_compression_generation_after,
+            "slot_representation_bindings": source_slot_representation_receipts,
+            "representation_bindings_verified_after": true,
             "slot_page_row_cap": 1_024,
             "slot_scan_count": slot_scans.len(),
             "similarity_prepass_slot_scan_count": similarity_prepass_slot_scan_count,
@@ -4880,7 +5801,26 @@ pub(crate) fn regenerate_lowered_under_lock(
     let salt = read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
         .unwrap_or_else(|| vault_salt(project));
     with_lowered_sqlite_lock(cache_dir, project, || {
-        let vault = open_shadow_vault_writable(&vault_dir, &vault_id, &salt, Vec::new())?;
+        // Lowering reads the exact current Graph rows, Base bindings, Blob
+        // source chunks, the legacy-registry sentinels in Kv+Recurrence, and
+        // the projection-relevant Ledger. It publishes only the Kernel
+        // lowering manifest plus its Ledger/TimeIndex rows. Historical MVCC
+        // restoration and every unrelated CF are outside this operation.
+        let vault = open_shadow_vault_writable_latest_selected(
+            &vault_dir,
+            &vault_id,
+            &salt,
+            vec![
+                ColumnFamily::Base,
+                ColumnFamily::Blob,
+                ColumnFamily::Graph,
+                ColumnFamily::Kv,
+                ColumnFamily::Recurrence,
+                ColumnFamily::Kernel,
+                ColumnFamily::Ledger,
+                ColumnFamily::TimeIndex,
+            ],
+        )?;
         lower_cbm_sqlite(
             &vault,
             lowered_sqlite_path(cache_dir, project),
@@ -5522,8 +6462,23 @@ pub(crate) fn try_shadow_index_noop_admission(
             .into());
         }
     }
-    let vault =
-        open_shadow_vault_read_only(&configured_vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    let vault = open_shadow_vault_read_only(
+        &configured_vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![
+            ColumnFamily::Base,
+            ColumnFamily::Blob,
+            ColumnFamily::Graph,
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Recurrence,
+            ColumnFamily::Kernel,
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+            ColumnFamily::slot(SlotId::new(20)),
+        ],
+    )?;
     let chain = verify_chain(&vault)?;
     let (current_ledger_checkpoint, ledger_prefix_physical_read) =
         validate_shadow_ledger_checkpoint_suffix(
@@ -5541,6 +6496,49 @@ pub(crate) fn try_shadow_index_noop_admission(
             .into()
         })?;
     validate_lower_verification(project, &lower_state, &lowered_verification)?;
+    let kernel_scope_id = kernel_artifact_scope_id(project);
+    let current_kernel =
+        astrolabe_weave::read_current_kernel_generation(&vault, project, &kernel_scope_id)
+    .map_err(|error| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_KERNEL_GENERATION_INVALID: project={project:?} scope={kernel_scope_id:?} code={} message={:?} remediation={:?}",
+            error.code(),
+            error.message(),
+            error.remediation()
+        )
+        .into()
+    })?
+    .ok_or_else(|| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_KERNEL_GENERATION_MISSING: project={project:?} scope={kernel_scope_id:?} has no complete current kernel generation; remediation: supply an explicit kernel_admission corpus and rebuild rather than reporting the prior shadow generation unchanged"
+        )
+        .into()
+        })?;
+    astrolabe_weave::verify_kernel_member_index_source_at_latest(
+        &vault,
+        &configured_vault_dir,
+        &current_kernel.index.descriptor,
+    )
+    .map_err(|error| -> DynError {
+        format!(
+            "ASTRO_SHADOW_NOOP_KERNEL_SOURCE_INVALID: project={project:?} scope={kernel_scope_id:?} code={} message={:?} remediation={:?}",
+            error.code(),
+            error.message(),
+            error.remediation()
+        )
+        .into()
+    })?;
+    let observed_kernel_admission =
+        persisted_kernel_admission_action_identity(&current_kernel.query_corpus)?;
+    let expected_kernel_admission = expected_identity.kernel_admission_action_identity()?;
+    if &observed_kernel_admission != expected_kernel_admission {
+        return Err(format!(
+            "ASTRO_SHADOW_NOOP_KERNEL_ADMISSION_MISMATCH: project={project:?} scope={kernel_scope_id:?} current composite query corpus/encoder identity does not match the admitted action (expected={}, observed={}); remediation: preserve the generation and rebuild from the exact explicit real-query corpus",
+            serde_json::to_string(expected_kernel_admission)?,
+            serde_json::to_string(&observed_kernel_admission)?
+        )
+        .into());
+    }
     drop(vault);
 
     let panel_version = required_shadow_config_u64(cache_dir, project, "panel_version")?;
@@ -5971,9 +6969,12 @@ fn parse_shadow_index_admission_identity(
         )
         .into()
     })?;
-    if schema != SHADOW_INDEX_ADMISSION_SCHEMA && schema != SHADOW_INDEX_ADMISSION_SCHEMA_V1 {
+    if schema != SHADOW_INDEX_ADMISSION_SCHEMA
+        && schema != SHADOW_INDEX_ADMISSION_SCHEMA_V2
+        && schema != SHADOW_INDEX_ADMISSION_SCHEMA_V1
+    {
         return Err(format!(
-            "ASTRO_SHADOW_ADMISSION_IDENTITY_SCHEMA: project {project:?} admission schema {schema:?} is neither current {SHADOW_INDEX_ADMISSION_SCHEMA:?} nor recognized predecessor {SHADOW_INDEX_ADMISSION_SCHEMA_V1:?}; remediation: preserve the generation and rebuild it with the active producer after diagnosing the unknown record"
+            "ASTRO_SHADOW_ADMISSION_IDENTITY_SCHEMA: project {project:?} admission schema {schema:?} is neither current {SHADOW_INDEX_ADMISSION_SCHEMA:?} nor a recognized predecessor ({SHADOW_INDEX_ADMISSION_SCHEMA_V2:?}, {SHADOW_INDEX_ADMISSION_SCHEMA_V1:?}); remediation: preserve the generation and rebuild it with the active producer after diagnosing the unknown record"
         )
         .into());
     }
@@ -6399,13 +7400,40 @@ pub(crate) fn open_shadow_vault_historical_read_only(
     open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, true, true)
 }
 
-pub(crate) fn open_shadow_vault_writable(
+/// Opens a latest-state write handle over exactly the named application CFs.
+/// Ledger and TimeIndex are mandatory because every accepted mutation is one
+/// ledger-bound durable transaction; no historical MVCC rows are restored.
+pub(crate) fn open_shadow_vault_writable_latest_selected(
     vault_dir: &Path,
     vault_id: &str,
     vault_salt: &str,
     selected_cfs: Vec<ColumnFamily>,
 ) -> Result<AsterVault, DynError> {
-    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, false, true)
+    if selected_cfs.is_empty()
+        || !selected_cfs.contains(&ColumnFamily::Ledger)
+        || !selected_cfs.contains(&ColumnFamily::TimeIndex)
+    {
+        return Err(ToolFault::new(
+            "ASTRO_SHADOW_WRITABLE_CF_SELECTION_INVALID",
+            "latest-state writable CF selection requires explicit application CFs, Ledger, and TimeIndex",
+            "name the exact transaction column families and include Ledger plus TimeIndex",
+        )
+        .into());
+    }
+    let vault_id = VaultId::from_str(vault_id)?;
+    Ok(AsterVault::open(
+        vault_dir,
+        vault_id,
+        vault_salt.as_bytes().to_vec(),
+        VaultOptions {
+            restore_mvcc_rows: false,
+            read_only: false,
+            restore_ledger_hook: true,
+            selected_cfs: Some(selected_cfs),
+            writable_selected_cfs: true,
+            ..VaultOptions::default()
+        },
+    )?)
 }
 
 /// Opens a write-capable vault whose ledger and time-index mutations belong to
@@ -6423,10 +7451,15 @@ pub(crate) fn open_shadow_vault_writable_with_generation_clock(
         vault_id,
         vault_salt.as_bytes().to_vec(),
         VaultOptions {
-            restore_mvcc_rows: true,
+            restore_mvcc_rows: false,
             read_only: false,
             restore_ledger_hook: true,
-            selected_cfs: None,
+            selected_cfs: Some(vec![
+                ColumnFamily::Kv,
+                ColumnFamily::Ledger,
+                ColumnFamily::TimeIndex,
+            ]),
+            writable_selected_cfs: true,
             ..VaultOptions::default()
         },
         FixedClock::new(generation_observed_at_ms),
@@ -6447,7 +7480,7 @@ fn open_shadow_vault_with_access(
     // (a guard against accidental empty selections). A caller that wants a read-only
     // handle over ALL CFs therefore passes an empty list, which must map to `None`,
     // not `Some(empty)` — otherwise the open fails with CALYX_VAULT_OPTIONS_INVALID
-    // (the #43 as_of historical-read break). Writable handles never select CFs.
+    // (the #43 as_of historical-read break).
     let selected_cfs = if read_only && !selected_cfs.is_empty() {
         Some(selected_cfs)
     } else {

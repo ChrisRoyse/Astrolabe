@@ -4578,7 +4578,67 @@ unsafe extern "C" {
     pub fn cbm_index_supervisor_mark_host();
 }
 unsafe extern "C" {
-    pub fn cbm_http_server_set_binary_path(path: *const ::std::os::raw::c_char);
+    pub fn cbm_index_supervisor_should_wrap() -> bool;
+}
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_OK: cbm_worker_binary_status_t = 0;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_UNBOUND: cbm_worker_binary_status_t = 1;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_INVALID_ARGUMENT:
+    cbm_worker_binary_status_t = 2;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_SELF_RESOLVE_FAILED:
+    cbm_worker_binary_status_t = 3;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE:
+    cbm_worker_binary_status_t = 4;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_PATH_ENCODING_FAILED:
+    cbm_worker_binary_status_t = 5;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_OPEN_FAILED: cbm_worker_binary_status_t = 6;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_NOT_REGULAR_FILE:
+    cbm_worker_binary_status_t = 7;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_REPARSE_POINT:
+    cbm_worker_binary_status_t = 8;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_NOT_EXECUTABLE:
+    cbm_worker_binary_status_t = 9;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_IDENTITY_READ_FAILED:
+    cbm_worker_binary_status_t = 10;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_FINAL_PATH_FAILED:
+    cbm_worker_binary_status_t = 11;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_PATH_TOO_LONG:
+    cbm_worker_binary_status_t = 12;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_ALLOCATION_FAILED:
+    cbm_worker_binary_status_t = 13;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_CAPABILITY_MISMATCH:
+    cbm_worker_binary_status_t = 14;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_BIND_IN_PROGRESS:
+    cbm_worker_binary_status_t = 15;
+pub const cbm_worker_binary_status_t_CBM_WORKER_BINARY_CONFLICT: cbm_worker_binary_status_t = 16;
+pub type cbm_worker_binary_status_t = ::std::os::raw::c_int;
+unsafe extern "C" {
+    pub fn cbm_http_server_bind_self_binary(
+        native_error: *mut ::std::os::raw::c_ulong,
+    ) -> cbm_worker_binary_status_t;
+}
+unsafe extern "C" {
+    pub fn cbm_http_server_bind_explicit_binary(
+        path: *const ::std::os::raw::c_char,
+        native_error: *mut ::std::os::raw::c_ulong,
+    ) -> cbm_worker_binary_status_t;
+}
+unsafe extern "C" {
+    pub fn cbm_http_server_binary_path() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_http_server_binary_status_code(
+        status: ::std::os::raw::c_int,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_http_server_binary_status_message(
+        status: ::std::os::raw::c_int,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_http_server_binary_status_remediation(
+        status: ::std::os::raw::c_int,
+    ) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
     pub fn cbm_pxc_canonicalize_appended_results(

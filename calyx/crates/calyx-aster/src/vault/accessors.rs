@@ -123,25 +123,7 @@ where
             .into_iter()
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
-        if self.durable.is_none() {
-            return self.commit_rows_if_current_volatile(expected_seq, rows);
-        }
-        self.with_durable_commit_lock(|| {
-            let current_seq = self.latest_seq();
-            if current_seq != expected_seq {
-                return Err(calyx_core::CalyxError {
-                    code: "CALYX_ASTER_SEQUENCE_CONFLICT",
-                    message: format!(
-                        "conditional CF batch expected seq {expected_seq}, current seq is {current_seq}; no rows were written"
-                    ),
-                    remediation: "re-read the current snapshot, revalidate the complete replacement, and retry with that exact sequence",
-                });
-            }
-            if rows.is_empty() {
-                return Ok(current_seq);
-            }
-            self.commit_rows_locked(&rows)
-        })
+        self.commit_rows_if_seq(expected_seq, rows, "conditional CF batch")
     }
 
     /// Writes one raw CF row through the WAL-backed batch path.

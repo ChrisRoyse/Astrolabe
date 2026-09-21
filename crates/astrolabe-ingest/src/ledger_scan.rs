@@ -31,6 +31,9 @@ pub const ASTRO_LEDGER_SCAN_SUBJECT_EMPTY: &str = "ASTRO_LEDGER_SCAN_SUBJECT_EMP
 /// no lineage row can be trusted. The scan refuses to serve rows scoped to a
 /// subject when the chain they hang from is broken or corrupt.
 pub const ASTRO_LEDGER_SCAN_CHAIN_NOT_INTACT: &str = "ASTRO_LEDGER_SCAN_CHAIN_NOT_INTACT";
+/// Refusal code: the physical vault path could not be classified as present or
+/// absent, so an empty Ledger must not be inferred.
+pub const ASTRO_LEDGER_SCAN_VAULT_UNEVALUABLE: &str = "ASTRO_LEDGER_SCAN_VAULT_UNEVALUABLE";
 /// Refusal code: the chain verified intact yet a persisted ledger row could not
 /// be decoded or its encoded sequence disagreed with its key. This is an
 /// internal-consistency violation; fail closed rather than drop the row (which
@@ -119,7 +122,19 @@ pub fn scan_subject_ledger_rows_vault_path(
     subject: &str,
 ) -> IngestResult<Vec<LedgerScanRow>> {
     let vault_dir = vault_dir.as_ref();
-    if !vault_dir.exists() {
+    if !vault_dir
+        .try_exists()
+        .map_err(|error| IngestError::Refused {
+            code: ASTRO_LEDGER_SCAN_VAULT_UNEVALUABLE,
+            message: format!(
+                "cannot inspect vault dir {} before Ledger scan: {error}",
+                vault_dir.display()
+            ),
+            remediation:
+                "repair access to the exact vault path, then retry the unchanged subject scan"
+                    .to_string(),
+        })?
+    {
         return Err(IngestError::InvalidInput(format!(
             "vault dir does not exist: {}",
             vault_dir.display()

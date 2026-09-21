@@ -36,18 +36,45 @@ pub use betweenness::{BetweennessResult, betweenness_auto, brandes, select_pivot
 pub mod groundedness;
 pub use groundedness::{GroundednessResult, score_groundedness};
 
-/// Approximate directed feedback vertex set (#37).
+/// Deterministic full-graph directed feedback vertex set with residual-DAG proof (#1148).
 pub mod fvs;
-pub use fvs::{FeedbackVertexSet, approximate_directed_fvs};
+pub use fvs::{
+    ASTRO_KERNEL_FVS_RESIDUAL_CYCLE, ASTRO_KERNEL_FVS_TRAVERSAL_INVALID, FVS_RESIDUAL_PROOF_SCHEMA,
+    FVS_SELECTION_SCHEMA, FVS_VALIDITY_METHOD, FeedbackVertexSet,
+    canonical_dfs_feedback_vertex_set,
+};
 
-/// Kernel build pipeline, recall gate, and persisted artifacts (#37).
+/// Kernel build pipeline, graph-coverage diagnostics, compactness admission, and artifacts.
 pub mod kernel_build;
 pub use kernel_build::{
-    KERNEL_ARTIFACT_SCHEMA, KERNEL_BUILD_KNOB_REGISTRY_VERSION, KERNEL_BUILD_KNOBS,
-    KERNEL_INDEX_SCHEMA, KERNEL_LEDGER_SCHEMA, KernelArtifact, KernelArtifactPaths,
-    KernelBuildConfig, KernelIndexManifest, KernelLedgerEntry, KernelMember, RecallMeasurement,
-    build_kernel, build_kernel_reusing_betweenness, kernel_betweenness_permille, measure_recall,
-    members_hash, refine_kernel_with_recall_support, write_kernel_artifacts,
+    ASTRO_KERNEL_BETWEENNESS_CACHE_MISMATCH, ASTRO_KERNEL_COMPACTNESS_UNREACHABLE,
+    ASTRO_KERNEL_NO_CYCLIC_CORE, ASTRO_KERNEL_REPRESENTATION_OVERFLOW,
+    ASTRO_KERNEL_SOURCE_IDENTITY_MISMATCH, BetweennessCache, FvsValidityProof,
+    GraphCoverageMeasurement, KERNEL_ARTIFACT_SCHEMA, KERNEL_BETWEENNESS_CACHE_SCHEMA,
+    KERNEL_BUILD_ALGORITHM_SCHEMA, KERNEL_BUILD_KNOB_REGISTRY_VERSION, KERNEL_BUILD_KNOBS,
+    KERNEL_INDEX_SCHEMA, KERNEL_LEDGER_SCHEMA, KERNEL_SOURCE_IDENTITY_SCHEMA, KernelArtifact,
+    KernelBuildConfig, KernelCompactness, KernelIndexManifest, KernelLedgerEntry, KernelMember,
+    KernelProjectionIdentity, KernelSourceIdentity, build_kernel, build_kernel_reusing_betweenness,
+    kernel_betweenness_cache, kernel_build_config_identity, kernel_projection_identity,
+    kernel_source_identity, measure_graph_coverage, members_hash,
+    verify_kernel_source_projection_identity,
+};
+
+/// Exact external-query answer recall through bounded weak-graph routing from
+/// kernel entries, with complete source/vector/query identity and work evidence (#1148).
+pub mod graph_routed_recall;
+pub use graph_routed_recall::{
+    ASTRO_KERNEL_ROUTE_BUDGET_EXCEEDED, ASTRO_KERNEL_ROUTE_COMPACTNESS_EXCEEDED,
+    ASTRO_KERNEL_ROUTE_EMPTY_INPUT, ASTRO_KERNEL_ROUTE_IDENTITY_DRIFT,
+    ASTRO_KERNEL_ROUTE_INSUFFICIENT_CANDIDATES, ASTRO_KERNEL_ROUTE_NO_EDGES,
+    ASTRO_KERNEL_ROUTE_PARAMS_INVALID, ASTRO_KERNEL_ROUTE_QUERY_INVALID,
+    ASTRO_KERNEL_ROUTE_RECALL_BELOW_FLOOR, ASTRO_KERNEL_ROUTE_REPORT_INVALID,
+    ASTRO_KERNEL_ROUTE_VECTOR_INVALID, GRAPH_ROUTED_HASH_SEMANTICS, GRAPH_ROUTED_QUERY_SEMANTICS,
+    GRAPH_ROUTED_RECALL_SCHEMA, GRAPH_ROUTED_SEARCH_SEMANTICS, GraphRoutedQuery,
+    GraphRoutedRecallParams, GraphRoutedRecallQueryEvidence, GraphRoutedRecallReport,
+    GraphRoutedScoredIdentity, evaluate_graph_routed_recall, graph_routed_kernel_artifact_hash,
+    graph_routed_query_content_hash, graph_routed_query_cx_id, graph_routed_query_vector_hash,
+    validate_graph_routed_recall_report,
 };
 
 /// Grounding-gap report + coverage-vs-importance quadrant over a persisted
@@ -96,7 +123,8 @@ pub use scope_cache::{
 /// Incremental rebuild and hierarchical region kernels (#38).
 pub mod incremental;
 pub use incremental::{
-    GraphDelta, RebuildReport, RegionGraph, build_region_graph, rebuild_dirty, region_id,
+    ASTRO_KERNEL_DELTA_INVALID, ASTRO_KERNEL_REGION_GRAPH_INVALID, GraphDelta, RebuildReport,
+    RegionGraph, build_region_graph, rebuild_dirty, region_id,
 };
 
 /// Grounded kernel answer paths: hop-attenuated, ledger-wired Q&A (#40).
@@ -116,10 +144,11 @@ pub use answer::{
 /// (#366): the answer-path reach term folded into `detect_changes` grounded risk.
 pub mod blast_radius;
 pub use blast_radius::{
-    ASTRO_CHANGE_REACH_KNOB_RANGE, ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL,
-    CHANGE_REACH_KNOB_REGISTRY_VERSION, CHANGE_REACH_KNOBS, CHANGE_REACH_SCHEMA, ChangeReach,
-    ReachConfig, ReachRisk, ReachedNode, change_reach, change_reach_artifact_bytes,
-    reach_risk_permille,
+    ASTRO_CHANGE_REACH_ARITHMETIC, ASTRO_CHANGE_REACH_KNOB_RANGE,
+    ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL, CHANGE_REACH_KNOB_REGISTRY_VERSION, CHANGE_REACH_KNOBS,
+    CHANGE_REACH_SCHEMA, ChangeReach, PreparedChangeReachGraph, ReachConfig, ReachRisk,
+    ReachedNode, change_reach, change_reach_artifact_blake3, change_reach_artifact_bytes,
+    change_reach_prepared, reach_risk_permille,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -131,7 +160,7 @@ pub const BRIDGE_SCHEMA: &str = "astrolabe.bridge.v1";
 pub const BRIDGE_CACHE_KEY_SCHEMA: &str = "astrolabe.bridge_cache_key.v1";
 pub const LABEL_PROPAGATION_SCHEMA: &str = "astrolabe.label_propagation.v1";
 pub const LABEL_PROPAGATION_KNOB_REGISTRY_VERSION: &str = "astro.kernel.label_propagation_knobs.v1";
-pub const SCOPE_SUMMARY_SCHEMA: &str = "astrolabe.scope_summary.v1";
+pub const SCOPE_SUMMARY_SCHEMA: &str = "astrolabe.scope_summary.v2";
 pub const FUNNEL_ACTIVATION_RECORDS_KNOB: &str = "search.funnel.activation_records";
 pub const SKILL_MIN_CLUSTER_SIZE_KNOB: &str = "skills.min_cluster_size";
 pub const SKILL_MIN_SHARED_TOKEN_PERMILLE_KNOB: &str = "skills.min_shared_token_permille";
@@ -1264,7 +1293,7 @@ pub struct ScopeSummaryInput {
     pub dirty_region_hash: String,
     pub grounded: bool,
     pub kernel_members: Vec<ScopeSummaryMember>,
-    pub recall: Option<ScopeRecallMeasurement>,
+    pub graph_coverage: Option<ScopeGraphCoverageMeasurement>,
 }
 
 impl ScopeSummaryInput {
@@ -1273,14 +1302,14 @@ impl ScopeSummaryInput {
         dirty_region_hash: impl Into<String>,
         grounded: bool,
         kernel_members: Vec<ScopeSummaryMember>,
-        recall: Option<ScopeRecallMeasurement>,
+        graph_coverage: Option<ScopeGraphCoverageMeasurement>,
     ) -> Self {
         Self {
             scope_id: scope_id.into(),
             dirty_region_hash: dirty_region_hash.into(),
             grounded,
             kernel_members,
-            recall,
+            graph_coverage,
         }
     }
 }
@@ -1313,8 +1342,8 @@ impl ScopeSummaryMember {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ScopeRecallMeasurement {
-    pub recalled: u64,
+pub struct ScopeGraphCoverageMeasurement {
+    pub covered: u64,
     pub total: u64,
 }
 
@@ -1324,8 +1353,8 @@ pub struct ScopeSummary {
     pub scope_id: String,
     pub dirty_region_hash: String,
     pub members: Vec<ScopeSummaryMember>,
-    pub recall: Option<ScopeRecallMeasurement>,
-    pub recall_millipoints: Option<u64>,
+    pub graph_coverage: Option<ScopeGraphCoverageMeasurement>,
+    pub graph_coverage_millipoints: Option<u64>,
     pub grounded_member_count: usize,
     pub total_member_count: usize,
     pub grounded_fraction_millipoints: u64,
@@ -1348,11 +1377,11 @@ pub fn summarize_scope_kernel(input: &ScopeSummaryInput) -> ScopeSummary {
         .saturating_mul(1_000)
         .checked_div(total_member_count as u64)
         .unwrap_or(0);
-    let recall_millipoints = input.recall.and_then(|recall| {
-        recall
-            .recalled
+    let graph_coverage_millipoints = input.graph_coverage.and_then(|coverage| {
+        coverage
+            .covered
             .saturating_mul(1_000)
-            .checked_div(recall.total)
+            .checked_div(coverage.total)
     });
     let summary_hash = scope_summary_hash(&input.scope_id, &input.dirty_region_hash, &members);
 
@@ -1361,8 +1390,8 @@ pub fn summarize_scope_kernel(input: &ScopeSummaryInput) -> ScopeSummary {
         scope_id: input.scope_id.clone(),
         dirty_region_hash: input.dirty_region_hash.clone(),
         members,
-        recall: input.recall,
-        recall_millipoints,
+        graph_coverage: input.graph_coverage,
+        graph_coverage_millipoints,
         grounded_member_count,
         total_member_count,
         grounded_fraction_millipoints,
@@ -1390,9 +1419,9 @@ pub fn scope_summary_artifact_bytes(summary: &ScopeSummary) -> Vec<u8> {
     out.push_str("grounded_fraction=");
     out.push_str(&summary.grounded_fraction_millipoints.to_string());
     out.push('\n');
-    if let Some(recall) = summary.recall_millipoints {
-        out.push_str("recall=");
-        out.push_str(&recall.to_string());
+    if let Some(coverage) = summary.graph_coverage_millipoints {
+        out.push_str("graph_coverage=");
+        out.push_str(&coverage.to_string());
         out.push('\n');
     }
     for member in &summary.members {

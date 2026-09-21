@@ -8,6 +8,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "manual-fsv")]
+use astrolabe_bridge::publish_file_no_replace_write_through;
 use astrolabe_bridge::{CbmPipelineRows, CbmToolRunner};
 use astrolabe_domain::SYMBOL_CANONICAL_TAG;
 use astrolabe_guard::{
@@ -29,12 +31,12 @@ use astrolabe_kernel::{
     LABEL_PROPAGATION_KNOB_REGISTRY_VERSION, LABEL_PROPAGATION_SCHEMA, LabelGraphEdge,
     LabelPropagationConfig, LabelPropagationReport, LabelSeed, LabelTombstone,
     SCOPE_SUMMARY_SCHEMA, SEARCH_SCALE_KNOB_REGISTRY_VERSION,
-    SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, ScopeRecallMeasurement, ScopeSummary,
-    ScopeSummaryInput, ScopeSummaryMember, SearchIndexBackend, SearchScaleConfig, SearchScalePlan,
-    SkillDiscoveryConfig, SkillSymbolInput, SkillTree, bridge_report_artifact_bytes,
-    bridge_symbols, build_skill_tree, label_propagation_artifact_bytes, plan_search_scale,
-    propagate_labels, scope_summary_artifact_bytes, skill_tree_artifact_bytes,
-    summarize_scope_kernel,
+    SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, ScopeGraphCoverageMeasurement,
+    ScopeSummary, ScopeSummaryInput, ScopeSummaryMember, SearchIndexBackend, SearchScaleConfig,
+    SearchScalePlan, SkillDiscoveryConfig, SkillSymbolInput, SkillTree,
+    bridge_report_artifact_bytes, bridge_symbols, build_skill_tree,
+    label_propagation_artifact_bytes, plan_search_scale, propagate_labels,
+    scope_summary_artifact_bytes, skill_tree_artifact_bytes, summarize_scope_kernel,
 };
 use astrolabe_lower::{
     AS_OF_BUCKET_DEFAULT_WIDTH_MS, AS_OF_BUCKET_WIDTH_MS_KNOB, as_of_bucket_knob,
@@ -63,8 +65,8 @@ use astrolabe_weave::{
     BlindSpotConfig, CrossTermValue, DEFAULT_BLIND_SPOT_PAIRS, DETECT_ANOMALIES_SCHEMA,
     EagerAgreementKind, EagerCrossTermDeltaPlanRequest, EagerCrossTermPlanRequest,
     LiveAnomalyInputs, SimilarityFamily, SimilarityNode, SimilarityPlannerConfig, SubscriptionId,
-    WeaveSlotSource, acknowledge_reactive_subscription, anomaly_report_artifact_bytes,
-    blind_spot_anomaly_inputs, blind_spot_slots, detect_anomalies,
+    WeaveSlotBinding, WeaveSlotSource, acknowledge_reactive_subscription,
+    anomaly_report_artifact_bytes, blind_spot_anomaly_inputs, blind_spot_slots, detect_anomalies,
     expand_persisted_similarity_region_from_vault, extend_similarity_candidate_region_for_family,
     live_anomaly_inputs_from_vault, persist_eager_cross_term_kind_run,
     persist_eager_cross_term_kind_run_delta, persist_similarity_family_run,
@@ -131,6 +133,9 @@ use bridges::*;
 mod kernel_context;
 use kernel_context::*;
 
+mod kernel_admission;
+use kernel_admission::*;
+
 mod kernel_gaps;
 use kernel_gaps::*;
 
@@ -138,6 +143,8 @@ mod kernel_answer;
 use kernel_answer::*;
 
 mod fleet_serving;
+#[cfg(feature = "manual-fsv")]
+pub use fleet_serving::manual_fsv_cache_clock_overflow;
 use fleet_serving::*;
 
 mod anomalies;
@@ -170,6 +177,9 @@ use shadow_publication::*;
 
 mod git_archaeology;
 use git_archaeology::*;
+
+mod oracle_generation;
+use oracle_generation::*;
 // #515/#530: the pooled historical-index extraction serve worker entry, dispatched from
 // `run_cli` in lib.rs (`astrolabe cli --archaeology-extract-serve`). Explicitly
 // re-exported because the glob `use` above is private to this module.

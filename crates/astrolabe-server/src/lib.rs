@@ -35,6 +35,14 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const ASTRO_INDEX_WORKER_CACHE_DIR_ARG: &str = "_astrolabe_worker_cache_dir";
 pub(crate) const ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG: &str =
     "_astrolabe_project_transition_writer";
+pub const ASTRO_INDEX_WORKER_CAPABILITY_ARG: &str = "__astrolabe-index-worker-capability-v1";
+pub const ASTRO_INDEX_WORKER_CAPABILITY_SCHEMA: &str = "astrolabe.index-worker-capability.v3";
+pub const ASTRO_INDEX_WORKER_ARGV_SCHEMA: &str = "astrolabe.index-worker-argv.v2";
+pub const ASTRO_INDEX_WORKER_PROGRESS_SCHEMA: &str = "cbm.worker-progress.v1";
+pub const ASTRO_WORKER_SOURCE_GENERATION_SCHEMA: &str =
+    env!("ASTROLABE_WORKER_SOURCE_GENERATION_SCHEMA");
+pub const ASTRO_WORKER_SOURCE_GENERATION_SHA256: &str =
+    env!("ASTROLABE_WORKER_SOURCE_GENERATION_SHA256");
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -150,6 +158,9 @@ pub fn run_from_env_on_sized_host_thread() -> i32 {
 
 pub fn run_from_env() -> i32 {
     let args: Vec<String> = env::args().collect();
+    if let Some(code) = run_index_worker_capability_probe(&args) {
+        return code;
+    }
     if args.len() == 1 {
         match connection_supervisor::run_if_installed_generation() {
             Ok(Some(code)) => return code,
@@ -176,6 +187,15 @@ pub fn run_from_env() -> i32 {
     // logging can reach stderr. Server (no-arg) dispatch is unaffected and keeps
     // INFO.
     let cli_mode = is_cli_invocation(&args);
+    let binding = if hook_mode {
+        astrolabe_bridge::prepare_cbm_non_host_process().map(|_| None)
+    } else {
+        astrolabe_bridge::bind_cbm_host_self().map(Some)
+    };
+    if let Err(error) = binding {
+        report_startup_error(&error, None);
+        return 1;
+    }
     let json_logs = match astrolabe_bridge::initialize_cbm_log_configuration() {
         Ok(json_logs) => json_logs,
         Err(error) => {
@@ -211,22 +231,23 @@ pub fn run_from_env() -> i32 {
             return 1;
         }
     }
-    let binary_path = env::current_exe()
-        .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
-        .or_else(|| args.first().cloned());
-
     let startup = if hook_mode {
-        astrolabe_bridge::initialize_cbm_host_process_silent(binary_path.as_deref())
+        astrolabe_bridge::activate_cbm_non_host_process(
+            astrolabe_bridge::CbmLogMode::Silent,
+            profile_active,
+        )
     } else if cli_mode {
-        astrolabe_bridge::initialize_cbm_host_process_cli(binary_path.as_deref())
+        astrolabe_bridge::activate_cbm_host_process(
+            astrolabe_bridge::CbmLogMode::CliWarnFloor,
+            profile_active,
+        )
     } else {
-        astrolabe_bridge::initialize_cbm_host_process(binary_path.as_deref())
+        astrolabe_bridge::activate_cbm_host_process(
+            astrolabe_bridge::CbmLogMode::Default,
+            profile_active,
+        )
     };
     if let Err(err) = startup {
-        if hook_mode {
-            return 0;
-        }
         report_startup_error(&err, Some(json_logs));
         return 1;
     }
@@ -239,6 +260,93 @@ pub fn run_from_env() -> i32 {
             }
             eprintln!("astrolabe: {err}");
             1
+        }
+    }
+}
+
+fn run_index_worker_capability_probe(args: &[String]) -> Option<i32> {
+    if args.get(1).map(String::as_str) != Some(ASTRO_INDEX_WORKER_CAPABILITY_ARG) {
+        return None;
+    }
+    let challenge = match args {
+        [_, _, challenge]
+            if !challenge.is_empty()
+                && challenge.len() <= 128
+                && challenge
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
+        {
+            challenge
+        }
+        _ => {
+            eprintln!(
+                "code=ASTRO_INDEX_WORKER_CAPABILITY_ARGUMENT_INVALID \
+message=the private worker capability probe requires exactly one bounded ASCII challenge \
+remediation=invoke the probe only through the Astrolabe bridge capability verifier"
+            );
+            return Some(1);
+        }
+    };
+    let executable = match env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!(
+                "code=ASTRO_INDEX_WORKER_CAPABILITY_CURRENT_EXE_FAILED \
+message=the capability process could not resolve its operating-system image: {error} \
+remediation=run the ordinary shipping Astrolabe executable from a readable local path"
+            );
+            return Some(1);
+        }
+    };
+    let artifact_identity = match astrolabe_bridge::capture_windows_file_identity(&executable) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!(
+                "code=ASTRO_INDEX_WORKER_CAPABILITY_IDENTITY_FAILED \
+message=the capability process could not identify its operating-system image: {error} \
+remediation=run one ordinary non-reparse shipping Astrolabe executable"
+            );
+            return Some(1);
+        }
+    };
+    let response = serde_json::json!({
+        "schema": ASTRO_INDEX_WORKER_CAPABILITY_SCHEMA,
+        "challenge": challenge,
+        "worker_argv_schema": ASTRO_INDEX_WORKER_ARGV_SCHEMA,
+        "progress_schema": ASTRO_INDEX_WORKER_PROGRESS_SCHEMA,
+        "progress_schema_version": 1,
+        "worker_argv_template": [
+            "cli",
+            "--index-worker",
+            "index_repository",
+            "--args-file",
+            "{args_path}",
+            "--response-out",
+            "{response_path}",
+            "--worker-progress-out",
+            "{progress_path}",
+            "--worker-progress-attempt",
+            "{attempt_sha256}",
+        ],
+        "worker_cache_arg": ASTRO_INDEX_WORKER_CACHE_DIR_ARG,
+        "transition_grant_arg": ASTRO_INDEX_WORKER_TRANSITION_GRANT_ARG,
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "source_generation_schema": ASTRO_WORKER_SOURCE_GENERATION_SCHEMA,
+        "source_generation_sha256": ASTRO_WORKER_SOURCE_GENERATION_SHA256,
+        "artifact_identity": artifact_identity,
+    });
+    match serde_json::to_string(&response) {
+        Ok(response) => {
+            println!("{response}");
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!(
+                "code=ASTRO_INDEX_WORKER_CAPABILITY_SERIALIZE_FAILED \
+message=the capability receipt could not be serialized: {error} \
+remediation=repair the fixed capability schema before enabling worker binding"
+            );
+            Some(1)
         }
     }
 }

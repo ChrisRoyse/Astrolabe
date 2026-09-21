@@ -24,9 +24,9 @@ use std::collections::BTreeSet;
 ///
 /// These rows are line-based text whose first line is
 /// `schema=astrolabe.placement_truth.v1`. This const is the reader-side single
-/// source of truth; a `#[test]` pins it byte-for-byte against
-/// `astrolabe_kernel::PLACEMENT_TRUTH_SCHEMA` (the writer-side const) so the two
-/// can never silently drift.
+/// source of truth. Shipping readers compare it byte-for-byte with the
+/// writer-side `astrolabe_kernel::PLACEMENT_TRUTH_SCHEMA`, and manual FSV
+/// independently reads both persisted representations so drift fails closed.
 pub const XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA: &str = "astrolabe.placement_truth.v1";
 /// Schema tag for exhaustive Astrolabe base-association rows. These rows use a
 /// prefix-disjoint XTerm key family and carry either an exact scalar bit pattern

@@ -2,18 +2,14 @@ use super::*;
 
 use astrolabe_domain::EdgeKind;
 use astrolabe_oracle::{
-    BacktestCase, ConsequenceEdge, ConsequenceEdgeKind, ConsequenceGraph, ImpactOutcome,
-    OracleError, OracleEvidence, PredictConfig, PredictRequest, predict_impact, run_backtest,
+    ASTRO_ORACLE_BACKTEST_ADMISSION_REQUIRED, ASTRO_ORACLE_BACKTEST_NOT_BEATEN, ConsequenceEdge,
+    ConsequenceEdgeKind, ConsequenceGraph, ImpactOutcome, OracleError, OracleEvidence,
+    PredictConfig, PredictRequest, predict_impact,
 };
 use calyx_core::CxId;
 
 /// Envelope schema for the `predict_impact` MCP tool.
 pub(crate) const PREDICT_IMPACT_SCHEMA: &str = "astrolabe.predict_impact.v1";
-/// Config-store metadata key holding the per-repo backtest gate state.
-pub(crate) const PREDICT_GATE_KEY: &str = "oracle_predict_gate";
-/// Ledger/actor-style provenance tag for the backtest gate record.
-const PREDICT_BACKTEST_ACTOR: &str = "astrolabe-predict-backtest";
-
 /// Stable failure code: the tool was called without a shadow-indexed project.
 const ASTRO_PREDICT_SHADOW_REQUIRED: &str = "ASTRO_PREDICT_SHADOW_REQUIRED";
 /// Stable failure code: the shadow vault directory is missing.
@@ -24,12 +20,6 @@ const ASTRO_PREDICT_SEEDS_REQUIRED: &str = "ASTRO_PREDICT_SEEDS_REQUIRED";
 const ASTRO_PREDICT_SEED_UNRESOLVED: &str = "ASTRO_PREDICT_SEED_UNRESOLVED";
 /// Stable failure code: an unsupported `mode` was requested.
 const ASTRO_PREDICT_MODE_UNSUPPORTED: &str = "ASTRO_PREDICT_MODE_UNSUPPORTED";
-/// Stable failure code: the persisted backtest gate row is corrupt.
-const ASTRO_PREDICT_GATE_CORRUPT: &str = "ASTRO_PREDICT_GATE_CORRUPT";
-/// Stable failure code: the gate write did not read back byte-identically.
-const ASTRO_PREDICT_GATE_FSV: &str = "ASTRO_PREDICT_GATE_FSV";
-/// Stable failure code: a backtest was requested but no held-out cases exist.
-const ASTRO_PREDICT_BACKTEST_NO_CASES: &str = "ASTRO_PREDICT_BACKTEST_NO_CASES";
 
 // ---------------------------------------------------------------------------
 // CBM edge_type -> oracle impact edge mapping
@@ -194,14 +184,6 @@ pub(crate) fn consequence_edges_from_snapshot(
     (edges, tests_by_covered, build)
 }
 
-fn build_consequence_graph(
-    snapshot: &CbmGraphSnapshot,
-) -> Result<(ConsequenceGraph, CoveredTestsIndex, GraphBuild), OracleError> {
-    let (edges, tests_by_covered, build) = consequence_edges_from_snapshot(snapshot);
-    let graph = ConsequenceGraph::from_edges(&edges)?;
-    Ok((graph, tests_by_covered, build))
-}
-
 pub(crate) fn graph_build_json(build: &GraphBuild) -> Value {
     json!({
         "edges_used": build.edges_used,
@@ -213,75 +195,6 @@ pub(crate) fn graph_build_json(build: &GraphBuild) -> Value {
         "edges_non_propagation": build.edges_untyped,
         "edges_self_loop": build.edges_self_loop,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Per-repo backtest gate state (persist + FSV readback)
-// ---------------------------------------------------------------------------
-
-/// The persisted per-repo backtest gate. Grounded confidence is advertised only
-/// when a gate row exists AND records `advertise_grounded: true`; every other
-/// case (absent row, gate not passed) resolves to provisional labeling — never a
-/// silent grounded default.
-#[derive(Debug, Clone)]
-struct PredictGate {
-    advertise_grounded: bool,
-    record: Value,
-}
-
-/// Reads the persisted backtest gate for `project`. An absent row is the honest
-/// default: provisional (grounded confidence withheld), clearly labeled.
-fn read_predict_gate(cache_dir: &Path, project: &str) -> Result<PredictGate, DynError> {
-    let Some(text) = read_config_value(cache_dir, &metadata_key(project, PREDICT_GATE_KEY))? else {
-        return Ok(PredictGate {
-            advertise_grounded: false,
-            record: json!({
-                "advertise_grounded": false,
-                "source": "absent",
-                "note": "no persisted backtest gate for this repo; grounded confidence is withheld and every consequence is labeled provisional",
-            }),
-        });
-    };
-    let record: Value = serde_json::from_str(&text).map_err(|error| -> DynError {
-        format!(
-            "{ASTRO_PREDICT_GATE_CORRUPT}: persisted backtest gate for project {project:?} is not valid JSON: {error}; remediation: re-run predict_impact mode=\"backtest\" to rewrite the gate"
-        )
-        .into()
-    })?;
-    let advertise_grounded = record
-        .get("advertise_grounded")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| -> DynError {
-            format!(
-                "{ASTRO_PREDICT_GATE_CORRUPT}: persisted backtest gate for project {project:?} has no boolean advertise_grounded; remediation: re-run predict_impact mode=\"backtest\""
-            )
-            .into()
-        })?;
-    let mut record = record;
-    if let Some(obj) = record.as_object_mut() {
-        obj.insert("source".to_string(), json!("persisted"));
-    }
-    Ok(PredictGate {
-        advertise_grounded,
-        record,
-    })
-}
-
-/// Persists the backtest gate `record` for `project` and independently reads it
-/// back, failing closed if the readback is not byte-identical (FSV, #122 pattern).
-fn persist_predict_gate(cache_dir: &Path, project: &str, record: &Value) -> Result<(), DynError> {
-    let text = serde_json::to_string(record)?;
-    let key = metadata_key(project, PREDICT_GATE_KEY);
-    write_config_value(cache_dir, &key, &text)?;
-    let readback = read_config_value(cache_dir, &key)?;
-    if readback.as_deref() != Some(text.as_str()) {
-        return Err(format!(
-            "{ASTRO_PREDICT_GATE_FSV}: backtest gate for project {project:?} did not read back byte-identically after write; remediation: retry, and if it persists inspect {cache}/_config.db for a conflicting writer",
-            cache = cache_dir.display(),
-        )
-        .into());
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -327,25 +240,59 @@ fn oracle_error_refused(project: &str, error: &OracleError) -> Value {
     )
 }
 
+fn gate_error_refused(project: &str, error: &dyn std::fmt::Display) -> Value {
+    let message = error.to_string();
+    let code = if message.contains(ASTRO_ORACLE_BACKTEST_ADMISSION_REQUIRED) {
+        ASTRO_ORACLE_BACKTEST_ADMISSION_REQUIRED
+    } else if message.contains(ASTRO_ORACLE_BACKTEST_NOT_BEATEN) {
+        ASTRO_ORACLE_BACKTEST_NOT_BEATEN
+    } else if message.contains(ASTRO_ORACLE_GATE_ABSENT) {
+        ASTRO_ORACLE_GATE_ABSENT
+    } else if message.contains(ASTRO_ORACLE_GATE_CORRUPT) {
+        ASTRO_ORACLE_GATE_CORRUPT
+    } else {
+        ASTRO_ORACLE_GATE_STALE
+    };
+    predict_refused(
+        project,
+        code,
+        message,
+        "publish one new shadow generation from real Git archaeology and source-backed CI outcome anchors; grounded serving never falls back to a manual or stale gate",
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Core: predict_impact_json_at
 // ---------------------------------------------------------------------------
 
-/// Shared core for the `predict_impact` MCP tool. Reads the persisted CBM graph
-/// and oracle change→outcome corpus for a shadow-indexed project, builds the
-/// composite consequence graph and grounded evidence from persisted state, honors
-/// the persisted per-repo backtest gate, and answers `mode`:
+/// Shared core for the `predict_impact` MCP tool. One retained generation binds
+/// the compact CBM graph, source-backed Oracle corpus, current complete kernel,
+/// and automatically-persisted chronological gate attestation.
 ///
 /// * `"predict"` (default): ranked consequences + test-selection, or an honest
 ///   `Insufficient` deficit card when the seeds carry no grounded history.
-/// * `"backtest"`: derives held-out cases from the corpus + graph, runs the
-///   grounded-vs-topology backtest, and persists (+ FSV reads back) the gate.
+/// * `"backtest"`: reads the exact generation-owned attestation. Serving never
+///   creates, replaces, or manually approves a gate.
+///
+/// At production `N=192,873`, `E=328,899`, this path performs one compact
+/// `O(N+E)` graph read/build and, only for `predict`, one `O(R)` Oracle-owned
+/// occurrence scan. Kernel and gate identities are point-read from the same
+/// retained generation; the obsolete second occurrence scan is absent
+/// (PC-04/PC-16/PC-38/PC-43).
 pub(crate) fn predict_impact_json_at(
     cache_dir: &Path,
     project: &str,
     seeds: &[String],
     mode: &str,
 ) -> Result<Value, DynError> {
+    if !matches!(mode, "predict" | "backtest") {
+        return Ok(predict_refused(
+            project,
+            ASTRO_PREDICT_MODE_UNSUPPORTED,
+            format!("predict_impact mode {mode:?} is not available"),
+            "use mode=\"predict\" (default) or mode=\"backtest\"",
+        ));
+    }
     if read_dial_at(cache_dir, project)? != MigrationDial::Shadow {
         return Ok(predict_refused(
             project,
@@ -370,70 +317,150 @@ pub(crate) fn predict_impact_json_at(
         &vault_id,
         &vault_salt,
         vec![
-            ColumnFamily::Graph,
             ColumnFamily::Base,
+            ColumnFamily::Graph,
             ColumnFamily::Kv,
-            ColumnFamily::Ledger,
             ColumnFamily::Recurrence,
+            ColumnFamily::Kernel,
+            ColumnFamily::Anchors,
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+            ColumnFamily::Slot(astrolabe_weave::search::SLOT_NAME_SEMANTIC),
         ],
     )?;
-
-    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
-    let node_map = astrolabe_ingest::read_node_map_cx_ids(&vault, project)?;
-    let evidence = OracleEvidence::from_vault(&vault)?;
-    // Subjects with at least one grounded *failing* occurrence, read back from the
-    // persisted oracle `Kv` rows — used to derive held-out backtest cases without
-    // reaching into OracleEvidence's private index.
-    let mut failing_subjects: BTreeSet<CxId> = BTreeSet::new();
-    for persisted in astrolabe_oracle::read_occurrence_rows(&vault)? {
-        if !persisted.row.passed {
-            failing_subjects.insert(persisted.row.subject);
-        }
+    let read_lease = vault.retain_latest_snapshot();
+    let read_seq = read_lease.seq();
+    let compact = astrolabe_ingest::read_cbm_compact_graph_snapshot(&vault, project)?;
+    if compact.receipt.snapshot_seq != read_seq {
+        return Ok(predict_refused(
+            project,
+            ASTRO_ORACLE_GATE_STALE,
+            format!(
+                "compact graph sequence {} differs from retained Oracle serving sequence {read_seq}",
+                compact.receipt.snapshot_seq
+            ),
+            "retry against one stable retained shadow generation",
+        ));
     }
-    drop(vault);
-
+    let mut node_map: BTreeMap<String, CxId> = BTreeMap::new();
     let mut cx_to_qn: BTreeMap<CxId, String> = BTreeMap::new();
-    for (qn, cx) in &node_map {
-        cx_to_qn.insert(*cx, qn.clone());
+    for node in &compact.nodes {
+        if let Some(previous) = node_map.insert(node.qualified_name.clone(), node.cx_id)
+            && previous != node.cx_id
+        {
+            return Ok(predict_refused(
+                project,
+                ASTRO_PREDICT_SEED_UNRESOLVED,
+                format!(
+                    "qualified name {:?} resolves to multiple constellations",
+                    node.qualified_name
+                ),
+                "reindex the project so each qualified seed name has one exact constellation identity",
+            ));
+        }
+        cx_to_qn
+            .entry(node.cx_id)
+            .or_insert_with(|| node.qualified_name.clone());
     }
-
-    let (graph, tests_by_covered, build) = match build_consequence_graph(&snapshot) {
+    let (graph, _, projection) = match consequence_graph_from_compact(&compact) {
         Ok(parts) => parts,
         Err(error) => return Ok(oracle_error_refused(project, &error)),
     };
-
-    match mode {
-        "predict" => predict_mode(
-            cache_dir, project, seeds, &node_map, &cx_to_qn, &graph, &evidence, &build,
-        ),
-        "backtest" => backtest_mode(
-            cache_dir,
+    let scope_id = kernel_artifact_scope_id(project);
+    let Some(generation) =
+        astrolabe_weave::read_current_kernel_generation_header(&vault, project, &scope_id)?
+    else {
+        return Ok(predict_refused(
             project,
-            &graph,
-            &tests_by_covered,
-            &failing_subjects,
-            &evidence,
-            &build,
-        ),
-        other => Ok(predict_refused(
+            ASTRO_ORACLE_GATE_STALE,
+            "the retained shadow generation has no complete current kernel artifact",
+            "publish one complete shadow/kernel/Oracle generation before predicting impact",
+        ));
+    };
+    let attestation = match validate_current_oracle_gate_at(
+        &vault,
+        read_seq,
+        project,
+        &generation.manifest,
+        &generation.pointer,
+    ) {
+        Ok(attestation) => attestation,
+        Err(error) => return Ok(gate_error_refused(project, error.as_ref())),
+    };
+    if !oracle_gate_projection_matches(&attestation, &projection) {
+        return Ok(predict_refused(
             project,
-            ASTRO_PREDICT_MODE_UNSUPPORTED,
-            format!("predict_impact mode {other:?} is not available"),
-            "use mode=\"predict\" (default) or mode=\"backtest\"",
-        )),
+            ASTRO_ORACLE_GATE_STALE,
+            "the serving consequence projection differs from the exact gate-attested projection accounting",
+            "publish one new shadow generation; do not serve across graph-projection drift",
+        ));
     }
+    let gate = oracle_gate_summary(&attestation);
+    if mode == "backtest" {
+        let admitted = gate
+            .get("admitted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return Ok(json!({
+            "schema": PREDICT_IMPACT_SCHEMA,
+            "project": project,
+            "status": "backtest_attested",
+            "advertise_grounded": admitted,
+            "gate": gate,
+            "graph": projection,
+            "trust": if admitted { "trusted" } else { "provisional" },
+            "freshness": "fresh",
+            "provenance": [
+                "backtest:generation-transaction:strict-chronological-held-out",
+                "gate:Kernel+Ledger:exact-attestation-readback",
+            ],
+        }));
+    }
+    let attestation = match require_current_oracle_gate_at(
+        &vault,
+        read_seq,
+        project,
+        &generation.manifest,
+        &generation.pointer,
+    ) {
+        Ok(attestation) => attestation,
+        Err(error) => return Ok(gate_error_refused(project, error.as_ref())),
+    };
+    let evidence = OracleEvidence::from_vault_at(&vault, read_seq)?;
+    if vault.latest_seq() != read_seq {
+        return Ok(predict_refused(
+            project,
+            ASTRO_ORACLE_GATE_STALE,
+            format!(
+                "vault advanced from retained sequence {read_seq} to {} during prediction preparation",
+                vault.latest_seq()
+            ),
+            "retry against one stable retained shadow generation",
+        ));
+    }
+    read_lease.record_progress();
+    predict_mode(
+        project,
+        seeds,
+        &node_map,
+        &cx_to_qn,
+        &graph,
+        &evidence,
+        &projection,
+        oracle_gate_summary(&attestation),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn predict_mode(
-    cache_dir: &Path,
     project: &str,
     seeds: &[String],
     node_map: &BTreeMap<String, CxId>,
     cx_to_qn: &BTreeMap<CxId, String>,
     graph: &ConsequenceGraph,
     evidence: &OracleEvidence,
-    build: &GraphBuild,
+    projection: &OracleProjectionBuild,
+    gate: Value,
 ) -> Result<Value, DynError> {
     if seeds.is_empty() {
         return Ok(predict_refused(
@@ -466,9 +493,8 @@ fn predict_mode(
         ));
     }
 
-    let gate = read_predict_gate(cache_dir, project)?;
     let config = PredictConfig {
-        advertise_grounded: gate.advertise_grounded,
+        advertise_grounded: true,
         ..PredictConfig::default()
     };
     let request = PredictRequest {
@@ -514,18 +540,14 @@ fn predict_mode(
                 "consequences": consequences,
                 "consequence_count": prediction.consequences.len(),
                 "test_selection": test_selection,
-                "gate": gate.record,
-                "graph": graph_build_json(build),
-                // grounded_mode gates whether a Trusted consequence may ride as
-                // Trusted; when the repo's backtest gate has not passed every
-                // consequence is provisional (labeled, never silent). Per-consequence
-                // trust tags refine this envelope-level operating-mode label.
-                "trust": if prediction.grounded_mode { "trusted" } else { "provisional" },
+                "gate": gate,
+                "graph": projection,
+                "trust": "trusted",
                 "freshness": "fresh",
                 "provenance": [
-                    "graph:read_cbm_graph_snapshot",
-                    "evidence:OracleEvidence::from_vault",
-                    format!("gate:advertise_grounded={}", gate.advertise_grounded),
+                    "graph:read_cbm_compact_graph_snapshot:one-retained-generation",
+                    "evidence:OracleEvidence::from_vault_at:one-owned-prefix-scan",
+                    "gate:exact-generation-attestation:admitted=true",
                 ],
             }))
         }
@@ -549,8 +571,8 @@ fn predict_mode(
                 "seeds": seed_labels,
                 "deficits": deficits,
                 "remediation": report.remediation,
-                "gate": gate.record,
-                "graph": graph_build_json(build),
+                "gate": gate,
+                "graph": projection,
                 "trust": "provisional",
                 "freshness": "fresh",
                 "provenance": ["refusal:insufficient-grounded-history:deficit-card"],
@@ -558,94 +580,6 @@ fn predict_mode(
         }
         Err(error) => Ok(oracle_error_refused(project, &error)),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn backtest_mode(
-    cache_dir: &Path,
-    project: &str,
-    graph: &ConsequenceGraph,
-    tests_by_covered: &BTreeMap<CxId, BTreeSet<CxId>>,
-    failing_subjects: &BTreeSet<CxId>,
-    evidence: &OracleEvidence,
-    build: &GraphBuild,
-) -> Result<Value, DynError> {
-    // Derive held-out cases from persisted state: each subject that carries a
-    // grounded failing outcome and is covered by a test yields the case
-    // (seed = subject, actually_failing_test = covering test). This exercises the
-    // real oracle backtest against the same corpus the predictor grounds on; it is
-    // an in-corpus self-backtest, not the crate-level held-out multi-corpus gate
-    // (#50), and is labeled as such so grounded mode is never over-advertised.
-    let mut cases: Vec<BacktestCase> = Vec::new();
-    let mut seen: BTreeSet<(CxId, CxId)> = BTreeSet::new();
-    for (&covered, tests) in tests_by_covered {
-        if !failing_subjects.contains(&covered) {
-            continue;
-        }
-        for &test in tests {
-            if seen.insert((covered, test)) {
-                cases.push(BacktestCase {
-                    seed: covered,
-                    actually_failing_test: test,
-                });
-            }
-        }
-    }
-
-    if cases.is_empty() {
-        return Ok(predict_refused(
-            project,
-            ASTRO_PREDICT_BACKTEST_NO_CASES,
-            "no held-out backtest cases: no indexed symbol carries both a grounded failing outcome and a covering test edge",
-            "ground failing outcomes via anchor_outcome and ensure the graph carries TESTS edges, then re-run mode=\"backtest\"",
-        ));
-    }
-
-    let config = PredictConfig::default();
-    let report = match run_backtest(graph, evidence, &cases, &config) {
-        Ok(report) => report,
-        Err(error) => return Ok(oracle_error_refused(project, &error)),
-    };
-
-    // Grounded confidence is advertised only when the grounded predictor strictly
-    // beat the topology baseline on this corpus (the phase-gate criterion).
-    let advertise_grounded = report.beats_baseline;
-    let record = json!({
-        "advertise_grounded": advertise_grounded,
-        "recorded_by": PREDICT_BACKTEST_ACTOR,
-        "backtest_kind": "in_corpus_self_backtest",
-        "cases": report.cases,
-        "grounded_top_k_hits": report.grounded_top_k_hits,
-        "baseline_top_k_hits": report.baseline_top_k_hits,
-        "grounded_top_k_rate": report.grounded_top_k_rate,
-        "baseline_top_k_rate": report.baseline_top_k_rate,
-        "beats_baseline": report.beats_baseline,
-        "meets_top_k_target": report.meets_top_k_target,
-        "top_k": report.top_k,
-    });
-    persist_predict_gate(cache_dir, project, &record)?;
-
-    // Independent readback: prove the persisted gate resolves to the verdict.
-    let gate = read_predict_gate(cache_dir, project)?;
-
-    Ok(json!({
-        "schema": PREDICT_IMPACT_SCHEMA,
-        "project": project,
-        "status": "backtest_recorded",
-        "advertise_grounded": gate.advertise_grounded,
-        "gate": gate.record,
-        "graph": graph_build_json(build),
-        // An in-corpus self-backtest, not the crate-level held-out gate (#50), so
-        // the report envelope is labeled provisional even though the persisted
-        // advertise_grounded verdict is a real run_backtest result.
-        "trust": "provisional",
-        "freshness": "fresh",
-        "provenance": [
-            "backtest:run_backtest",
-            "gate:persist+fsv-readback",
-            format!("gate:advertise_grounded={}", gate.advertise_grounded),
-        ],
-    }))
 }
 
 // ---------------------------------------------------------------------------

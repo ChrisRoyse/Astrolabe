@@ -32,6 +32,7 @@ use astrolabe_domain::knobs::U64KnobDeclaration;
 use calyx_core::{CxId, Ts};
 
 use crate::corpus::{OccurrenceRecord, OracleError};
+use crate::gate::validated_outcome_groups;
 
 // ---------------------------------------------------------------------------
 // Stable failure codes
@@ -62,7 +63,7 @@ pub const ORACLE_FLAKY_EVIDENCE_REMEDIATION: &str = "This test's outcome series 
 // ---------------------------------------------------------------------------
 
 /// Registry version tag for the recurrence-forecast knobs (#51).
-pub const ORACLE_FORECAST_KNOB_REGISTRY_VERSION: &str = "astrolabe-oracle-forecast-knobs-v1";
+pub const ORACLE_FORECAST_KNOB_REGISTRY_VERSION: &str = "astrolabe-oracle-forecast-knobs-v2";
 
 /// Name of the minimum-events knob (events).
 pub const ORACLE_FORECAST_MIN_EVENTS_KNOB: &str = "oracle_forecast_min_events";
@@ -98,9 +99,9 @@ pub const ORACLE_FORECAST_KNOBS: &[U64KnobDeclaration] = &[
         default: 3,
         min: 2,
         max: 1_000_000,
-        unit: "events",
+        unit: "distinct_events",
         source: "ASTROLABE blueprint 11_ORACLE §5: a cadence needs at least two intervals to have a dispersion",
-        rationale: "at least 3 events (2 intervals) are required before a median cadence and a MAD dispersion are defined; below this the tool refuses with ASTRO_NO_RECURRENCE rather than inventing a cadence from a single interval; replace with a measured minimum once cadence stability is benchmarked",
+        rationale: "at least 3 distinct events (2 intervals) are required before a median cadence and a MAD dispersion are defined; corpus callers count exact OutcomeId groups, never candidate-pair rows; below this the tool refuses with ASTRO_NO_RECURRENCE rather than inventing a cadence from a single interval; replace with a measured minimum once cadence stability is benchmarked",
     },
     U64KnobDeclaration {
         registry_version: ORACLE_FORECAST_KNOB_REGISTRY_VERSION,
@@ -160,7 +161,7 @@ pub const ORACLE_FORECAST_KNOBS: &[U64KnobDeclaration] = &[
         max: 999,
         unit: "permille",
         source: "ASTROLABE blueprint 11_ORACLE §5 oracle self-consistency (flakiness floor)",
-        rationale: "a pass/fail series whose pairwise outcome agreement falls below 0.70 (700 permille) is judged flaky, so forecast_flaky_window refuses with ASTRO_FLAKY_EVIDENCE naming the test rather than forecasting a cadence from self-inconsistent noise; replace with a measured flakiness floor once benchmarked",
+        rationale: "a pass/fail series of distinct source-backed outcomes whose pairwise agreement falls below 0.70 (700 permille) is judged flaky, so forecast_flaky_window refuses with ASTRO_FLAKY_EVIDENCE naming the test rather than forecasting a cadence from self-inconsistent noise; candidate-pair fan-out never changes the series; replace with a measured flakiness floor once benchmarked",
     },
     U64KnobDeclaration {
         registry_version: ORACLE_FORECAST_KNOB_REGISTRY_VERSION,
@@ -397,8 +398,11 @@ pub enum FlakyOutcome {
 
 /// Forecasts the recurrence cadence of a raw event series.
 ///
-/// `events` are wall-clock event instants (any order; sorted internally); `now`
-/// is the reference instant for the overdue hazard. Returns
+/// `events` are already-distinct real events represented by their wall-clock
+/// instants (any order; sorted internally); coincident events remain distinct.
+/// Corpus callers obtain this invariant from
+/// [`failure_events_from_occurrences`]. `now` is the reference instant for the
+/// overdue hazard. Returns
 /// [`ForecastOutcome::NoRecurrence`] when the series has fewer than
 /// `config.min_events` events (a labeled refusal, not an error). `subject` is
 /// carried through into the report and refusal for provenance.
@@ -410,10 +414,10 @@ pub fn forecast_recurrence(
 ) -> Result<ForecastOutcome, OracleError> {
     config.validate()?;
 
-    // Sort and de-duplicate coincident events; a recurrence is a distinct instant.
+    // Sort only. Distinct source-backed outcomes may share a coarse timestamp;
+    // collapsing them would make an instant, rather than OutcomeId, the identity.
     let mut sorted: Vec<Ts> = events.to_vec();
     sorted.sort_unstable();
-    sorted.dedup();
 
     if sorted.len() < config.min_events as usize {
         return Ok(ForecastOutcome::NoRecurrence(RecurrenceRefusal {
@@ -425,7 +429,8 @@ pub fn forecast_recurrence(
         }));
     }
 
-    // Inter-arrival intervals (strictly positive after de-dup).
+    // Inter-arrival intervals. Coincident distinct events produce an honest zero
+    // interval instead of being silently collapsed.
     let intervals: Vec<u64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
     let interval_count = intervals.len();
     let median_cadence = lower_median(&intervals);
@@ -550,31 +555,48 @@ pub fn forecast_flaky_window(
 // Adapters from the grounded corpus
 // ---------------------------------------------------------------------------
 
-/// Extracts a subject's *failing* occurrence instants (the failure-recurrence
-/// series), sorted ascending, from mined [`OccurrenceRecord`]s.
-pub fn failure_events_from_occurrences(records: &[OccurrenceRecord], subject: CxId) -> Vec<Ts> {
-    let mut events: Vec<Ts> = records
+/// Extracts one instant per distinct source-backed *failing outcome* for a
+/// subject, sorted by instant then [`crate::OutcomeId`]. Candidate-pair rows are
+/// validated as complete groups and never inflate the recurrence floor.
+pub fn failure_events_from_occurrences(
+    records: &[OccurrenceRecord],
+    subject: CxId,
+) -> Result<Vec<Ts>, OracleError> {
+    let outcomes = validated_outcome_groups(records)?;
+    let mut events: Vec<(Ts, &str)> = outcomes
         .iter()
-        .filter(|r| r.subject == subject && !r.passed)
-        .map(|r| r.outcome_ts)
+        .filter(|outcome| outcome.subject == subject && !outcome.passed)
+        .map(|outcome| (outcome.outcome_ts, outcome.outcome_id.as_str()))
         .collect();
     events.sort_unstable();
-    events
+    Ok(events.into_iter().map(|(ts, _)| ts).collect())
 }
 
-/// Extracts a subject's `(instant, passed)` outcome series, sorted by instant,
-/// from mined [`OccurrenceRecord`]s — the input to [`forecast_flaky_window`].
+/// Extracts one `(instant, passed)` observation per distinct source-backed
+/// outcome, sorted by instant then [`crate::OutcomeId`], from mined
+/// [`OccurrenceRecord`]s — the input to [`forecast_flaky_window`]. Incomplete,
+/// duplicate, or metadata-drifted candidate groups fail closed.
 pub fn outcome_series_from_occurrences(
     records: &[OccurrenceRecord],
     subject: CxId,
-) -> Vec<(Ts, bool)> {
-    let mut series: Vec<(Ts, bool)> = records
+) -> Result<Vec<(Ts, bool)>, OracleError> {
+    let outcomes = validated_outcome_groups(records)?;
+    let mut series: Vec<(Ts, &str, bool)> = outcomes
         .iter()
-        .filter(|r| r.subject == subject)
-        .map(|r| (r.outcome_ts, r.passed))
+        .filter(|outcome| outcome.subject == subject)
+        .map(|outcome| {
+            (
+                outcome.outcome_ts,
+                outcome.outcome_id.as_str(),
+                outcome.passed,
+            )
+        })
         .collect();
-    series.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    series
+    series.sort_unstable();
+    Ok(series
+        .into_iter()
+        .map(|(ts, _, passed)| (ts, passed))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +662,7 @@ fn cusum_regime_changes(
     changes
 }
 
-fn choose2(k: usize) -> usize {
-    k.saturating_mul(k.saturating_sub(1)) / 2
+fn choose2(k: usize) -> u128 {
+    let k = k as u128;
+    k * k.saturating_sub(1) / 2
 }

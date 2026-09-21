@@ -319,7 +319,7 @@ fn happy_and_boundaries(root: &Path) -> Value {
 
     let session = vault.sst_read_session().expect("open retained SST session");
     assert_eq!(session.snapshot_seq(), seq_ledger);
-    let plan = vec![
+    let plan = [
         (ColumnFamily::Kv, b"bravo".to_vec()),
         (ColumnFamily::Kv, b"missing".to_vec()),
         (ColumnFamily::Kv, b"alpha".to_vec()),

@@ -1,5 +1,14 @@
 use super::*;
 
+struct RouterKeyPlanContext<'context, 'key> {
+    snapshot: Snapshot,
+    cf: ColumnFamily,
+    unresolved: &'context [(usize, &'key [u8])],
+    metrics: OrderedReadbackMetrics,
+    router: &'context CfRouter,
+    clock: &'context dyn Clock,
+}
+
 impl VersionedCfStore {
     /// Reads one CF/key at the pinned sequence.
     pub fn read_at(
@@ -207,10 +216,7 @@ impl VersionedCfStore {
                 let lower = Bound::Included((cf, keys[0].1.to_vec()));
                 let mut rows = table.range((lower, Bound::Unbounded)).peekable();
                 for (position, (ordinal, key)) in keys.iter().enumerate() {
-                    loop {
-                        let Some(((row_cf, row_key), versions)) = rows.peek() else {
-                            break;
-                        };
+                    while let Some(((row_cf, row_key), versions)) = rows.peek() {
                         if *row_cf != cf || row_key.as_slice() > *key {
                             break;
                         }
@@ -294,12 +300,14 @@ impl VersionedCfStore {
                 ))
             })?;
             return self.visit_router_key_plan(
-                snapshot,
-                cf,
-                &unresolved,
-                metrics,
-                router,
-                clock,
+                RouterKeyPlanContext {
+                    snapshot,
+                    cf,
+                    unresolved: &unresolved,
+                    metrics,
+                    router,
+                    clock,
+                },
                 on_value,
             );
         }
@@ -316,27 +324,40 @@ impl VersionedCfStore {
             }
             return Ok(metrics);
         };
-        self.visit_router_key_plan(snapshot, cf, &unresolved, metrics, router, clock, on_value)
+        self.visit_router_key_plan(
+            RouterKeyPlanContext {
+                snapshot,
+                cf,
+                unresolved: &unresolved,
+                metrics,
+                router,
+                clock,
+            },
+            on_value,
+        )
     }
 
     fn visit_router_key_plan<E, F>(
         &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        unresolved: &[(usize, &[u8])],
-        mut metrics: OrderedReadbackMetrics,
-        router: &CfRouter,
-        clock: &dyn Clock,
+        context: RouterKeyPlanContext<'_, '_>,
         on_value: &mut F,
     ) -> std::result::Result<OrderedReadbackMetrics, E>
     where
         E: From<calyx_core::CalyxError>,
         F: FnMut(usize, Option<&[u8]>) -> std::result::Result<(), E>,
     {
+        let RouterKeyPlanContext {
+            snapshot,
+            cf,
+            unresolved,
+            mut metrics,
+            router,
+            clock,
+        } = context;
         let mut router_rows = 0_u64;
         let mut router_bytes = 0_u64;
         let mut max_value_bytes = 0_u64;
-        let router_metrics = router.visit_key_plan(cf, &unresolved, &mut |ordinal, value| {
+        let router_metrics = router.visit_key_plan(cf, unresolved, &mut |ordinal, value| {
             // Every row resolved from an immutable generation is demonstrated
             // forward progress. This is the loop that runs for minutes on a
             // corpus-sized plan, so it owns keeping the lease alive (#980).
@@ -529,7 +550,8 @@ impl VersionedCfStore {
         Ok(())
     }
 
-    pub(super) fn ensure_cf_selected(&self, cf: ColumnFamily) -> Result<()> {
+    pub(crate) fn ensure_cf_selected(&self, cf: ColumnFamily) -> Result<()> {
+        self.ensure_no_terminal_durable_fault()?;
         if let Some(selected) = &self.selected_cfs
             && !selected.contains(&cf)
         {

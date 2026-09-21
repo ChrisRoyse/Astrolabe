@@ -51,6 +51,10 @@ const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SALT: &[u8] = b"issue-594-compression-ledger-fsv";
 
 type AnyResult<T> = Result<T, Box<dyn Error>>;
+type ResealBatch = (
+    Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    Vec<GenerationLifecycleRecord>,
+);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct RowEvidence {
@@ -471,13 +475,7 @@ fn exercise_multislot_erase(vault_dir: &Path) -> AnyResult<()> {
     Ok(())
 }
 
-fn reseal_rows(
-    vault: &AsterVault<SystemClock>,
-    slots: &[SlotId],
-) -> AnyResult<(
-    Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
-    Vec<GenerationLifecycleRecord>,
-)> {
+fn reseal_rows(vault: &AsterVault<SystemClock>, slots: &[SlotId]) -> AnyResult<ResealBatch> {
     let snapshot = vault.latest_seq();
     let mut rows = Vec::with_capacity(slots.len() * 2);
     let mut records = Vec::with_capacity(slots.len());

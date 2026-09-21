@@ -57,6 +57,9 @@ pub struct GenerationDeleteReport {
     pub ledger: LedgerRef,
 }
 
+/// One owned column-family write in a compression-generation transaction.
+pub(super) type CompressionWriteRow = (ColumnFamily, Vec<u8>, Vec<u8>);
+
 /// Adds `new_rows` to an already-manifested generation, resealing the whole
 /// column under a fresh generation root (`AppendReseal`).
 ///
@@ -371,7 +374,7 @@ pub(super) fn lifecycle_record_row_from_report(
     prior_seq: Seq,
     report: &SlotCompressionReport,
     affected: &[CxId],
-) -> Result<(ColumnFamily, Vec<u8>, Vec<u8>)> {
+) -> Result<CompressionWriteRow> {
     let manifest = parse_compression_manifest(&report.generation_manifest_bytes)?;
     let record = GenerationLifecycleRecord::new(
         transition,
@@ -436,7 +439,7 @@ fn commit_reseal<C: Clock>(
 fn generation_column_writes(
     slot: &Slot,
     report: &SlotCompressionReport,
-) -> Result<Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>> {
+) -> Result<Vec<CompressionWriteRow>> {
     let capacity = report
         .rows
         .len()

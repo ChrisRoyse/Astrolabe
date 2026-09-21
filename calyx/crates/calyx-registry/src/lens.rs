@@ -14,12 +14,12 @@ mod contract;
 pub use contract::validate_quant_policy_for_shape;
 
 use crate::compression::{
-    self, CompressedSlotIndex, CompressionAdmissionReadback, CompressionAdmissionStatus,
-    CompressionCandidateCommissionReadback, CompressionCandidateEvaluationReadback,
-    CompressionCandidateEvaluationRequest, CompressionCandidateReference, CompressionQuery,
-    GenerationDeleteReport, MultiVectorCompressionConfig, MultiVectorCompressionQuery,
-    MultiVectorCompressionReport, MultiVectorCompressionRow, MxFp4AssayEvidence,
-    PackedMultiVectorIndex, SlotCompressionReport,
+    self, CompressedGenerationIdentity, CompressedSlotIndex, CompressionAdmissionReadback,
+    CompressionAdmissionStatus, CompressionCandidateCommissionReadback,
+    CompressionCandidateEvaluationReadback, CompressionCandidateEvaluationRequest,
+    CompressionCandidateReference, CompressionQuery, GenerationDeleteReport,
+    MultiVectorCompressionConfig, MultiVectorCompressionQuery, MultiVectorCompressionReport,
+    MultiVectorCompressionRow, MxFp4AssayEvidence, PackedMultiVectorIndex, SlotCompressionReport,
 };
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
@@ -294,6 +294,23 @@ impl Registry {
     {
         let spec = self.compression_spec(slot)?;
         CompressedSlotIndex::open(vault, slot, spec)
+    }
+
+    /// Reads and validates one manifested compression generation without
+    /// constructing codec geometry. Representation binding/status paths need
+    /// only the immutable manifest identity; actual row decoding continues to
+    /// use [`Self::compressed_slot_index`].
+    pub fn compressed_generation_identity_at<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        snapshot: Seq,
+    ) -> Result<CompressedGenerationIdentity>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::generation_identity_without_codec_at(vault, slot, spec, snapshot)
     }
 
     /// Builds and times one real candidate generation, then evaluates and

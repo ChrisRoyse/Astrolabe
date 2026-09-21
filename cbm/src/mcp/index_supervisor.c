@@ -10,7 +10,7 @@
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "foundation/sha256.h"
 #include "foundation/worker_progress.h"
-#include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
+#include "ui/http_server.h"      /* exact configured worker binary */
 #include <yyjson/yyjson.h>
 
 #ifdef ASTRO_ENV_STORE
@@ -343,11 +343,20 @@ int cbm_index_spawn_worker(const char *args_json, cbm_index_worker_result_t *res
         return 0;
     }
 
-    char self[1024] = {0};
-    if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
-        cbm_log_error("index.supervisor.no_self_path", "action", "fail_closed");
+    const cbm_worker_binary_status_t binary_status = CBM_WORKER_BINARY_UNBOUND;
+    const char *self = cbm_http_server_binary_path();
+    if (!self) {
+        result->progress_error_code =
+            cbm_strdup(cbm_http_server_binary_status_code(binary_status));
+        result->progress_error_detail =
+            cbm_strdup(cbm_http_server_binary_status_message(binary_status));
+        cbm_log_error("index.supervisor.binary_path", "code",
+                      cbm_http_server_binary_status_code(binary_status), "message",
+                      cbm_http_server_binary_status_message(binary_status), "remediation",
+                      cbm_http_server_binary_status_remediation(binary_status));
         return -1;
     }
+    cbm_log_info("index.supervisor.binary_path", "path", self, "source", "configured_exact");
 
     int pid = (int)cbm_getpid();
     char workspace[1024];

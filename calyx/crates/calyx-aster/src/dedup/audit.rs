@@ -125,6 +125,7 @@ fn dedup_undo_locked<C>(vault: &AsterVault<C>, token: &ReversalToken) -> Result<
 where
     C: Clock,
 {
+    let evaluation_seq = vault.snapshot();
     validate_token_vault(vault, token)?;
     if let Some(restored) = already_undone(vault, token)? {
         return Ok(restored);
@@ -201,6 +202,7 @@ where
     let payload = undo_payload(token, &restored)?;
     let subject = token_subject(token)?;
     vault.commit_dedup_undo(
+        evaluation_seq,
         restored_cx,
         updated_bases,
         recurrence_rows,

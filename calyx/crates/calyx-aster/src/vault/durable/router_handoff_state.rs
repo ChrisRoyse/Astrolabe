@@ -40,7 +40,10 @@ impl DurableVault {
         &self,
     ) -> Result<Option<DurableManifestIdentity>> {
         let current_path = self.root.join("CURRENT");
-        if !current_path.exists() {
+        if !current_path
+            .try_exists()
+            .map_err(|error| storage_error("inspect current handoff manifest", error))?
+        {
             return Ok(None);
         }
         let store = ManifestStore::open(&self.root);
@@ -138,7 +141,10 @@ impl DurableVault {
 
 fn read_state(root: &Path) -> Result<Option<RouterHandoffStateV1>> {
     let path = root.join(ROUTER_HANDOFF_FILE);
-    if !path.exists() {
+    if !path
+        .try_exists()
+        .map_err(|error| storage_error("inspect ROUTER_HANDOFF", error))?
+    {
         return Ok(None);
     }
     let bytes = fs::read(&path).map_err(|error| storage_error("read ROUTER_HANDOFF", error))?;

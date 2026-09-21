@@ -54,8 +54,8 @@
 //!
 //! # Debt-based recomposition (segment/LSM pattern)
 //!
-//! Per-repo kernels accumulate change **debt** against the fleet kernel's
-//! compose sidecar baseline (`repos[].members_hash` pairs): a changed,
+//! Per-repo kernels accumulate change **debt** against the atomic fleet
+//! generation's immutable source roster (`store_key,compose_source_hash` pairs): a changed,
 //! added, or removed pair is one unit of debt. Below the declared
 //! `fleet.grow.debt_threshold_repos` knob the cycle records an explicit
 //! `deferred_below_threshold` decision; at or above it, the cycle runs the
@@ -86,24 +86,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use astrolabe_ingest::read_persisted_kernel_artifact;
 use astrolabe_kernel::U64KnobDeclaration;
 use calyx_aster::cf::ColumnFamily;
-use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{CalyxError, VaultId};
+use calyx_core::CalyxError;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{FarmConfig, Selection, run_clone_pass_outcome, safe_reason};
-use crate::compose::{ComposeConfig, FLEET_KERNEL_REPORT_KIND, compose_fleet_kernel};
+use crate::compose::{
+    ASTRO_FLEET_KERNEL_MISSING, ComposeConfig, compose_fleet_kernel, load_repo_kernel,
+};
 use crate::discover::run_discovery;
+use crate::kernel_generation::{FleetKernelAdmissionInput, read_current_fleet_kernel_generation};
 use crate::orchestrator::{
-    PipelineConfig, SHADOW_VAULT_ID, project_name, repo_store_identity, run_pipeline_pass_outcome,
-    shadow_vault_salt,
+    PipelineConfig, project_name, repo_store_identity, run_pipeline_pass_outcome,
 };
 use crate::record::{FleetRepoRow, SourceRetirementStage, TransitionContext};
 use crate::retirement::{RetirementConfig, run_source_retirement_pass};
@@ -218,6 +217,9 @@ pub struct GrowConfig {
     pub max_repos_per_cycle: u64,
     /// Recomposition debt threshold ([`KNOB_DEBT_THRESHOLD`]).
     pub debt_threshold_repos: u64,
+    /// Explicit genuine external fleet query capture and generation controls.
+    /// There is deliberately no default or synthesized corpus.
+    pub fleet_admission: FleetKernelAdmissionInput,
     /// Clone-farm knobs for the update-fetch and acquire phases.
     pub farm: FarmConfig,
     /// Pipeline knobs for the (re-)index phase.
@@ -230,6 +232,7 @@ impl GrowConfig {
         catalog_root: std::path::PathBuf,
         farm: FarmConfig,
         pipeline: PipelineConfig,
+        fleet_admission: FleetKernelAdmissionInput,
     ) -> Self {
         Self {
             catalog_root,
@@ -243,6 +246,7 @@ impl GrowConfig {
             force_repos: Vec::new(),
             max_repos_per_cycle: knob_default(KNOB_MAX_REPOS_PER_CYCLE),
             debt_threshold_repos: knob_default(KNOB_DEBT_THRESHOLD),
+            fleet_admission,
             farm,
             pipeline,
         }
@@ -252,52 +256,56 @@ impl GrowConfig {
     pub fn validate(&self) -> Result<(), CalyxError> {
         check_range(KNOB_MAX_REPOS_PER_CYCLE, self.max_repos_per_cycle)?;
         check_range(KNOB_DEBT_THRESHOLD, self.debt_threshold_repos)?;
+        self.fleet_admission.validate()?;
         Ok(())
     }
 }
 
-/// Opens a repo's shadow vault read-only and reads back its persisted kernel
-/// artifact's members-hash — the light debt probe (no corpus/vector load).
-/// `Ok(None)` when the vault or artifact does not exist.
-fn repo_kernel_members_hash(
+/// Rebuilds one repo's exact compose-input identity through the same atomic
+/// current generation, projection, anchors, Base/input rows, and complete S20
+/// vectors consumed by composition. Missing, corrupt, legacy-fixed-only, or
+/// source-drifted state is a hard refusal; the debt census never substitutes a
+/// member-roster-only identity.
+///
+/// # Cost contract (#1064)
+///
+/// For `R` kerneled repositories this performs
+/// `O(sum(N_i + E_i + A_i + B_i + K_i*D_i))`: each current graph projection,
+/// anchor/promotion rollup, checksum-bound composite generation, exact
+/// Cx-addressed Base/Blob inputs, complete S20 vectors, and current/previous
+/// physical Ledger point reads.
+/// Production `N=192,873`, `E=328,899` were measured 2026-08-20; `A_i`, `B_i`,
+/// and `K_i`/`D_i` are persisted outputs, not fixture guesses. Repository identity,
+/// current pointer/generation, projection, anchor roster, member roster, and
+/// source binding are invariant
+/// within each read (PC-03/04/07/14/15/28/32/35/37/41/43).
+fn repo_kernel_compose_source_hash(
     store_root: &Path,
     row: &FleetRepoRow,
-) -> Result<Option<String>, CalyxError> {
+) -> Result<String, CalyxError> {
     let identity = repo_store_identity(row)?;
-    let vault_dir = store_root
-        .join(&identity.store_key)
-        .join(format!("{}.astrolabe-vault", identity.index_project));
-    if !vault_dir.exists() {
-        return Ok(None);
-    }
-    let vault_id = VaultId::from_str(SHADOW_VAULT_ID).map_err(|error| CalyxError {
-        code: "ASTRO_FLEET_STORE_UNAVAILABLE",
-        message: format!("shadow vault id failed to parse: {error:?}"),
-        remediation: "internal defect: SHADOW_VAULT_ID must be a valid ULID",
-    })?;
-    let vault = AsterVault::open(
-        &vault_dir,
-        vault_id,
-        shadow_vault_salt(&identity.index_project).into_bytes(),
-        VaultOptions {
-            restore_mvcc_rows: false,
-            restore_ledger_hook: false,
-            read_only: true,
-            selected_cfs: Some(vec![ColumnFamily::Kernel]),
-            ..VaultOptions::default()
-        },
-    )?;
-    let artifact = read_persisted_kernel_artifact(&vault, &identity.kernel_scope).map_err(
-        |error| CalyxError {
+    let load = load_repo_kernel(
+        store_root,
+        &identity.store_key,
+        &identity.index_project,
+    )
+    .map_err(|error| CalyxError {
             code: "ASTRO_FLEET_KERNEL_READBACK",
             message: format!(
-                "read per-repo kernel artifact for {}: {error}",
-                identity.kernel_scope
+                "read exact current compose input for {}: underlying_code={} underlying_message={:?}",
+                identity.kernel_scope, error.code, error.message
             ),
-            remediation: "the per-repo kernel row is unreadable; re-run the pipeline for this repo",
-        },
-    )?;
-    Ok(artifact.map(|artifact| artifact.members_hash))
+            remediation: "preserve the per-repo vault and repair or rebuild its complete atomic generation, projection, anchors, Base inputs, and S20 rows before retrying debt accounting",
+        })?
+    .ok_or_else(|| CalyxError {
+        code: ASTRO_FLEET_KERNEL_MISSING,
+        message: format!(
+            "catalog row {} is kerneled but scope {} has no exact current compose input",
+            row.record.full_name, identity.kernel_scope
+        ),
+        remediation: "re-run the pipeline for this repo; a missing composite generation or incomplete source/vector input cannot participate in fleet debt accounting",
+    })?;
+    Ok(load.compose_source_hash)
 }
 
 /// Walks the catalog ledger once and returns, per `github_id`, the head the
@@ -868,61 +876,40 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         }
     };
 
-    // Phase 7: debt accounting against the compose sidecar baseline, then
-    // debt-gated recomposition (both outcomes explicit).
+    // Phase 7: debt accounting against the atomic fleet-generation baseline,
+    // then debt-gated recomposition (both outcomes explicit). External-query
+    // admission is generation input: changing it forces recomposition even
+    // when every repository source is byte-identical.
     let kerneled_rows = catalog.query(Some(RepoState::Kerneled), None)?;
     let debt_report = if kerneled_rows.is_empty() {
         json!({"skipped": "no kerneled repos; nothing to compose"})
     } else {
-        let baseline: BTreeMap<String, String> =
-            match catalog.read_fleet_report(FLEET_KERNEL_REPORT_KIND, &config.scope)? {
-                Some(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                    Ok(sidecar) => sidecar["repos"]
-                        .as_array()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .filter_map(|repo| {
-                            Some((
-                                repo["project"].as_str()?.to_string(),
-                                repo["members_hash"].as_str()?.to_string(),
-                            ))
-                        })
+        let (baseline, baseline_admission): (BTreeMap<String, String>, Option<String>) =
+            match read_current_fleet_kernel_generation(catalog.vault(), &config.scope) {
+                Ok(Some(generation)) => (
+                    generation
+                        .source_roster
+                        .repositories
+                        .into_iter()
+                        .map(|repo| (repo.store_key, repo.compose_source_hash))
                         .collect(),
-                    Err(error) => {
-                        errors.push(cycle_error(
-                        "debt",
-                        &CalyxError {
-                            code: "ASTRO_FLEET_KERNEL_READBACK",
-                            message: format!(
-                                "fleet-kernel sidecar for {} did not parse: {error}",
-                                config.scope
-                            ),
-                            remediation: "recompose the fleet kernel; the sidecar row is corrupt",
-                        },
-                    ));
-                        BTreeMap::new()
-                    }
-                },
-                None => BTreeMap::new(),
+                    Some(generation.manifest.admission_input_blake3),
+                ),
+                Ok(None) => (BTreeMap::new(), None),
+                Err(error) => {
+                    errors.push(cycle_error("debt", &error));
+                    (BTreeMap::new(), None)
+                }
             };
+        let current_admission = config.fleet_admission.identity_blake3()?;
+        let admission_changed = baseline_admission.as_deref() != Some(current_admission.as_str());
         let mut current: BTreeMap<String, String> = BTreeMap::new();
         for row in &kerneled_rows {
             let project = project_name(&row.record.full_name);
-            match repo_kernel_members_hash(&config.pipeline.store_root, row) {
-                Ok(Some(hash)) => {
+            match repo_kernel_compose_source_hash(&config.pipeline.store_root, row) {
+                Ok(hash) => {
                     current.insert(project, hash);
                 }
-                Ok(None) => errors.push(cycle_error(
-                    "debt",
-                    &CalyxError {
-                        code: "ASTRO_FLEET_KERNEL_MISSING",
-                        message: format!(
-                            "catalog row {} is kerneled but its store holds no kernel artifact",
-                            row.record.full_name
-                        ),
-                        remediation: "re-run the pipeline for this repo; the catalog and store disagree",
-                    },
-                )),
                 Err(error) => errors.push(cycle_error("debt", &error)),
             }
         }
@@ -942,10 +929,10 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         let debt = (changed.len() + added.len() + removed.len()) as u64;
         let decision;
         let compose_summary;
-        if debt == 0 {
+        if debt == 0 && !admission_changed {
             decision = "no_debt";
-            compose_summary = json!({"skipped": "compose input pairs match the sidecar baseline"});
-        } else if debt < config.debt_threshold_repos {
+            compose_summary = json!({"skipped": "repository source pairs and explicit external-query admission match the atomic generation baseline"});
+        } else if !admission_changed && debt < config.debt_threshold_repos {
             decision = "deferred_below_threshold";
             compose_summary = json!({
                 "skipped": format!(
@@ -954,7 +941,11 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
                 ),
             });
         } else {
-            decision = "recomposed";
+            decision = if admission_changed {
+                "recomposed_admission_changed"
+            } else {
+                "recomposed_repository_debt"
+            };
             let mut projects: Vec<String> = current.keys().cloned().collect();
             projects.sort();
             compose_summary = match compose_fleet_kernel(
@@ -963,6 +954,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
                 &config.scope,
                 &projects,
                 &ComposeConfig::with_registry_defaults(),
+                &config.fleet_admission,
             ) {
                 Ok(summary) => summary,
                 Err(error) => {
@@ -978,6 +970,9 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
             "added": added,
             "removed": removed,
             "debt": debt,
+            "baseline_admission_input_blake3": baseline_admission,
+            "current_admission_input_blake3": current_admission,
+            "admission_changed": admission_changed,
             "debt_threshold_repos": config.debt_threshold_repos,
             "decision": decision,
             "compose": compose_summary,
@@ -985,8 +980,9 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     };
 
     // Phase 8: optional post-compose source retirement (#807). The retirement
-    // path independently proves each exact per-repo kernel is present in the
-    // current fleet sidecar/artifact before reclaiming its checkout.
+    // path independently proves each exact per-repo kernel generation/source
+    // binding is present in the current atomic fleet generation before
+    // reclaiming its checkout.
     let retirement = if config.retire_sources {
         let workset: BTreeSet<&str> = worklist.iter().map(String::as_str).collect();
         let eligible: Vec<String> = catalog

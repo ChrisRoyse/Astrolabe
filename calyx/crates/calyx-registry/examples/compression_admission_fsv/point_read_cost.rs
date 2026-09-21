@@ -1014,14 +1014,14 @@ fn measure_column(
         require_dense_shape(&vector)?;
     }
     let mut allocation_samples = Vec::with_capacity(COST_SAMPLES as usize);
-    let mut decoded_sha256 = None;
+    let mut decoded_sha256: Option<String> = None;
     for sample in 0..COST_SAMPLES {
         let (result, allocation) = count_allocations(|| index.read_at(point_cx_id, snapshot));
         let vector = result?;
         let digest = require_dense_shape(&vector)?;
-        if let Some(expected) = &decoded_sha256 {
+        if let Some(expected) = decoded_sha256.as_deref() {
             require(
-                expected == &digest,
+                expected == digest.as_str(),
                 format!("allocation sample {sample} changed decoded vector bytes"),
             )?;
         } else {
@@ -1048,7 +1048,7 @@ fn measure_column(
             .map_err(|_| "point-read latency exceeds u64 nanoseconds")?;
         let digest = require_dense_shape(&vector)?;
         require(
-            elapsed > 0 && decoded_sha256.as_ref() == Some(&digest),
+            elapsed > 0 && decoded_sha256.as_deref() == Some(digest.as_str()),
             format!("latency sample {sample} was zero or changed decoded vector bytes"),
         )?;
         latency_samples_ns.push(elapsed);
@@ -1224,7 +1224,7 @@ fn capture_selected_value(
         )));
     }
     output.push(SelectedValueEvidence {
-        role: (*role).to_string(),
+        role: role.to_string(),
         column_family: cf.name().to_string(),
         key_hex: hex(key),
         value_bytes: value.len() as u64,
@@ -1332,7 +1332,7 @@ fn preflight_point_cost_source(
             project == PRODUCTION_PROJECT
                 && blob.len() == PRODUCTION_DIM as usize
                 && last_node_id.is_none_or(|previous| previous < node_id)
-                && !blob.iter().any(|byte| *byte == 0x80),
+                && !blob.contains(&0x80),
             format!("point-cost preflight row {node_id} violated project/dimension/order/int8"),
         )?;
         count = count

@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use astrolabe_anchors::archaeology::{
-    GitArchaeologyConfig, GitHistoryState, GitLineRange, GitMineMode,
+    GitArchaeologyConfig, GitArchaeologyReport, GitHistoryState, GitLineRange, GitMineMode,
     mine_git_archaeology_at_history,
 };
 use astrolabe_anchors::{
@@ -185,6 +185,10 @@ struct ArchaeologyPersistenceWindow {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GitArchaeologyImportReport {
+    /// Exact already-mined archaeology output for Oracle corpus generation.
+    /// Keeping it in this transaction prevents a second full Git-history scan
+    /// (PC-04); it is not serialized into the public import summary.
+    pub(crate) oracle_mining: Option<GitArchaeologyReport>,
     pub(crate) history: Option<GitHistoryState>,
     pub(crate) head: Option<String>,
     pub(crate) mode: &'static str,
@@ -521,8 +525,23 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     } else {
         (ARCHAEOLOGY_SOURCE_PARENT_REPO, Some(corpus_rel.clone()))
     };
+    let mut oracle_mining = mined.clone();
+    if !corpus_rel.is_empty() {
+        let corpus_prefix = format!("{corpus_rel}/");
+        oracle_mining
+            .szz_findings
+            .retain(|finding| normalized_path(&finding.path).starts_with(&corpus_prefix));
+        for finding in &mut oracle_mining.szz_findings {
+            let normalized = normalized_path(&finding.path);
+            finding.path = normalized
+                .strip_prefix(&corpus_prefix)
+                .map(str::to_string)
+                .unwrap_or(normalized);
+        }
+    }
     if matches!(&mined.history, GitHistoryState::Unborn { .. }) {
         return Ok(GitArchaeologyImportReport {
+            oracle_mining: Some(oracle_mining),
             history: Some(mined.history),
             head: None,
             mode: "history_absent",
@@ -691,6 +710,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     }
 
     let mut report = GitArchaeologyImportReport {
+        oracle_mining: Some(oracle_mining),
         history: Some(mined.history),
         head: Some(mined_head),
         mode: mode_name,

@@ -21,8 +21,23 @@ where
         DurableVault::validate_options(&options)?;
         let clock = std::sync::Arc::new(clock);
         let vault_root = vault_dir.as_ref().to_path_buf();
+        if !options.read_only {
+            std::fs::create_dir_all(vault_root.join("locks")).map_err(|error| {
+                CalyxError::disk_pressure(format!(
+                    "create durable vault lock directory {}: {error}",
+                    vault_root.join("locks").display()
+                ))
+            })?;
+        }
         let read_snapshot_lock_started = std::time::Instant::now();
         let read_snapshot_lock_usage_before = current_process_usage()?;
+        let _write_open_snapshot_guard = if options.read_only {
+            None
+        } else {
+            Some(crate::file_lock::FileLockGuard::acquire(
+                &vault_root.join("locks").join("durable.commit.lock"),
+            )?)
+        };
         let read_snapshot_guard = if options.read_only {
             Some(crate::file_lock::FileLockGuard::acquire_shared_existing(
                 &vault_root.join("locks").join("durable.commit.lock"),
@@ -91,10 +106,13 @@ where
         };
         if recovery.mode == durable::RecoveryMode::LatestRouter {
             router.replay_latest_rows(recovery.batches.iter().flat_map(|batch| {
-                batch
-                    .rows
-                    .iter()
-                    .map(move |row| (batch.seq, row.cf, row.key.as_slice(), row.value.as_slice()))
+                batch.rows.iter().filter_map(move |row| {
+                    options
+                        .selected_cfs
+                        .as_ref()
+                        .is_none_or(|selected| selected.contains(&row.cf))
+                        .then_some((batch.seq, row.cf, row.key.as_slice(), row.value.as_slice()))
+                })
             }))?;
         }
         let router_us = elapsed_us(router_started);
@@ -122,33 +140,47 @@ where
                 .collect()
         };
         for batch in recovery.batches {
+            if batch
+                .rows
+                .iter()
+                .any(|row| row.cf.feeds_derived_search_content())
+            {
+                rows.advance_derived_content_seq_to_at_least(batch.seq);
+            }
             match recovery.mode {
                 durable::RecoveryMode::FullMvcc => {
                     let rows_at_seq = batch
                         .rows
                         .into_iter()
+                        .filter(|row| {
+                            options
+                                .selected_cfs
+                                .as_ref()
+                                .is_none_or(|selected| selected.contains(&row.cf))
+                        })
                         .map(|row| (row.cf, row.key, row.value));
                     rows.restore_mvcc_batch(batch.seq, rows_at_seq)?;
                 }
-                durable::RecoveryMode::LatestRouter => {
-                    if batch
-                        .rows
-                        .iter()
-                        .any(|row| row.cf.feeds_derived_search_content())
-                    {
-                        rows.advance_derived_content_seq_to_at_least(batch.seq);
-                    }
-                }
+                durable::RecoveryMode::LatestRouter => {}
             }
         }
+        rows.install_recovered_cf_content_generations(
+            recovery.cf_content_generation_floor_seq,
+            recovery.cf_content_generations.clone(),
+        )?;
         rows.set_start_seq(recovery.last_recovered_seq)?;
         if recovery.mode == durable::RecoveryMode::FullMvcc {
             // Full-restore contract (issue #1132): every row physically held
             // in Router-class SSTs must be visible to the restored MVCC state,
             // otherwise snapshot reads on this handle silently miss it.
+            let selected_cfs = options
+                .selected_cfs
+                .as_ref()
+                .map(|selected| selected.iter().copied().collect::<std::collections::BTreeSet<_>>());
             let violations = durable::router_coverage::router_only_rows(
                 vault_dir.as_ref(),
                 options.tiering_policy.as_ref(),
+                selected_cfs.as_ref(),
                 |cf, key| rows.has_any_version(cf, key),
             )?;
             if !violations.is_empty() {

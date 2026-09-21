@@ -264,10 +264,10 @@ fn legacy_lensforge_manifest_v1_ids(
         )),
         _ => None,
     };
-    if let Some(debug) = pre_gpu_runtime {
-        if !runtime_debugs.contains(&debug) {
-            runtime_debugs.push(debug);
-        }
+    if let Some(debug) = pre_gpu_runtime
+        && !runtime_debugs.contains(&debug)
+    {
+        runtime_debugs.push(debug);
     }
     Ok(runtime_debugs
         .into_iter()

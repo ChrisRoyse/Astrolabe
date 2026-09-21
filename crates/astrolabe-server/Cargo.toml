@@ -7,7 +7,7 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-manual-fsv = []
+manual-fsv = ["astrolabe-fleet/manual-fsv"]
 
 [dependencies]
 astrolabe-anchors.workspace = true
@@ -46,6 +46,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
+[build-dependencies]
+sha2 = "0.10"
+
 [lib]
 path = "src/lib.rs"
 
@@ -71,4 +74,12 @@ required-features = ["manual-fsv"]
 
 [[example]]
 name = "issue_557_564_compression_mcp_fsv"
+required-features = ["manual-fsv"]
+
+[[example]]
+name = "issue_1116_1119_fsv"
+required-features = ["manual-fsv"]
+
+[[example]]
+name = "issue_1151_fleet_generation_fsv"
 required-features = ["manual-fsv"]

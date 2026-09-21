@@ -84,7 +84,9 @@ where
                     value: row.value().to_vec(),
                 }));
                 let seq = self.commit_rows_locked_owned(rows, false)?;
-                ledger_hook::commit_staged(&mut guard, &staged)?;
+                ledger_hook::commit_staged(&mut guard, &staged).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(seq, &error)
+                })?;
                 return Ok(LedgerBoundGroupBatchReceipt {
                     seq,
                     groups: receipts,

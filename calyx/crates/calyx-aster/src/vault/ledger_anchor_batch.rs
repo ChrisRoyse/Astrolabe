@@ -122,9 +122,11 @@ where
                 key: row.key().to_vec(),
                 value: row.value().to_vec(),
             }));
-            self.commit_rows_locked(&rows)?;
+            let committed_seq = self.commit_rows_locked(&rows)?;
             for row in &staged {
-                guard.commit_staged(row)?;
+                guard.commit_staged(row).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(committed_seq, &error)
+                })?;
             }
             Ok(ledger_ref)
         })
@@ -284,6 +286,17 @@ where
         }
         rows.sort_by_key(|row| row.seq);
         Ok(rows)
+    }
+
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        Ok(self
+            .vault
+            .read_cf_at(
+                self.vault.snapshot(),
+                ColumnFamily::Ledger,
+                &ledger_key(seq),
+            )?
+            .map(|bytes| LedgerRow { seq, bytes }))
     }
 
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {

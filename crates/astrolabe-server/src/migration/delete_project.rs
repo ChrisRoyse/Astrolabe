@@ -256,8 +256,8 @@ pub(crate) fn handle_delete_project(
         // The C store delete reported an error. Only a "not_found" is eligible
         // for the residue-recovery remap (#429): a genuine "delete_failed" means
         // `<name>.db` is present but its unlink failed — that MUST stay an error,
-        // never masked. Read the C status (absent from structuredContent on an
-        // error result, so `tool_result_c_status` also parses content[0].text).
+        // never masked. Read the C status from either the object mirror or the
+        // legacy content[0].text fallback through `tool_result_c_status`.
         let c_status = tool_result_c_status(&base_result);
         // Did THIS call actually erase host-owned residue? Use the file/dir sidecar
         // removals (`removed`) as the signal: every ASTRO_DELETE_PROJECT_SIDECAR_

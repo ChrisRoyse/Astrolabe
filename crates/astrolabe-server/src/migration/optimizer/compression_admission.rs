@@ -399,7 +399,7 @@ pub(crate) fn commission_optimizer_compression_candidates_json_at(
     calyx_registry::preflight_compression_candidate_operation(&candidate_slot_values, &request)
         .map_err(|error| -> DynError {
             ToolFault::new(
-                error.code.clone(),
+                error.code,
                 format!(
                     "project {project:?} compression-admission {OPERATION_PREFLIGHT_STAGE} failed: {}",
                     error.message
@@ -454,11 +454,15 @@ pub(crate) fn commission_optimizer_compression_candidates_json_at(
         };
         slots.push(slot);
     }
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Compression, ColumnFamily::Ledger],
+        vec![
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
     )?;
     let before_seq = vault.latest_seq();
     let candidate_slots = slots
@@ -654,11 +658,15 @@ pub(crate) fn select_optimizer_compression_candidates_json_at(
             receipt_sha256: *receipt_sha256,
         });
     }
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Compression, ColumnFamily::Ledger],
+        vec![
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
     )?;
     let before_seq = vault.latest_seq();
     let selected = panel_state

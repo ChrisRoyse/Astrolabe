@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use calyx_aster::manifest::{ImmutableRef, ManifestStore, VaultManifest};
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Panel, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Panel, Result, SlotId, SlotShape, SlotVector,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence_contracts::{contract_field_diffs, load_runtime_lens_from_spec};
@@ -47,6 +49,35 @@ pub struct VaultPanelState {
     pub panel: Panel,
     pub registry: Registry,
     pub registry_snapshot: Option<VaultRegistrySnapshot>,
+    pub(crate) slot_indices: BTreeMap<SlotId, usize>,
+}
+
+impl VaultPanelState {
+    /// Constructs one panel/Registry interpretation and its deterministic slot
+    /// lookup index. Duplicate SlotIds refuse before any resolution path can
+    /// observe an ambiguous panel.
+    pub fn from_parts(
+        panel: Panel,
+        registry: Registry,
+        registry_snapshot: Option<VaultRegistrySnapshot>,
+    ) -> Result<Self> {
+        let mut slot_indices = BTreeMap::new();
+        for (index, slot) in panel.slots.iter().enumerate() {
+            if slot_indices.insert(slot.slot_id, index).is_some() {
+                return Err(CalyxError::lens_frozen_violation(format!(
+                    "persisted panel version {} contains duplicate slot id {}",
+                    panel.version,
+                    slot.slot_id.get()
+                )));
+            }
+        }
+        Ok(Self {
+            panel,
+            registry,
+            registry_snapshot,
+            slot_indices,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,19 +123,16 @@ pub fn persist_vault_panel_state(
 ) -> Result<VaultPanelWrite> {
     let vault_dir = vault_dir.as_ref();
     let store = ManifestStore::open(vault_dir);
-    let mut manifest = store.load_current()?;
+    let observed = store.load_current_snapshot()?;
     let panel_ref = assets::write_panel_asset(vault_dir, panel)?;
     let registry_ref = assets::write_registry_asset(vault_dir, &panel_ref, registry)?;
-    manifest.manifest_seq = manifest
-        .manifest_seq
-        .checked_add(1)
-        .ok_or_else(|| CalyxError::aster_corrupt_shard("manifest sequence exhausted"))?;
-    manifest.panel_ref = panel_ref.clone();
-    manifest.registry_ref = Some(registry_ref.clone());
-    manifest.validate()?;
-    let durable_seq = manifest.durable_seq;
-    let manifest_seq = manifest.manifest_seq;
-    store.write_current(&manifest)?;
+    let update = store.transact_current_if_identity(&observed.identity, |mut manifest| {
+        manifest.panel_ref = panel_ref.clone();
+        manifest.registry_ref = Some(registry_ref.clone());
+        Ok(manifest)
+    })?;
+    let durable_seq = update.after.manifest.durable_seq;
+    let manifest_seq = update.after.manifest.manifest_seq;
     Ok(VaultPanelWrite {
         manifest_seq,
         durable_seq,
@@ -127,9 +155,5 @@ pub fn load_vault_panel_state(vault_dir: impl AsRef<Path>) -> Result<VaultPanelS
     let registry = snapshot
         .as_ref()
         .map_or_else(|| Ok(Registry::new()), lazy::rebuild_registry)?;
-    Ok(VaultPanelState {
-        panel,
-        registry,
-        registry_snapshot: snapshot,
-    })
+    VaultPanelState::from_parts(panel, registry, snapshot)
 }

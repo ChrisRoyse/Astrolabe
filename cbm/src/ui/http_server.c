@@ -34,6 +34,9 @@
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 #include "foundation/subprocess.h" /* cbm_subprocess_run — the one long-path-safe spawn (#426) */
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -51,6 +54,7 @@
 #include <process.h>
 #include <psapi.h> /* GetProcessMemoryInfo */
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -880,110 +884,512 @@ static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 /* ── Background indexing ──────────────────────────────────────── */
 
-static char g_binary_path[1024] = {0};
+static char *g_binary_path = NULL;
+enum {
+    CBM_BINARY_PATH_UNBOUND = 0,
+    CBM_BINARY_PATH_BINDING = 1,
+    CBM_BINARY_PATH_BOUND = 2,
+};
+static atomic_int g_binary_path_state = CBM_BINARY_PATH_UNBOUND;
+#ifdef _WIN32
+static HANDLE g_binary_handle = INVALID_HANDLE_VALUE;
+static FILE_ID_INFO g_binary_identity;
+#else
+static int g_binary_fd = -1;
+static dev_t g_binary_device;
+static ino_t g_binary_inode;
+#endif
 
-static bool copy_path(char *out, size_t outsz, const char *path) {
-    if (!out || outsz == 0 || !path || !path[0]) {
-        return false;
+const char *cbm_http_server_binary_status_code(int status) {
+    switch (status) {
+        case CBM_WORKER_BINARY_OK:
+            return "CBM_WORKER_BINARY_OK";
+        case CBM_WORKER_BINARY_UNBOUND:
+            return "CBM_INDEX_WORKER_BINARY_PATH_UNBOUND";
+        case CBM_WORKER_BINARY_INVALID_ARGUMENT:
+            return "CBM_WORKER_BINARY_INVALID_ARGUMENT";
+        case CBM_WORKER_BINARY_SELF_RESOLVE_FAILED:
+            return "CBM_WORKER_BINARY_SELF_RESOLVE_FAILED";
+        case CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE:
+            return "CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE";
+        case CBM_WORKER_BINARY_PATH_ENCODING_FAILED:
+            return "CBM_WORKER_BINARY_PATH_ENCODING_FAILED";
+        case CBM_WORKER_BINARY_OPEN_FAILED:
+            return "CBM_WORKER_BINARY_OPEN_FAILED";
+        case CBM_WORKER_BINARY_NOT_REGULAR_FILE:
+            return "CBM_WORKER_BINARY_NOT_REGULAR_FILE";
+        case CBM_WORKER_BINARY_REPARSE_POINT:
+            return "CBM_WORKER_BINARY_REPARSE_POINT";
+        case CBM_WORKER_BINARY_NOT_EXECUTABLE:
+            return "CBM_WORKER_BINARY_NOT_EXECUTABLE";
+        case CBM_WORKER_BINARY_IDENTITY_READ_FAILED:
+            return "CBM_WORKER_BINARY_IDENTITY_READ_FAILED";
+        case CBM_WORKER_BINARY_FINAL_PATH_FAILED:
+            return "CBM_WORKER_BINARY_FINAL_PATH_FAILED";
+        case CBM_WORKER_BINARY_PATH_TOO_LONG:
+            return "CBM_WORKER_BINARY_PATH_TOO_LONG";
+        case CBM_WORKER_BINARY_ALLOCATION_FAILED:
+            return "CBM_WORKER_BINARY_ALLOCATION_FAILED";
+        case CBM_WORKER_BINARY_CAPABILITY_MISMATCH:
+            return "CBM_WORKER_BINARY_CAPABILITY_MISMATCH";
+        case CBM_WORKER_BINARY_BIND_IN_PROGRESS:
+            return "CBM_WORKER_BINARY_BIND_IN_PROGRESS";
+        case CBM_WORKER_BINARY_CONFLICT:
+            return "CBM_WORKER_BINARY_CONFLICT";
+        default:
+            return "CBM_WORKER_BINARY_UNKNOWN_STATUS";
     }
-    int n = snprintf(out, outsz, "%s", path);
-    return n > 0 && (size_t)n < outsz;
 }
 
-#ifndef _WIN32
-static bool is_executable_file(const char *path) {
-    struct stat st;
-    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+const char *cbm_http_server_binary_status_message(int status) {
+    switch (status) {
+        case CBM_WORKER_BINARY_OK:
+            return "the exact worker executable identity is bound";
+        case CBM_WORKER_BINARY_UNBOUND:
+            return "no exact worker executable identity was bound before supervisor admission";
+        case CBM_WORKER_BINARY_INVALID_ARGUMENT:
+            return "the worker executable path argument is null or empty";
+        case CBM_WORKER_BINARY_SELF_RESOLVE_FAILED:
+            return "the operating system could not resolve the running process image";
+        case CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE:
+            return "the worker executable path is not absolute";
+        case CBM_WORKER_BINARY_PATH_ENCODING_FAILED:
+            return "the worker executable path is not valid platform text";
+        case CBM_WORKER_BINARY_OPEN_FAILED:
+            return "the worker executable could not be opened for retained identity binding";
+        case CBM_WORKER_BINARY_NOT_REGULAR_FILE:
+            return "the worker executable path is not a regular file";
+        case CBM_WORKER_BINARY_REPARSE_POINT:
+            return "the worker executable path names a reparse point";
+        case CBM_WORKER_BINARY_NOT_EXECUTABLE:
+            return "the bound ordinary file is not an operating-system executable image";
+        case CBM_WORKER_BINARY_IDENTITY_READ_FAILED:
+            return "the opened worker executable identity could not be read";
+        case CBM_WORKER_BINARY_FINAL_PATH_FAILED:
+            return "the opened worker executable final path could not be read";
+        case CBM_WORKER_BINARY_PATH_TOO_LONG:
+            return "the running process image path exceeds the operating-system limit";
+        case CBM_WORKER_BINARY_ALLOCATION_FAILED:
+            return "memory allocation failed while binding the worker executable";
+        case CBM_WORKER_BINARY_CAPABILITY_MISMATCH:
+            return "the executable does not publish the required private worker capability";
+        case CBM_WORKER_BINARY_BIND_IN_PROGRESS:
+            return "another thread is currently binding the worker executable identity";
+        case CBM_WORKER_BINARY_CONFLICT:
+            return "a different worker executable identity is already bound";
+        default:
+            return "the worker executable binding returned an unknown status";
+    }
 }
 
-static bool resolve_from_path(const char *name, char *out, size_t outsz) {
-    const char *path = getenv("PATH");
-    if (!name || !name[0] || strchr(name, '/') || !path || !path[0]) {
+const char *cbm_http_server_binary_status_remediation(int status) {
+    switch (status) {
+        case CBM_WORKER_BINARY_OK:
+            return "no remediation is required";
+        case CBM_WORKER_BINARY_UNBOUND:
+            return "bind the shipping executable before enabling supervised indexing";
+        case CBM_WORKER_BINARY_INVALID_ARGUMENT:
+            return "pass one non-empty absolute executable path";
+        case CBM_WORKER_BINARY_SELF_RESOLVE_FAILED:
+            return "inspect the native error and launch the existing shipping executable directly";
+        case CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE:
+            return "resolve the executable to an absolute path before binding it";
+        case CBM_WORKER_BINARY_PATH_ENCODING_FAILED:
+            return "supply the exact executable path as valid UTF-8";
+        case CBM_WORKER_BINARY_OPEN_FAILED:
+            return "inspect the native error and make the exact executable path readable";
+        case CBM_WORKER_BINARY_NOT_REGULAR_FILE:
+            return "bind an existing regular executable file, not a directory or device";
+        case CBM_WORKER_BINARY_REPARSE_POINT:
+            return "bind the final ordinary executable path instead of a reparse point";
+        case CBM_WORKER_BINARY_NOT_EXECUTABLE:
+            return "bind the existing native shipping executable image";
+        case CBM_WORKER_BINARY_IDENTITY_READ_FAILED:
+            return "inspect the native error and repair access to the executable filesystem "
+                   "identity";
+        case CBM_WORKER_BINARY_FINAL_PATH_FAILED:
+            return "inspect the native error and repair final-path resolution for the executable";
+        case CBM_WORKER_BINARY_PATH_TOO_LONG:
+            return "place the shipping executable within the native process-image path limit";
+        case CBM_WORKER_BINARY_ALLOCATION_FAILED:
+            return "free memory and restart before enabling indexing";
+        case CBM_WORKER_BINARY_CAPABILITY_MISMATCH:
+            return "bind an Astrolabe executable with the exact worker and progress protocol "
+                   "generation";
+        case CBM_WORKER_BINARY_BIND_IN_PROGRESS:
+            return "serialize host startup and bind the executable exactly once";
+        case CBM_WORKER_BINARY_CONFLICT:
+            return "restart the process and bind only the intended shipping executable identity";
+        default:
+            return "report the unknown status and do not enable supervised indexing";
+    }
+}
+
+#ifdef _WIN32
+static bool windows_absolute_path(const wchar_t *path) {
+    if (!path || !path[0]) {
         return false;
     }
+    if (((path[0] >= L'A' && path[0] <= L'Z') ||
+         (path[0] >= L'a' && path[0] <= L'z')) &&
+        path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+        return true;
+    }
+    if (wcsncmp(path, L"\\\\?\\UNC\\", 8) == 0) {
+        return path[8] != L'\0';
+    }
+    if (wcsncmp(path, L"\\\\?\\", 4) == 0) {
+        return ((path[4] >= L'A' && path[4] <= L'Z') ||
+                (path[4] >= L'a' && path[4] <= L'z')) &&
+               path[5] == L':' && (path[6] == L'\\' || path[6] == L'/');
+    }
+    return path[0] == L'\\' && path[1] == L'\\' && path[2] != L'\0' && path[2] != L'?' &&
+           path[2] != L'.';
+}
 
-    const char *cur = path;
-    while (*cur) {
-        const char *colon = strchr(cur, ':');
-        size_t dir_len = colon ? (size_t)(colon - cur) : strlen(cur);
-        if (dir_len > 0 && dir_len < 900) {
-            char candidate[1024];
-            int n = snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)dir_len, cur, name);
-            if (n > 0 && (size_t)n < sizeof(candidate) && is_executable_file(candidate)) {
-                return copy_path(out, outsz, candidate);
+static bool windows_utf8_absolute_path(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
+        return true;
+    }
+    if (strncmp(path, "\\\\?\\UNC\\", 8) == 0) {
+        return path[8] != '\0';
+    }
+    if (strncmp(path, "\\\\?\\", 4) == 0) {
+        return ((path[4] >= 'A' && path[4] <= 'Z') ||
+                (path[4] >= 'a' && path[4] <= 'z')) &&
+               path[5] == ':' && (path[6] == '\\' || path[6] == '/');
+    }
+    return path[0] == '\\' && path[1] == '\\' && path[2] != '\0' && path[2] != '?' &&
+           path[2] != '.';
+}
+
+static bool windows_identity_equal(const FILE_ID_INFO *a, const FILE_ID_INFO *b) {
+    return a->VolumeSerialNumber == b->VolumeSerialNumber &&
+           memcmp(a->FileId.Identifier, b->FileId.Identifier,
+                  sizeof(a->FileId.Identifier)) == 0;
+}
+
+static cbm_worker_binary_status_t bind_windows_path(const wchar_t *path,
+                                                    unsigned long *native_error) {
+    if (!windows_absolute_path(path)) {
+        return CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE;
+    }
+    HANDLE candidate =
+        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS |
+                        FILE_FLAG_OPEN_REPARSE_POINT,
+                    NULL);
+    if (candidate == INVALID_HANDLE_VALUE) {
+        if (native_error) {
+            *native_error = (unsigned long)GetLastError();
+        }
+        return CBM_WORKER_BINARY_OPEN_FAILED;
+    }
+
+    FILE_ATTRIBUTE_TAG_INFO attributes = {0};
+    FILE_STANDARD_INFO standard = {0};
+    FILE_ID_INFO identity = {0};
+    if (!GetFileInformationByHandleEx(candidate, FileAttributeTagInfo, &attributes,
+                                      sizeof(attributes)) ||
+        !GetFileInformationByHandleEx(candidate, FileStandardInfo, &standard,
+                                      sizeof(standard))) {
+        if (native_error) {
+            *native_error = (unsigned long)GetLastError();
+        }
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_IDENTITY_READ_FAILED;
+    }
+    SetLastError(ERROR_SUCCESS);
+    DWORD file_type = GetFileType(candidate);
+    DWORD file_type_error = GetLastError();
+    if (file_type == FILE_TYPE_UNKNOWN && file_type_error != ERROR_SUCCESS) {
+        if (native_error) {
+            *native_error = (unsigned long)file_type_error;
+        }
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_IDENTITY_READ_FAILED;
+    }
+    if (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_REPARSE_POINT;
+    }
+    if (file_type != FILE_TYPE_DISK || standard.Directory || standard.DeletePending ||
+        (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_NOT_REGULAR_FILE;
+    }
+    if (!GetFileInformationByHandleEx(candidate, FileIdInfo, &identity, sizeof(identity))) {
+        if (native_error) {
+            *native_error = (unsigned long)GetLastError();
+        }
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_IDENTITY_READ_FAILED;
+    }
+    DWORD binary_type = 0;
+    SetLastError(ERROR_SUCCESS);
+    if (!GetBinaryTypeW(path, &binary_type) ||
+        (binary_type != SCS_32BIT_BINARY && binary_type != SCS_64BIT_BINARY)) {
+        if (native_error) {
+            DWORD error = GetLastError();
+            *native_error = (unsigned long)error;
+        }
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_NOT_EXECUTABLE;
+    }
+
+    const DWORD final_flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    DWORD needed = GetFinalPathNameByHandleW(candidate, NULL, 0, final_flags);
+    if (needed == 0) {
+        if (native_error) {
+            *native_error = (unsigned long)GetLastError();
+        }
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_FINAL_PATH_FAILED;
+    }
+    wchar_t *final_wide = calloc((size_t)needed, sizeof(*final_wide));
+    if (!final_wide) {
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_ALLOCATION_FAILED;
+    }
+    DWORD written = GetFinalPathNameByHandleW(candidate, final_wide, needed, final_flags);
+    if (written == 0 || written >= needed) {
+        if (native_error) {
+            DWORD error = written == 0 ? GetLastError() : ERROR_INSUFFICIENT_BUFFER;
+            *native_error = (unsigned long)error;
+        }
+        free(final_wide);
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_FINAL_PATH_FAILED;
+    }
+    char *final_path = cbm_wide_final_path_to_utf8(final_wide);
+    free(final_wide);
+    if (!final_path) {
+        if (native_error) {
+            DWORD error = GetLastError();
+            *native_error = (unsigned long)(error != ERROR_SUCCESS ? error
+                                                                   : ERROR_NO_UNICODE_TRANSLATION);
+        }
+        CloseHandle(candidate);
+        return CBM_WORKER_BINARY_PATH_ENCODING_FAILED;
+    }
+
+    int expected = CBM_BINARY_PATH_UNBOUND;
+    if (!atomic_compare_exchange_strong_explicit(
+            &g_binary_path_state, &expected, CBM_BINARY_PATH_BINDING, memory_order_acq_rel,
+            memory_order_acquire)) {
+        cbm_worker_binary_status_t status = CBM_WORKER_BINARY_BIND_IN_PROGRESS;
+        if (expected == CBM_BINARY_PATH_BOUND) {
+            status = windows_identity_equal(&g_binary_identity, &identity)
+                         ? CBM_WORKER_BINARY_OK
+                         : CBM_WORKER_BINARY_CONFLICT;
+        }
+        free(final_path);
+        CloseHandle(candidate);
+        return status;
+    }
+    g_binary_handle = candidate;
+    g_binary_identity = identity;
+    g_binary_path = final_path;
+    atomic_store_explicit(&g_binary_path_state, CBM_BINARY_PATH_BOUND, memory_order_release);
+    return CBM_WORKER_BINARY_OK;
+}
+#else
+static cbm_worker_binary_status_t bind_posix_path(const char *path,
+                                                  unsigned long *native_error) {
+    if (!path || path[0] != '/') {
+        return CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE;
+    }
+    struct stat namespace_info;
+    if (lstat(path, &namespace_info) != 0) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
+        }
+        return CBM_WORKER_BINARY_OPEN_FAILED;
+    }
+    if (S_ISLNK(namespace_info.st_mode)) {
+        return CBM_WORKER_BINARY_REPARSE_POINT;
+    }
+    if (!S_ISREG(namespace_info.st_mode)) {
+        return CBM_WORKER_BINARY_NOT_REGULAR_FILE;
+    }
+    if (access(path, X_OK) != 0) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
+        }
+        return CBM_WORKER_BINARY_NOT_EXECUTABLE;
+    }
+    int candidate = open(path, O_RDONLY);
+    if (candidate < 0) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
+        }
+        return CBM_WORKER_BINARY_OPEN_FAILED;
+    }
+    struct stat identity;
+    if (fstat(candidate, &identity) != 0) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
+        }
+        close(candidate);
+        return CBM_WORKER_BINARY_IDENTITY_READ_FAILED;
+    }
+    if (!S_ISREG(identity.st_mode) || identity.st_dev != namespace_info.st_dev ||
+        identity.st_ino != namespace_info.st_ino) {
+        close(candidate);
+        return CBM_WORKER_BINARY_NOT_REGULAR_FILE;
+    }
+    char *final_path = realpath(path, NULL);
+    if (!final_path) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
+        }
+        close(candidate);
+        return CBM_WORKER_BINARY_FINAL_PATH_FAILED;
+    }
+
+    int expected = CBM_BINARY_PATH_UNBOUND;
+    if (!atomic_compare_exchange_strong_explicit(
+            &g_binary_path_state, &expected, CBM_BINARY_PATH_BINDING, memory_order_acq_rel,
+            memory_order_acquire)) {
+        cbm_worker_binary_status_t status = CBM_WORKER_BINARY_BIND_IN_PROGRESS;
+        if (expected == CBM_BINARY_PATH_BOUND) {
+            status = g_binary_device == identity.st_dev && g_binary_inode == identity.st_ino
+                         ? CBM_WORKER_BINARY_OK
+                         : CBM_WORKER_BINARY_CONFLICT;
+        }
+        free(final_path);
+        close(candidate);
+        return status;
+    }
+    g_binary_fd = candidate;
+    g_binary_device = identity.st_dev;
+    g_binary_inode = identity.st_ino;
+    g_binary_path = final_path;
+    atomic_store_explicit(&g_binary_path_state, CBM_BINARY_PATH_BOUND, memory_order_release);
+    return CBM_WORKER_BINARY_OK;
+}
+#endif
+
+cbm_worker_binary_status_t cbm_http_server_bind_explicit_binary(const char *path,
+                                                                unsigned long *native_error) {
+    if (native_error) {
+        *native_error = 0;
+    }
+    if (!path || !path[0]) {
+        return CBM_WORKER_BINARY_INVALID_ARGUMENT;
+    }
+#ifdef _WIN32
+    if (!windows_utf8_absolute_path(path)) {
+        return CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE;
+    }
+    DWORD error = ERROR_SUCCESS;
+    wchar_t *wide = cbm_utf8_to_wide_path_checked(path, &error);
+    if (!wide) {
+        if (native_error) {
+            *native_error = (unsigned long)error;
+        }
+        if (error == ERROR_NOT_ENOUGH_MEMORY) {
+            return CBM_WORKER_BINARY_ALLOCATION_FAILED;
+        }
+        if (error == ERROR_FILENAME_EXCED_RANGE) {
+            return CBM_WORKER_BINARY_PATH_TOO_LONG;
+        }
+        return CBM_WORKER_BINARY_PATH_ENCODING_FAILED;
+    }
+    cbm_worker_binary_status_t status = bind_windows_path(wide, native_error);
+    free(wide);
+    return status;
+#else
+    return bind_posix_path(path, native_error);
+#endif
+}
+
+cbm_worker_binary_status_t cbm_http_server_bind_self_binary(unsigned long *native_error) {
+    if (native_error) {
+        *native_error = 0;
+    }
+#ifdef _WIN32
+    DWORD capacity = 256;
+    wchar_t *path = NULL;
+    while (capacity <= 32768) {
+        wchar_t *next = realloc(path, (size_t)capacity * sizeof(*next));
+        if (!next) {
+            free(path);
+            return CBM_WORKER_BINARY_ALLOCATION_FAILED;
+        }
+        path = next;
+        SetLastError(ERROR_SUCCESS);
+        DWORD written = GetModuleFileNameW(NULL, path, capacity);
+        if (written > 0 && written < capacity) {
+            cbm_worker_binary_status_t status = bind_windows_path(path, native_error);
+            free(path);
+            return status;
+        }
+        if (written == 0) {
+            if (native_error) {
+                DWORD error = GetLastError();
+                *native_error = (unsigned long)error;
             }
+            free(path);
+            return CBM_WORKER_BINARY_SELF_RESOLVE_FAILED;
         }
-        if (!colon) {
-            break;
-        }
-        cur = colon + 1;
+        capacity *= 2;
     }
-    return false;
-}
-
-static bool resolve_self_executable(char *out, size_t outsz) {
+    free(path);
+    return CBM_WORKER_BINARY_PATH_TOO_LONG;
+#else
+    char *path = NULL;
 #if defined(__APPLE__)
-    char buf[1024];
-    uint32_t sz = sizeof(buf);
-    if (_NSGetExecutablePath(buf, &sz) == 0 && buf[0]) {
-        return copy_path(out, outsz, buf);
+    uint32_t capacity = 0;
+    if (_NSGetExecutablePath(NULL, &capacity) != -1 || capacity == 0) {
+        return CBM_WORKER_BINARY_SELF_RESOLVE_FAILED;
     }
-    return false;
-#else
-    char buf[1024];
-    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len > 0) {
-        buf[len] = '\0';
-        return copy_path(out, outsz, buf);
+    path = malloc((size_t)capacity);
+    if (!path) {
+        return CBM_WORKER_BINARY_ALLOCATION_FAILED;
     }
-    return false;
-#endif
-}
-#else
-static bool resolve_self_executable(char *out, size_t outsz) {
-    char buf[1024];
-    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)sizeof(buf));
-    if (n > 0 && n < sizeof(buf)) {
-        return copy_path(out, outsz, buf);
-    }
-    return false;
-}
-#endif
-
-bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz) {
-    if (!out || outsz == 0) {
-        return false;
-    }
-    out[0] = '\0';
-
-#ifndef _WIN32
-    if (argv0 && strchr(argv0, '/') && is_executable_file(argv0)) {
-        return copy_path(out, outsz, argv0);
-    }
-    if (resolve_from_path(argv0, out, outsz)) {
-        return true;
+    if (_NSGetExecutablePath(path, &capacity) != 0) {
+        free(path);
+        return CBM_WORKER_BINARY_SELF_RESOLVE_FAILED;
     }
 #else
-    if (argv0 && argv0[0]) {
-        DWORD attrs = GetFileAttributesA(argv0);
-        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            return copy_path(out, outsz, argv0);
+    path = realpath("/proc/self/exe", NULL);
+    if (!path) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
         }
+        return CBM_WORKER_BINARY_SELF_RESOLVE_FAILED;
     }
 #endif
-
-    if (resolve_self_executable(out, outsz)) {
-        return true;
+    char *final_path;
+#if defined(__APPLE__)
+    final_path = realpath(path, NULL);
+    free(path);
+#else
+    final_path = path;
+#endif
+    if (!final_path) {
+        if (native_error) {
+            *native_error = (unsigned long)errno;
+        }
+        return CBM_WORKER_BINARY_SELF_RESOLVE_FAILED;
     }
-    return copy_path(out, outsz, argv0);
+    cbm_worker_binary_status_t status = bind_posix_path(final_path, native_error);
+    free(final_path);
+    return status;
+#endif
 }
 
-void cbm_http_server_set_binary_path(const char *path) {
-    if (path) {
-        if (!cbm_http_server_resolve_binary_path(path, g_binary_path, sizeof(g_binary_path))) {
-            g_binary_path[0] = '\0';
-        }
+const char *cbm_http_server_binary_path(void) {
+    if (atomic_load_explicit(&g_binary_path_state, memory_order_acquire) !=
+        CBM_BINARY_PATH_BOUND) {
+        return NULL;
     }
+    return g_binary_path;
 }
 
 /* Tail-line sink for the UI index worker: forward each completed worker log line
@@ -1016,12 +1422,21 @@ static void *index_thread_fn(void *arg) {
     index_job_t *job = arg;
     cbm_log_info("ui.index.start", "path", job->root_path);
 
-    /* Use stored binary path, or try to find it */
-    const char *bin = g_binary_path;
-    char self_path[1024] = {0};
-    if (!bin[0]) {
-        cbm_http_server_resolve_binary_path(NULL, self_path, sizeof(self_path));
-        bin = self_path[0] ? self_path : "codebase-memory-mcp";
+    /* The server startup boundary must have bound the exact worker executable. */
+    const cbm_worker_binary_status_t binary_status = CBM_WORKER_BINARY_UNBOUND;
+    const char *bin = cbm_http_server_binary_path();
+    if (!bin) {
+        cbm_log_error("ui.index.binary_path", "code",
+                      cbm_http_server_binary_status_code(binary_status), "message",
+                      cbm_http_server_binary_status_message(binary_status), "remediation",
+                      cbm_http_server_binary_status_remediation(binary_status));
+        snprintf(job->error_msg, sizeof(job->error_msg),
+                 "%s: %s; remediation: %s", cbm_http_server_binary_status_code(binary_status),
+                 cbm_http_server_binary_status_message(binary_status),
+                 cbm_http_server_binary_status_remediation(binary_status));
+        atomic_store(&job->status, 3);
+        cbm_log_info("ui.index.done", "path", job->root_path, "rc", "binary_path_unbound");
+        return NULL;
     }
 
     /* JSON-escape root_path and optional project name. */

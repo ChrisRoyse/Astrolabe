@@ -67,6 +67,9 @@ enum {
 #include "mcp/index_supervisor.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_regex.h"
+#ifdef ASTRO_SPAWN
+#include "astro_spawn.h"
+#endif
 #include "pipeline/artifact.h"
 #include "traces/otlp_decode.h"
 #include "traces/trace_ingest.h"
@@ -87,6 +90,7 @@ enum {
 #endif
 #include <yyjson/yyjson.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +136,7 @@ static char *heap_strdup(const char *s) {
     return d;
 }
 
+static char *yy_doc_to_str_with_len(yyjson_mut_doc *doc, size_t *out_len);
 static char *yy_doc_to_str(yyjson_mut_doc *doc);
 
 #ifdef _WIN32
@@ -172,9 +177,9 @@ static void mcp_release_mutex_or_abort(HANDLE mutex, const char *operation, cons
     char native_error[CBM_SZ_32];
     snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)error);
     cbm_log_error("index.admission.release_failed", "code", "CBM_INDEX_MUTEX_RELEASE_FAILED",
-                  "operation", operation ? operation : "unknown", "project",
-                  project ? project : "", "repo_path", repo_path ? repo_path : "",
-                  "native_error_kind", "win32", "native_error", native_error, "remediation",
+                  "operation", operation ? operation : "unknown", "project", project ? project : "",
+                  "repo_path", repo_path ? repo_path : "", "native_error_kind", "win32",
+                  "native_error", native_error, "remediation",
                   "inspect the exact worker thread ownership; the process will terminate so the "
                   "kernel releases every retained admission handle");
     fflush(NULL);
@@ -185,10 +190,10 @@ static void add_index_admission_telemetry(yyjson_mut_doc *doc, yyjson_mut_val *r
                                           const cbm_index_admission_t *admission) {
     yyjson_mut_val *telemetry = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_uint(doc, telemetry, "host_timeout_ms",
-                           (uint64_t)admission->host_timeout_ms);
+                            (uint64_t)admission->host_timeout_ms);
     yyjson_mut_obj_add_uint(doc, telemetry, "host_waited_ms", admission->host_waited_ms);
     yyjson_mut_obj_add_bool(doc, telemetry, "recovered_abandoned_capacity",
-                           admission->recovered_abandoned_capacity);
+                            admission->recovered_abandoned_capacity);
     yyjson_mut_obj_add_val(doc, root, "index_admission", telemetry);
 }
 
@@ -249,11 +254,13 @@ static char *load_fleet_host_timeout(const char *project, const char *repo_path,
                 project, "repo_path", repo_path, "message",
                 "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is not unsigned decimal milliseconds",
                 "remediation",
-                "remove the variable for fail-fast MCP admission or pass finite decimal milliseconds");
+                "remove the variable for fail-fast MCP admission or pass finite decimal "
+                "milliseconds");
             return index_admission_error(
                 "CBM_INDEX_ADMISSION_WAIT_INVALID", project, repo_path,
                 "ASTRO_FLEET_INDEX_ADMISSION_TIMEOUT_MS is not unsigned decimal milliseconds",
-                "remove the variable for fail-fast MCP admission or pass finite decimal milliseconds",
+                "remove the variable for fail-fast MCP admission or pass finite decimal "
+                "milliseconds",
                 admission);
         }
     }
@@ -330,8 +337,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
             "let the exact project index finish, then retry once", admission);
     }
     if (project_wait == WAIT_ABANDONED) {
-        mcp_release_mutex_or_abort(admission->project_mutex,
-                                   "index_admission.project_abandoned", project, repo_path);
+        mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.project_abandoned",
+                                   project, repo_path);
         mcp_close_windows_handle_or_abort(&admission->project_mutex,
                                           "index_admission.project_abandoned");
         cbm_log_error(
@@ -372,8 +379,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
                       "native_error", native_error, "message",
                       "the host-wide expensive-index lease could not be opened", "remediation",
                       "resolve the reported Windows named-object failure and retry");
-        mcp_release_mutex_or_abort(admission->project_mutex,
-                                   "index_admission.host_create_failed", project, repo_path);
+        mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.host_create_failed",
+                                   project, repo_path);
         mcp_close_windows_handle_or_abort(&admission->project_mutex,
                                           "index_admission.host_create_failed");
         return index_admission_error(
@@ -386,12 +393,10 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
     DWORD host_wait = WaitForSingleObject(admission->host_mutex, admission->host_timeout_ms);
     admission->host_waited_ms = cbm_now_ms() - wait_started_ms;
     if (host_wait == WAIT_TIMEOUT) {
-        mcp_close_windows_handle_or_abort(&admission->host_mutex,
-                                          "index_admission.host_busy");
+        mcp_close_windows_handle_or_abort(&admission->host_mutex, "index_admission.host_busy");
         mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.host_busy", project,
                                    repo_path);
-        mcp_close_windows_handle_or_abort(&admission->project_mutex,
-                                          "index_admission.host_busy");
+        mcp_close_windows_handle_or_abort(&admission->project_mutex, "index_admission.host_busy");
         cbm_log_error("index.admission.refused", "code", "CBM_INDEX_HOST_BUSY", "project", project,
                       "repo_path", repo_path, "pipeline_started", "false",
                       "sqlite_publication_started", "false", "message",
@@ -407,8 +412,8 @@ static char *acquire_index_admission(const char *project, const char *repo_path,
         snprintf(native_error, sizeof(native_error), "%lu", (unsigned long)GetLastError());
         mcp_close_windows_handle_or_abort(&admission->host_mutex,
                                           "index_admission.host_wait_failed");
-        mcp_release_mutex_or_abort(admission->project_mutex,
-                                   "index_admission.host_wait_failed", project, repo_path);
+        mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.host_wait_failed",
+                                   project, repo_path);
         mcp_close_windows_handle_or_abort(&admission->project_mutex,
                                           "index_admission.host_wait_failed");
         cbm_log_error("index.admission.failed", "code", "CBM_INDEX_HOST_MUTEX_WAIT_FAILED",
@@ -440,8 +445,7 @@ static bool release_index_admission(cbm_index_admission_t *admission, const char
     if (admission->host_mutex) {
         mcp_release_mutex_or_abort(admission->host_mutex, "index_admission.release_host", project,
                                    repo_path);
-        mcp_close_windows_handle_or_abort(&admission->host_mutex,
-                                          "index_admission.release_host");
+        mcp_close_windows_handle_or_abort(&admission->host_mutex, "index_admission.release_host");
     }
     if (admission->project_mutex) {
         mcp_release_mutex_or_abort(admission->project_mutex, "index_admission.release_project",
@@ -457,7 +461,7 @@ static bool release_index_admission(cbm_index_admission_t *admission, const char
  * MCP is a UTF-8 protocol boundary.  Invalid persisted/process text must fail
  * here with an exact diagnostic rather than leaking malformed JSON to a host
  * that can only reject the entire response. */
-static char *yy_doc_to_str(yyjson_mut_doc *doc) {
+static char *yy_doc_to_str_with_len(yyjson_mut_doc *doc, size_t *out_len) {
     size_t len = 0;
     yyjson_write_err error = {0};
     char *s = yyjson_mut_write_opts(doc, 0, NULL, &len, &error);
@@ -470,7 +474,14 @@ static char *yy_doc_to_str(yyjson_mut_doc *doc) {
                       "repair the invalid response field or free memory, then retry the exact "
                       "operation");
     }
+    if (out_len) {
+        *out_len = s ? len : 0;
+    }
     return s;
+}
+
+static char *yy_doc_to_str(yyjson_mut_doc *doc) {
+    return yy_doc_to_str_with_len(doc, NULL);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -606,12 +617,9 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
                       "a tool attempted to publish a missing result payload", "remediation",
                       "inspect the preceding serialization diagnostic and retry only after the "
                       "reported response field is repaired");
-        text = "{\"code\":\"CBM_MCP_TEXT_RESULT_MISSING\",\"message\":\"the tool could not "
-               "serialize its result payload\",\"remediation\":\"inspect the server's "
-               "CBM_MCP_JSON_SERIALIZATION_FAILED log and repair the reported field before "
-               "retrying\"}";
-        is_error = true;
+        return NULL;
     }
+    size_t text_length = strlen(text);
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         cbm_log_error("mcp.result_envelope_allocation_failed", "code",
@@ -632,23 +640,68 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     }
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_str(doc, item, "type", "text");
-    yyjson_mut_obj_add_str(doc, item, "text", text ? text : "");
-    yyjson_mut_arr_add_val(content, item);
-    yyjson_mut_obj_add_val(doc, root, "content", content);
-
-    if (!is_error && text) {
-        yyjson_doc *structured_doc = yyjson_read(text, strlen(text), 0);
-        if (structured_doc) {
-            yyjson_val *structured_root = yyjson_doc_get_root(structured_doc);
-            if (yyjson_is_obj(structured_root)) {
-                yyjson_mut_val *structured = yyjson_val_mut_copy(doc, structured_root);
-                yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
-            }
-            yyjson_doc_free(structured_doc);
-        }
+    if (!yyjson_mut_obj_add_str(doc, item, "type", "text") ||
+        !yyjson_mut_obj_add_str(doc, item, "text", text) ||
+        !yyjson_mut_arr_add_val(content, item) ||
+        !yyjson_mut_obj_add_val(doc, root, "content", content)) {
+        cbm_log_error("mcp.result_envelope_allocation_failed", "code",
+                      "CBM_MCP_RESULT_ENVELOPE_ALLOCATION_FAILED", "operation",
+                      "construct_content_text", "remediation",
+                      "free memory and retry the exact call; no partial MCP result was returned");
+        yyjson_mut_doc_free(doc);
+        return NULL;
     }
-    yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
+
+    const char *first_nonspace = text;
+    while (*first_nonspace == ' ' || *first_nonspace == '\t' || *first_nonspace == '\r' ||
+           *first_nonspace == '\n') {
+        first_nonspace++;
+    }
+    yyjson_read_err structured_error = {0};
+    yyjson_doc *structured_doc = yyjson_read_opts((char *)(uintptr_t)(const void *)text,
+                                                  text_length, 0, NULL, &structured_error);
+    if (structured_doc) {
+        yyjson_val *structured_root = yyjson_doc_get_root(structured_doc);
+        if (yyjson_is_obj(structured_root)) {
+            yyjson_mut_val *structured = yyjson_val_mut_copy(doc, structured_root);
+            if (!structured ||
+                !yyjson_mut_obj_add_val(doc, root, "structuredContent", structured)) {
+                cbm_log_error(
+                    "mcp.result_envelope_allocation_failed", "code",
+                    "CBM_MCP_STRUCTURED_CONTENT_ALLOCATION_FAILED", "operation",
+                    "copy_structured_content", "remediation",
+                    "free memory and retry the exact call; no text-only partial result was "
+                    "returned");
+                yyjson_doc_free(structured_doc);
+                yyjson_mut_doc_free(doc);
+                return NULL;
+            }
+        }
+        yyjson_doc_free(structured_doc);
+    } else if (*first_nonspace == '{') {
+        char reader_code[CBM_SZ_32];
+        char reader_position[CBM_SZ_32];
+        snprintf(reader_code, sizeof(reader_code), "%u", (unsigned int)structured_error.code);
+        snprintf(reader_position, sizeof(reader_position), "%llu",
+                 (unsigned long long)structured_error.pos);
+        cbm_log_error("mcp.structured_content_parse_failed", "code",
+                      "CBM_MCP_STRUCTURED_CONTENT_PARSE_FAILED", "reader_code", reader_code,
+                      "reader_position", reader_position, "reader_message",
+                      structured_error.msg ? structured_error.msg : "unknown yyjson read failure",
+                      "operation", "parse_object_text", "remediation",
+                      "repair the invalid UTF-8 JSON object or free memory, then retry the exact "
+                      "call; no text-only partial result was returned");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    if (!yyjson_mut_obj_add_bool(doc, root, "isError", is_error)) {
+        cbm_log_error("mcp.result_envelope_allocation_failed", "code",
+                      "CBM_MCP_RESULT_ENVELOPE_ALLOCATION_FAILED", "operation", "add_is_error",
+                      "remediation",
+                      "free memory and retry the exact call; no partial MCP result was returned");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
 
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -867,20 +920,47 @@ static const tool_def_t TOOLS[] = {
 
     {"get_architecture", "Get architecture",
      "Get high-level architecture overview — packages, services, dependencies, and project "
-     "structure at a glance. Includes 'clusters': Leiden community detection over the call/import "
-     "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
-     "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
-     "the real architectural seams, which often cut across the folder layout. Optional path scopes "
-     "analysis to nodes under that directory prefix (file_path).",
+     "structure at a glance. Includes 'clusters': a deterministic, versioned Leiden variant over "
+     "the call/import "
+     "graph's complete stable-atom projection, surfacing every de-facto module (each with a "
+     "label, member count, cohesion score, "
+     "a complete canonical member_atom_ids identity roster, up to five degree-ranked top_nodes "
+     "representative display names, and the packages/edge_types that bind it) — "
+     "use these to grasp "
+     "the real architectural seams, which often cut across the folder layout. The cluster_receipt "
+     "binds exact source/projection/result hashes, counts, convergence, work, and connectivity. "
+     "Optional path scopes analysis to nodes under that literal directory prefix (file_path). "
+     "Clustering is never implicit: request clusters or all and provide resolution plus every "
+     "cluster_* work bound.",
      /* The aspects enum mirrors VALID_ASPECTS (see aspect_is_valid) — update both together. */
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
      "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. "
      "apps/hoa)\"},"
+     "\"resolution\":{\"type\":\"number\",\"exclusiveMinimum\":0,\"description\":"
+     "\"Required with clusters/all; finite modularity resolution (no default)\"},"
+     "\"cluster_max_nodes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2147483647,"
+     "\"description\":\"Required with clusters/all; caller-owned preallocation node bound\"},"
+     "\"cluster_max_edges\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2147483647,"
+     "\"description\":\"Required with clusters/all; caller-owned induced-edge bound\"},"
+     "\"cluster_max_move_visits\":{\"type\":\"integer\",\"minimum\":1,"
+     "\"maximum\":18446744073709551615,\"description\":\"Required with clusters/all; "
+     "global deterministic move-work bound\"},"
+     "\"cluster_max_result_bytes\":{\"type\":\"integer\",\"minimum\":1,"
+     "\"maximum\":18446744073709551615,\"description\":\"Required with clusters/all; "
+     "bounds the complete compact UTF-8 C architecture object copied to content[0].text and "
+     "structuredContent after all native fields are constructed; excludes the outer MCP "
+     "envelope and canonical hash preimage; a Rust host must re-enforce after augmentation\"},"
      "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"all\","
      "\"overview\",\"structure\",\"dependencies\",\"routes\",\"languages\",\"packages\","
      "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\"]},"
-     "\"description\":\"Aspects to include. 'all' = everything; 'overview' = compact summary "
-     "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}",
+     "\"minItems\":1,\"maxItems\":" MCP_STRINGIFY(
+         CBM_ARCH_MAX_ASPECTS) ",\"uniqueItems\":true,"
+                               "\"description\":\"Aspects to include. 'all' = everything and "
+                               "requires cluster controls; "
+                               "'all' must be the sole selector; 'overview' = narrow summary "
+                               "without file_tree/clusters; "
+                               "omit = overview.\"}},"
+                               "\"required\":[\"project\"],\"additionalProperties\":false}",
      handle_get_architecture, TOOL_FLAG_FIRST_PAGE_REQUIRED},
 
     {"search_code", "Search code",
@@ -921,13 +1001,21 @@ static const tool_def_t TOOLS[] = {
      "\"project\"]}",
      handle_index_status, TOOL_FLAG_NONE},
 
-    {"detect_changes", "Detect changes", "Detect code changes and their impact",
+    {"detect_changes", "Detect changes",
+     "Detect the exact canonical Git changed-file roster and, for scope=symbols, every measured "
+     "indexed constellation mapped to those files. Every Git source must succeed; unmapped-file "
+     "coverage is explicit. The Astrolabe host requires a current hash-bound Oracle/kernel "
+     "generation for symbol grounding and refuses when it is unavailable.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
-     "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
-     "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
-     "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
-     "\"required\":"
-     "[\"project\"]}",
+     "\"string\",\"enum\":[\"files\",\"symbols\"],\"default\":\"symbols\"},\"depth\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":16,\"default\":2,\"description\":\"Exact change-reach hop budget; Astrolabe's declared kernel reach registry admits 1..16.\"},"
+      "\"changed_file_max\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2147483647,\"description\":\"Required caller bound for the complete canonical changed-file roster.\"},"
+      "\"impact_max_symbols\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2147483647,\"description\":\"Required caller work bound for the complete impacted constellation roster.\"},"
+      "\"reach_max_nodes_per_symbol\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2147483647,\"description\":\"Required caller output bound per impacted symbol; full reach counts and digest remain returned.\"},"
+      "\"result_max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":18446744073709551615,\"description\":\"Required caller bound for the complete final public MCP result in UTF-8 bytes; no default or truncation.\"},\"base_branch\":{\"type\":"
+      "\"string\",\"minLength\":1,\"default\":\"main\"},\"since\":{\"type\":\"string\",\"minLength\":1,\"description\":"
+      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
+      "\"required\":"
+      "[\"project\",\"changed_file_max\",\"impact_max_symbols\",\"reach_max_nodes_per_symbol\",\"result_max_bytes\"],\"additionalProperties\":false}",
      handle_detect_changes, TOOL_FLAG_NONE},
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
@@ -1423,8 +1511,7 @@ typedef struct {
     const char *argument;
 } cbm_generation_clock_arg_t;
 
-static bool parse_generation_clock_arg(const char *args_json,
-                                       cbm_generation_clock_arg_t *out) {
+static bool parse_generation_clock_arg(const char *args_json, cbm_generation_clock_arg_t *out) {
     memset(out, 0, sizeof(*out));
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
     if (!doc) {
@@ -1465,16 +1552,14 @@ static bool parse_generation_clock_arg(const char *args_json,
         out->message = yyjson_is_sint(value)
                            ? "generation_observed_at_ms cannot be negative"
                            : "generation_observed_at_ms must be an unsigned integer";
-        out->remediation =
-            "pass a nonzero Unix-millisecond integer exactly divisible by 1000";
+        out->remediation = "pass a nonzero Unix-millisecond integer exactly divisible by 1000";
         yyjson_doc_free(doc);
         return false;
     }
     if (parsed == 0) {
         out->code = "CBM_GENERATION_CLOCK_ZERO";
         out->message = "generation_observed_at_ms must be nonzero";
-        out->remediation =
-            "pass a nonzero Unix-millisecond integer exactly divisible by 1000";
+        out->remediation = "pass a nonzero Unix-millisecond integer exactly divisible by 1000";
         yyjson_doc_free(doc);
         return false;
     }
@@ -1487,9 +1572,8 @@ static bool parse_generation_clock_arg(const char *args_json,
     }
     if (parsed % UINT64_C(1000) != 0) {
         out->code = "CBM_GENERATION_CLOCK_SECOND_INEXACT";
-        out->message =
-            "generation_observed_at_ms cannot be represented exactly by the UTC-seconds "
-            "Project field";
+        out->message = "generation_observed_at_ms cannot be represented exactly by the UTC-seconds "
+                       "Project field";
         out->remediation =
             "pass a Unix-millisecond value exactly divisible by 1000; CBM never rounds an "
             "explicit observation";
@@ -1503,8 +1587,8 @@ static bool parse_generation_clock_arg(const char *args_json,
 
 static char *generation_clock_error_result(const cbm_generation_clock_arg_t *error) {
     cbm_log_error("index.generation_clock_refused", "code", error->code, "argument",
-                  error->argument ? error->argument : "", "message", error->message,
-                  "remediation", error->remediation);
+                  error->argument ? error->argument : "", "message", error->message, "remediation",
+                  error->remediation);
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return cbm_mcp_text_result(
@@ -1518,8 +1602,7 @@ static char *generation_clock_error_result(const cbm_generation_clock_arg_t *err
         !yyjson_mut_obj_add_str(doc, root, "code", error->code) ||
         !yyjson_mut_obj_add_str(doc, root, "message", error->message) ||
         !yyjson_mut_obj_add_str(doc, root, "remediation", error->remediation) ||
-        (error->argument &&
-         !yyjson_mut_obj_add_str(doc, root, "argument", error->argument))) {
+        (error->argument && !yyjson_mut_obj_add_str(doc, root, "argument", error->argument))) {
         yyjson_mut_doc_free(doc);
         return cbm_mcp_text_result(
             "CBM_GENERATION_CLOCK_ERROR_SERIALIZE_FAILED: the exact generation-clock refusal "
@@ -1545,9 +1628,9 @@ static char *generation_clock_error_result(const cbm_generation_clock_arg_t *err
  * ══════════════════════════════════════════════════════════════════ */
 
 struct cbm_mcp_server {
-    cbm_store_t *store;     /* currently open project store (or NULL) */
-    bool owns_store;        /* true if we opened the store */
-    char *current_project;  /* which project store is open for (heap) */
+    cbm_store_t *store;    /* currently open project store (or NULL) */
+    bool owns_store;       /* true if we opened the store */
+    char *current_project; /* which project store is open for (heap) */
     /* Idle clock owned by the currently published named-store generation.
      * Zero means the startup/embedded store was never resolved by project. */
     time_t store_last_used;
@@ -1640,8 +1723,7 @@ static void clear_cached_store_close_error(cbm_mcp_server_t *srv) {
     srv->store_close_shm_bytes = CBM_NOT_FOUND;
 }
 
-static bool current_exact_process_identity(uint64_t *process_id,
-                                           uint64_t *process_start_utc_ticks,
+static bool current_exact_process_identity(uint64_t *process_id, uint64_t *process_start_utc_ticks,
                                            unsigned long *native_error) {
     if (process_id) {
         *process_id = 0;
@@ -1670,8 +1752,7 @@ static bool current_exact_process_identity(uint64_t *process_id,
         }
         return false;
     }
-    *process_start_utc_ticks =
-        ((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
+    *process_start_utc_ticks = ((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
     return *process_id > 0 && *process_start_utc_ticks > 0;
 #else
     (void)process_id;
@@ -1691,8 +1772,7 @@ static void cached_store_family_readback(cbm_mcp_server_t *srv, const char *db_p
     char shm_path[CBM_STORE_VERIFY_PATH_MAX];
     int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
     int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
-    srv->store_close_db_probe =
-        cbm_path_probe(db_path, &srv->store_close_db_probe_native_error);
+    srv->store_close_db_probe = cbm_path_probe(db_path, &srv->store_close_db_probe_native_error);
     srv->store_close_db_present = srv->store_close_db_probe == CBM_PATH_PROBE_PRESENT;
     if (srv->store_close_db_present) {
         srv->store_close_db_bytes = cbm_file_size(db_path);
@@ -1752,8 +1832,7 @@ static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation
     snprintf(srv->store_close_operation, sizeof(srv->store_close_operation), "%s",
              operation ? operation : "cached_store.close");
     snprintf(srv->store_close_project, sizeof(srv->store_close_project), "%s",
-             project_hint ? project_hint
-                          : (srv->current_project ? srv->current_project : ""));
+             project_hint ? project_hint : (srv->current_project ? srv->current_project : ""));
     time_t now = time(NULL);
     if (srv->store_last_used > 0 && now >= srv->store_last_used) {
         srv->store_close_cache_age_s = (uint64_t)(now - srv->store_last_used);
@@ -1773,19 +1852,17 @@ static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation
         srv->store_close_result.status = CBM_STORE_CLOSE_INVALID_ARGUMENT;
         srv->store_close_result.sqlite_close_code = SQLITE_MISUSE;
         srv->store_close_result.connection_was_present = 1;
-        snprintf(srv->store_close_result.db_path,
-                 sizeof(srv->store_close_result.db_path), "%s", db_path);
+        snprintf(srv->store_close_result.db_path, sizeof(srv->store_close_result.db_path), "%s",
+                 db_path);
         cached_store_family_readback(srv, db_path);
-        cbm_log_error("mcp.cached_store.close_refused", "code",
-                      "CBM_CACHED_STORE_NOT_OWNED", "operation",
-                      srv->store_close_operation, "project", srv->store_close_project,
+        cbm_log_error("mcp.cached_store.close_refused", "code", "CBM_CACHED_STORE_NOT_OWNED",
+                      "operation", srv->store_close_operation, "project", srv->store_close_project,
                       "db_path", db_path, "connection_destroyed", "false", "remediation",
                       "retain the borrowed connection and close it through its exact owner");
         return CBM_NOT_FOUND;
     }
 
-    cbm_store_close_status_t close_status =
-        cbm_store_close(&srv->store, &srv->store_close_result);
+    cbm_store_close_status_t close_status = cbm_store_close(&srv->store, &srv->store_close_result);
     cached_store_family_readback(srv, db_path);
     if (srv->store_close_result.connection_destroyed) {
         clear_cached_store_metadata_after_destroy(srv);
@@ -1818,12 +1895,9 @@ static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation
              (unsigned long long)srv->store_close_process_start_utc_ticks);
     snprintf(process_identity_error_text, sizeof(process_identity_error_text), "%lu",
              srv->store_close_process_identity_native_error);
-    snprintf(db_bytes_text, sizeof(db_bytes_text), "%lld",
-             (long long)srv->store_close_db_bytes);
-    snprintf(wal_bytes_text, sizeof(wal_bytes_text), "%lld",
-             (long long)srv->store_close_wal_bytes);
-    snprintf(shm_bytes_text, sizeof(shm_bytes_text), "%lld",
-             (long long)srv->store_close_shm_bytes);
+    snprintf(db_bytes_text, sizeof(db_bytes_text), "%lld", (long long)srv->store_close_db_bytes);
+    snprintf(wal_bytes_text, sizeof(wal_bytes_text), "%lld", (long long)srv->store_close_wal_bytes);
+    snprintf(shm_bytes_text, sizeof(shm_bytes_text), "%lld", (long long)srv->store_close_shm_bytes);
     snprintf(db_probe_text, sizeof(db_probe_text), "%d", (int)srv->store_close_db_probe);
     snprintf(wal_probe_text, sizeof(wal_probe_text), "%d", (int)srv->store_close_wal_probe);
     snprintf(shm_probe_text, sizeof(shm_probe_text), "%d", (int)srv->store_close_shm_probe);
@@ -1839,24 +1913,23 @@ static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation
     bool physically_destroyed = srv->store_close_result.connection_destroyed && !srv->store;
     bool closed = close_status == CBM_STORE_CLOSE_OK && physically_destroyed;
     if (closed) {
-        cbm_log_info(
-            "mcp.cached_store.closed", "operation", srv->store_close_operation, "project",
-            srv->store_close_project, "db_path", db_path, "cache_age_s", cache_age_text,
-            "process_id", process_id_text, "process_start_utc_ticks", process_start_text,
-            "process_identity_available",
-            srv->store_close_process_identity_available ? "true" : "false",
-            "process_identity_native_error", process_identity_error_text,
-            "close_status", close_status_text, "sqlite_error", sqlite_error_text,
-            "connection_destroyed", "true", "outstanding_statements", outstanding_text,
-            "first_outstanding_sql_sha256",
-            srv->store_close_result.first_outstanding_sql_sha256, "db_present",
-            srv->store_close_db_present ? "true" : "false", "db_bytes", db_bytes_text,
-            "db_probe", db_probe_text, "db_probe_native_error", db_probe_error_text,
-            "wal_present", srv->store_close_wal_present ? "true" : "false", "wal_bytes",
-            wal_bytes_text, "wal_probe", wal_probe_text, "wal_probe_native_error",
-            wal_probe_error_text, "shm_present",
-            srv->store_close_shm_present ? "true" : "false", "shm_bytes", shm_bytes_text,
-            "shm_probe", shm_probe_text, "shm_probe_native_error", shm_probe_error_text);
+        cbm_log_info("mcp.cached_store.closed", "operation", srv->store_close_operation, "project",
+                     srv->store_close_project, "db_path", db_path, "cache_age_s", cache_age_text,
+                     "process_id", process_id_text, "process_start_utc_ticks", process_start_text,
+                     "process_identity_available",
+                     srv->store_close_process_identity_available ? "true" : "false",
+                     "process_identity_native_error", process_identity_error_text, "close_status",
+                     close_status_text, "sqlite_error", sqlite_error_text, "connection_destroyed",
+                     "true", "outstanding_statements", outstanding_text,
+                     "first_outstanding_sql_sha256",
+                     srv->store_close_result.first_outstanding_sql_sha256, "db_present",
+                     srv->store_close_db_present ? "true" : "false", "db_bytes", db_bytes_text,
+                     "db_probe", db_probe_text, "db_probe_native_error", db_probe_error_text,
+                     "wal_present", srv->store_close_wal_present ? "true" : "false", "wal_bytes",
+                     wal_bytes_text, "wal_probe", wal_probe_text, "wal_probe_native_error",
+                     wal_probe_error_text, "shm_present",
+                     srv->store_close_shm_present ? "true" : "false", "shm_bytes", shm_bytes_text,
+                     "shm_probe", shm_probe_text, "shm_probe_native_error", shm_probe_error_text);
         return 0;
     }
 
@@ -1866,24 +1939,22 @@ static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation
      * ownership failure. */
     srv->store_close_error_active = !physically_destroyed;
     cbm_log_error(
-        "mcp.cached_store.close_failed", "code", "CBM_CACHED_STORE_CLOSE_FAILED",
-        "operation", srv->store_close_operation, "project", srv->store_close_project,
-        "db_path", db_path, "cache_age_s", cache_age_text, "process_id", process_id_text,
-        "process_start_utc_ticks", process_start_text, "close_status", close_status_text,
-        "process_identity_available",
+        "mcp.cached_store.close_failed", "code", "CBM_CACHED_STORE_CLOSE_FAILED", "operation",
+        srv->store_close_operation, "project", srv->store_close_project, "db_path", db_path,
+        "cache_age_s", cache_age_text, "process_id", process_id_text, "process_start_utc_ticks",
+        process_start_text, "close_status", close_status_text, "process_identity_available",
         srv->store_close_process_identity_available ? "true" : "false",
-        "process_identity_native_error", process_identity_error_text,
-        "sqlite_error", sqlite_error_text, "connection_destroyed",
-        srv->store_close_result.connection_destroyed ? "true" : "false",
-        "outstanding_statements", outstanding_text, "first_outstanding_sql_sha256",
+        "process_identity_native_error", process_identity_error_text, "sqlite_error",
+        sqlite_error_text, "connection_destroyed",
+        srv->store_close_result.connection_destroyed ? "true" : "false", "outstanding_statements",
+        outstanding_text, "first_outstanding_sql_sha256",
         srv->store_close_result.first_outstanding_sql_sha256, "db_present",
-        srv->store_close_db_present ? "true" : "false", "db_bytes", db_bytes_text,
-        "db_probe", db_probe_text, "db_probe_native_error", db_probe_error_text,
-        "wal_present", srv->store_close_wal_present ? "true" : "false", "wal_bytes",
-        wal_bytes_text, "wal_probe", wal_probe_text, "wal_probe_native_error",
-        wal_probe_error_text, "shm_present", srv->store_close_shm_present ? "true" : "false",
-        "shm_bytes", shm_bytes_text, "shm_probe", shm_probe_text, "shm_probe_native_error",
-        shm_probe_error_text, "remediation",
+        srv->store_close_db_present ? "true" : "false", "db_bytes", db_bytes_text, "db_probe",
+        db_probe_text, "db_probe_native_error", db_probe_error_text, "wal_present",
+        srv->store_close_wal_present ? "true" : "false", "wal_bytes", wal_bytes_text, "wal_probe",
+        wal_probe_text, "wal_probe_native_error", wal_probe_error_text, "shm_present",
+        srv->store_close_shm_present ? "true" : "false", "shm_bytes", shm_bytes_text, "shm_probe",
+        shm_probe_text, "shm_probe_native_error", shm_probe_error_text, "remediation",
         "finalize the named outstanding statement or resolve the exact SQLite close error; "
         "preserve the complete database family and retry only after physical close succeeds");
     return CBM_NOT_FOUND;
@@ -1893,8 +1964,7 @@ static int close_cached_store_exact(cbm_mcp_server_t *srv, const char *operation
  * exact physical close contract. A diagnostic from a destroyed connection is
  * returned as false; a retained connection terminates because no caller has a
  * durable owner-result channel beyond its stack-local pointer. */
-static bool close_local_store_exact(cbm_store_t **store, const char *operation,
-                                    const char *project,
+static bool close_local_store_exact(cbm_store_t **store, const char *operation, const char *project,
                                     cbm_store_close_result_t *out_result) {
     cbm_store_close_result_t local_result;
     cbm_store_close_result_t *result = out_result ? out_result : &local_result;
@@ -1910,12 +1980,11 @@ static bool close_local_store_exact(cbm_store_t **store, const char *operation,
     snprintf(outstanding_text, sizeof(outstanding_text), "%llu",
              (unsigned long long)result->outstanding_statement_count);
     cbm_log_error(
-        "mcp.local_store.close_failed", "code", "CBM_LOCAL_STORE_CLOSE_FAILED",
-        "operation", operation ? operation : "local_store.close", "project",
-        project ? project : "", "db_path", result->db_path, "close_status", status_text,
-        "sqlite_error", sqlite_text, "connection_destroyed",
-        result->connection_destroyed ? "true" : "false", "outstanding_statements",
-        outstanding_text, "first_outstanding_sql_sha256",
+        "mcp.local_store.close_failed", "code", "CBM_LOCAL_STORE_CLOSE_FAILED", "operation",
+        operation ? operation : "local_store.close", "project", project ? project : "", "db_path",
+        result->db_path, "close_status", status_text, "sqlite_error", sqlite_text,
+        "connection_destroyed", result->connection_destroyed ? "true" : "false",
+        "outstanding_statements", outstanding_text, "first_outstanding_sql_sha256",
         result->first_outstanding_sql_sha256, "remediation",
         "finalize the named outstanding statement or resolve the exact SQLite close error; "
         "preserve the complete database family");
@@ -1936,10 +2005,9 @@ static char *build_local_store_close_error(const char *operation, const char *pr
         if (doc) {
             yyjson_mut_doc_free(doc);
         }
-        return heap_strdup(
-            "{\"status\":\"error\",\"code\":\"CBM_LOCAL_STORE_CLOSE_FAILED\","
-            "\"message\":\"the exact local-store close failure could not be fully "
-            "serialized\"}");
+        return heap_strdup("{\"status\":\"error\",\"code\":\"CBM_LOCAL_STORE_CLOSE_FAILED\","
+                           "\"message\":\"the exact local-store close failure could not be fully "
+                           "serialized\"}");
     }
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
@@ -2146,8 +2214,8 @@ static HANDLE project_transition_open_exclusive(const char *path, DWORD *native_
         *native_error = ERROR_NO_UNICODE_TRANSLATION;
         return INVALID_HANDLE_VALUE;
     }
-    HANDLE handle = CreateFileW(wide, GENERIC_READ, 0, NULL, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE handle =
+        CreateFileW(wide, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     free(wide);
     if (handle == INVALID_HANDLE_VALUE &&
@@ -2187,10 +2255,8 @@ typedef struct {
 
 typedef DWORD(WINAPI *cbm_rm_start_session_fn)(DWORD *, DWORD, WCHAR *);
 typedef DWORD(WINAPI *cbm_rm_register_resources_fn)(DWORD, UINT, LPCWSTR *, UINT,
-                                                    cbm_rm_unique_process_t *, UINT,
-                                                    LPCWSTR *);
-typedef DWORD(WINAPI *cbm_rm_get_list_fn)(DWORD, UINT *, UINT *, cbm_rm_process_info_t *,
-                                         LPDWORD);
+                                                    cbm_rm_unique_process_t *, UINT, LPCWSTR *);
+typedef DWORD(WINAPI *cbm_rm_get_list_fn)(DWORD, UINT *, UINT *, cbm_rm_process_info_t *, LPDWORD);
 typedef DWORD(WINAPI *cbm_rm_end_session_fn)(DWORD);
 typedef BOOL(WINAPI *cbm_query_full_process_image_name_fn)(HANDLE, DWORD, LPWSTR, PDWORD);
 
@@ -2224,8 +2290,7 @@ static BOOL CALLBACK initialize_project_holder_api(PINIT_ONCE once, PVOID parame
     }
 
     HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    FARPROC start_address =
-        GetProcAddress(project_holder_api.restart_manager, "RmStartSession");
+    FARPROC start_address = GetProcAddress(project_holder_api.restart_manager, "RmStartSession");
     FARPROC register_address =
         GetProcAddress(project_holder_api.restart_manager, "RmRegisterResources");
     FARPROC list_address = GetProcAddress(project_holder_api.restart_manager, "RmGetList");
@@ -2246,10 +2311,8 @@ static BOOL CALLBACK initialize_project_holder_api(PINIT_ONCE once, PVOID parame
            sizeof(project_holder_api.start_session));
     memcpy(&project_holder_api.register_resources, &register_address,
            sizeof(project_holder_api.register_resources));
-    memcpy(&project_holder_api.get_list, &list_address,
-           sizeof(project_holder_api.get_list));
-    memcpy(&project_holder_api.end_session, &end_address,
-           sizeof(project_holder_api.end_session));
+    memcpy(&project_holder_api.get_list, &list_address, sizeof(project_holder_api.get_list));
+    memcpy(&project_holder_api.end_session, &end_address, sizeof(project_holder_api.end_session));
     memcpy(&project_holder_api.query_process_path, &query_path_address,
            sizeof(project_holder_api.query_process_path));
     if (!project_holder_api.start_session || !project_holder_api.register_resources ||
@@ -2275,8 +2338,7 @@ static bool get_project_holder_api(cbm_restart_manager_api_t **api, DWORD *nativ
     if (api) {
         *api = NULL;
     }
-    if (!InitOnceExecuteOnce(&project_holder_api_once, initialize_project_holder_api, NULL,
-                             NULL)) {
+    if (!InitOnceExecuteOnce(&project_holder_api_once, initialize_project_holder_api, NULL, NULL)) {
         if (native_error) {
             *native_error = GetLastError();
         }
@@ -2355,8 +2417,7 @@ static bool project_holder_inventories_equal(const cbm_project_holder_inventory_
     }
     for (size_t i = 0; i < a->count; i++) {
         if (a->holders[i].process_id != b->holders[i].process_id ||
-            a->holders[i].process_start_utc_ticks !=
-                b->holders[i].process_start_utc_ticks ||
+            a->holders[i].process_start_utc_ticks != b->holders[i].process_start_utc_ticks ||
             strcmp(a->holders[i].path, b->holders[i].path) != 0) {
             return false;
         }
@@ -2399,8 +2460,7 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
     }
     if (registered_count == 0) {
         inventory->status = CBM_PROJECT_HOLDER_PROBE_STABLE;
-        snprintf(inventory->operation, sizeof(inventory->operation), "%s",
-                 "family_absent");
+        snprintf(inventory->operation, sizeof(inventory->operation), "%s", "family_absent");
         return 0;
     }
 
@@ -2422,8 +2482,7 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
         goto cleanup_paths;
     }
 
-    rc = api->register_resources(session, (UINT)registered_count, wide_members, 0, NULL, 0,
-                                 NULL);
+    rc = api->register_resources(session, (UINT)registered_count, wide_members, 0, NULL, 0, NULL);
     if (rc != ERROR_SUCCESS) {
         project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_REGISTER_FAILED, rc,
                                       "RmRegisterResources");
@@ -2448,8 +2507,7 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
             processes = NULL;
             goto end_session;
         }
-        cbm_rm_process_info_t *next =
-            realloc(processes, (size_t)needed * sizeof(*processes));
+        cbm_rm_process_info_t *next = realloc(processes, (size_t)needed * sizeof(*processes));
         if (!next) {
             project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_LIST_FAILED,
                                           ERROR_NOT_ENOUGH_MEMORY, "allocate_RmGetList");
@@ -2482,11 +2540,11 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
         DWORD pid = processes[i].process.process_id;
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (!process) {
-            project_holder_inventory_fail(
-                inventory, GetLastError() == ERROR_INVALID_PARAMETER
-                               ? CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED
-                               : CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED,
-                GetLastError(), "OpenProcess");
+            project_holder_inventory_fail(inventory,
+                                          GetLastError() == ERROR_INVALID_PARAMETER
+                                              ? CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED
+                                              : CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED,
+                                          GetLastError(), "OpenProcess");
             free(processes);
             goto end_session;
         }
@@ -2497,9 +2555,8 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
         if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
             DWORD process_error = GetLastError();
             mcp_close_windows_handle_or_abort(&process, "restart_manager.process_times");
-            project_holder_inventory_fail(
-                inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED, process_error,
-                "GetProcessTimes");
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_QUERY_FAILED,
+                                          process_error, "GetProcessTimes");
             free(processes);
             goto end_session;
         }
@@ -2507,9 +2564,9 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
             filetime_raw_ticks(processes[i].process.process_start_time)) {
             mcp_close_windows_handle_or_abort(&process,
                                               "restart_manager.process_generation_mismatch");
-            project_holder_inventory_fail(
-                inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED, ERROR_RETRY,
-                "compare_process_start_time");
+            project_holder_inventory_fail(inventory,
+                                          CBM_PROJECT_HOLDER_PROBE_PROCESS_IDENTITY_CHANGED,
+                                          ERROR_RETRY, "compare_process_start_time");
             free(processes);
             goto end_session;
         }
@@ -2518,8 +2575,7 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
         if (!api->query_process_path(process, 0, wide_path, &wide_count)) {
             DWORD path_error = GetLastError();
             mcp_close_windows_handle_or_abort(&process, "restart_manager.process_path");
-            project_holder_inventory_fail(inventory,
-                                          CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED,
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED,
                                           path_error, "QueryFullProcessImageNameW");
             free(processes);
             goto end_session;
@@ -2529,16 +2585,14 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
         if (!utf8_path || strlen(utf8_path) >= sizeof(inventory->holders[i].path)) {
             DWORD path_error = utf8_path ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
             free(utf8_path);
-            project_holder_inventory_fail(inventory,
-                                          CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED,
+            project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_PROCESS_PATH_FAILED,
                                           path_error, "encode_process_path");
             free(processes);
             goto end_session;
         }
         inventory->holders[i].process_id = pid;
         inventory->holders[i].process_start_utc_ticks = filetime_raw_ticks(creation);
-        snprintf(inventory->holders[i].path, sizeof(inventory->holders[i].path), "%s",
-                 utf8_path);
+        snprintf(inventory->holders[i].path, sizeof(inventory->holders[i].path), "%s", utf8_path);
         free(utf8_path);
     }
     free(processes);
@@ -2551,13 +2605,12 @@ static int project_holder_inventory_once(const char *const *members, size_t memb
     snprintf(inventory->operation, sizeof(inventory->operation), "%s", "RmGetList");
 
 end_session: {
-        DWORD end_rc = api->end_session(session);
-        if (end_rc != ERROR_SUCCESS && inventory->status == CBM_PROJECT_HOLDER_PROBE_STABLE) {
-            project_holder_inventory_fail(inventory,
-                                          CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED, end_rc,
-                                          "RmEndSession");
-        }
+    DWORD end_rc = api->end_session(session);
+    if (end_rc != ERROR_SUCCESS && inventory->status == CBM_PROJECT_HOLDER_PROBE_STABLE) {
+        project_holder_inventory_fail(inventory, CBM_PROJECT_HOLDER_PROBE_END_SESSION_FAILED,
+                                      end_rc, "RmEndSession");
     }
+}
 cleanup_paths:
     for (size_t i = 0; i < registered_count; i++) {
         free((void *)wide_members[i]);
@@ -2612,8 +2665,7 @@ static int project_holder_inventory_stable(const char *const *members, size_t me
              "RmGetList.stable");
     if (first.count > 0) {
         result->first_holder_process_id = first.holders[0].process_id;
-        result->first_holder_process_start_utc_ticks =
-            first.holders[0].process_start_utc_ticks;
+        result->first_holder_process_start_utc_ticks = first.holders[0].process_start_utc_ticks;
         snprintf(result->first_holder_path, sizeof(result->first_holder_path), "%s",
                  first.holders[0].path);
     }
@@ -2623,9 +2675,10 @@ static int project_holder_inventory_stable(const char *const *members, size_t me
 }
 #endif
 
-int cbm_project_transition_wait_store_quiescent(
-    cbm_project_transition_t *transition, const char *db_path, unsigned long timeout_ms,
-    unsigned long poll_ms, cbm_project_quiescence_result_t *result) {
+int cbm_project_transition_wait_store_quiescent(cbm_project_transition_t *transition,
+                                                const char *db_path, unsigned long timeout_ms,
+                                                unsigned long poll_ms,
+                                                cbm_project_quiescence_result_t *result) {
     if (result) {
         memset(result, 0, sizeof(*result));
     }
@@ -2663,13 +2716,12 @@ int cbm_project_transition_wait_store_quiescent(
         for (size_t i = 0; i < 3; i++) {
             DWORD member_error = ERROR_SUCCESS;
             bool present = false;
-            HANDLE handle =
-                project_transition_open_exclusive(members[i], &member_error, &present);
+            HANDLE handle = project_transition_open_exclusive(members[i], &member_error, &present);
             if (handle == INVALID_HANDLE_VALUE) {
                 snprintf(result->failed_path, sizeof(result->failed_path), "%s", members[i]);
                 result->native_error = member_error;
-                retry = member_error == ERROR_SHARING_VIOLATION ||
-                        member_error == ERROR_LOCK_VIOLATION;
+                retry =
+                    member_error == ERROR_SHARING_VIOLATION || member_error == ERROR_LOCK_VIOLATION;
                 fatal_member_error = !retry;
                 break;
             }
@@ -2677,8 +2729,7 @@ int cbm_project_transition_wait_store_quiescent(
         }
         for (size_t i = 0; i < 3; i++) {
             if (held[i]) {
-                mcp_close_windows_handle_or_abort(&held[i],
-                                                  "project_quiescence.family_guard");
+                mcp_close_windows_handle_or_abort(&held[i], "project_quiescence.family_guard");
             }
         }
         int holder_rc = project_holder_inventory_stable(members, 3, result);
@@ -2759,8 +2810,7 @@ static void record_project_transition_state(cbm_mcp_server_t *srv, const char *p
     snprintf(srv->transition_error_project, sizeof(srv->transition_error_project), "%s",
              project ? project : "");
     srv->transition_native_error = native_error;
-    const char *code = state == CBM_PROJECT_TRANSITION_ACTIVE
-                           ? "CBM_PROJECT_TRANSITION_ACTIVE"
+    const char *code = state == CBM_PROJECT_TRANSITION_ACTIVE ? "CBM_PROJECT_TRANSITION_ACTIVE"
                        : state == CBM_PROJECT_TRANSITION_ABANDONED
                            ? "CBM_PROJECT_TRANSITION_ABANDONED"
                            : "CBM_PROJECT_TRANSITION_PROBE_FAILED";
@@ -2878,9 +2928,8 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     if ((srv->store || srv->store_close_error_active) &&
         close_cached_store_exact(srv, "mcp_server.free", NULL) != 0) {
-        cbm_log_error("mcp.server.free_refused", "code",
-                      "CBM_MCP_SERVER_FREE_STORE_CLOSE_FAILED", "operation",
-                      srv->store_close_operation, "project", srv->store_close_project,
+        cbm_log_error("mcp.server.free_refused", "code", "CBM_MCP_SERVER_FREE_STORE_CLOSE_FAILED",
+                      "operation", srv->store_close_operation, "project", srv->store_close_project,
                       "connection_destroyed",
                       srv->store_close_result.connection_destroyed ? "true" : "false",
                       "remediation",
@@ -2967,8 +3016,7 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
     cbm_project_transition_state_t state =
         probe_project_transition(project, &native_error, &object_preexisted, &wait_result);
     srv->transition_probe_count++;
-    bool sampled_probe =
-        (srv->transition_probe_count & (srv->transition_probe_count - 1)) == 0;
+    bool sampled_probe = (srv->transition_probe_count & (srv->transition_probe_count - 1)) == 0;
     if (sampled_probe || state != CBM_PROJECT_TRANSITION_INACTIVE) {
         char project_digest[CBM_SHA256_HEX_LEN + 1];
         char call_count[CBM_SZ_32];
@@ -2981,15 +3029,11 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
         snprintf(probe_count, sizeof(probe_count), "%llu",
                  (unsigned long long)srv->transition_probe_count);
         snprintf(wait_result_text, sizeof(wait_result_text), "%lu", (unsigned long)wait_result);
-        snprintf(native_error_text, sizeof(native_error_text), "%lu",
-                 (unsigned long)native_error);
-        const char *state_text = state == CBM_PROJECT_TRANSITION_ACTIVE
-                                     ? "active"
-                                 : state == CBM_PROJECT_TRANSITION_INACTIVE
-                                     ? "inactive"
-                                 : state == CBM_PROJECT_TRANSITION_ABANDONED
-                                     ? "abandoned"
-                                     : "probe_failed";
+        snprintf(native_error_text, sizeof(native_error_text), "%lu", (unsigned long)native_error);
+        const char *state_text = state == CBM_PROJECT_TRANSITION_ACTIVE      ? "active"
+                                 : state == CBM_PROJECT_TRANSITION_INACTIVE  ? "inactive"
+                                 : state == CBM_PROJECT_TRANSITION_ABANDONED ? "abandoned"
+                                                                             : "probe_failed";
         cbm_log_info("project.transition.probe_observed", "project", project, "project_sha256",
                      project_digest, "call_count", call_count, "probe_count", probe_count,
                      "object_preexisted", object_preexisted ? "true" : "false", "wait_result",
@@ -3001,13 +3045,12 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
     }
     if (close_cached_store_exact(srv, "project_transition.quiesce", project) != 0) {
         record_project_transition_state(srv, project, state, native_error);
-        cbm_log_error("project.transition.quiesce_failed", "code",
-                      "CBM_PROJECT_TRANSITION_STORE_CLOSE_FAILED", "project", project,
-                      "connection_destroyed",
-                      srv->store_close_result.connection_destroyed ? "true" : "false",
-                      "remediation",
-                      "resolve the exact cached-store close failure before admitting the "
-                      "transition worker or publication");
+        cbm_log_error(
+            "project.transition.quiesce_failed", "code",
+            "CBM_PROJECT_TRANSITION_STORE_CLOSE_FAILED", "project", project, "connection_destroyed",
+            srv->store_close_result.connection_destroyed ? "true" : "false", "remediation",
+            "resolve the exact cached-store close failure before admitting the "
+            "transition worker or publication");
         free(project);
         return -1;
     }
@@ -3020,9 +3063,9 @@ int cbm_mcp_server_quiesce_project_transition(cbm_mcp_server_t *srv) {
         free(project);
         return 1;
     }
-    cbm_log_error("project.transition.probe_failed", "code",
-                  "CBM_PROJECT_TRANSITION_PROBE_FAILED", "project", project,
-                  "native_error_kind", "win32", "native_error", native_error_text, "message",
+    cbm_log_error("project.transition.probe_failed", "code", "CBM_PROJECT_TRANSITION_PROBE_FAILED",
+                  "project", project, "native_error_kind", "win32", "native_error",
+                  native_error_text, "message",
                   "the resident query store closed because transition ownership was unevaluable",
                   "remediation", "resolve the named-mutex failure before reopening the project");
     free(project);
@@ -3047,8 +3090,8 @@ cbm_store_close_status_t cbm_mcp_server_close_cached_project_store(
     result->status = CBM_STORE_CLOSE_INVALID_ARGUMENT;
     result->sqlite_close_code = SQLITE_MISUSE;
     if (!srv) {
-        cbm_log_error("mcp.cached_store.close_refused", "code",
-                      "CBM_CACHED_STORE_SERVER_REQUIRED", "remediation",
+        cbm_log_error("mcp.cached_store.close_refused", "code", "CBM_CACHED_STORE_SERVER_REQUIRED",
+                      "remediation",
                       "create the MCP server before closing its cached project store");
         return result->status;
     }
@@ -3082,8 +3125,8 @@ static bool cache_dir(char *buf, size_t bufsz, unsigned long *native_error) {
         if (native_error) {
             *native_error = ERROR_INVALID_PARAMETER;
         }
-        cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_OUTPUT_INVALID",
-                      "message", "cache path output storage is missing", "remediation",
+        cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_OUTPUT_INVALID", "message",
+                      "cache path output storage is missing", "remediation",
                       "provide one caller-owned non-empty path buffer");
         return false;
     }
@@ -3094,8 +3137,8 @@ static bool cache_dir(char *buf, size_t bufsz, unsigned long *native_error) {
             *native_error = ERROR_PATH_NOT_FOUND;
         }
         cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_UNRESOLVED", "message",
-                      "the configured project-store directory could not be resolved",
-                      "remediation", "set one valid cache root and retry the unchanged request");
+                      "the configured project-store directory could not be resolved", "remediation",
+                      "set one valid cache root and retry the unchanged request");
         return false;
     }
     int wrote = snprintf(buf, bufsz, "%s", dir);
@@ -3105,8 +3148,8 @@ static bool cache_dir(char *buf, size_t bufsz, unsigned long *native_error) {
             *native_error = ERROR_BUFFER_OVERFLOW;
         }
         cbm_log_error("mcp.cache_path_failed", "code", "CBM_CACHE_PATH_TOO_LONG", "message",
-                      "the configured project-store directory exceeds path capacity",
-                      "remediation", "shorten the configured cache root and retry");
+                      "the configured project-store directory exceeds path capacity", "remediation",
+                      "shorten the configured cache root and retry");
         return false;
     }
     return true;
@@ -3132,8 +3175,8 @@ static bool project_db_path(const char *project, char *buf, size_t bufsz,
         if (native_error) {
             *native_error = ERROR_INVALID_NAME;
         }
-        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_NAME_INVALID",
-                      "message", "the project name cannot form a store identity", "remediation",
+        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_NAME_INVALID", "message",
+                      "the project name cannot form a store identity", "remediation",
                       "use the exact validated project name derived from the repository root");
         return false;
     }
@@ -3147,8 +3190,8 @@ static bool project_db_path(const char *project, char *buf, size_t bufsz,
         if (native_error) {
             *native_error = ERROR_BUFFER_OVERFLOW;
         }
-        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_TOO_LONG",
-                      "project", project, "message",
+        cbm_log_error("mcp.project_path_failed", "code", "CBM_PROJECT_PATH_TOO_LONG", "project",
+                      project, "message",
                       "the exact cache root and project name exceed destination path capacity",
                       "remediation", "shorten the configured cache root and retry");
         return false;
@@ -3255,8 +3298,7 @@ static db_project_inspect_status_t inspect_root_derived_project_identity(
 
     cbm_project_t project = {0};
     int project_rc = cbm_store_get_project(store, expected_project, &project);
-    if (project_rc != CBM_STORE_OK || !project.name || !project.root_path ||
-        !project.indexed_at) {
+    if (project_rc != CBM_STORE_OK || !project.name || !project.root_path || !project.indexed_at) {
         record_store_query_failure(
             srv, expected_project, db_path, store,
             project_rc == CBM_STORE_NOT_FOUND ? CBM_STORE_VERIFY_INTEGRITY_FAILED
@@ -3397,13 +3439,9 @@ static bool refresh_named_store_idle_clock(cbm_mcp_server_t *srv, const char *pr
  * the internal name is copied into name_out; if out_store is non-NULL the open
  * handle is transferred to the caller (who must cbm_store_close it). On failure
  * the store is always closed. Defined after is_project_db_file below. */
-static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *srv,
-                                                            const char *error_project,
-                                                            const char *full_path, char *name_out,
-                                                            size_t name_sz,
-                                                            cbm_store_t **out_store,
-                                                            cbm_store_verify_result_t
-                                                                *out_verification);
+static db_project_inspect_status_t db_internal_project_name(
+    cbm_mcp_server_t *srv, const char *error_project, const char *full_path, char *name_out,
+    size_t name_sz, cbm_store_t **out_store, cbm_store_verify_result_t *out_verification);
 
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
@@ -3436,8 +3474,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     }
 
     /* Close old store */
-    if (srv->store &&
-        close_cached_store_exact(srv, "resolve_store.switch_project", project) != 0) {
+    if (srv->store && close_cached_store_exact(srv, "resolve_store.switch_project", project) != 0) {
         return NULL;
     }
 
@@ -3555,8 +3592,7 @@ static cbm_store_t *resolve_mutation_store(cbm_mcp_server_t *srv, const char *pr
         record_store_error_state(srv, project, db_path, &verification);
         if (writer) {
             cbm_store_close_result_t writer_close;
-            (void)close_local_store_exact(&writer,
-                                          "resolve_mutation_store.failed_verified_open",
+            (void)close_local_store_exact(&writer, "resolve_mutation_store.failed_verified_open",
                                           project, &writer_close);
         }
         return NULL;
@@ -3569,10 +3605,9 @@ static cbm_store_t *resolve_mutation_store(cbm_mcp_server_t *srv, const char *pr
         record_store_query_failure(
             srv, project, db_path, resolved, CBM_STORE_VERIFY_IO_FAILED,
             "source.writer.cached_query_ownership",
-            writer_closed
-                ? "verified path-backed query store is not owned by this MCP server"
-                : "verified mutation writer also failed exact close after cached-query "
-                  "ownership refusal");
+            writer_closed ? "verified path-backed query store is not owned by this MCP server"
+                          : "verified mutation writer also failed exact close after cached-query "
+                            "ownership refusal");
         return NULL;
     }
     if (close_cached_store_exact(srv, "resolve_mutation_store.release_query", project) != 0) {
@@ -3710,10 +3745,8 @@ static char *build_integrity_failed_error(const cbm_mcp_server_t *srv) {
         yyjson_mut_obj_add_str(doc, root, "stored_root", srv->store_error_stored_root);
         yyjson_mut_obj_add_str(doc, root, "stored_indexed_at", srv->store_error_indexed_at);
         yyjson_mut_obj_add_str(doc, root, "canonical_root", srv->store_error_canonical_root);
-        yyjson_mut_obj_add_str(doc, root, "canonical_project",
-                               srv->store_error_canonical_project);
-        yyjson_mut_obj_add_str(doc, root, "canonical_db_path",
-                               srv->store_error_canonical_db_path);
+        yyjson_mut_obj_add_str(doc, root, "canonical_project", srv->store_error_canonical_project);
+        yyjson_mut_obj_add_str(doc, root, "canonical_db_path", srv->store_error_canonical_db_path);
         yyjson_mut_obj_add_bool(doc, root, "canonical_db_present",
                                 cbm_path_exists(srv->store_error_canonical_db_path));
         yyjson_mut_obj_add_str(doc, root, "identity_selection", "root-derived");
@@ -3783,10 +3816,8 @@ static char *build_provenance_failed_error(const cbm_mcp_server_t *srv) {
         yyjson_mut_obj_add_str(doc, root, "stored_root", srv->store_error_stored_root);
         yyjson_mut_obj_add_str(doc, root, "stored_indexed_at", srv->store_error_indexed_at);
         yyjson_mut_obj_add_str(doc, root, "canonical_root", srv->store_error_canonical_root);
-        yyjson_mut_obj_add_str(doc, root, "canonical_project",
-                               srv->store_error_canonical_project);
-        yyjson_mut_obj_add_str(doc, root, "canonical_db_path",
-                               srv->store_error_canonical_db_path);
+        yyjson_mut_obj_add_str(doc, root, "canonical_project", srv->store_error_canonical_project);
+        yyjson_mut_obj_add_str(doc, root, "canonical_db_path", srv->store_error_canonical_db_path);
         yyjson_mut_obj_add_bool(doc, root, "canonical_db_present",
                                 cbm_path_exists(srv->store_error_canonical_db_path));
         yyjson_mut_obj_add_str(doc, root, "identity_selection", "root-derived");
@@ -3879,8 +3910,7 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
         yyjson_mut_obj_add_strcpy(doc, root, "operation", srv->store_close_operation);
         yyjson_mut_obj_add_strcpy(doc, root, "project", srv->store_close_project);
         yyjson_mut_obj_add_strcpy(doc, root, "db_path", srv->store_close_result.db_path);
-        yyjson_mut_obj_add_int(doc, root, "close_status",
-                               srv->store_close_result.status);
+        yyjson_mut_obj_add_int(doc, root, "close_status", srv->store_close_result.status);
         yyjson_mut_obj_add_int(doc, root, "sqlite_error",
                                srv->store_close_result.sqlite_close_code);
         yyjson_mut_obj_add_bool(doc, root, "connection_was_present",
@@ -3901,17 +3931,17 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
         yyjson_mut_obj_add_int(doc, root, "db_bytes", srv->store_close_db_bytes);
         yyjson_mut_obj_add_int(doc, root, "db_probe", srv->store_close_db_probe);
         yyjson_mut_obj_add_uint(doc, root, "db_probe_native_error",
-                               srv->store_close_db_probe_native_error);
+                                srv->store_close_db_probe_native_error);
         yyjson_mut_obj_add_bool(doc, root, "wal_present", srv->store_close_wal_present);
         yyjson_mut_obj_add_int(doc, root, "wal_bytes", srv->store_close_wal_bytes);
         yyjson_mut_obj_add_int(doc, root, "wal_probe", srv->store_close_wal_probe);
         yyjson_mut_obj_add_uint(doc, root, "wal_probe_native_error",
-                               srv->store_close_wal_probe_native_error);
+                                srv->store_close_wal_probe_native_error);
         yyjson_mut_obj_add_bool(doc, root, "shm_present", srv->store_close_shm_present);
         yyjson_mut_obj_add_int(doc, root, "shm_bytes", srv->store_close_shm_bytes);
         yyjson_mut_obj_add_int(doc, root, "shm_probe", srv->store_close_shm_probe);
         yyjson_mut_obj_add_uint(doc, root, "shm_probe_native_error",
-                               srv->store_close_shm_probe_native_error);
+                                srv->store_close_shm_probe_native_error);
         yyjson_mut_obj_add_bool(doc, root, "worker_started", false);
         yyjson_mut_obj_add_bool(doc, root, "delete_attempted", false);
         yyjson_mut_obj_add_bool(doc, root, "sqlite_publication_started", false);
@@ -3932,22 +3962,24 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
         strcmp(srv->transition_error_project, project) == 0) {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
         if (!doc) {
-            return heap_strdup("{\"code\":\"CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED\",\"message\":\"the exact project transition refusal could not be serialized\",\"remediation\":\"free memory and retry the unchanged request\"}");
+            return heap_strdup(
+                "{\"code\":\"CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED\",\"message\":\"the "
+                "exact project transition refusal could not be serialized\",\"remediation\":\"free "
+                "memory and retry the unchanged request\"}");
         }
         yyjson_mut_val *root = yyjson_mut_obj(doc);
         yyjson_mut_doc_set_root(doc, root);
         yyjson_mut_obj_add_str(doc, root, "code", srv->transition_error_code);
         yyjson_mut_obj_add_str(doc, root, "project", project);
-        yyjson_mut_obj_add_int(doc, root, "native_error",
-                               (int64_t)srv->transition_native_error);
+        yyjson_mut_obj_add_int(doc, root, "native_error", (int64_t)srv->transition_native_error);
         yyjson_mut_obj_add_bool(doc, root, "cached_store_closed",
                                 !srv->store && !srv->store_close_error_active);
         yyjson_mut_obj_add_bool(doc, root, "reopen_attempted", false);
         bool active = strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ACTIVE") == 0;
         bool abandoned =
             strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_ABANDONED") == 0;
-        bool granted_inactive = strcmp(srv->transition_error_code,
-                                       "CBM_PROJECT_TRANSITION_WRITER_GRANT_INACTIVE") == 0;
+        bool granted_inactive =
+            strcmp(srv->transition_error_code, "CBM_PROJECT_TRANSITION_WRITER_GRANT_INACTIVE") == 0;
         yyjson_mut_obj_add_str(
             doc, root, "message",
             active      ? "the exact project has an active index/publication transition"
@@ -3958,13 +3990,16 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
         yyjson_mut_obj_add_str(
             doc, root, "remediation",
             active      ? "retry after the exact transition publishes its terminal durable state"
-            : abandoned ? "inspect the durable transition receipt and complete exact abandoned-owner recovery before retrying"
+            : abandoned ? "inspect the durable transition receipt and complete exact "
+                          "abandoned-owner recovery before retrying"
             : granted_inactive
-                ? "preserve the staged database and restart indexing from one live parent transition"
+                ? "preserve the staged database and restart indexing from one live parent "
+                  "transition"
                 : "resolve the structured Windows named-mutex failure before retrying");
         char *json = yyjson_mut_write(doc, 0, NULL);
         yyjson_mut_doc_free(doc);
-        return json ? json : heap_strdup("{\"code\":\"CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED\"}");
+        return json ? json
+                    : heap_strdup("{\"code\":\"CBM_PROJECT_TRANSITION_RESPONSE_ALLOC_FAILED\"}");
     }
     if (srv && project && strcmp(srv->store_error_project, project) == 0) {
         if (store_error_is_provenance(&srv->store_verify)) {
@@ -4104,13 +4139,9 @@ static bool project_name_from_db_path(const char *full_path, char *project, size
 }
 
 /* db_internal_project_name — see forward declaration above resolve_store. */
-static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *srv,
-                                                            const char *error_project,
-                                                            const char *full_path, char *name_out,
-                                                            size_t name_sz,
-                                                            cbm_store_t **out_store,
-                                                            cbm_store_verify_result_t
-                                                                *out_verification) {
+static db_project_inspect_status_t db_internal_project_name(
+    cbm_mcp_server_t *srv, const char *error_project, const char *full_path, char *name_out,
+    size_t name_sz, cbm_store_t **out_store, cbm_store_verify_result_t *out_verification) {
     if (out_store) {
         *out_store = NULL;
     }
@@ -4173,11 +4204,9 @@ static db_project_inspect_status_t db_internal_project_name(cbm_mcp_server_t *sr
         }
     } else {
         cbm_store_close_result_t close_result;
-        if (!close_local_store_exact(&st, "inspect_project.finish", error_project,
-                                     &close_result)) {
+        if (!close_local_store_exact(&st, "inspect_project.finish", error_project, &close_result)) {
             record_store_query_failure(
-                srv, error_project, full_path, st, CBM_STORE_VERIFY_IO_FAILED,
-                "source.query_close",
+                srv, error_project, full_path, st, CBM_STORE_VERIFY_IO_FAILED, "source.query_close",
                 "temporary verified project query connection failed exact physical close");
             ok = false;
         }
@@ -4198,8 +4227,7 @@ static bool add_index_capability_json(yyjson_mut_doc *doc, yyjson_mut_val *paren
                                 cbm_semantic_state_name(capability->semantic_state)) ||
         !yyjson_mut_obj_add_bool(doc, semantic, "available",
                                  capability->semantic_state == CBM_SEMANTIC_AVAILABLE) ||
-        !yyjson_mut_obj_add_int(doc, semantic, "vector_dimension",
-                                capability->vector_dimension) ||
+        !yyjson_mut_obj_add_int(doc, semantic, "vector_dimension", capability->vector_dimension) ||
         !yyjson_mut_obj_add_int(doc, semantic, "node_vector_count",
                                 capability->node_vector_count) ||
         !yyjson_mut_obj_add_int(doc, semantic, "token_vector_count",
@@ -4236,9 +4264,8 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
     char project_name[CBM_SZ_1K];
     cbm_store_t *pstore = NULL;
     cbm_store_verify_result_t verification;
-    db_project_inspect_status_t inspect =
-        db_internal_project_name(srv, "", full_path, project_name, sizeof(project_name), &pstore,
-                                 &verification);
+    db_project_inspect_status_t inspect = db_internal_project_name(
+        srv, "", full_path, project_name, sizeof(project_name), &pstore, &verification);
     if (inspect != DB_PROJECT_INSPECT_OK) {
         return inspect;
     }
@@ -4272,13 +4299,11 @@ static db_project_inspect_status_t build_project_json_entry(cbm_mcp_server_t *sr
         return DB_PROJECT_INSPECT_FAILED;
     }
     cbm_store_close_result_t close_result;
-    if (!close_local_store_exact(&pstore, "list_projects.finish", project_name,
-                                  &close_result)) {
+    if (!close_local_store_exact(&pstore, "list_projects.finish", project_name, &close_result)) {
         cbm_project_free_fields(&persisted_project);
-        record_store_query_failure(
-            srv, project_name, full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
-            "source.query_close",
-            "project-list query connection failed exact physical close");
+        record_store_query_failure(srv, project_name, full_path, pstore, CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.query_close",
+                                   "project-list query connection failed exact physical close");
         return DB_PROJECT_INSPECT_FAILED;
     }
 
@@ -4434,8 +4459,7 @@ static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refus
     yyjson_mut_obj_add_strcpy(doc, item, "scratch_path", srv->store_verify.scratch_path);
     yyjson_mut_obj_add_bool(doc, item, "scratch_cleanup_complete",
                             srv->store_verify.scratch_cleanup_complete);
-    yyjson_mut_obj_add_strcpy(doc, item, "cleanup_operation",
-                              srv->store_verify.cleanup_operation);
+    yyjson_mut_obj_add_strcpy(doc, item, "cleanup_operation", srv->store_verify.cleanup_operation);
     yyjson_mut_obj_add_int(doc, item, "cleanup_native_error",
                            (int64_t)srv->store_verify.cleanup_native_error);
     yyjson_mut_obj_add_bool(doc, item, "source_mutation_attempted", false);
@@ -4457,8 +4481,7 @@ static void append_store_refusal_json(yyjson_mut_doc *doc, yyjson_mut_val *refus
     yyjson_mut_arr_add_val(refusals, item);
 }
 
-static void append_project_identity_conflict_json(yyjson_mut_doc *doc,
-                                                  yyjson_mut_val *conflicts,
+static void append_project_identity_conflict_json(yyjson_mut_doc *doc, yyjson_mut_val *conflicts,
                                                   const cbm_mcp_server_t *srv) {
     char canonical_wal_path[CBM_STORE_VERIFY_PATH_MAX + 5];
     char canonical_shm_path[CBM_STORE_VERIFY_PATH_MAX + 5];
@@ -4472,29 +4495,21 @@ static void append_project_identity_conflict_json(yyjson_mut_doc *doc,
     yyjson_mut_obj_add_strcpy(doc, item, "legacy_db_path", srv->store_error_db_path);
     yyjson_mut_obj_add_strcpy(doc, item, "legacy_wal_path", srv->store_error_wal_path);
     yyjson_mut_obj_add_strcpy(doc, item, "legacy_shm_path", srv->store_error_shm_path);
-    yyjson_mut_obj_add_strcpy(doc, item, "stored_project",
-                              srv->store_error_stored_project);
+    yyjson_mut_obj_add_strcpy(doc, item, "stored_project", srv->store_error_stored_project);
     yyjson_mut_obj_add_strcpy(doc, item, "stored_root", srv->store_error_stored_root);
-    yyjson_mut_obj_add_strcpy(doc, item, "stored_indexed_at",
-                              srv->store_error_indexed_at);
-    yyjson_mut_obj_add_strcpy(doc, item, "canonical_root",
-                              srv->store_error_canonical_root);
-    yyjson_mut_obj_add_strcpy(doc, item, "canonical_project",
-                              srv->store_error_canonical_project);
-    yyjson_mut_obj_add_strcpy(doc, item, "canonical_db_path",
-                              srv->store_error_canonical_db_path);
+    yyjson_mut_obj_add_strcpy(doc, item, "stored_indexed_at", srv->store_error_indexed_at);
+    yyjson_mut_obj_add_strcpy(doc, item, "canonical_root", srv->store_error_canonical_root);
+    yyjson_mut_obj_add_strcpy(doc, item, "canonical_project", srv->store_error_canonical_project);
+    yyjson_mut_obj_add_strcpy(doc, item, "canonical_db_path", srv->store_error_canonical_db_path);
     yyjson_mut_obj_add_bool(doc, item, "canonical_db_present",
                             cbm_path_exists(srv->store_error_canonical_db_path));
     yyjson_mut_obj_add_bool(doc, item, "canonical_wal_present",
                             cbm_path_exists(canonical_wal_path));
     yyjson_mut_obj_add_bool(doc, item, "canonical_shm_present",
                             cbm_path_exists(canonical_shm_path));
-    yyjson_mut_obj_add_int(doc, item, "legacy_db_bytes",
-                           (int64_t)srv->store_verify.db_bytes);
-    yyjson_mut_obj_add_strcpy(doc, item, "legacy_db_sha256",
-                              srv->store_verify.db_sha256);
-    yyjson_mut_obj_add_strcpy(doc, item, "failed_operation",
-                              srv->store_verify.operation);
+    yyjson_mut_obj_add_int(doc, item, "legacy_db_bytes", (int64_t)srv->store_verify.db_bytes);
+    yyjson_mut_obj_add_strcpy(doc, item, "legacy_db_sha256", srv->store_verify.db_sha256);
+    yyjson_mut_obj_add_strcpy(doc, item, "failed_operation", srv->store_verify.operation);
     yyjson_mut_obj_add_strcpy(doc, item, "detail", srv->store_verify.detail);
     yyjson_mut_obj_add_str(doc, item, "identity_selection", "root-derived");
     yyjson_mut_obj_add_bool(doc, item, "query_admitted", false);
@@ -5543,8 +5558,7 @@ static char *semantic_query_error_result(const semantic_query_outcome_t *outcome
         operation = "admit_semantic_search";
         message = "the committed index generation does not advertise semantic search";
         remediation = outcome->capability_observed &&
-                              outcome->capability.semantic_state ==
-                                  CBM_SEMANTIC_UNAVAILABLE_MODE
+                              outcome->capability.semantic_state == CBM_SEMANTIC_UNAVAILABLE_MODE
                           ? "re-index the exact repository in moderate or full mode"
                           : "index a real corpus containing at least two functions or methods";
         break;
@@ -6203,8 +6217,8 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     if (!project_db_path(name, path, sizeof(path), &path_error)) {
         char native_error[32];
         (void)snprintf(native_error, sizeof(native_error), "%lu", path_error);
-        cbm_log_error("mcp.delete_project_failed", "code", "CBM_PROJECT_PATH_UNRESOLVED",
-                      "project", name, "native_error", native_error, "remediation",
+        cbm_log_error("mcp.delete_project_failed", "code", "CBM_PROJECT_PATH_UNRESOLVED", "project",
+                      name, "native_error", native_error, "remediation",
                       "fix the configured cache root and retry");
         cbm_pipeline_unlock();
         free(name);
@@ -6302,12 +6316,12 @@ static bool aspect_is_valid(const char *name) {
     return false;
 }
 
-/* Check if an aspect is requested. NULL aspects = all. The array can contain
- * "all" (everything), "overview" (everything except file_tree — see
+/* Check if an aspect is requested. NULL aspects = the narrow overview. The array can contain
+ * "all" (everything), "overview" (everything except file_tree/clusters — see
  * cbm_store_arch_aspect_in_overview in store.c), or the aspect name itself. */
 static bool aspect_wanted(yyjson_doc *aspects_doc, yyjson_val *aspects_arr, const char *name) {
     if (!aspects_arr) {
-        return true; /* no filter = all */
+        return cbm_store_arch_aspect_in_overview(name);
     }
     yyjson_arr_iter iter;
     yyjson_arr_iter_init(aspects_arr, &iter);
@@ -6332,72 +6346,648 @@ static bool aspect_wanted(yyjson_doc *aspects_doc, yyjson_val *aspects_arr, cons
 }
 
 /* Append cross_repo_links summary to architecture JSON if CROSS_* edges exist. */
-static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+static bool append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_schema_info_t *schema) {
     /* Scan edge types for any CROSS_* edges and sum them */
-    int cross_total = 0;
+    uint64_t cross_total = 0;
     yyjson_mut_val *cr = yyjson_mut_obj(doc);
+    if (!cr) {
+        return false;
+    }
     static const char *cross_types[] = {"CROSS_HTTP_CALLS",    "CROSS_ASYNC_CALLS",
                                         "CROSS_CHANNEL",       "CROSS_GRPC_CALLS",
                                         "CROSS_GRAPHQL_CALLS", "CROSS_TRPC_CALLS"};
     for (int t = 0; t < (int)(sizeof(cross_types) / sizeof(cross_types[0])); t++) {
         for (int i = 0; i < schema->edge_type_count; i++) {
             if (strcmp(schema->edge_types[i].type, cross_types[t]) == 0) {
-                yyjson_mut_obj_add_int(doc, cr, cross_types[t], schema->edge_types[i].count);
-                cross_total += schema->edge_types[i].count;
+                if (schema->edge_types[i].count < 0 ||
+                    UINT64_MAX - cross_total < (uint64_t)schema->edge_types[i].count ||
+                    !yyjson_mut_obj_add_int(doc, cr, cross_types[t], schema->edge_types[i].count)) {
+                    return false;
+                }
+                cross_total += (uint64_t)schema->edge_types[i].count;
                 break;
             }
         }
     }
     if (cross_total > 0) {
-        yyjson_mut_obj_add_int(doc, cr, "total", cross_total);
-        yyjson_mut_obj_add_val(doc, root, "cross_repo_links", cr);
+        return yyjson_mut_obj_add_uint(doc, cr, "total", cross_total) &&
+               yyjson_mut_obj_add_val(doc, root, "cross_repo_links", cr);
     }
+    return true;
+}
+
+static bool append_cluster_receipt(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                   const cbm_cluster_receipt_t *receipt) {
+    if (!receipt || !receipt->present) {
+        return true;
+    }
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    if (!item || !yyjson_mut_obj_add_str(doc, item, "status", receipt->status) ||
+        !yyjson_mut_obj_add_str(doc, item, "algorithm", receipt->algorithm) ||
+        !yyjson_mut_obj_add_str(doc, item, "algorithm_version", receipt->algorithm_version) ||
+        !yyjson_mut_obj_add_str(doc, item, "projection_schema", receipt->projection_schema) ||
+        !yyjson_mut_obj_add_str(doc, item, "result_schema", receipt->result_schema) ||
+        !yyjson_mut_obj_add_str(doc, item, "node_label_selection", receipt->node_label_selection) ||
+        !yyjson_mut_obj_add_uint(doc, item, "observed_node_label_count",
+                                 receipt->observed_node_label_count) ||
+        !yyjson_mut_obj_add_str(doc, item, "node_label_roster_sha256",
+                                receipt->node_label_roster_sha256) ||
+        !yyjson_mut_obj_add_str(doc, item, "edge_type_roster", receipt->edge_type_roster) ||
+        !yyjson_mut_obj_add_str(doc, item, "seed", receipt->seed) ||
+        !yyjson_mut_obj_add_str(doc, item, "objective_function", receipt->objective_function) ||
+        !yyjson_mut_obj_add_str(doc, item, "move_rule", receipt->move_rule) ||
+        !yyjson_mut_obj_add_str(doc, item, "refinement_rule", receipt->refinement_rule) ||
+        !yyjson_mut_obj_add_str(doc, item, "aggregation_rule", receipt->aggregation_rule) ||
+        !yyjson_mut_obj_add_str(doc, item, "edge_transform", receipt->edge_transform) ||
+        !yyjson_mut_obj_add_real(doc, item, "resolution", receipt->resolution) ||
+        !yyjson_mut_obj_add_bool(doc, item, "converged", receipt->converged) ||
+        !yyjson_mut_obj_add_bool(doc, item, "connectivity_verified",
+                                 receipt->connectivity_verified) ||
+        !yyjson_mut_obj_add_bool(doc, item, "complete_coverage_verified",
+                                 receipt->complete_coverage_verified) ||
+        !yyjson_mut_obj_add_uint(doc, item, "requested_node_count",
+                                 receipt->requested_node_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "included_node_count", receipt->included_node_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "excluded_node_count", receipt->excluded_node_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "requested_edge_count",
+                                 receipt->requested_edge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "included_edge_count", receipt->included_edge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "excluded_edge_count", receipt->excluded_edge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "canonical_typed_edge_count",
+                                 receipt->canonical_typed_edge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "weighted_undirected_edge_count",
+                                 receipt->weighted_undirected_edge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "undirected_fold_count",
+                                 receipt->undirected_fold_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "duplicate_edge_count",
+                                 receipt->duplicate_edge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "self_loop_count", receipt->self_loop_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "community_count", receipt->community_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "level_count", receipt->level_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "level_bound", receipt->level_bound) ||
+        !yyjson_mut_obj_add_uint(doc, item, "move_visit_count", receipt->move_visit_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "move_visit_cap", receipt->move_visit_cap) ||
+        !yyjson_mut_obj_add_uint(doc, item, "refine_visit_count", receipt->refine_visit_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "refine_visit_bound", receipt->refine_visit_bound) ||
+        !yyjson_mut_obj_add_uint(doc, item, "refine_merge_count", receipt->refine_merge_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "relabel_visit_count", receipt->relabel_visit_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "aggregate_visit_count",
+                                 receipt->aggregate_visit_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "allocation_attempt_count",
+                                 receipt->allocation_attempt_count) ||
+        !yyjson_mut_obj_add_uint(doc, item, "node_bound", receipt->node_bound) ||
+        !yyjson_mut_obj_add_uint(doc, item, "edge_bound", receipt->edge_bound) ||
+        !yyjson_mut_obj_add_uint(doc, item, "result_byte_bound", receipt->result_byte_bound) ||
+        !yyjson_mut_obj_add_str(doc, item, "result_byte_bound_scope",
+                                receipt->result_byte_bound_scope) ||
+        !yyjson_mut_obj_add_uint(doc, item, "canonical_result_bytes",
+                                 receipt->canonical_result_bytes) ||
+        !yyjson_mut_obj_add_uint(doc, item, "architecture_payload_bytes",
+                                 receipt->architecture_payload_bytes) ||
+        !yyjson_mut_obj_add_str(doc, item, "move_phase_status", receipt->move_phase_status) ||
+        !yyjson_mut_obj_add_str(doc, item, "refine_phase_status", receipt->refine_phase_status) ||
+        !yyjson_mut_obj_add_str(doc, item, "relabel_phase_status", receipt->relabel_phase_status) ||
+        !yyjson_mut_obj_add_str(doc, item, "aggregate_phase_status",
+                                receipt->aggregate_phase_status) ||
+        !yyjson_mut_obj_add_str(doc, item, "readback_phase_status",
+                                receipt->readback_phase_status) ||
+        !yyjson_mut_obj_add_real(doc, item, "objective", receipt->objective) ||
+        !yyjson_mut_obj_add_str(doc, item, "source_sha256", receipt->source_sha256) ||
+        !yyjson_mut_obj_add_str(doc, item, "projection_sha256", receipt->projection_sha256) ||
+        !yyjson_mut_obj_add_str(doc, item, "result_sha256", receipt->result_sha256)) {
+        return false;
+    }
+    if (receipt->error_code[0]) {
+        if (!yyjson_mut_obj_add_str(doc, item, "error_code", receipt->error_code) ||
+            !yyjson_mut_obj_add_str(doc, item, "error_stage", receipt->error_stage) ||
+            !yyjson_mut_obj_add_str(doc, item, "error_message", receipt->error_message) ||
+            !yyjson_mut_obj_add_str(doc, item, "error_remediation", receipt->error_remediation)) {
+            return false;
+        }
+    }
+    return yyjson_mut_obj_add_val(doc, root, "cluster_receipt", item);
+}
+
+static char *architecture_error_result(const cbm_cluster_receipt_t *receipt,
+                                       const char *store_detail) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        cbm_log_error("mcp.architecture_error_allocation_failed", "code",
+                      "CBM_ARCH_ERROR_SERIALIZE_FAILED", "operation", "allocate_error_document",
+                      "remediation",
+                      "free memory and retry the exact request after inspecting the preceding "
+                      "architecture diagnostic; no incomplete error result was returned");
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        cbm_log_error("mcp.architecture_error_allocation_failed", "code",
+                      "CBM_ARCH_ERROR_SERIALIZE_FAILED", "operation", "allocate_error_root",
+                      "remediation",
+                      "free memory and retry the exact request after inspecting the preceding "
+                      "architecture diagnostic; no incomplete error result was returned");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    const char *code =
+        receipt && receipt->error_code[0] ? receipt->error_code : "CBM_ARCHITECTURE_QUERY_FAILED";
+    const char *message =
+        receipt && receipt->error_message[0]
+            ? receipt->error_message
+            : (store_detail && store_detail[0] ? store_detail : "architecture query failed");
+    const char *remediation =
+        receipt && receipt->error_remediation[0]
+            ? receipt->error_remediation
+            : "inspect the exact store diagnostic, repair the failed read, and retry unchanged";
+    bool built = yyjson_mut_obj_add_str(doc, root, "schema", "cbm.tool_fault/v1") &&
+                 yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+                 yyjson_mut_obj_add_str(doc, root, "code", code) &&
+                 yyjson_mut_obj_add_str(doc, root, "message", message) &&
+                 yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    if (receipt && receipt->error_stage[0]) {
+        built = built && yyjson_mut_obj_add_str(doc, root, "stage", receipt->error_stage);
+    }
+    if (receipt && receipt->present) {
+        built = built && append_cluster_receipt(doc, root, receipt);
+    }
+    if (store_detail && store_detail[0]) {
+        built = built && yyjson_mut_obj_add_str(doc, root, "store_detail", store_detail);
+    }
+    if (!built) {
+        cbm_log_error("mcp.architecture_error_allocation_failed", "code",
+                      "CBM_ARCH_ERROR_SERIALIZE_FAILED", "operation",
+                      "construct_complete_error_receipt", "remediation",
+                      "free memory and retry the exact request after inspecting the preceding "
+                      "architecture diagnostic; no incomplete error result was returned");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        cbm_log_error("mcp.architecture_error_serialization_failed", "code",
+                      "CBM_ARCH_ERROR_SERIALIZE_FAILED", "operation",
+                      "serialize_complete_error_receipt", "remediation",
+                      "free memory or repair the invalid receipt field, then retry the exact "
+                      "request; no incomplete error result was returned");
+        return NULL;
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+static char *architecture_argument_error_result(const char *argument, const char *message,
+                                                const char *remediation) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!root) {
+        cbm_log_error("mcp.architecture_argument_error_allocation_failed", "code",
+                      "CBM_ARCH_ARGUMENT_ERROR_SERIALIZE_FAILED", "operation",
+                      doc ? "allocate_argument_error_root" : "allocate_argument_error_document",
+                      "remediation",
+                      "free memory and retry the exact invalid request to obtain its complete "
+                      "typed refusal; no incomplete error result was returned");
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    bool built =
+        yyjson_mut_obj_add_str(doc, root, "schema", "cbm.tool_fault/v1") &&
+        yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+        yyjson_mut_obj_add_str(doc, root, "code", "CBM_ARCH_ARGUMENT_INVALID") &&
+        yyjson_mut_obj_add_str(doc, root, "argument", argument ? argument : "arguments") &&
+        yyjson_mut_obj_add_str(doc, root, "message", message ? message : "invalid value") &&
+        yyjson_mut_obj_add_str(
+            doc, root, "remediation",
+            remediation ? remediation : "send the exact closed inputSchema returned by tools/list");
+    if (!built) {
+        cbm_log_error("mcp.architecture_argument_error_allocation_failed", "code",
+                      "CBM_ARCH_ARGUMENT_ERROR_SERIALIZE_FAILED", "operation",
+                      "construct_argument_error_receipt", "remediation",
+                      "free memory and retry the exact invalid request to obtain its complete "
+                      "typed refusal; no incomplete error result was returned");
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        cbm_log_error("mcp.architecture_argument_error_serialization_failed", "code",
+                      "CBM_ARCH_ARGUMENT_ERROR_SERIALIZE_FAILED", "operation",
+                      "serialize_argument_error_receipt", "remediation",
+                      "free memory or repair the invalid argument diagnostic, then retry the "
+                      "exact request; no incomplete error result was returned");
+        return NULL;
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+static int architecture_argument_name_index(const char *name) {
+    static const char *names[] = {"project",
+                                  "path",
+                                  "aspects",
+                                  "resolution",
+                                  "cluster_max_nodes",
+                                  "cluster_max_edges",
+                                  "cluster_max_move_visits",
+                                  "cluster_max_result_bytes"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(name, names[i]) == 0) {
+            return (int)i;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+static uint64_t architecture_u64_decimal_digits(uint64_t value) {
+    uint64_t digits = 1;
+    while (value >= UINT64_C(10)) {
+        value /= UINT64_C(10);
+        digits++;
+    }
+    return digits;
+}
+
+/* The receipt is first written with UINT64_MAX, whose decimal representation
+ * is exactly 20 bytes.  Removing that placeholder leaves a fixed base; this
+ * solves payload_bytes = base + decimal_digits(payload_bytes) without
+ * reconstructing the architecture object. The caller still serializes once more and
+ * byte-compares the observed length to this proof. */
+static bool architecture_payload_size_from_u64_placeholder(size_t placeholder_payload_bytes,
+                                                           uint64_t *out) {
+    _Static_assert(SIZE_MAX <= UINT64_MAX,
+                   "architecture payload accounting requires size_t to fit uint64_t");
+    if (!out || placeholder_payload_bytes < 20) {
+        return false;
+    }
+    uint64_t base = (uint64_t)placeholder_payload_bytes - UINT64_C(20);
+    uint64_t candidate = base;
+    for (uint64_t step = 0; step <= UINT64_C(20); step++) {
+        uint64_t digits = architecture_u64_decimal_digits(candidate);
+        if (base > UINT64_MAX - digits) {
+            return false;
+        }
+        uint64_t next = base + digits;
+        if (next == candidate) {
+            *out = next;
+            return true;
+        }
+        candidate = next;
+    }
+    return false;
+}
+
+static bool architecture_double_bits_equal(double left, double right) {
+    _Static_assert(sizeof(double) == sizeof(uint64_t),
+                   "architecture receipt validation requires a 64-bit double representation");
+    uint64_t left_bits = 0;
+    uint64_t right_bits = 0;
+    memcpy(&left_bits, &left, sizeof(left_bits));
+    memcpy(&right_bits, &right, sizeof(right_bits));
+    return left_bits == right_bits;
+}
+
+static bool architecture_sha256_is_canonical(const char value[65]) {
+    if (!value || value[64] != '\0') {
+        return false;
+    }
+    for (size_t i = 0; i < 64; i++) {
+        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool architecture_cluster_accounting_valid(uint64_t requested, uint64_t included,
+                                                  uint64_t excluded, uint64_t bound) {
+    return bound > 0 && included <= requested && excluded == requested - included &&
+           requested <= bound && included <= bound;
+}
+
+static bool architecture_cluster_phase_contract_valid(const cbm_cluster_receipt_t *receipt) {
+    bool graph_has_edges = receipt->weighted_undirected_edge_count > 0;
+    bool graph_has_nodes = receipt->included_node_count > 0;
+    bool refinement_ran = strcmp(receipt->refine_phase_status, "complete") == 0;
+    bool refinement_not_run = strcmp(receipt->refine_phase_status, "not_run") == 0;
+
+    if (strcmp(receipt->move_phase_status, graph_has_edges ? "complete" : "not_run") != 0 ||
+        strcmp(receipt->relabel_phase_status, graph_has_nodes ? "complete" : "not_run") != 0 ||
+        strcmp(receipt->readback_phase_status, "complete") != 0 ||
+        (!refinement_ran && !refinement_not_run) ||
+        strcmp(receipt->aggregate_phase_status, refinement_ran ? "complete" : "not_run") != 0) {
+        return false;
+    }
+    if ((graph_has_edges && (receipt->move_visit_count == 0 || receipt->level_count == 0)) ||
+        (!graph_has_edges && (receipt->move_visit_count != 0 || receipt->level_count != 0)) ||
+        (graph_has_nodes && receipt->relabel_visit_count == 0) ||
+        (!graph_has_nodes && receipt->relabel_visit_count != 0)) {
+        return false;
+    }
+    return refinement_ran
+               ? receipt->refine_visit_count > 0 && receipt->refine_visit_bound > 0 &&
+                     receipt->refine_merge_count > 0 && receipt->aggregate_visit_count > 0
+               : receipt->refine_visit_count == 0 && receipt->refine_visit_bound == 0 &&
+                     receipt->refine_merge_count == 0 && receipt->aggregate_visit_count == 0;
+}
+
+static bool architecture_cluster_receipt_contract_valid(const cbm_cluster_receipt_t *receipt,
+                                                        const cbm_arch_cluster_options_t *options,
+                                                        const cbm_architecture_info_t *architecture,
+                                                        const char **failed_invariant) {
+    if (failed_invariant) {
+        *failed_invariant = NULL;
+    }
+#define ARCH_RECEIPT_REQUIRE(condition, invariant) \
+    do {                                           \
+        if (!(condition)) {                        \
+            if (failed_invariant) {                \
+                *failed_invariant = invariant;     \
+            }                                      \
+            return false;                          \
+        }                                          \
+    } while (0)
+
+    ARCH_RECEIPT_REQUIRE(receipt && options && architecture, "validator pointers are non-null");
+    ARCH_RECEIPT_REQUIRE(receipt->present, "receipt.present=true");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->status, "complete") == 0, "status=complete");
+    ARCH_RECEIPT_REQUIRE(receipt->error_code[0] == '\0' && receipt->error_stage[0] == '\0' &&
+                             receipt->error_message[0] == '\0' &&
+                             receipt->error_remediation[0] == '\0',
+                         "complete receipt has an empty error tuple");
+    ARCH_RECEIPT_REQUIRE(receipt->converged, "converged=true");
+    ARCH_RECEIPT_REQUIRE(receipt->connectivity_verified, "connectivity_verified=true");
+    ARCH_RECEIPT_REQUIRE(receipt->complete_coverage_verified, "complete_coverage_verified=true");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->algorithm, "deterministic_leiden_variant") == 0,
+                         "algorithm=deterministic_leiden_variant");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->algorithm_version, "3") == 0, "algorithm_version=3");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->projection_schema, "cbm.architecture.cluster.v3") == 0,
+                         "projection_schema=cbm.architecture.cluster.v3");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->result_schema, "cbm.architecture.cluster.result.v4") == 0,
+                         "result_schema=cbm.architecture.cluster.result.v4");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->result_byte_bound_scope, "c_architecture_payload_utf8") ==
+                             0,
+                         "result_byte_bound_scope=c_architecture_payload_utf8");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->node_label_selection, "all_indexed_labels") == 0,
+                         "node_label_selection=all_indexed_labels");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->edge_type_roster, "CALLS,IMPORTS") == 0,
+                         "edge_type_roster=CALLS,IMPORTS");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->seed, "none") == 0, "seed=none");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->objective_function, "weighted_modularity_v1") == 0,
+                         "objective_function=weighted_modularity_v1");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->move_rule, "strict_gain_current_tie_lifo_empty") == 0,
+                         "move_rule=strict_gain_current_tie_lifo_empty");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->refinement_rule, "well_connected_nonnegative_max_gain") ==
+                             0,
+                         "refinement_rule=well_connected_nonnegative_max_gain");
+    ARCH_RECEIPT_REQUIRE(strcmp(receipt->aggregation_rule, "refined_graph_move_partition_seed") ==
+                             0,
+                         "aggregation_rule=refined_graph_move_partition_seed");
+    ARCH_RECEIPT_REQUIRE(
+        strcmp(receipt->edge_transform, "typed_directed_runs_to_weighted_undirected_pairs") == 0,
+        "edge_transform=typed_directed_runs_to_weighted_undirected_pairs");
+    ARCH_RECEIPT_REQUIRE(architecture_double_bits_equal(receipt->resolution, options->resolution),
+                         "resolution bits equal the caller value");
+    ARCH_RECEIPT_REQUIRE(isfinite(receipt->objective), "objective is finite");
+    ARCH_RECEIPT_REQUIRE(receipt->node_bound == options->max_nodes,
+                         "node_bound equals cluster_max_nodes");
+    ARCH_RECEIPT_REQUIRE(receipt->edge_bound == options->max_edges,
+                         "edge_bound equals cluster_max_edges");
+    ARCH_RECEIPT_REQUIRE(receipt->move_visit_cap == options->max_move_visits,
+                         "move_visit_cap equals cluster_max_move_visits");
+    ARCH_RECEIPT_REQUIRE(receipt->result_byte_bound == options->max_result_bytes,
+                         "result_byte_bound equals cluster_max_result_bytes");
+    ARCH_RECEIPT_REQUIRE(receipt->move_visit_count <= receipt->move_visit_cap,
+                         "move_visit_count<=move_visit_cap");
+    ARCH_RECEIPT_REQUIRE(receipt->architecture_payload_bytes == 0,
+                         "store architecture_payload_bytes=0 before serialization");
+    ARCH_RECEIPT_REQUIRE(receipt->canonical_result_bytes > 0, "canonical_result_bytes>0");
+    ARCH_RECEIPT_REQUIRE(receipt->allocation_attempt_count > 0, "allocation_attempt_count>0");
+    ARCH_RECEIPT_REQUIRE(architecture_sha256_is_canonical(receipt->node_label_roster_sha256),
+                         "node_label_roster_sha256 is lowercase SHA-256");
+    ARCH_RECEIPT_REQUIRE(architecture_sha256_is_canonical(receipt->source_sha256),
+                         "source_sha256 is lowercase SHA-256");
+    ARCH_RECEIPT_REQUIRE(architecture_sha256_is_canonical(receipt->projection_sha256),
+                         "projection_sha256 is lowercase SHA-256");
+    ARCH_RECEIPT_REQUIRE(architecture_sha256_is_canonical(receipt->result_sha256),
+                         "result_sha256 is lowercase SHA-256");
+    ARCH_RECEIPT_REQUIRE(
+        architecture_cluster_accounting_valid(receipt->requested_node_count,
+                                              receipt->included_node_count,
+                                              receipt->excluded_node_count, receipt->node_bound),
+        "requested_node_count=included_node_count+excluded_node_count within node_bound");
+    ARCH_RECEIPT_REQUIRE(
+        architecture_cluster_accounting_valid(receipt->requested_edge_count,
+                                              receipt->included_edge_count,
+                                              receipt->excluded_edge_count, receipt->edge_bound),
+        "requested_edge_count=included_edge_count+excluded_edge_count within edge_bound");
+    ARCH_RECEIPT_REQUIRE(receipt->excluded_node_count == 0,
+                         "complete projection excluded_node_count=0");
+    ARCH_RECEIPT_REQUIRE(receipt->excluded_edge_count == 0,
+                         "complete projection excluded_edge_count=0");
+    ARCH_RECEIPT_REQUIRE(receipt->observed_node_label_count <= receipt->included_node_count,
+                         "observed_node_label_count<=included_node_count");
+    ARCH_RECEIPT_REQUIRE((receipt->included_node_count == 0) ==
+                             (receipt->observed_node_label_count == 0),
+                         "observed label roster is empty exactly when the node roster is empty");
+    ARCH_RECEIPT_REQUIRE(architecture->cluster_count >= 0, "architecture cluster_count>=0");
+    ARCH_RECEIPT_REQUIRE(receipt->community_count == (uint64_t)architecture->cluster_count,
+                         "community_count equals architecture cluster_count");
+    ARCH_RECEIPT_REQUIRE(architecture->cluster_count == 0 || architecture->clusters,
+                         "non-empty architecture cluster array is present");
+    ARCH_RECEIPT_REQUIRE(receipt->community_count <= receipt->included_node_count,
+                         "community_count<=included_node_count");
+    ARCH_RECEIPT_REQUIRE((receipt->included_node_count == 0) == (receipt->community_count == 0),
+                         "community roster is empty exactly when the node roster is empty");
+    ARCH_RECEIPT_REQUIRE(receipt->canonical_typed_edge_count <= receipt->included_edge_count,
+                         "canonical_typed_edge_count<=included_edge_count");
+    ARCH_RECEIPT_REQUIRE(receipt->duplicate_edge_count ==
+                             receipt->included_edge_count - receipt->canonical_typed_edge_count,
+                         "duplicate_edge_count=included_edge_count-canonical_typed_edge_count");
+    ARCH_RECEIPT_REQUIRE(receipt->weighted_undirected_edge_count <=
+                             receipt->canonical_typed_edge_count,
+                         "weighted_undirected_edge_count<=canonical_typed_edge_count");
+    ARCH_RECEIPT_REQUIRE(
+        receipt->undirected_fold_count ==
+            receipt->canonical_typed_edge_count - receipt->weighted_undirected_edge_count,
+        "undirected_fold_count=canonical_typed_edge_count-weighted_undirected_edge_count");
+    ARCH_RECEIPT_REQUIRE(receipt->self_loop_count <= receipt->canonical_typed_edge_count,
+                         "self_loop_count<=canonical_typed_edge_count");
+    ARCH_RECEIPT_REQUIRE(receipt->level_bound == receipt->included_node_count,
+                         "level_bound=included_node_count");
+    ARCH_RECEIPT_REQUIRE(receipt->level_count <= receipt->level_bound, "level_count<=level_bound");
+    ARCH_RECEIPT_REQUIRE(receipt->refine_visit_count == receipt->refine_visit_bound,
+                         "refine_visit_count=refine_visit_bound");
+    ARCH_RECEIPT_REQUIRE(receipt->refine_merge_count <= receipt->refine_visit_count,
+                         "refine_merge_count<=refine_visit_count");
+    ARCH_RECEIPT_REQUIRE(architecture_cluster_phase_contract_valid(receipt),
+                         "phase statuses and phase counters are internally consistent");
+
+#undef ARCH_RECEIPT_REQUIRE
+    return true;
 }
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
-    char *project = get_project_arg(args);
-    char *scope_path = cbm_mcp_get_string_arg(args, "path");
-    cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    if (!args) {
+        return architecture_argument_error_result(
+            "arguments", "get_architecture arguments are missing",
+            "send the exact closed JSON object advertised by tools/list");
+    }
+    /* Parse the complete closed request once. Strings point into aspects_doc,
+     * which therefore outlives the store call and serializer. */
+    yyjson_doc *aspects_doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *args_root = aspects_doc ? yyjson_doc_get_root(aspects_doc) : NULL;
+    if (!aspects_doc || !yyjson_is_obj(args_root)) {
+        if (aspects_doc) {
+            yyjson_doc_free(aspects_doc);
+        }
+        return architecture_argument_error_result(
+            "arguments", "get_architecture arguments must be one valid JSON object",
+            "send the exact closed JSON object advertised by tools/list");
+    }
+    size_t argument_idx;
+    size_t argument_max;
+    yyjson_val *argument_key;
+    yyjson_val *argument_value;
+    uint32_t seen_arguments = 0;
+    yyjson_obj_foreach(args_root, argument_idx, argument_max, argument_key, argument_value) {
+        const char *name = yyjson_get_str(argument_key);
+        int name_index = name && strlen(name) == yyjson_get_len(argument_key)
+                             ? architecture_argument_name_index(name)
+                             : CBM_NOT_FOUND;
+        if (!name || strlen(name) != yyjson_get_len(argument_key) || name_index == CBM_NOT_FOUND) {
+            char *result = architecture_argument_error_result(
+                name ? name : "arguments", "get_architecture received an unknown argument",
+                "remove the unknown field and send only the closed inputSchema returned by "
+                "tools/list");
+            yyjson_doc_free(aspects_doc);
+            return result;
+        }
+        uint32_t argument_bit = UINT32_C(1) << (uint32_t)name_index;
+        if ((seen_arguments & argument_bit) != 0) {
+            char *result = architecture_argument_error_result(
+                name, "get_architecture arguments cannot contain duplicate object keys",
+                "send each field at most once in the closed JSON request object");
+            yyjson_doc_free(aspects_doc);
+            return result;
+        }
+        seen_arguments |= argument_bit;
+        (void)argument_value;
+    }
+    yyjson_val *project_value = yyjson_obj_get(args_root, "project");
+    if (!project_value || !yyjson_is_str(project_value) || yyjson_get_len(project_value) == 0 ||
+        strlen(yyjson_get_str(project_value)) != yyjson_get_len(project_value)) {
+        yyjson_doc_free(aspects_doc);
+        return architecture_argument_error_result(
+            "project", "project is required and must be a non-empty JSON string",
+            "pass the exact indexed project name returned by list_projects");
+    }
+    yyjson_val *path_value = yyjson_obj_get(args_root, "path");
+    if (path_value && (!yyjson_is_str(path_value) ||
+                       strlen(yyjson_get_str(path_value)) != yyjson_get_len(path_value))) {
+        yyjson_doc_free(aspects_doc);
+        return architecture_argument_error_result(
+            "path", "path must be a JSON string when present",
+            "pass a literal indexed file_path directory prefix or omit path");
+    }
+    char *project = normalize_project_arg(heap_strdup(yyjson_get_str(project_value)));
+    if (!project) {
+        yyjson_doc_free(aspects_doc);
+        return architecture_argument_error_result(
+            "project", "project could not be retained or normalized exactly",
+            "pass an existing indexed project name and retry unchanged");
+    }
+    char *scope_path = path_value ? heap_strdup(yyjson_get_str(path_value)) : NULL;
+    if (path_value && !scope_path) {
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        return architecture_argument_error_result(
+            "path", "path could not be retained exactly",
+            "free memory and retry the identical request; no truncated scope is accepted");
+    }
 
-    char *not_indexed = verify_project_indexed(srv, store, project);
-    if (not_indexed) {
+    yyjson_val *aspects_arr = yyjson_obj_get(args_root, "aspects");
+    if (aspects_arr && !yyjson_is_arr(aspects_arr)) {
+        char *result = architecture_argument_error_result(
+            "aspects", "aspects must be a non-empty JSON array of supported strings",
+            "use the exact aspect enum returned by tools/list or omit aspects for overview");
+        yyjson_doc_free(aspects_doc);
         free(project);
         free(scope_path);
-        return not_indexed;
+        return result;
     }
 
-    /* Parse aspects array from args */
-    yyjson_doc *aspects_doc = NULL;
-    yyjson_val *aspects_arr = NULL;
-    {
-        yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
-        if (args_doc) {
-            yyjson_val *aval = yyjson_obj_get(yyjson_doc_get_root(args_doc), "aspects");
-            if (yyjson_is_arr(aval)) {
-                aspects_doc = args_doc; /* keep alive */
-                aspects_arr = aval;
-            } else {
-                yyjson_doc_free(args_doc);
-            }
-        }
-    }
-
-    /* Build a C string array from aspects for cbm_store_get_architecture.
-     * Strings point into aspects_doc memory so aspects_doc must outlive this array. */
-    const char *aspects_strs[MCP_COL_16];
+    const char *aspects_strs[CBM_ARCH_MAX_ASPECTS];
     int aspects_strs_count = 0;
     if (aspects_arr) {
+        size_t aspect_count = yyjson_arr_size(aspects_arr);
+        if (aspect_count == 0 || aspect_count > CBM_ARCH_MAX_ASPECTS) {
+            char *result = architecture_argument_error_result(
+                "aspects",
+                "aspects must contain between 1 and " MCP_STRINGIFY(CBM_ARCH_MAX_ASPECTS) " values",
+                "use supported aspect tokens or omit aspects for the narrow overview");
+            yyjson_doc_free(aspects_doc);
+            free(project);
+            free(scope_path);
+            return result;
+        }
         size_t aspect_idx;
         size_t aspect_max;
         yyjson_val *aspect_val;
         yyjson_arr_foreach(aspects_arr, aspect_idx, aspect_max, aspect_val) {
-            const char *s = yyjson_get_str(aspect_val);
-            if (s && aspects_strs_count < MCP_COL_16) {
-                aspects_strs[aspects_strs_count++] = s;
+            if (!yyjson_is_str(aspect_val)) {
+                char *result = architecture_argument_error_result(
+                    "aspects", "every aspects value must be a JSON string",
+                    "use only the exact aspect enum strings returned by tools/list");
+                yyjson_doc_free(aspects_doc);
+                free(project);
+                free(scope_path);
+                return result;
             }
+            if (strlen(yyjson_get_str(aspect_val)) != yyjson_get_len(aspect_val)) {
+                char *result = architecture_argument_error_result(
+                    "aspects", "aspects strings cannot contain embedded NUL bytes",
+                    "use only the exact aspect enum strings returned by tools/list");
+                yyjson_doc_free(aspects_doc);
+                free(project);
+                free(scope_path);
+                return result;
+            }
+            const char *aspect = yyjson_get_str(aspect_val);
+            for (int i = 0; i < aspects_strs_count; i++) {
+                if (strcmp(aspects_strs[i], aspect) == 0) {
+                    char *result = architecture_argument_error_result(
+                        "aspects", "aspects cannot contain duplicate selectors",
+                        "supply each requested architecture aspect exactly once");
+                    yyjson_doc_free(aspects_doc);
+                    free(project);
+                    free(scope_path);
+                    return result;
+                }
+            }
+            aspects_strs[aspects_strs_count++] = aspect;
         }
+    }
+
+    bool all_selected = false;
+    for (int i = 0; i < aspects_strs_count; i++) {
+        all_selected = all_selected || strcmp(aspects_strs[i], "all") == 0;
+    }
+    if (all_selected && aspects_strs_count != 1) {
+        char *result = architecture_argument_error_result(
+            "aspects", "the all aspect cannot be combined with another selector",
+            "request all by itself or list the exact individual aspects without all");
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
     }
 
     /* Server-side validation: reject unknown aspect tokens with an isError
@@ -6419,267 +7009,779 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             char msg[CBM_SZ_512];
             snprintf(msg, sizeof(msg), "Unknown aspect '%s'. Valid: %s.", aspects_strs[i],
                      valid_list);
-            char *err = cbm_mcp_text_result(msg, true);
+            char *err = architecture_argument_error_result(
+                "aspects", msg, "use only the exact aspect enum strings returned by tools/list");
             free(project);
             free(scope_path);
-            if (aspects_doc) {
-                yyjson_doc_free(aspects_doc);
-            }
+            yyjson_doc_free(aspects_doc);
             return err;
         }
     }
 
+    bool clusters_requested = aspect_wanted(aspects_doc, aspects_arr, "clusters");
+    static const char *cluster_control_names[] = {"resolution", "cluster_max_nodes",
+                                                  "cluster_max_edges", "cluster_max_move_visits",
+                                                  "cluster_max_result_bytes"};
+    bool any_cluster_control = false;
+    for (size_t i = 0; i < sizeof(cluster_control_names) / sizeof(cluster_control_names[0]); i++) {
+        if (yyjson_obj_get(args_root, cluster_control_names[i])) {
+            any_cluster_control = true;
+        }
+    }
+    if (!clusters_requested && any_cluster_control) {
+        char *result = architecture_argument_error_result(
+            "resolution", "cluster controls require an explicit clusters or all aspect",
+            "remove every cluster control or select aspects containing clusters/all and provide "
+            "all five controls");
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
+
+    cbm_arch_cluster_options_t cluster_options = {0};
+    if (clusters_requested) {
+        yyjson_val *resolution_value = yyjson_obj_get(args_root, "resolution");
+        if (!resolution_value || !yyjson_is_num(resolution_value)) {
+            char *result = architecture_argument_error_result(
+                "resolution",
+                "explicit clustering requires a finite numeric resolution greater than zero",
+                "provide resolution plus all four positive cluster_max_* controls; no default is "
+                "substituted");
+            yyjson_doc_free(aspects_doc);
+            free(project);
+            free(scope_path);
+            return result;
+        }
+        cluster_options.resolution = yyjson_get_num(resolution_value);
+        if (!isfinite(cluster_options.resolution) || cluster_options.resolution <= 0.0) {
+            char *result = architecture_argument_error_result(
+                "resolution", "resolution must be finite and greater than zero",
+                "provide a finite positive JSON number; no default is substituted");
+            yyjson_doc_free(aspects_doc);
+            free(project);
+            free(scope_path);
+            return result;
+        }
+
+        const char *bound_names[] = {"cluster_max_nodes", "cluster_max_edges",
+                                     "cluster_max_move_visits", "cluster_max_result_bytes"};
+        uint64_t bound_maxima[] = {(uint64_t)INT_MAX, (uint64_t)INT_MAX, UINT64_MAX,
+                                   (uint64_t)SIZE_MAX};
+        uint64_t *bound_outputs[] = {&cluster_options.max_nodes, &cluster_options.max_edges,
+                                     &cluster_options.max_move_visits,
+                                     &cluster_options.max_result_bytes};
+        for (size_t i = 0; i < sizeof(bound_names) / sizeof(bound_names[0]); i++) {
+            yyjson_val *value = yyjson_obj_get(args_root, bound_names[i]);
+            uint64_t parsed = 0;
+            bool valid = false;
+            if (value && yyjson_is_uint(value)) {
+                parsed = yyjson_get_uint(value);
+                valid = parsed > 0 && parsed <= bound_maxima[i];
+            } else if (value && yyjson_is_sint(value)) {
+                int64_t signed_value = yyjson_get_sint(value);
+                if (signed_value > 0) {
+                    parsed = (uint64_t)signed_value;
+                    valid = parsed <= bound_maxima[i];
+                }
+            }
+            if (!valid) {
+                char message[CBM_SZ_512];
+                snprintf(message, sizeof(message),
+                         "%s is required and must be a positive JSON integer no greater than %llu",
+                         bound_names[i], (unsigned long long)bound_maxima[i]);
+                char *result = architecture_argument_error_result(
+                    bound_names[i], message,
+                    "provide every cluster_max_* control as an integer within its advertised "
+                    "tools/list range; no default is substituted");
+                yyjson_doc_free(aspects_doc);
+                free(project);
+                free(scope_path);
+                return result;
+            }
+            *bound_outputs[i] = parsed;
+        }
+    }
+
+    char *norm_path = NULL;
+    int path_scope_status = cbm_store_normalize_arch_path_alloc(scope_path, &norm_path);
+    if (path_scope_status == CBM_STORE_ERR) {
+        char *result = architecture_error_result(
+            NULL, "architecture path normalization could not retain the exact literal scope");
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
+    bool path_scoped = path_scope_status == 1;
+    const char *query_path = path_scoped ? norm_path : NULL;
+
+    /* Argument admission is complete before any project-store lookup or graph
+     * read, so malformed cluster controls cannot open a wider data path. */
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *error = build_no_store_error(srv, project);
+        char *result =
+            error ? cbm_mcp_text_result(error, true)
+                  : architecture_error_result(
+                        NULL, "project-store resolution failed and its exact diagnostic could "
+                              "not be allocated; free memory and retry the identical request");
+        free(error);
+        free(norm_path);
+        free(project);
+        free(scope_path);
+        yyjson_doc_free(aspects_doc);
+        return result;
+    }
+    char *not_indexed = verify_project_indexed(srv, store, project);
+    if (not_indexed) {
+        free(norm_path);
+        free(project);
+        free(scope_path);
+        yyjson_doc_free(aspects_doc);
+        return not_indexed;
+    }
+
     cbm_schema_info_t schema = {0};
-    /* Counts-only: this handler renders label/type counts but never property
-     * keys, and full key discovery json_each-scans every row (seconds-to-
-     * minutes on multi-million-node graphs). */
-    cbm_store_get_schema_counts_scoped(store, project, scope_path, &schema);
-
     cbm_architecture_info_t arch = {0};
-    cbm_store_get_architecture(store, project, scope_path,
-                               aspects_strs_count > 0 ? aspects_strs : NULL, aspects_strs_count,
-                               &arch);
+    int architecture_rc = cbm_store_get_architecture_with_options(
+        store, project, query_path, aspects_strs_count > 0 ? aspects_strs : NULL,
+        aspects_strs_count, clusters_requested ? &cluster_options : NULL, &arch);
+    cbm_cluster_receipt_t cluster_receipt = {0};
+    if (cbm_store_get_cluster_receipt(store, &cluster_receipt) != CBM_STORE_OK) {
+        char *result = architecture_error_result(
+            NULL, "architecture cluster receipt readback failed after the store operation; "
+                  "inspect the store diagnostic and repair receipt publication before retrying");
+        cbm_store_architecture_free(&arch);
+        free(norm_path);
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
+    if (architecture_rc != CBM_STORE_OK) {
+        char detail[CBM_SZ_512];
+        snprintf(detail, sizeof(detail), "%s", cbm_store_error(store));
+        char *result = architecture_error_result(&cluster_receipt, detail);
+        cbm_store_architecture_free(&arch);
+        cbm_store_schema_free(&schema);
+        free(norm_path);
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
+    const char *cluster_receipt_failed_invariant = NULL;
+    bool cluster_receipt_contract_valid =
+        clusters_requested
+            ? architecture_cluster_receipt_contract_valid(&cluster_receipt, &cluster_options, &arch,
+                                                          &cluster_receipt_failed_invariant)
+            : !cluster_receipt.present;
+    if (!clusters_requested && cluster_receipt.present) {
+        cluster_receipt_failed_invariant =
+            "a non-cluster request must not publish a cluster receipt";
+    }
+    if (!cluster_receipt_contract_valid) {
+        cbm_cluster_receipt_t contract_error = cluster_receipt;
+        snprintf(contract_error.status, sizeof(contract_error.status), "refused");
+        snprintf(contract_error.error_code, sizeof(contract_error.error_code),
+                 "CBM_ARCH_CLUSTER_RECEIPT_CONTRACT_INVALID");
+        snprintf(contract_error.error_stage, sizeof(contract_error.error_stage), "store_readback");
+        snprintf(contract_error.error_message, sizeof(contract_error.error_message),
+                 "the successful store result violates receipt invariant: %s",
+                 cluster_receipt_failed_invariant ? cluster_receipt_failed_invariant
+                                                  : "unknown validator outcome");
+        snprintf(contract_error.error_remediation, sizeof(contract_error.error_remediation),
+                 "repair store receipt publication and native ABI bindings before retrying; no "
+                 "architecture payload was serialized");
+        cbm_log_error("mcp.architecture_cluster_receipt_invalid", "code", contract_error.error_code,
+                      "stage", contract_error.error_stage, "message", contract_error.error_message,
+                      "failed_invariant",
+                      cluster_receipt_failed_invariant ? cluster_receipt_failed_invariant
+                                                       : "unknown validator outcome",
+                      "remediation", contract_error.error_remediation);
+        char *result = architecture_error_result(&contract_error, NULL);
+        cbm_store_architecture_free(&arch);
+        free(norm_path);
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
 
-    int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
-    int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
-    char norm_path[CBM_SZ_512];
-    bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
+    /* Open schema column families only for aspects that serialize them. A
+     * clusters-only request must not pay the unrelated label/type-grouping
+     * scan. The literal scope predicate remains shared when they are opened. */
+    bool structure_requested = aspect_wanted(aspects_doc, aspects_arr, "structure");
+    bool dependencies_requested = aspect_wanted(aspects_doc, aspects_arr, "dependencies");
+    if ((structure_requested || dependencies_requested) &&
+        cbm_store_get_schema_counts_scoped(store, project, query_path, &schema) != CBM_STORE_OK) {
+        char detail[CBM_SZ_512];
+        snprintf(detail, sizeof(detail), "%s", cbm_store_error(store));
+        char *result = architecture_error_result(&cluster_receipt, detail);
+        cbm_store_architecture_free(&arch);
+        cbm_store_schema_free(&schema);
+        free(norm_path);
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
 
+    /* A successful cluster receipt already read this exact scoped node count
+     * inside its retained SQLite snapshot. Reuse it instead of paying a
+     * second O(N) count and risking a cross-snapshot total. */
+    int node_count = CBM_STORE_ERR;
+    if (clusters_requested) {
+        if (cluster_receipt.included_node_count > (uint64_t)INT_MAX) {
+            char *result = architecture_error_result(
+                &cluster_receipt,
+                "completed cluster node count exceeds the MCP signed-int representation");
+            free(norm_path);
+            cbm_store_architecture_free(&arch);
+            cbm_store_schema_free(&schema);
+            yyjson_doc_free(aspects_doc);
+            free(project);
+            free(scope_path);
+            return result;
+        }
+        node_count = (int)cluster_receipt.included_node_count;
+    } else {
+        node_count = cbm_store_count_nodes_scoped(store, project, query_path);
+    }
+    int edge_count = CBM_STORE_ERR;
+    if (structure_requested || dependencies_requested) {
+        uint64_t grouped_edge_count = 0;
+        bool grouped_edge_count_valid = true;
+        for (int i = 0; i < schema.edge_type_count; i++) {
+            if (schema.edge_types[i].count < 0 ||
+                UINT64_MAX - grouped_edge_count < (uint64_t)schema.edge_types[i].count) {
+                grouped_edge_count_valid = false;
+                break;
+            }
+            grouped_edge_count += (uint64_t)schema.edge_types[i].count;
+        }
+        if (!grouped_edge_count_valid || grouped_edge_count > (uint64_t)INT_MAX) {
+            char *result = architecture_error_result(
+                &cluster_receipt,
+                "grouped architecture edge count exceeds the MCP signed-int representation");
+            free(norm_path);
+            cbm_store_architecture_free(&arch);
+            cbm_store_schema_free(&schema);
+            yyjson_doc_free(aspects_doc);
+            free(project);
+            free(scope_path);
+            return result;
+        }
+        edge_count = (int)grouped_edge_count;
+    } else {
+        edge_count = cbm_store_count_edges_scoped(store, project, query_path);
+    }
+    if (node_count < 0 || edge_count < 0) {
+        char detail[CBM_SZ_512];
+        snprintf(detail, sizeof(detail), "%s", cbm_store_error(store));
+        char *result = architecture_error_result(&cluster_receipt, detail);
+        free(norm_path);
+        cbm_store_architecture_free(&arch);
+        cbm_store_schema_free(&schema);
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
+
+    int root_nodes = 0;
+    int root_edges = 0;
+    if (path_scoped) {
+        root_nodes = cbm_store_count_nodes(store, project);
+        root_edges = cbm_store_count_edges(store, project);
+        if (root_nodes < 0 || root_edges < 0) {
+            char detail[CBM_SZ_512];
+            snprintf(detail, sizeof(detail), "%s", cbm_store_error(store));
+            char *result = architecture_error_result(&cluster_receipt, detail);
+            free(norm_path);
+            cbm_store_architecture_free(&arch);
+            cbm_store_schema_free(&schema);
+            yyjson_doc_free(aspects_doc);
+            free(project);
+            free(scope_path);
+            return result;
+        }
+    }
+
+    char *result = NULL;
+    char *json = NULL;
+    size_t serialized_bytes = 0;
+    bool architecture_payload_size_resolved = false;
+    const char *architecture_json_failed_operation = "construct_architecture_document";
+    const char *architecture_json_failure_code = "CBM_ARCH_CLUSTER_SERIALIZATION_FAILED";
+    const char *architecture_json_failure_stage = "serialization";
+    const char *architecture_json_failure_message =
+        "complete cluster result could not be allocated and serialized";
+    const char *architecture_json_failure_remediation =
+        "free memory or request an exact smaller scope; no partial result was returned";
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root) {
+        goto architecture_json_failed;
+    }
     yyjson_mut_doc_set_root(doc, root);
 
-    if (project) {
-        yyjson_mut_obj_add_str(doc, root, "project", project);
-    }
-    if (path_scoped) {
-        yyjson_mut_obj_add_str(doc, root, "path", norm_path);
-        int root_nodes = cbm_store_count_nodes(store, project);
-        int root_edges = cbm_store_count_edges(store, project);
-        yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_nodes);
-        yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_edges);
-        yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", node_count);
-        yyjson_mut_obj_add_int(doc, root, "scoped_total_edges", edge_count);
-    }
-    yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
-    yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
+#define ARCH_JSON_REQUIRE(expression)                         \
+    do {                                                      \
+        if (!(expression)) {                                  \
+            architecture_json_failed_operation = #expression; \
+            goto architecture_json_failed;                    \
+        }                                                     \
+    } while (0)
 
-    /* Node label summary */
-    if (aspect_wanted(aspects_doc, aspects_arr, "structure")) {
+    ARCH_JSON_REQUIRE(yyjson_mut_obj_add_str(doc, root, "project", project));
+    if (path_scoped) {
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_str(doc, root, "path", norm_path));
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_nodes));
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_edges));
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", node_count));
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, root, "scoped_total_edges", edge_count));
+    }
+    ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count));
+    ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count));
+
+    if (structure_requested) {
         yyjson_mut_val *labels = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(labels);
         for (int i = 0; i < schema.node_label_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "label", schema.node_labels[i].label);
-            yyjson_mut_obj_add_int(doc, item, "count", schema.node_labels[i].count);
-            yyjson_mut_arr_add_val(labels, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "label",
+                                       schema.node_labels[i].label ? schema.node_labels[i].label
+                                                                   : "") &&
+                yyjson_mut_obj_add_int(doc, item, "count", schema.node_labels[i].count) &&
+                yyjson_mut_arr_add_val(labels, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "node_labels", labels);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "node_labels", labels));
     }
 
-    /* Edge type summary */
-    if (aspect_wanted(aspects_doc, aspects_arr, "dependencies")) {
+    if (dependencies_requested) {
         yyjson_mut_val *types = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(types);
         for (int i = 0; i < schema.edge_type_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "type", schema.edge_types[i].type);
-            yyjson_mut_obj_add_int(doc, item, "count", schema.edge_types[i].count);
-            yyjson_mut_arr_add_val(types, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "type",
+                                       schema.edge_types[i].type ? schema.edge_types[i].type
+                                                                 : "") &&
+                yyjson_mut_obj_add_int(doc, item, "count", schema.edge_types[i].count) &&
+                yyjson_mut_arr_add_val(types, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "edge_types", types);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "edge_types", types));
     }
 
-    /* Relationship patterns */
     if (aspect_wanted(aspects_doc, aspects_arr, "routes") && schema.rel_pattern_count > 0) {
-        yyjson_mut_val *pats = yyjson_mut_arr(doc);
+        yyjson_mut_val *patterns = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(patterns);
         for (int i = 0; i < schema.rel_pattern_count; i++) {
-            yyjson_mut_arr_add_str(doc, pats, schema.rel_patterns[i]);
+            ARCH_JSON_REQUIRE(yyjson_mut_arr_add_str(
+                doc, patterns, schema.rel_patterns[i] ? schema.rel_patterns[i] : ""));
         }
-        yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "relationship_patterns", patterns));
     }
 
-    /* Languages */
     if (arch.language_count > 0) {
-        yyjson_mut_val *langs = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.language_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "language",
-                                   arch.languages[i].language ? arch.languages[i].language : "");
-            yyjson_mut_obj_add_int(doc, item, "file_count", arch.languages[i].file_count);
-            yyjson_mut_arr_add_val(langs, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "language",
+                                       arch.languages[i].language ? arch.languages[i].language
+                                                                  : "") &&
+                yyjson_mut_obj_add_int(doc, item, "file_count", arch.languages[i].file_count) &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "languages", langs);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "languages", values));
     }
 
-    /* Packages */
     if (arch.package_count > 0) {
-        yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.package_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.packages[i].name ? arch.packages[i].name : "");
-            yyjson_mut_obj_add_int(doc, item, "node_count", arch.packages[i].node_count);
-            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.packages[i].fan_in);
-            yyjson_mut_obj_add_int(doc, item, "fan_out", arch.packages[i].fan_out);
-            yyjson_mut_arr_add_val(pkgs, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "name",
+                                       arch.packages[i].name ? arch.packages[i].name : "") &&
+                yyjson_mut_obj_add_int(doc, item, "node_count", arch.packages[i].node_count) &&
+                yyjson_mut_obj_add_int(doc, item, "fan_in", arch.packages[i].fan_in) &&
+                yyjson_mut_obj_add_int(doc, item, "fan_out", arch.packages[i].fan_out) &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "packages", pkgs);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "packages", values));
     }
 
-    /* Entry points */
     if (arch.entry_point_count > 0) {
-        yyjson_mut_val *eps = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.entry_point_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.entry_points[i].name ? arch.entry_points[i].name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                arch.entry_points[i].qualified_name ? arch.entry_points[i].qualified_name : "");
-            yyjson_mut_obj_add_str(doc, item, "file",
-                                   arch.entry_points[i].file ? arch.entry_points[i].file : "");
-            yyjson_mut_arr_add_val(eps, item);
+            ARCH_JSON_REQUIRE(item &&
+                              yyjson_mut_obj_add_str(
+                                  doc, item, "name",
+                                  arch.entry_points[i].name ? arch.entry_points[i].name : "") &&
+                              yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                                                     arch.entry_points[i].qualified_name
+                                                         ? arch.entry_points[i].qualified_name
+                                                         : "") &&
+                              yyjson_mut_obj_add_str(
+                                  doc, item, "file",
+                                  arch.entry_points[i].file ? arch.entry_points[i].file : "") &&
+                              yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "entry_points", values));
     }
 
-    /* HTTP routes */
     if (arch.route_count > 0) {
-        yyjson_mut_val *routes = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.route_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "method",
-                                   arch.routes[i].method ? arch.routes[i].method : "");
-            yyjson_mut_obj_add_str(doc, item, "path",
-                                   arch.routes[i].path ? arch.routes[i].path : "");
-            yyjson_mut_obj_add_str(doc, item, "handler",
-                                   arch.routes[i].handler ? arch.routes[i].handler : "");
-            yyjson_mut_arr_add_val(routes, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "method",
+                                       arch.routes[i].method ? arch.routes[i].method : "") &&
+                yyjson_mut_obj_add_str(doc, item, "path",
+                                       arch.routes[i].path ? arch.routes[i].path : "") &&
+                yyjson_mut_obj_add_str(doc, item, "handler",
+                                       arch.routes[i].handler ? arch.routes[i].handler : "") &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "routes", routes);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "routes", values));
     }
 
-    /* Hotspots */
     if (arch.hotspot_count > 0) {
-        yyjson_mut_val *hotspots = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.hotspot_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.hotspots[i].name ? arch.hotspots[i].name : "");
-            yyjson_mut_obj_add_str(doc, item, "qualified_name",
-                                   arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name
-                                                                   : "");
-            yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in);
-            yyjson_mut_arr_add_val(hotspots, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "name",
+                                       arch.hotspots[i].name ? arch.hotspots[i].name : "") &&
+                yyjson_mut_obj_add_str(
+                    doc, item, "qualified_name",
+                    arch.hotspots[i].qualified_name ? arch.hotspots[i].qualified_name : "") &&
+                yyjson_mut_obj_add_int(doc, item, "fan_in", arch.hotspots[i].fan_in) &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "hotspots", hotspots);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "hotspots", values));
     }
 
-    /* Cross-package boundaries */
     if (arch.boundary_count > 0) {
-        yyjson_mut_val *boundaries = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.boundary_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "from",
-                                   arch.boundaries[i].from ? arch.boundaries[i].from : "");
-            yyjson_mut_obj_add_str(doc, item, "to",
-                                   arch.boundaries[i].to ? arch.boundaries[i].to : "");
-            yyjson_mut_obj_add_int(doc, item, "call_count", arch.boundaries[i].call_count);
-            yyjson_mut_arr_add_val(boundaries, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "from",
+                                       arch.boundaries[i].from ? arch.boundaries[i].from : "") &&
+                yyjson_mut_obj_add_str(doc, item, "to",
+                                       arch.boundaries[i].to ? arch.boundaries[i].to : "") &&
+                yyjson_mut_obj_add_int(doc, item, "call_count", arch.boundaries[i].call_count) &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "boundaries", boundaries);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "boundaries", values));
     }
 
-    /* Cross-service links (HTTP/async between services) */
     if (arch.service_count > 0) {
-        yyjson_mut_val *services = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.service_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "from",
-                                   arch.services[i].from ? arch.services[i].from : "");
-            yyjson_mut_obj_add_str(doc, item, "to", arch.services[i].to ? arch.services[i].to : "");
-            yyjson_mut_obj_add_str(doc, item, "type",
-                                   arch.services[i].type ? arch.services[i].type : "");
-            yyjson_mut_obj_add_int(doc, item, "count", arch.services[i].count);
-            yyjson_mut_arr_add_val(services, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "from",
+                                       arch.services[i].from ? arch.services[i].from : "") &&
+                yyjson_mut_obj_add_str(doc, item, "to",
+                                       arch.services[i].to ? arch.services[i].to : "") &&
+                yyjson_mut_obj_add_str(doc, item, "type",
+                                       arch.services[i].type ? arch.services[i].type : "") &&
+                yyjson_mut_obj_add_int(doc, item, "count", arch.services[i].count) &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "services", services);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "services", values));
     }
 
-    /* Package layers */
     if (arch.layer_count > 0) {
-        yyjson_mut_val *layers = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.layer_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.layers[i].name ? arch.layers[i].name : "");
-            yyjson_mut_obj_add_str(doc, item, "layer",
-                                   arch.layers[i].layer ? arch.layers[i].layer : "");
-            yyjson_mut_obj_add_str(doc, item, "reason",
-                                   arch.layers[i].reason ? arch.layers[i].reason : "");
-            yyjson_mut_arr_add_val(layers, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "name",
+                                       arch.layers[i].name ? arch.layers[i].name : "") &&
+                yyjson_mut_obj_add_str(doc, item, "layer",
+                                       arch.layers[i].layer ? arch.layers[i].layer : "") &&
+                yyjson_mut_obj_add_str(doc, item, "reason",
+                                       arch.layers[i].reason ? arch.layers[i].reason : "") &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "layers", layers);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "layers", values));
     }
 
-    /* Clusters (community detection) */
-    if (arch.cluster_count > 0) {
+    if (clusters_requested) {
         yyjson_mut_val *clusters = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(clusters);
+        uint64_t serialized_cluster_members = 0;
         for (int i = 0; i < arch.cluster_count; i++) {
-            const cbm_cluster_info_t *c = &arch.clusters[i];
+            const cbm_cluster_info_t *cluster = &arch.clusters[i];
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_int(doc, item, "id", c->id);
-            yyjson_mut_obj_add_str(doc, item, "label", c->label ? c->label : "");
-            yyjson_mut_obj_add_int(doc, item, "members", c->members);
-            yyjson_mut_obj_add_real(doc, item, "cohesion", c->cohesion);
+            yyjson_mut_val *member_atom_ids = yyjson_mut_arr(doc);
             yyjson_mut_val *top = yyjson_mut_arr(doc);
-            for (int j = 0; j < c->top_node_count; j++) {
-                yyjson_mut_arr_add_str(doc, top, c->top_nodes[j] ? c->top_nodes[j] : "");
+            yyjson_mut_val *packages = yyjson_mut_arr(doc);
+            yyjson_mut_val *edge_types = yyjson_mut_arr(doc);
+            ARCH_JSON_REQUIRE(
+                cluster->id == i && cluster->label && cluster->members > 0 &&
+                isfinite(cluster->cohesion) && cluster->cohesion >= 0.0 &&
+                cluster->cohesion <= 1.0 && cluster->member_atom_id_count == cluster->members &&
+                cluster->member_atom_ids &&
+                cluster->top_node_count == (cluster->members < CBM_CLUSTER_MAX_TOPNODES
+                                                ? cluster->members
+                                                : CBM_CLUSTER_MAX_TOPNODES) &&
+                cluster->top_nodes && cluster->package_count >= 0 &&
+                (cluster->package_count == 0 || cluster->packages) &&
+                cluster->edge_type_count >= 0 &&
+                (cluster->edge_type_count == 0 || cluster->edge_types) && item && member_atom_ids &&
+                top && packages && edge_types &&
+                yyjson_mut_obj_add_int(doc, item, "id", cluster->id) &&
+                yyjson_mut_obj_add_str(doc, item, "label", cluster->label) &&
+                yyjson_mut_obj_add_int(doc, item, "members", cluster->members) &&
+                yyjson_mut_obj_add_real(doc, item, "cohesion", cluster->cohesion));
+            ARCH_JSON_REQUIRE((uint64_t)cluster->members <=
+                              UINT64_MAX - serialized_cluster_members);
+            serialized_cluster_members += (uint64_t)cluster->members;
+            ARCH_JSON_REQUIRE(yyjson_mut_obj_add_int(doc, item, "member_atom_id_count",
+                                                     cluster->member_atom_id_count));
+            for (int j = 0; j < cluster->member_atom_id_count; j++) {
+                ARCH_JSON_REQUIRE(
+                    cluster->member_atom_ids[j] &&
+                    (j == 0 ||
+                     strcmp(cluster->member_atom_ids[j - 1], cluster->member_atom_ids[j]) < 0) &&
+                    yyjson_mut_arr_add_str(doc, member_atom_ids, cluster->member_atom_ids[j]));
             }
-            yyjson_mut_obj_add_val(doc, item, "top_nodes", top);
-            yyjson_mut_val *pkgs = yyjson_mut_arr(doc);
-            for (int j = 0; j < c->package_count; j++) {
-                yyjson_mut_arr_add_str(doc, pkgs, c->packages[j] ? c->packages[j] : "");
+            ARCH_JSON_REQUIRE(
+                yyjson_mut_obj_add_val(doc, item, "member_atom_ids", member_atom_ids));
+            for (int j = 0; j < cluster->top_node_count; j++) {
+                ARCH_JSON_REQUIRE(cluster->top_nodes[j] &&
+                                  yyjson_mut_arr_add_str(doc, top, cluster->top_nodes[j]));
             }
-            yyjson_mut_obj_add_val(doc, item, "packages", pkgs);
-            yyjson_mut_val *etypes = yyjson_mut_arr(doc);
-            for (int j = 0; j < c->edge_type_count; j++) {
-                yyjson_mut_arr_add_str(doc, etypes, c->edge_types[j] ? c->edge_types[j] : "");
+            ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, item, "top_nodes", top));
+            for (int j = 0; j < cluster->package_count; j++) {
+                ARCH_JSON_REQUIRE(cluster->packages[j] &&
+                                  yyjson_mut_arr_add_str(doc, packages, cluster->packages[j]));
             }
-            yyjson_mut_obj_add_val(doc, item, "edge_types", etypes);
-            yyjson_mut_arr_add_val(clusters, item);
+            ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, item, "packages", packages));
+            for (int j = 0; j < cluster->edge_type_count; j++) {
+                ARCH_JSON_REQUIRE(cluster->edge_types[j] &&
+                                  yyjson_mut_arr_add_str(doc, edge_types, cluster->edge_types[j]));
+            }
+            ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, item, "edge_types", edge_types) &&
+                              yyjson_mut_arr_add_val(clusters, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "clusters", clusters);
+        ARCH_JSON_REQUIRE(serialized_cluster_members == cluster_receipt.included_node_count);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "clusters", clusters));
     }
+    if (clusters_requested) {
+        /* Fixed-width placeholder used to derive and then read back the exact
+         * final compact architecture-object byte count. */
+        cluster_receipt.architecture_payload_bytes = UINT64_MAX;
+    }
+    ARCH_JSON_REQUIRE(append_cluster_receipt(doc, root, &cluster_receipt));
 
-    /* File tree */
     if (arch.file_tree_count > 0) {
-        yyjson_mut_val *file_tree = yyjson_mut_arr(doc);
+        yyjson_mut_val *values = yyjson_mut_arr(doc);
+        ARCH_JSON_REQUIRE(values);
         for (int i = 0; i < arch.file_tree_count; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "path",
-                                   arch.file_tree[i].path ? arch.file_tree[i].path : "");
-            yyjson_mut_obj_add_str(doc, item, "type",
-                                   arch.file_tree[i].type ? arch.file_tree[i].type : "");
-            yyjson_mut_obj_add_int(doc, item, "children", arch.file_tree[i].children);
-            yyjson_mut_arr_add_val(file_tree, item);
+            ARCH_JSON_REQUIRE(
+                item &&
+                yyjson_mut_obj_add_str(doc, item, "path",
+                                       arch.file_tree[i].path ? arch.file_tree[i].path : "") &&
+                yyjson_mut_obj_add_str(doc, item, "type",
+                                       arch.file_tree[i].type ? arch.file_tree[i].type : "") &&
+                yyjson_mut_obj_add_int(doc, item, "children", arch.file_tree[i].children) &&
+                yyjson_mut_arr_add_val(values, item));
         }
-        yyjson_mut_obj_add_val(doc, root, "file_tree", file_tree);
+        ARCH_JSON_REQUIRE(yyjson_mut_obj_add_val(doc, root, "file_tree", values));
     }
 
-    append_cross_repo_summary(doc, root, &schema);
+    if (dependencies_requested) {
+        ARCH_JSON_REQUIRE(append_cross_repo_summary(doc, root, &schema));
+    }
 
-    char *json = yy_doc_to_str(doc);
+#undef ARCH_JSON_REQUIRE
+
+    json = yy_doc_to_str_with_len(doc, &serialized_bytes);
+    if (!json) {
+        architecture_json_failed_operation = "serialize_placeholder_architecture_payload";
+        goto architecture_json_failed;
+    }
+    if (clusters_requested) {
+        uint64_t exact_payload_bytes = 0;
+        yyjson_mut_val *receipt_object = yyjson_mut_obj_get(root, "cluster_receipt");
+        yyjson_mut_val *payload_bytes_value =
+            receipt_object ? yyjson_mut_obj_get(receipt_object, "architecture_payload_bytes")
+                           : NULL;
+        if (!architecture_payload_size_from_u64_placeholder(serialized_bytes,
+                                                            &exact_payload_bytes) ||
+            !payload_bytes_value ||
+            !yyjson_mut_set_uint(payload_bytes_value, exact_payload_bytes)) {
+            architecture_json_failure_code = "CBM_ARCH_CLUSTER_PAYLOAD_SIZE_ACCOUNTING_FAILED";
+            architecture_json_failure_stage = "serialization_readback";
+            architecture_json_failure_message =
+                "the final C architecture payload byte field could not be resolved exactly";
+            architecture_json_failure_remediation =
+                "repair native payload-size accounting before retrying; no partial result was "
+                "returned";
+            architecture_json_failed_operation = "resolve_embedded_architecture_payload_bytes";
+            goto architecture_json_failed;
+        }
+        cluster_receipt.architecture_payload_bytes = exact_payload_bytes;
+        architecture_payload_size_resolved = true;
+        free(json);
+        json = yy_doc_to_str_with_len(doc, &serialized_bytes);
+        if (!json) {
+            architecture_json_failure_code = "CBM_ARCH_CLUSTER_SERIALIZATION_FAILED";
+            architecture_json_failure_stage = "serialization";
+            architecture_json_failure_message =
+                "the final C architecture payload could not be serialized after exact byte "
+                "accounting";
+            architecture_json_failure_remediation =
+                "free memory or repair the invalid native response field, then retry unchanged; "
+                "no partial result was returned";
+            architecture_json_failed_operation = "serialize_final_architecture_payload";
+            goto architecture_json_failed;
+        }
+        if ((uint64_t)serialized_bytes != exact_payload_bytes) {
+            architecture_json_failure_code = "CBM_ARCH_CLUSTER_PAYLOAD_SIZE_READBACK_MISMATCH";
+            architecture_json_failure_stage = "serialization_readback";
+            architecture_json_failure_message =
+                "the serialized C architecture payload length differs from its exact embedded "
+                "byte receipt";
+            architecture_json_failure_remediation =
+                "repair native payload serialization determinism before retrying; no partial "
+                "result was returned";
+            architecture_json_failed_operation = "read_back_final_architecture_payload_length";
+            goto architecture_json_failed;
+        }
+    }
     yyjson_mut_doc_free(doc);
+    doc = NULL;
+    /* This is the final logical architecture object produced by C: these
+     * exact compact UTF-8 bytes become content[0].text, and cbm_mcp_text_result
+     * parses the same object into structuredContent. The outer MCP envelope is
+     * deliberately excluded. Any Rust-side augmentation occurs after this
+     * boundary and must independently re-enforce the identical caller bound. */
+    if (clusters_requested && (uint64_t)serialized_bytes > cluster_options.max_result_bytes) {
+        free(json);
+        snprintf(cluster_receipt.status, sizeof(cluster_receipt.status), "refused");
+        snprintf(cluster_receipt.error_code, sizeof(cluster_receipt.error_code),
+                 "CBM_ARCH_CLUSTER_SERIALIZED_RESULT_BOUND_EXCEEDED");
+        snprintf(cluster_receipt.error_stage, sizeof(cluster_receipt.error_stage), "serialization");
+        snprintf(cluster_receipt.error_message, sizeof(cluster_receipt.error_message),
+                 "complete compact UTF-8 C architecture payload is %llu bytes and exceeds "
+                 "cluster_max_result_bytes=%llu",
+                 (unsigned long long)serialized_bytes,
+                 (unsigned long long)cluster_options.max_result_bytes);
+        snprintf(cluster_receipt.error_remediation, sizeof(cluster_receipt.error_remediation),
+                 "request an exact smaller scope or a larger caller-owned representable result "
+                 "budget; no prefix was returned");
+        cbm_log_error("mcp.architecture_payload_bound_refused", "code", cluster_receipt.error_code,
+                      "stage", cluster_receipt.error_stage, "message",
+                      cluster_receipt.error_message, "remediation",
+                      cluster_receipt.error_remediation);
+        result = architecture_error_result(&cluster_receipt, NULL);
+        free(norm_path);
+        cbm_store_architecture_free(&arch);
+        cbm_store_schema_free(&schema);
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return result;
+    }
+
+    result = cbm_mcp_text_result(json, false);
+    free(json);
+    free(norm_path);
     cbm_store_architecture_free(&arch);
     cbm_store_schema_free(&schema);
-    if (aspects_doc) {
-        yyjson_doc_free(aspects_doc);
-    }
+    yyjson_doc_free(aspects_doc);
     free(project);
     free(scope_path);
+    if (!result) {
+        if (clusters_requested) {
+            snprintf(cluster_receipt.status, sizeof(cluster_receipt.status), "refused");
+            snprintf(cluster_receipt.error_code, sizeof(cluster_receipt.error_code),
+                     "CBM_ARCH_CLUSTER_ENVELOPE_SERIALIZATION_FAILED");
+            snprintf(cluster_receipt.error_stage, sizeof(cluster_receipt.error_stage),
+                     "mcp_envelope");
+            snprintf(cluster_receipt.error_message, sizeof(cluster_receipt.error_message),
+                     "the verified C architecture payload could not be copied into a complete "
+                     "MCP result envelope");
+            snprintf(cluster_receipt.error_remediation, sizeof(cluster_receipt.error_remediation),
+                     "inspect the preceding MCP envelope diagnostic, free memory or repair the "
+                     "reported field, and retry unchanged");
+            return architecture_error_result(&cluster_receipt, NULL);
+        }
+        return architecture_error_result(NULL, "architecture response envelope allocation failed");
+    }
+    return result;
 
-    char *result = cbm_mcp_text_result(json, false);
+architecture_json_failed:
+#undef ARCH_JSON_REQUIRE
     free(json);
+    if (doc) {
+        yyjson_mut_doc_free(doc);
+    }
+    if (clusters_requested) {
+        if (!architecture_payload_size_resolved) {
+            cluster_receipt.architecture_payload_bytes = 0;
+        }
+        snprintf(cluster_receipt.status, sizeof(cluster_receipt.status), "refused");
+        snprintf(cluster_receipt.error_code, sizeof(cluster_receipt.error_code), "%s",
+                 architecture_json_failure_code);
+        snprintf(cluster_receipt.error_stage, sizeof(cluster_receipt.error_stage), "%s",
+                 architecture_json_failure_stage);
+        snprintf(cluster_receipt.error_message, sizeof(cluster_receipt.error_message), "%s",
+                 architecture_json_failure_message);
+        snprintf(cluster_receipt.error_remediation, sizeof(cluster_receipt.error_remediation), "%s",
+                 architecture_json_failure_remediation);
+        cbm_log_error("mcp.architecture_serialization_refused", "code", cluster_receipt.error_code,
+                      "stage", cluster_receipt.error_stage, "operation",
+                      architecture_json_failed_operation, "message", cluster_receipt.error_message,
+                      "remediation", cluster_receipt.error_remediation);
+    } else {
+        cbm_log_error(
+            "mcp.architecture_serialization_refused", "code", "CBM_ARCH_SERIALIZATION_FAILED",
+            "stage", "serialization", "operation", architecture_json_failed_operation, "message",
+            "the complete architecture payload could not be constructed", "remediation",
+            "free memory or repair the exact failed response field, then retry unchanged; "
+            "no partial result was returned");
+    }
+    char architecture_failure_detail[CBM_SZ_512];
+    snprintf(architecture_failure_detail, sizeof(architecture_failure_detail),
+             "architecture JSON operation failed: %s", architecture_json_failed_operation);
+    result = architecture_error_result(clusters_requested ? &cluster_receipt : NULL,
+                                       architecture_failure_detail);
+    free(norm_path);
+    cbm_store_architecture_free(&arch);
+    cbm_store_schema_free(&schema);
+    yyjson_doc_free(aspects_doc);
+    free(project);
+    free(scope_path);
     return result;
 }
 
@@ -7330,8 +8432,7 @@ static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_na
     unsigned long path_error = ERROR_SUCCESS;
     if (!project_db_path(project_name, db_buf, sizeof(db_buf), &path_error)) {
         result->destination_probe_native_error = (uint32_t)path_error;
-        snprintf(result->operation, sizeof(result->operation), "%s",
-                 "bootstrap.project_db_path");
+        snprintf(result->operation, sizeof(result->operation), "%s", "bootstrap.project_db_path");
         snprintf(result->detail, sizeof(result->detail), "%s",
                  "the exact artifact destination path could not be resolved or represented");
         return ARTIFACT_BOOTSTRAP_FAILED;
@@ -7342,9 +8443,8 @@ static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_na
     result->destination_probe = db_probe;
     result->destination_probe_native_error = (uint32_t)db_error;
     if (db_probe == CBM_PATH_PROBE_ERROR) {
-        cbm_log_error("index.artifact_bootstrap", "code",
-                      "CBM_ARTIFACT_BOOTSTRAP_DB_PROBE_FAILED", "project", project_name,
-                      "db_path", db_buf, "remediation",
+        cbm_log_error("index.artifact_bootstrap", "code", "CBM_ARTIFACT_BOOTSTRAP_DB_PROBE_FAILED",
+                      "project", project_name, "db_path", db_buf, "remediation",
                       "resolve the exact destination database path probe before retrying");
         snprintf(result->operation, sizeof(result->operation), "%s", "bootstrap.db_probe");
         snprintf(result->detail, sizeof(result->detail), "%s",
@@ -7363,13 +8463,10 @@ static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_na
                                   CBM_ARTIFACT_DIR, CBM_ARTIFACT_META);
     if (wrote < 0 || (size_t)wrote >= sizeof(artifact_path) || metadata_wrote < 0 ||
         (size_t)metadata_wrote >= sizeof(metadata_path)) {
-        cbm_log_error("index.artifact_bootstrap", "code",
-                      "CBM_ARTIFACT_BOOTSTRAP_PATH_TOO_LONG", "project", project_name,
-                      "repo_path", repo_path);
-        snprintf(result->operation, sizeof(result->operation), "%s",
-                 "bootstrap.artifact_path");
-        snprintf(result->detail, sizeof(result->detail), "%s",
-                 "artifact path is too long");
+        cbm_log_error("index.artifact_bootstrap", "code", "CBM_ARTIFACT_BOOTSTRAP_PATH_TOO_LONG",
+                      "project", project_name, "repo_path", repo_path);
+        snprintf(result->operation, sizeof(result->operation), "%s", "bootstrap.artifact_path");
+        snprintf(result->detail, sizeof(result->detail), "%s", "artifact path is too long");
         return ARTIFACT_BOOTSTRAP_FAILED;
     }
     unsigned long artifact_error = 0;
@@ -7381,22 +8478,17 @@ static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_na
                       "CBM_ARTIFACT_BOOTSTRAP_ARTIFACT_PROBE_FAILED", "project", project_name,
                       "path", artifact_path, "remediation",
                       "resolve the exact artifact path probe before retrying");
-        snprintf(result->operation, sizeof(result->operation), "%s",
-                 "bootstrap.artifact_probe");
-        snprintf(result->detail, sizeof(result->detail), "%s",
-                 "artifact path probe failed");
+        snprintf(result->operation, sizeof(result->operation), "%s", "bootstrap.artifact_probe");
+        snprintf(result->detail, sizeof(result->detail), "%s", "artifact path probe failed");
         return ARTIFACT_BOOTSTRAP_FAILED;
     }
-    if (artifact_probe == CBM_PATH_PROBE_ABSENT &&
-        metadata_probe == CBM_PATH_PROBE_ABSENT) {
+    if (artifact_probe == CBM_PATH_PROBE_ABSENT && metadata_probe == CBM_PATH_PROBE_ABSENT) {
         return ARTIFACT_BOOTSTRAP_NOT_NEEDED;
     }
-    if (artifact_probe != CBM_PATH_PROBE_PRESENT ||
-        metadata_probe != CBM_PATH_PROBE_PRESENT) {
+    if (artifact_probe != CBM_PATH_PROBE_PRESENT || metadata_probe != CBM_PATH_PROBE_PRESENT) {
         cbm_log_error("index.artifact_bootstrap", "code",
                       "CBM_ARTIFACT_BOOTSTRAP_PARTIAL_GENERATION", "project", project_name,
-                      "artifact_path", artifact_path, "metadata_path", metadata_path,
-                      "remediation",
+                      "artifact_path", artifact_path, "metadata_path", metadata_path, "remediation",
                       "restore one complete content-bound artifact generation before retrying");
         snprintf(result->operation, sizeof(result->operation), "%s",
                  "bootstrap.artifact_generation");
@@ -7406,8 +8498,7 @@ static artifact_bootstrap_status_t try_artifact_bootstrap(const char *project_na
     }
 
     cbm_log_info("index.artifact_bootstrap", "project", project_name, "path", artifact_path);
-    if (cbm_artifact_import(repo_path, db_buf, project_name, result) !=
-        CBM_ARTIFACT_IMPORT_OK) {
+    if (cbm_artifact_import(repo_path, db_buf, project_name, result) != CBM_ARTIFACT_IMPORT_OK) {
         cbm_log_error("index.artifact_bootstrap", "code", "CBM_ARTIFACT_BOOTSTRAP_FAILED",
                       "project", project_name, "path", artifact_path, "remediation",
                       "repair or remove the explicitly published artifact before retrying; no "
@@ -7472,12 +8563,12 @@ static bool add_artifact_bootstrap_revert(yyjson_mut_doc *doc, yyjson_mut_val *r
            yyjson_mut_obj_add_int(doc, node, "status", revert->status) &&
            yyjson_mut_obj_add_strcpy(doc, node, "operation", revert->operation) &&
            yyjson_mut_obj_add_strcpy(doc, node, "detail", revert->detail) &&
-           yyjson_mut_obj_add_str(
-               doc, node, "destination_state",
-               revert->destination_probe == CBM_PATH_PROBE_PRESENT
-                   ? "present"
-                   : (revert->destination_probe == CBM_PATH_PROBE_ABSENT ? "absent"
-                                                                         : "probe_error")) &&
+           yyjson_mut_obj_add_str(doc, node, "destination_state",
+                                  revert->destination_probe == CBM_PATH_PROBE_PRESENT
+                                      ? "present"
+                                      : (revert->destination_probe == CBM_PATH_PROBE_ABSENT
+                                             ? "absent"
+                                             : "probe_error")) &&
            yyjson_mut_obj_add_uint(doc, node, "destination_probe_native_error",
                                    revert->destination_probe_native_error) &&
            yyjson_mut_obj_add_bool(doc, node, "sidecars_absent", revert->sidecars_absent != 0) &&
@@ -7487,9 +8578,8 @@ static bool add_artifact_bootstrap_revert(yyjson_mut_doc *doc, yyjson_mut_val *r
            yyjson_mut_obj_add_strcpy(doc, node, "observed_sha256", revert->observed_sha256);
 }
 
-static char *build_artifact_bootstrap_error(
-    const char *project_name, const char *repo_path,
-    const cbm_artifact_import_result_t *import_result) {
+static char *build_artifact_bootstrap_error(const char *project_name, const char *repo_path,
+                                            const cbm_artifact_import_result_t *import_result) {
     static const char allocation_failure[] =
         "{\"status\":\"error\","
         "\"code\":\"CBM_ARTIFACT_BOOTSTRAP_RESPONSE_ALLOC_FAILED\","
@@ -7524,29 +8614,29 @@ static char *build_artifact_bootstrap_error(
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path) &&
         yyjson_mut_obj_add_strcpy(doc, root, "destination_db_path",
                                   import_result->destination_db_path) &&
-        yyjson_mut_obj_add_str(
-            doc, root, "destination_db_state",
-            import_result->destination_probe == CBM_PATH_PROBE_PRESENT
-                ? "present"
-                : (import_result->destination_probe == CBM_PATH_PROBE_ABSENT ? "absent"
-                                                                             : "probe_error")) &&
+        yyjson_mut_obj_add_str(doc, root, "destination_db_state",
+                               import_result->destination_probe == CBM_PATH_PROBE_PRESENT
+                                   ? "present"
+                                   : (import_result->destination_probe == CBM_PATH_PROBE_ABSENT
+                                          ? "absent"
+                                          : "probe_error")) &&
         yyjson_mut_obj_add_uint(doc, root, "destination_probe_native_error",
-                               import_result->destination_probe_native_error) &&
+                                import_result->destination_probe_native_error) &&
         yyjson_mut_obj_add_int(doc, root, "import_status", import_result->status) &&
         yyjson_mut_obj_add_strcpy(doc, root, "import_operation", import_result->operation) &&
         yyjson_mut_obj_add_strcpy(doc, root, "import_detail", import_result->detail) &&
-        yyjson_mut_obj_add_strcpy(
-            doc, root, "detail", detail ? detail : "inspect the preceding artifact.import log");
+        yyjson_mut_obj_add_strcpy(doc, root, "detail",
+                                  detail ? detail : "inspect the preceding artifact.import log");
     if (import_result->publication_started) {
-        complete = complete &&
-                   yyjson_mut_obj_add_str(
-                       doc, root, "message",
-                       "the artifact database was durably published, but its post-publication "
-                       "identity or namespace readback failed; indexing was refused") &&
-                   yyjson_mut_obj_add_str(
-                       doc, root, "remediation",
-                       "inspect the durable destination database and the preceding "
-                       "artifact.import diagnostic before retrying");
+        complete =
+            complete &&
+            yyjson_mut_obj_add_str(
+                doc, root, "message",
+                "the artifact database was durably published, but its post-publication "
+                "identity or namespace readback failed; indexing was refused") &&
+            yyjson_mut_obj_add_str(doc, root, "remediation",
+                                   "inspect the durable destination database and the preceding "
+                                   "artifact.import diagnostic before retrying");
     } else if (import_result->destination_probe == CBM_PATH_PROBE_ABSENT) {
         complete = complete &&
                    yyjson_mut_obj_add_str(
@@ -7667,21 +8757,18 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "phase", errs[i].phase ? errs[i].phase : "");
-        yyjson_mut_obj_add_str(
-            doc, fe, "outcome_class",
-            errs[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT
-                ? "content_defect"
-                : errs[i].outcome_class == CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL
-                      ? "infrastructure_fatal"
-                      : "unclassified");
+        yyjson_mut_obj_add_str(doc, fe, "outcome_class",
+                               errs[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT
+                                   ? "content_defect"
+                               : errs[i].outcome_class == CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL
+                                   ? "infrastructure_fatal"
+                                   : "unclassified");
         yyjson_mut_obj_add_strcpy(doc, fe, "code", errs[i].code ? errs[i].code : "");
-        yyjson_mut_obj_add_strcpy(doc, fe, "operation",
-                                  errs[i].operation ? errs[i].operation : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "operation", errs[i].operation ? errs[i].operation : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "file_sha256",
                                   errs[i].file_sha256 ? errs[i].file_sha256 : "");
         yyjson_mut_obj_add_uint(doc, fe, "requested", (uint64_t)errs[i].requested);
-        yyjson_mut_obj_add_uint(doc, fe, "discarded_atom_facts",
-                                errs[i].discarded_atom_facts);
+        yyjson_mut_obj_add_uint(doc, fe, "discarded_atom_facts", errs[i].discarded_atom_facts);
         yyjson_mut_obj_add_uint(doc, fe, "discarded_relationship_facts",
                                 errs[i].discarded_relationship_facts);
         yyjson_mut_obj_add_bool(doc, fe, "unmeasured_file", errs[i].unmeasured_file);
@@ -7707,8 +8794,7 @@ static bool add_compile_context_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val 
         diagnostics.bound_files + diagnostics.configuration_absent_files +
                 diagnostics.empty_files !=
             diagnostics.c_family_files ||
-        (diagnostics.configuration_absent_files > 0 &&
-         !diagnostics.configuration_absent_paths)) {
+        (diagnostics.configuration_absent_files > 0 && !diagnostics.configuration_absent_paths)) {
         return false;
     }
 
@@ -7717,8 +8803,7 @@ static bool add_compile_context_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val 
         !yyjson_mut_obj_add_strcpy(doc, context, "authority",
                                    diagnostics.authority ? diagnostics.authority
                                                          : "not_applicable") ||
-        !yyjson_mut_obj_add_int(doc, context, "c_family_files",
-                                diagnostics.c_family_files) ||
+        !yyjson_mut_obj_add_int(doc, context, "c_family_files", diagnostics.c_family_files) ||
         !yyjson_mut_obj_add_int(doc, context, "bound_files", diagnostics.bound_files) ||
         !yyjson_mut_obj_add_int(doc, context, "configuration_absent_files",
                                 diagnostics.configuration_absent_files) ||
@@ -7737,17 +8822,15 @@ static bool add_compile_context_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val 
                         : INDEX_COMPILE_CONTEXT_ABSENCE_CAP;
         for (int i = 0; i < shown; i++) {
             if (!diagnostics.configuration_absent_paths[i] ||
-                !yyjson_mut_arr_add_strcpy(doc, paths,
-                                           diagnostics.configuration_absent_paths[i])) {
+                !yyjson_mut_arr_add_strcpy(doc, paths, diagnostics.configuration_absent_paths[i])) {
                 return false;
             }
         }
-        const char *reason = diagnostics.authority &&
-                                     strcmp(diagnostics.authority, "absent") == 0
+        const char *reason = diagnostics.authority && strcmp(diagnostics.authority, "absent") == 0
                                  ? "compile_database_absent"
                                  : "not_in_active_build_closure";
-        if (!yyjson_mut_obj_add_str(
-                doc, absence, "code", "CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT") ||
+        if (!yyjson_mut_obj_add_str(doc, absence, "code",
+                                    "CBM_COMPILE_CONTEXT_CONFIGURATION_ABSENT") ||
             !yyjson_mut_obj_add_str(
                 doc, absence, "message",
                 "C-family source atoms outside the selected build configuration were retained "
@@ -7760,9 +8843,9 @@ static bool add_compile_context_diagnostics(yyjson_mut_doc *doc, yyjson_mut_val 
             !yyjson_mut_obj_add_int(doc, absence, "count",
                                     diagnostics.configuration_absent_files) ||
             !yyjson_mut_obj_add_int(doc, absence, "returned", shown) ||
-            !yyjson_mut_obj_add_bool(
-                doc, absence, "truncated",
-                diagnostics.configuration_absent_files > INDEX_COMPILE_CONTEXT_ABSENCE_CAP) ||
+            !yyjson_mut_obj_add_bool(doc, absence, "truncated",
+                                     diagnostics.configuration_absent_files >
+                                         INDEX_COMPILE_CONTEXT_ABSENCE_CAP) ||
             !yyjson_mut_obj_add_val(doc, absence, "paths", paths) ||
             !yyjson_mut_obj_add_val(doc, context, "configuration_absent", absence)) {
             return false;
@@ -7805,32 +8888,29 @@ static bool browser_runtime_request_property_is(yyjson_val *root, const char *ke
 
 static bool validate_browser_runtime_request_node(const cbm_node_t *node, char *detail,
                                                   size_t detail_size) {
-    if (!node || !node->label || strcmp(node->label, "RuntimeModuleRequest") != 0 ||
-        !node->name || !node->name[0] || !node->qualified_name || !node->qualified_name[0] ||
-        !node->file_path || !node->file_path[0] || !is_lower_hex_sha256(node->atom_id) ||
-        node->source_present || node->source_len != 0 || node->start_byte != 0 ||
-        node->end_byte != 0 || node->start_line != 0 || node->end_line != 0) {
+    if (!node || !node->label || strcmp(node->label, "RuntimeModuleRequest") != 0 || !node->name ||
+        !node->name[0] || !node->qualified_name || !node->qualified_name[0] || !node->file_path ||
+        !node->file_path[0] || !is_lower_hex_sha256(node->atom_id) || node->source_present ||
+        node->source_len != 0 || node->start_byte != 0 || node->end_byte != 0 ||
+        node->start_line != 0 || node->end_line != 0) {
         snprintf(detail, detail_size,
                  "RuntimeModuleRequest row has invalid identity/source fields (atom=%.64s, "
                  "specifier=%.160s, source=%.160s)",
-                 node && node->atom_id ? node->atom_id : "",
-                 node && node->name ? node->name : "",
+                 node && node->atom_id ? node->atom_id : "", node && node->name ? node->name : "",
                  node && node->file_path ? node->file_path : "");
         return false;
     }
 
     yyjson_doc *properties =
-        node->properties_json
-            ? yyjson_read(node->properties_json, strlen(node->properties_json), 0)
-            : NULL;
+        node->properties_json ? yyjson_read(node->properties_json, strlen(node->properties_json), 0)
+                              : NULL;
     yyjson_val *property_root = properties ? yyjson_doc_get_root(properties) : NULL;
-    bool valid = browser_runtime_request_property_is(property_root, "resolution_kind",
-                                                     "browser_url") &&
-                 browser_runtime_request_property_is(property_root, "source_file",
-                                                     node->file_path) &&
-                 browser_runtime_request_property_is(property_root, "specifier", node->name) &&
-                 browser_runtime_request_property_is(property_root, "target_state",
-                                                     "runtime_resolution_required");
+    bool valid =
+        browser_runtime_request_property_is(property_root, "resolution_kind", "browser_url") &&
+        browser_runtime_request_property_is(property_root, "source_file", node->file_path) &&
+        browser_runtime_request_property_is(property_root, "specifier", node->name) &&
+        browser_runtime_request_property_is(property_root, "target_state",
+                                            "runtime_resolution_required");
     if (!valid) {
         snprintf(detail, detail_size,
                  "RuntimeModuleRequest properties do not exactly bind browser_url, source_file, "
@@ -7855,7 +8935,8 @@ static browser_runtime_diagnostics_status_t add_browser_runtime_request_diagnost
     cbm_node_t *requests = NULL;
     int count = 0;
     if (cbm_store_find_nodes_by_label(store, project_name, "RuntimeModuleRequest", &requests,
-                                      &count) != CBM_STORE_OK || count < 0) {
+                                      &count) != CBM_STORE_OK ||
+        count < 0) {
         record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
                                    CBM_STORE_VERIFY_IO_FAILED,
                                    "source.query_browser_runtime_requests", cbm_store_error(store));
@@ -7864,8 +8945,7 @@ static browser_runtime_diagnostics_status_t add_browser_runtime_request_diagnost
     }
 
     if (count > 1) {
-        qsort(requests, (size_t)count, sizeof(*requests),
-              compare_browser_runtime_request_nodes);
+        qsort(requests, (size_t)count, sizeof(*requests), compare_browser_runtime_request_nodes);
     }
     for (int i = 0; i < count; i++) {
         char detail[CBM_STORE_VERIFY_DETAIL_MAX];
@@ -7883,22 +8963,19 @@ static browser_runtime_diagnostics_status_t add_browser_runtime_request_diagnost
         yyjson_mut_val *diagnostic = yyjson_mut_obj(doc);
         yyjson_mut_val *items = yyjson_mut_arr(doc);
         response_ok = response_ok && diagnostic && items;
-        int shown = count < INDEX_BROWSER_RUNTIME_REQUEST_CAP
-                        ? count
-                        : INDEX_BROWSER_RUNTIME_REQUEST_CAP;
+        int shown =
+            count < INDEX_BROWSER_RUNTIME_REQUEST_CAP ? count : INDEX_BROWSER_RUNTIME_REQUEST_CAP;
         for (int i = 0; response_ok && i < shown; i++) {
             yyjson_mut_val *item = yyjson_mut_obj(doc);
-            response_ok = item &&
-                          yyjson_mut_obj_add_strcpy(doc, item, "atom_id", requests[i].atom_id) &&
-                          yyjson_mut_obj_add_strcpy(doc, item, "specifier", requests[i].name) &&
-                          yyjson_mut_obj_add_strcpy(doc, item, "source_file",
-                                                   requests[i].file_path) &&
-                          yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
-                                                   requests[i].qualified_name) &&
-                          yyjson_mut_obj_add_str(doc, item, "resolution_kind", "browser_url") &&
-                          yyjson_mut_obj_add_str(doc, item, "target_state",
-                                                "runtime_resolution_required") &&
-                          yyjson_mut_arr_add_val(items, item);
+            response_ok =
+                item && yyjson_mut_obj_add_strcpy(doc, item, "atom_id", requests[i].atom_id) &&
+                yyjson_mut_obj_add_strcpy(doc, item, "specifier", requests[i].name) &&
+                yyjson_mut_obj_add_strcpy(doc, item, "source_file", requests[i].file_path) &&
+                yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                          requests[i].qualified_name) &&
+                yyjson_mut_obj_add_str(doc, item, "resolution_kind", "browser_url") &&
+                yyjson_mut_obj_add_str(doc, item, "target_state", "runtime_resolution_required") &&
+                yyjson_mut_arr_add_val(items, item);
         }
         response_ok =
             response_ok &&
@@ -7927,16 +9004,14 @@ static browser_runtime_diagnostics_status_t add_browser_runtime_request_diagnost
 static char *build_browser_runtime_diagnostics_response_error(const char *project_name) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
-        return heap_strdup(
-            "{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
-            "\"source_family_preserved\":true}");
+        return heap_strdup("{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
+                           "\"source_family_preserved\":true}");
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     if (!root) {
         yyjson_mut_doc_free(doc);
-        return heap_strdup(
-            "{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
-            "\"source_family_preserved\":true}");
+        return heap_strdup("{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
+                           "\"source_family_preserved\":true}");
     }
     yyjson_mut_doc_set_root(doc, root);
     bool complete =
@@ -7958,9 +9033,8 @@ static char *build_browser_runtime_diagnostics_response_error(const char *projec
     char *json = complete ? yyjson_mut_write(doc, 0, NULL) : NULL;
     yyjson_mut_doc_free(doc);
     return json ? json
-                : heap_strdup(
-                      "{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
-                      "\"source_family_preserved\":true}");
+                : heap_strdup("{\"code\":\"CBM_INDEX_RUNTIME_REQUEST_DIAGNOSTIC_ALLOC_FAILED\","
+                              "\"source_family_preserved\":true}");
 }
 
 static bool write_skip_log_json_line(FILE *file, yyjson_mut_doc *doc) {
@@ -7986,8 +9060,8 @@ static bool write_skip_log_json_line(FILE *file, yyjson_mut_doc *doc) {
 static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs, int count,
                                char *out_path, size_t out_sz) {
     if (!errs || count <= 0 || !out_path || out_sz == 0) {
-        cbm_log_error("index.logfile_contract_fail", "code",
-                      "CBM_INDEX_SKIP_LOG_INPUT_INVALID", "message",
+        cbm_log_error("index.logfile_contract_fail", "code", "CBM_INDEX_SKIP_LOG_INPUT_INVALID",
+                      "message",
                       "the typed outcome log request lacks outcomes or a reportable path buffer",
                       "remediation", "repair the index response contract before retrying");
         return false;
@@ -7997,10 +9071,9 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     if (override && override[0]) {
         int path_length = snprintf(path, sizeof(path), "%s", override);
         if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
-            cbm_log_error("index.logfile_path_fail", "code",
-                          "CBM_INDEX_SKIP_LOG_PATH_INVALID", "message",
-                          "CBM_INDEX_LOG cannot be represented without truncation", "remediation",
-                          "shorten CBM_INDEX_LOG and retry the unchanged corpus");
+            cbm_log_error("index.logfile_path_fail", "code", "CBM_INDEX_SKIP_LOG_PATH_INVALID",
+                          "message", "CBM_INDEX_LOG cannot be represented without truncation",
+                          "remediation", "shorten CBM_INDEX_LOG and retry the unchanged corpus");
             return false;
         }
     } else {
@@ -8022,12 +9095,11 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
                           "remediation", "restore the configured cache directory and retry");
             return false;
         }
-        int path_length =
-            snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir,
-                     project ? project : "index", (long long)time(NULL));
+        int path_length = snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir,
+                                   project ? project : "index", (long long)time(NULL));
         if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
-            cbm_log_error("index.logfile_path_fail", "code",
-                          "CBM_INDEX_SKIP_LOG_PATH_INVALID", "message",
+            cbm_log_error("index.logfile_path_fail", "code", "CBM_INDEX_SKIP_LOG_PATH_INVALID",
+                          "message",
                           "the generated typed outcome log path cannot be represented without "
                           "truncation",
                           "remediation", "shorten the project or cache path and retry");
@@ -8044,8 +9116,8 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     }
     FILE *f = cbm_fopen(path, "wb");
     if (!f) {
-        cbm_log_error("index.logfile_open_fail", "code", "CBM_INDEX_SKIP_LOG_OPEN_FAILED",
-                      "path", path, "message", "the uncapped typed outcome log could not open",
+        cbm_log_error("index.logfile_open_fail", "code", "CBM_INDEX_SKIP_LOG_OPEN_FAILED", "path",
+                      path, "message", "the uncapped typed outcome log could not open",
                       "remediation", "restore write access to the index log directory and retry");
         return false;
     }
@@ -8056,12 +9128,11 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         complete = false;
     } else {
         yyjson_mut_doc_set_root(header_doc, header);
-        complete = yyjson_mut_obj_add_str(header_doc, header, "schema",
-                                          "cbm.index-skip-report.v2") &&
-                   yyjson_mut_obj_add_strcpy(header_doc, header, "project",
-                                             project ? project : "") &&
-                   yyjson_mut_obj_add_int(header_doc, header, "skipped_count", count) &&
-                   write_skip_log_json_line(f, header_doc);
+        complete =
+            yyjson_mut_obj_add_str(header_doc, header, "schema", "cbm.index-skip-report.v2") &&
+            yyjson_mut_obj_add_strcpy(header_doc, header, "project", project ? project : "") &&
+            yyjson_mut_obj_add_int(header_doc, header, "skipped_count", count) &&
+            write_skip_log_json_line(f, header_doc);
     }
     if (header_doc) {
         yyjson_mut_doc_free(header_doc);
@@ -8077,20 +9148,18 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
             break;
         }
         yyjson_mut_doc_set_root(row_doc, row);
-        const char *outcome_class =
-            errs[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT
-                ? "content_defect"
-                : errs[i].outcome_class == CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL
-                      ? "infrastructure_fatal"
-                      : "unclassified";
+        const char *outcome_class = errs[i].outcome_class == CBM_FILE_OUTCOME_CONTENT_DEFECT
+                                        ? "content_defect"
+                                    : errs[i].outcome_class == CBM_FILE_OUTCOME_INFRASTRUCTURE_FATAL
+                                        ? "infrastructure_fatal"
+                                        : "unclassified";
         complete =
             yyjson_mut_obj_add_str(row_doc, row, "schema", "cbm.index-source-outcome.v1") &&
             yyjson_mut_obj_add_strcpy(row_doc, row, "outcome_class", outcome_class) &&
             yyjson_mut_obj_add_strcpy(row_doc, row, "code", errs[i].code ? errs[i].code : "") &&
             yyjson_mut_obj_add_strcpy(row_doc, row, "operation",
                                       errs[i].operation ? errs[i].operation : "") &&
-            yyjson_mut_obj_add_strcpy(row_doc, row, "phase",
-                                      errs[i].phase ? errs[i].phase : "") &&
+            yyjson_mut_obj_add_strcpy(row_doc, row, "phase", errs[i].phase ? errs[i].phase : "") &&
             yyjson_mut_obj_add_strcpy(row_doc, row, "path", errs[i].path ? errs[i].path : "") &&
             yyjson_mut_obj_add_strcpy(row_doc, row, "file_sha256",
                                       errs[i].file_sha256 ? errs[i].file_sha256 : "") &&
@@ -8103,8 +9172,7 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
                                     errs[i].discarded_atom_facts) &&
             yyjson_mut_obj_add_uint(row_doc, row, "discarded_relationship_facts",
                                     errs[i].discarded_relationship_facts) &&
-            yyjson_mut_obj_add_bool(row_doc, row, "unmeasured_file",
-                                    errs[i].unmeasured_file) &&
+            yyjson_mut_obj_add_bool(row_doc, row, "unmeasured_file", errs[i].unmeasured_file) &&
             yyjson_mut_obj_add_bool(row_doc, row, "graph_diagnostic_persisted",
                                     errs[i].graph_diagnostic_persisted) &&
             write_skip_log_json_line(f, row_doc);
@@ -8120,10 +9188,11 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         complete = false;
     }
     if (!complete) {
-        cbm_log_error(
-            "index.logfile_write_fail", "code", "CBM_INDEX_SKIP_LOG_WRITE_FAILED", "path", path,
-            "message", "the uncapped typed outcome log was not written and closed completely",
-            "remediation", "preserve the partial log, restore storage, and retry the unchanged corpus");
+        cbm_log_error("index.logfile_write_fail", "code", "CBM_INDEX_SKIP_LOG_WRITE_FAILED", "path",
+                      path, "message",
+                      "the uncapped typed outcome log was not written and closed completely",
+                      "remediation",
+                      "preserve the partial log, restore storage, and retry the unchanged corpus");
     }
     return complete;
 }
@@ -8165,11 +9234,10 @@ static char *build_skip_log_persist_error(const char *project_name, const char *
     char *json = complete ? yyjson_mut_write(doc, 0, NULL) : NULL;
     yyjson_mut_doc_free(doc);
     return json ? json
-                : heap_strdup(
-                      "{\"status\":\"error\",\"code\":"
-                      "\"CBM_INDEX_SKIP_LOG_PERSIST_FAILED\",\"operation\":"
-                      "\"write_skip_logfile\",\"phase\":\"postcondition\","
-                      "\"sqlite_publication_started\":true}");
+                : heap_strdup("{\"status\":\"error\",\"code\":"
+                              "\"CBM_INDEX_SKIP_LOG_PERSIST_FAILED\",\"operation\":"
+                              "\"write_skip_logfile\",\"phase\":\"postcondition\","
+                              "\"sqlite_publication_started\":true}");
 }
 
 static char *build_index_state_mismatch_error(const char *project_name, int expected_nodes,
@@ -8203,11 +9271,11 @@ static char *build_index_state_mismatch_error(const char *project_name, int expe
 }
 
 static char *build_content_defect_readback_error(const char *project_name, int observed_this_run,
-                                                  int persisted_nodes, int persisted_edges,
-                                                  int dangling_observed_this_run,
-                                                  int persisted_dangling_nodes,
-                                                  uint_least64_t reported_dangling_skips,
-                                                  bool full_generation) {
+                                                 int persisted_nodes, int persisted_edges,
+                                                 int dangling_observed_this_run,
+                                                 int persisted_dangling_nodes,
+                                                 uint_least64_t reported_dangling_skips,
+                                                 bool full_generation) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return heap_strdup(
@@ -8218,12 +9286,13 @@ static char *build_content_defect_readback_error(const char *project_name, int o
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "code", "CBM_CONTENT_DEFECT_READBACK_MISMATCH");
     yyjson_mut_obj_add_str(doc, root, "operation", "recount_persisted_content_defects");
-    yyjson_mut_obj_add_str(
-        doc, root, "message",
-        "typed source-local defect nodes and relationships do not match the completed outcome inventory");
+    yyjson_mut_obj_add_str(doc, root, "message",
+                           "typed source-local defect nodes and relationships do not match the "
+                           "completed outcome inventory");
     yyjson_mut_obj_add_str(
         doc, root, "remediation",
-        "preserve the published store, inspect ContentDefect and HAS_CONTENT_DEFECT rows, and repair the atomic outcome transaction before retrying");
+        "preserve the published store, inspect ContentDefect and HAS_CONTENT_DEFECT rows, and "
+        "repair the atomic outcome transaction before retrying");
     yyjson_mut_obj_add_strcpy(doc, root, "project", project_name ? project_name : "");
     yyjson_mut_obj_add_int(doc, root, "observed_this_run", observed_this_run);
     yyjson_mut_obj_add_int(doc, root, "persisted_nodes", persisted_nodes);
@@ -8252,8 +9321,7 @@ static bool vector_state_matches_capability(const cbm_index_capability_t *capabi
     }
     bool node_dimensions_match =
         readback->node_vector_count == 0
-            ? readback->node_vector_min_dimension == -1 &&
-                  readback->node_vector_max_dimension == -1
+            ? readback->node_vector_min_dimension == -1 && readback->node_vector_max_dimension == -1
             : readback->node_vector_min_dimension == capability->vector_dimension &&
                   readback->node_vector_max_dimension == capability->vector_dimension;
     bool token_dimensions_match =
@@ -8328,16 +9396,13 @@ static char *build_index_semantic_state_mismatch_error(
 static bool add_vector_state_readback_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                            const cbm_vector_state_readback_t *readback) {
     yyjson_mut_val *state = yyjson_mut_obj(doc);
-    return state &&
-           yyjson_mut_obj_add_str(doc, state, "source", "physical_vector_tables") &&
-           yyjson_mut_obj_add_int(doc, state, "node_vector_count",
-                                  readback->node_vector_count) &&
+    return state && yyjson_mut_obj_add_str(doc, state, "source", "physical_vector_tables") &&
+           yyjson_mut_obj_add_int(doc, state, "node_vector_count", readback->node_vector_count) &&
            yyjson_mut_obj_add_int(doc, state, "node_vector_min_dimension",
                                   readback->node_vector_min_dimension) &&
            yyjson_mut_obj_add_int(doc, state, "node_vector_max_dimension",
                                   readback->node_vector_max_dimension) &&
-           yyjson_mut_obj_add_int(doc, state, "token_vector_count",
-                                  readback->token_vector_count) &&
+           yyjson_mut_obj_add_int(doc, state, "token_vector_count", readback->token_vector_count) &&
            yyjson_mut_obj_add_int(doc, state, "token_vector_min_dimension",
                                   readback->token_vector_min_dimension) &&
            yyjson_mut_obj_add_int(doc, state, "token_vector_max_dimension",
@@ -8553,25 +9618,20 @@ static bool add_pipeline_parallel_resolver_accounting(
     cbm_pipeline_parallel_resolver_accounting_t accounting = {0};
     bool present = cbm_pipeline_get_parallel_resolver_accounting(p, &accounting);
     bool required = expectation == CBM_PIPELINE_PARALLEL_DISPATCH_EXPECTATION_NONZERO;
-    bool internally_consistent = !present ||
-                                 (accounting.completed == accounting.denominator &&
-                                  accounting.recounted == accounting.denominator &&
-                                  accounting.cross_lsp_accounted_units ==
-                                      accounting.cross_lsp_units &&
-                                  accounting.cross_lsp_seeded_rows <=
-                                      UINT64_MAX - accounting.cross_lsp_source_rows &&
-                                  accounting.cross_lsp_seen_rows ==
-                                      accounting.cross_lsp_seeded_rows +
-                                          accounting.cross_lsp_source_rows &&
-                                  accounting.cross_lsp_duplicate_rows <=
-                                      accounting.cross_lsp_source_rows &&
-                                  accounting.cross_lsp_appended_rows ==
-                                      accounting.cross_lsp_source_rows -
-                                          accounting.cross_lsp_duplicate_rows);
+    bool internally_consistent =
+        !present ||
+        (accounting.completed == accounting.denominator &&
+         accounting.recounted == accounting.denominator &&
+         accounting.cross_lsp_accounted_units == accounting.cross_lsp_units &&
+         accounting.cross_lsp_seeded_rows <= UINT64_MAX - accounting.cross_lsp_source_rows &&
+         accounting.cross_lsp_seen_rows ==
+             accounting.cross_lsp_seeded_rows + accounting.cross_lsp_source_rows &&
+         accounting.cross_lsp_duplicate_rows <= accounting.cross_lsp_source_rows &&
+         accounting.cross_lsp_appended_rows ==
+             accounting.cross_lsp_source_rows - accounting.cross_lsp_duplicate_rows);
 
     yyjson_mut_val *item = yyjson_mut_obj(doc);
-    if (!item ||
-        !yyjson_mut_obj_add_str(doc, item, "state", present ? "measured" : "not_run") ||
+    if (!item || !yyjson_mut_obj_add_str(doc, item, "state", present ? "measured" : "not_run") ||
         !yyjson_mut_obj_add_bool(doc, item, "required", required)) {
         return false;
     }
@@ -8582,17 +9642,17 @@ static bool add_pipeline_parallel_resolver_accounting(
          !yyjson_mut_obj_add_uint(doc, item, "dynamic_lsp_items", accounting.dynamic_lsp_items) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_units", accounting.cross_lsp_units) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_accounted_units",
-                                 accounting.cross_lsp_accounted_units) ||
+                                  accounting.cross_lsp_accounted_units) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_seen_rows",
-                                 accounting.cross_lsp_seen_rows) ||
+                                  accounting.cross_lsp_seen_rows) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_seeded_rows",
-                                 accounting.cross_lsp_seeded_rows) ||
+                                  accounting.cross_lsp_seeded_rows) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_source_rows",
-                                 accounting.cross_lsp_source_rows) ||
+                                  accounting.cross_lsp_source_rows) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_duplicate_rows",
-                                 accounting.cross_lsp_duplicate_rows) ||
+                                  accounting.cross_lsp_duplicate_rows) ||
          !yyjson_mut_obj_add_uint(doc, item, "cross_lsp_appended_rows",
-                                 accounting.cross_lsp_appended_rows))) {
+                                  accounting.cross_lsp_appended_rows))) {
         return false;
     }
     if (!yyjson_mut_obj_add_val(doc, root, "parallel_resolver_accounting", item)) {
@@ -8612,16 +9672,14 @@ static char *build_index_parallel_resolver_accounting_error(
     bool present, const cbm_pipeline_parallel_resolver_accounting_t *accounting) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
-        return heap_strdup(
-            "{\"status\":\"error\",\"code\":"
-            "\"CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID\","
-            "\"source_family_preserved\":true}");
+        return heap_strdup("{\"status\":\"error\",\"code\":"
+                           "\"CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID\","
+                           "\"source_family_preserved\":true}");
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
-    yyjson_mut_obj_add_str(doc, root, "code",
-                           "CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID");
+    yyjson_mut_obj_add_str(doc, root, "code", "CBM_INDEX_PARALLEL_RESOLVER_ACCOUNTING_INVALID");
     yyjson_mut_obj_add_str(doc, root, "operation", "retain_parallel_resolver_accounting");
     yyjson_mut_obj_add_str(
         doc, root, "message",
@@ -8641,17 +9699,16 @@ static char *build_index_parallel_resolver_accounting_error(
         yyjson_mut_obj_add_uint(doc, root, "dynamic_lsp_items", accounting->dynamic_lsp_items);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_units", accounting->cross_lsp_units);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_accounted_units",
-                               accounting->cross_lsp_accounted_units);
-        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_seen_rows",
-                               accounting->cross_lsp_seen_rows);
+                                accounting->cross_lsp_accounted_units);
+        yyjson_mut_obj_add_uint(doc, root, "cross_lsp_seen_rows", accounting->cross_lsp_seen_rows);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_seeded_rows",
-                               accounting->cross_lsp_seeded_rows);
+                                accounting->cross_lsp_seeded_rows);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_source_rows",
-                               accounting->cross_lsp_source_rows);
+                                accounting->cross_lsp_source_rows);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_duplicate_rows",
-                               accounting->cross_lsp_duplicate_rows);
+                                accounting->cross_lsp_duplicate_rows);
         yyjson_mut_obj_add_uint(doc, root, "cross_lsp_appended_rows",
-                               accounting->cross_lsp_appended_rows);
+                                accounting->cross_lsp_appended_rows);
     }
     yyjson_mut_obj_add_bool(doc, root, "source_family_preserved", true);
     char *json = yyjson_mut_write(doc, 0, NULL);
@@ -8704,8 +9761,7 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
         return build_index_state_mismatch_error(project_name, exp_nodes, exp_edges, nodes, edges);
     }
 
-    int content_defect_nodes =
-        cbm_store_count_nodes_by_label(store, project_name, "ContentDefect");
+    int content_defect_nodes = cbm_store_count_nodes_by_label(store, project_name, "ContentDefect");
     int content_defect_edges =
         cbm_store_count_edges_by_type(store, project_name, "HAS_CONTENT_DEFECT");
     int dangling_rust_module_defects = cbm_store_count_nodes_by_label_and_name(
@@ -8728,11 +9784,11 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     }
     cbm_pipeline_execution_route_t content_route = cbm_pipeline_get_execution_route(p);
     bool full_generation = content_route == CBM_PIPELINE_EXECUTION_ROUTE_FULL_MATERIALIZED;
-    bool content_counts_valid = content_defect_nodes >= 0 && content_defect_edges >= 0 &&
-                                content_defect_nodes == content_defect_edges &&
-                                content_defects_observed_this_run <= content_defect_nodes &&
-                                (!full_generation ||
-                                  content_defects_observed_this_run == content_defect_nodes);
+    bool content_counts_valid =
+        content_defect_nodes >= 0 && content_defect_edges >= 0 &&
+        content_defect_nodes == content_defect_edges &&
+        content_defects_observed_this_run <= content_defect_nodes &&
+        (!full_generation || content_defects_observed_this_run == content_defect_nodes);
     uint_least64_t dangling_rust_module_skips = cbm_pipeline_get_dangling_rust_module_skips(p);
     bool dangling_counts_valid =
         dangling_rust_module_defects >= 0 &&
@@ -8761,20 +9817,19 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     cbm_project_t persisted_project = {0};
     int project_rc = cbm_store_get_project(store, project_name, &persisted_project);
     if (project_rc != CBM_STORE_OK) {
-        record_store_query_failure(
-            srv, project_name, cbm_store_db_path(store), store,
-            project_rc == CBM_STORE_SEMANTIC_STATE_INVALID
-                ? CBM_STORE_VERIFY_INTEGRITY_FAILED
-                : CBM_STORE_VERIFY_IO_FAILED,
-            "source.query_semantic_manifest", cbm_store_error(store));
+        record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
+                                   project_rc == CBM_STORE_SEMANTIC_STATE_INVALID
+                                       ? CBM_STORE_VERIFY_INTEGRITY_FAILED
+                                       : CBM_STORE_VERIFY_IO_FAILED,
+                                   "source.query_semantic_manifest", cbm_store_error(store));
         cbm_project_free_fields(&persisted_project);
         return build_recorded_store_error(srv);
     }
     cbm_vector_state_readback_t vector_readback = {0};
     if (cbm_store_read_vector_state(store, project_name, &vector_readback) != CBM_STORE_OK) {
         record_store_query_failure(srv, project_name, cbm_store_db_path(store), store,
-                                   CBM_STORE_VERIFY_IO_FAILED,
-                                   "source.query_physical_vector_state", cbm_store_error(store));
+                                   CBM_STORE_VERIFY_IO_FAILED, "source.query_physical_vector_state",
+                                   cbm_store_error(store));
         cbm_project_free_fields(&persisted_project);
         return build_recorded_store_error(srv);
     }
@@ -8782,8 +9837,8 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
     if (persisted_project.capability.index_mode != requested_mode ||
         !vector_state_matches_capability(&persisted_project.capability, &vector_readback)) {
         cbm_log_error(
-            "dump.semantic_verify_failed", "code", "CBM_INDEX_SEMANTIC_STATE_MISMATCH",
-            "project", project_name, "message",
+            "dump.semantic_verify_failed", "code", "CBM_INDEX_SEMANTIC_STATE_MISMATCH", "project",
+            project_name, "message",
             "the persisted semantic manifest and physical vector rows differ from the completed "
             "index generation",
             "remediation", "preserve the database family and inspect persistence");
@@ -8833,12 +9888,11 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
 
     cbm_pipeline_parallel_resolver_accounting_t resolver_accounting = {0};
     bool resolver_accounting_present = false;
-    if (!add_pipeline_parallel_resolver_accounting(
-            doc, root, p, dispatch_expectation, &resolver_accounting,
-            &resolver_accounting_present)) {
+    if (!add_pipeline_parallel_resolver_accounting(doc, root, p, dispatch_expectation,
+                                                   &resolver_accounting,
+                                                   &resolver_accounting_present)) {
         return build_index_parallel_resolver_accounting_error(
-            project_name, dispatch_expectation, resolver_accounting_present,
-            &resolver_accounting);
+            project_name, dispatch_expectation, resolver_accounting_present, &resolver_accounting);
     }
 
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
@@ -8895,8 +9949,7 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
             "layout, delete the dangling declaration, or bind it with #[path = \"...\"].");
     }
 
-    uint_least64_t parse_recovery_diagnostics =
-        cbm_pipeline_get_parse_recovery_diagnostics(p);
+    uint_least64_t parse_recovery_diagnostics = cbm_pipeline_get_parse_recovery_diagnostics(p);
     yyjson_mut_obj_add_uint(doc, root, "parse_recovery_diagnostics",
                             (uint64_t)parse_recovery_diagnostics);
     if (parse_recovery_diagnostics > 0) {
@@ -8925,8 +9978,7 @@ static char *build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc 
                            unresolved_source_skips > 0 || dangling_rust_module_skips > 0 ||
                            parse_recovery_diagnostics > 0 || invalid_utf8_bytes > 0 ||
                            invalid_utf8_quarantined_definitions > 0;
-    yyjson_mut_obj_add_str(doc, root, "status",
-                           partial_success ? "partial_success" : "indexed");
+    yyjson_mut_obj_add_str(doc, root, "status", partial_success ? "partial_success" : "indexed");
 
     bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
@@ -8962,8 +10014,7 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
     const char *borrowed_path = cbm_store_db_path(srv->store);
     char *db_path = borrowed_path ? heap_strdup(borrowed_path) : NULL;
     bool path_alloc_failed = borrowed_path && !db_path;
-    int close_rc =
-        close_cached_store_exact(srv, "index_worker.finalize_store", project_name);
+    int close_rc = close_cached_store_exact(srv, "index_worker.finalize_store", project_name);
 
     const char *code = NULL;
     const char *message = NULL;
@@ -8979,8 +10030,7 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
     char *shm_path = NULL;
     if (close_rc != 0) {
         code = "CBM_INDEX_WORKER_STORE_CLOSE_FAILED";
-        message =
-            "the worker SQLite connection did not close exactly; publication is not complete";
+        message = "the worker SQLite connection did not close exactly; publication is not complete";
     } else if (path_alloc_failed) {
         code = "CBM_INDEX_WORKER_STORE_PATH_ALLOC_FAILED";
         message = "the worker could not retain the authoritative store path through finalization";
@@ -9002,11 +10052,9 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
                 shm_probe = cbm_path_probe(shm_path, &shm_probe_error);
                 wal_present = wal_probe == CBM_PATH_PROBE_PRESENT;
                 shm_present = shm_probe == CBM_PATH_PROBE_PRESENT;
-                if (wal_probe != CBM_PATH_PROBE_ABSENT ||
-                    shm_probe != CBM_PATH_PROBE_ABSENT) {
+                if (wal_probe != CBM_PATH_PROBE_ABSENT || shm_probe != CBM_PATH_PROBE_ABSENT) {
                     code = "CBM_INDEX_WORKER_STORE_FINALIZE_FAILED";
-                    message = wal_probe == CBM_PATH_PROBE_ERROR ||
-                                      shm_probe == CBM_PATH_PROBE_ERROR
+                    message = wal_probe == CBM_PATH_PROBE_ERROR || shm_probe == CBM_PATH_PROBE_ERROR
                                   ? "the worker could not prove exact WAL/shared-memory absence "
                                     "after close"
                                   : "the worker readback store retained WAL or shared-memory "
@@ -9028,9 +10076,8 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
     cbm_log_error("index.worker.store_finalize_failed", "code", code, "project",
                   project_name ? project_name : "", "db_path", db_path ? db_path : "",
                   "wal_present", wal_present ? "true" : "false", "shm_present",
-                  shm_present ? "true" : "false", "wal_probe_native_error",
-                  wal_probe_error_text, "shm_probe_native_error", shm_probe_error_text, "message",
-                  message, "remediation",
+                  shm_present ? "true" : "false", "wal_probe_native_error", wal_probe_error_text,
+                  "shm_probe_native_error", shm_probe_error_text, "message", message, "remediation",
                   "close concurrent readers or writers, preserve the database family, and retry");
     yyjson_mut_doc *error_doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *error_root = error_doc ? yyjson_mut_obj(error_doc) : NULL;
@@ -9048,11 +10095,9 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
         yyjson_mut_obj_add_bool(error_doc, error_root, "wal_present", wal_present);
         yyjson_mut_obj_add_bool(error_doc, error_root, "shm_present", shm_present);
         yyjson_mut_obj_add_int(error_doc, error_root, "wal_probe", wal_probe);
-        yyjson_mut_obj_add_uint(error_doc, error_root, "wal_probe_native_error",
-                               wal_probe_error);
+        yyjson_mut_obj_add_uint(error_doc, error_root, "wal_probe_native_error", wal_probe_error);
         yyjson_mut_obj_add_int(error_doc, error_root, "shm_probe", shm_probe);
-        yyjson_mut_obj_add_uint(error_doc, error_root, "shm_probe_native_error",
-                               shm_probe_error);
+        yyjson_mut_obj_add_uint(error_doc, error_root, "shm_probe_native_error", shm_probe_error);
         yyjson_mut_obj_add_bool(error_doc, error_root, "sqlite_publication_started", true);
         error_json = yyjson_mut_write(error_doc, 0, NULL);
     }
@@ -9076,16 +10121,11 @@ static char *finalize_index_worker_store(cbm_mcp_server_t *srv, const char *proj
  * text if something ever writes more. */
 enum { CBM_WORKER_RESPONSE_TAIL_MAX = 2048 };
 
-static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome,
-                                            int exit_code, const char *worker_response,
-                                            const char *worker_log, const char *worker_log_path,
-                                            const char *progress_path,
-                                            const char *progress_error_code,
-                                            const char *progress_error_detail,
-                                            const char *progress_stage,
-                                            uint64_t progress_record_count,
-                                            uint64_t progress_completed,
-                                            uint64_t progress_total) {
+static char *build_worker_failure_response(
+    const char *args, cbm_proc_outcome_t outcome, int exit_code, const char *worker_response,
+    const char *worker_log, const char *worker_log_path, const char *progress_path,
+    const char *progress_error_code, const char *progress_error_detail, const char *progress_stage,
+    uint64_t progress_record_count, uint64_t progress_completed, uint64_t progress_total) {
 #else
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
 #endif
@@ -9095,26 +10135,26 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
-    const char *code =
-        outcome == CBM_PROC_HANG              ? "CBM_INDEX_WORKER_HUNG"
-        : outcome == CBM_PROC_CRASH           ? "CBM_INDEX_WORKER_CRASHED"
-        : outcome == CBM_PROC_CANCELLED       ? "CBM_INDEX_WORKER_CANCELLED"
-        : outcome == CBM_PROC_PROGRESS_FAILED ? "CBM_INDEX_WORKER_PROGRESS_PROTOCOL_FAILED"
-                                               : "CBM_INDEX_WORKER_FAILED";
+    const char *code = outcome == CBM_PROC_HANG        ? "CBM_INDEX_WORKER_HUNG"
+                       : outcome == CBM_PROC_CRASH     ? "CBM_INDEX_WORKER_CRASHED"
+                       : outcome == CBM_PROC_CANCELLED ? "CBM_INDEX_WORKER_CANCELLED"
+                       : outcome == CBM_PROC_PROGRESS_FAILED
+                           ? "CBM_INDEX_WORKER_PROGRESS_PROTOCOL_FAILED"
+                           : "CBM_INDEX_WORKER_FAILED";
     yyjson_mut_obj_add_str(doc, root, "code", code);
     yyjson_mut_obj_add_str(
         doc, root, "message",
-        outcome == CBM_PROC_HANG
-            ? "the isolated index worker stopped making semantic progress"
-        : outcome == CBM_PROC_CANCELLED
-            ? "the exact owning host cancelled the isolated index worker during shutdown before publication"
+        outcome == CBM_PROC_HANG ? "the isolated index worker stopped making semantic progress"
+        : outcome == CBM_PROC_CANCELLED ? "the exact owning host cancelled the isolated index "
+                                          "worker during shutdown before publication"
         : outcome == CBM_PROC_PROGRESS_FAILED
             ? "the isolated index worker semantic-progress stream failed validation"
             : "the isolated index worker terminated before a complete graph was committed");
     yyjson_mut_obj_add_str(
         doc, root, "remediation",
         outcome == CBM_PROC_CANCELLED
-            ? "start a fresh resident connection; the unchanged watcher baseline remains pending and no partial child result was accepted"
+            ? "start a fresh resident connection; the unchanged watcher baseline remains pending "
+              "and no partial child result was accepted"
         : outcome == CBM_PROC_PROGRESS_FAILED
             ? "preserve the worker workspace and repair the exact progress producer/consumer "
               "diagnostic before retrying the unchanged repository"
@@ -9143,18 +10183,15 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
         yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_path", progress_path);
     }
     if (progress_error_code && progress_error_code[0]) {
-        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_error_code",
-                                  progress_error_code);
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_error_code", progress_error_code);
     }
     if (progress_error_detail && progress_error_detail[0]) {
-        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_error_detail",
-                                  progress_error_detail);
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_error_detail", progress_error_detail);
     }
     if (progress_stage && progress_stage[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "worker_progress_stage", progress_stage);
     }
-    yyjson_mut_obj_add_uint(doc, root, "worker_progress_record_count",
-                           progress_record_count);
+    yyjson_mut_obj_add_uint(doc, root, "worker_progress_record_count", progress_record_count);
     yyjson_mut_obj_add_uint(doc, root, "worker_progress_completed", progress_completed);
     yyjson_mut_obj_add_uint(doc, root, "worker_progress_total", progress_total);
 #endif
@@ -9198,23 +10235,18 @@ static char *supervisor_invalidate_store(cbm_mcp_server_t *srv, const char *oper
  * Unlike build_worker_failure_response (a CONTAINED crash *after* the child ran),
  * these are pre-run refusals; both carry `outcome` so the Rust caller maps them to
  * a fail-closed {code, message, remediation} without ever touching the vault. */
-static char *build_strict_supervised_error(const char *args, const char *outcome,
-                                           const char *message) {
+static char *build_strict_supervised_error_with_code(const char *args, const char *outcome,
+                                                     const char *code, const char *message,
+                                                     const char *remediation) {
     char *repo_path = args ? cbm_mcp_get_string_arg(args, "repo_path") : NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "outcome", outcome);
-    yyjson_mut_obj_add_str(doc, root, "code",
-                           strcmp(outcome, "response_missing") == 0
-                               ? "CBM_INDEX_WORKER_RESPONSE_MISSING"
-                               : "CBM_INDEX_SUPERVISOR_UNAVAILABLE");
+    yyjson_mut_obj_add_strcpy(doc, root, "code", code);
     yyjson_mut_obj_add_strcpy(doc, root, "message", message);
-    yyjson_mut_obj_add_str(
-        doc, root, "remediation",
-        "restore isolated worker execution and inspect process-creation diagnostics; do not "
-        "rerun in-process or accept a partial graph");
+    yyjson_mut_obj_add_strcpy(doc, root, "remediation", remediation);
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
@@ -9224,6 +10256,17 @@ static char *build_strict_supervised_error(const char *args, const char *outcome
     char *result = cbm_mcp_text_result(json, true);
     free(json);
     return result;
+}
+
+static char *build_strict_supervised_error(const char *args, const char *outcome,
+                                           const char *message) {
+    return build_strict_supervised_error_with_code(
+        args, outcome,
+        strcmp(outcome, "response_missing") == 0 ? "CBM_INDEX_WORKER_RESPONSE_MISSING"
+                                                 : "CBM_INDEX_SUPERVISOR_UNAVAILABLE",
+        message,
+        "restore isolated worker execution and inspect process-creation diagnostics; do not "
+        "rerun in-process or accept a partial graph");
 }
 
 /* A tool execution error is a completed worker result, not a worker crash. The
@@ -9259,8 +10302,7 @@ static bool supervised_worker_returned_tool_error(const cbm_index_worker_result_
  * response failure is a terminal structured refusal; the supervisor never
  * retries with a changed corpus and never degrades to in-process execution. */
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
-    char *close_error =
-        supervisor_invalidate_store(srv, "index_supervisor.before_worker");
+    char *close_error = supervisor_invalidate_store(srv, "index_supervisor.before_worker");
     if (close_error) {
         return close_error;
     }
@@ -9268,14 +10310,25 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     cbm_index_worker_result_t wr;
     int rc = cbm_index_spawn_worker(args, &wr);
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
+        char *failure =
+            wr.progress_error_code && wr.progress_error_code[0]
+                ? build_strict_supervised_error_with_code(
+                      args, "spawn_refused", wr.progress_error_code,
+                      wr.progress_error_detail && wr.progress_error_detail[0]
+                          ? wr.progress_error_detail
+                          : "the isolated index worker was refused before process creation",
+                      "bind one exact ordinary shipping executable before marking the process "
+                      "as a supervisor host; do not retry through the embedding image")
+                : build_strict_supervised_error(
+                      args, "spawn_failed",
+                      "the isolated index worker could not be spawned; no index transaction ran");
         cbm_index_worker_result_free(&wr);
         close_error = supervisor_invalidate_store(srv, "index_supervisor.spawn_failure");
         if (close_error) {
+            free(failure);
             return close_error;
         }
-        return build_strict_supervised_error(
-            args, "spawn_failed",
-            "the isolated index worker could not be spawned; no index transaction ran");
+        return failure;
     }
 
     if (wr.outcome == CBM_PROC_CLEAN && wr.response) {
@@ -9315,12 +10368,10 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
                                                 "the isolated index worker exited cleanly without "
                                                 "a complete index_repository response");
     } else {
-        failure = build_worker_failure_response(args, wr.outcome, wr.exit_code, wr.response,
-                                                 wr.log_tail, wr.log_path, wr.progress_path,
-                                                 wr.progress_error_code,
-                                                 wr.progress_error_detail, wr.progress_stage,
-                                                 wr.progress_record_count,
-                                                 wr.progress_completed, wr.progress_total);
+        failure = build_worker_failure_response(
+            args, wr.outcome, wr.exit_code, wr.response, wr.log_tail, wr.log_path, wr.progress_path,
+            wr.progress_error_code, wr.progress_error_detail, wr.progress_stage,
+            wr.progress_record_count, wr.progress_completed, wr.progress_total);
     }
 #else
     char *failure =
@@ -9523,10 +10574,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(name_override);
     name_override = NULL;
 
-    bool compilation_context_present =
-        cbm_mcp_has_arg(args, ASTRO_COMPILATION_CONTEXT_ARG);
-    char *compilation_context =
-        cbm_mcp_get_string_arg(args, ASTRO_COMPILATION_CONTEXT_ARG);
+    bool compilation_context_present = cbm_mcp_has_arg(args, ASTRO_COMPILATION_CONTEXT_ARG);
+    char *compilation_context = cbm_mcp_get_string_arg(args, ASTRO_COMPILATION_CONTEXT_ARG);
     if (compilation_context_present && !compilation_context) {
         cbm_log_error("index.compile_context_transport_refused", "code",
                       "CBM_COMPILE_CONTEXT_TRANSPORT_TYPE_INVALID", "repo_path", repo_path,
@@ -9577,10 +10626,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
 
-    cbm_pipeline_t *p = generation_clock_arg.present
-                            ? cbm_pipeline_new_at(repo_path, NULL, mode,
-                                                  generation_clock_arg.observed_at_ms)
-                            : cbm_pipeline_new(repo_path, NULL, mode);
+    cbm_pipeline_t *p =
+        generation_clock_arg.present
+            ? cbm_pipeline_new_at(repo_path, NULL, mode, generation_clock_arg.observed_at_ms)
+            : cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
         free(compilation_context);
         free(repo_path);
@@ -9596,13 +10645,14 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
     if (compilation_context &&
-        cbm_pipeline_set_embedded_compilation_context(
-            p, (const uint8_t *)compilation_context, strlen(compilation_context)) != 0) {
+        cbm_pipeline_set_embedded_compilation_context(p, (const uint8_t *)compilation_context,
+                                                      strlen(compilation_context)) != 0) {
         cbm_log_error("index.compile_context_transport_refused", "code",
                       "CBM_COMPILE_CONTEXT_TRANSPORT_INSTALL_FAILED", "repo_path", repo_path,
                       "message", "the pipeline refused the exact private compilation context",
-                      "remediation", "inspect the preceding structured pipeline diagnostic, fix "
-                                     "the cause, and retry the unchanged request");
+                      "remediation",
+                      "inspect the preceding structured pipeline diagnostic, fix "
+                      "the cause, and retry the unchanged request");
         free(compilation_context);
         cbm_pipeline_free(p);
         free(repo_path);
@@ -9637,10 +10687,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * A normal CBM/watch worker may index only while no Rust publication transition
      * exists. A shadow worker may cross an ACTIVE transition only when the Rust host
      * validated and installed the exact private same-generation writer grant before
-    * entering libcbm. Refuse before artifact bootstrap, source discovery, or SQLite. */
+     * entering libcbm. Refuse before artifact bootstrap, source discovery, or SQLite. */
     if (!project_transition_admits_process(srv, project_name)) {
-        char *cached_close_error = supervisor_invalidate_store(
-            srv, "index_repository.transition_refusal");
+        char *cached_close_error =
+            supervisor_invalidate_store(srv, "index_repository.transition_refusal");
         if (cached_close_error) {
             cbm_pipeline_free(p);
             free(project_name);
@@ -9809,11 +10859,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (bootstrap == ARTIFACT_BOOTSTRAP_IMPORTED) {
         (void)add_artifact_bootstrap_provenance(
             doc, root, &artifact_import_result,
-            bootstrap_revert_attempted
-                ? (bootstrap_revert.status == CBM_ARTIFACT_REVERT_REMOVED
-                       ? "reverted_unpublished_generation"
-                       : "revert_refused_state_preserved")
-                : "retained_as_index_base");
+            bootstrap_revert_attempted ? (bootstrap_revert.status == CBM_ARTIFACT_REVERT_REMOVED
+                                              ? "reverted_unpublished_generation"
+                                              : "revert_refused_state_preserved")
+                                       : "retained_as_index_base");
     }
     if (bootstrap_revert_attempted) {
         (void)add_artifact_bootstrap_revert(doc, root, &bootstrap_revert);
@@ -9836,8 +10885,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         } else {
             postcondition_error = build_index_success_response(
                 srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs,
-                excluded_count, file_errors, file_error_count,
-                has_logfile ? logfile_path : NULL);
+                excluded_count, file_errors, file_error_count, has_logfile ? logfile_path : NULL);
         }
     } else if (rc == CBM_PIPELINE_EMPTY_SOURCE_CORPUS) {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
@@ -10572,11 +11620,10 @@ static source_verify_status_t verify_node_source(cbm_store_t *store, const char 
     mcp_close_windows_handle_or_abort(&handle, "source.finalize_current_read");
     if (!extra_read_ok || !after_ok) {
         verified_source_free(verified);
-        return source_failure(
-            failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
-            "current_file_readback_incomplete", "source.finalize_current_read",
-            "the current file readback could not be finalized and inspected",
-            (uint32_t)(extra_error ? extra_error : after_error));
+        return source_failure(failure, SOURCE_VERIFY_ERROR, "CBM_SOURCE_VERIFICATION_FAILED",
+                              "current_file_readback_incomplete", "source.finalize_current_read",
+                              "the current file readback could not be finalized and inspected",
+                              (uint32_t)(extra_error ? extra_error : after_error));
     }
     if (total != (size_t)current_size || extra_count != 0 ||
         !mcp_file_identity_equal(&before, &after)) {
@@ -11542,8 +12589,7 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
 #else
     int prefix_cmp = strncmp(path, root, prefix_len);
 #endif
-    if (prefix_cmp != 0 ||
-        (path[prefix_len] != '\0' && !search_path_separator(path[prefix_len]))) {
+    if (prefix_cmp != 0 || (path[prefix_len] != '\0' && !search_path_separator(path[prefix_len]))) {
         return path;
     }
     const char *p = path + prefix_len;
@@ -12375,8 +13421,7 @@ static bool validate_scoped_source_file(const char *root_path, const char *absol
     DWORD after_error = after_ok ? ERROR_SUCCESS : GetLastError();
     mcp_close_windows_handle_or_abort(&handle, "scope.finalize_current_read");
     if (!extra_ok || !after_ok) {
-        result->native_error =
-            (uint32_t)(extra_error ? extra_error : after_error);
+        result->native_error = (uint32_t)(extra_error ? extra_error : after_error);
         free(bytes);
         result->status = SEARCH_SCOPE_IO_FAILED;
         snprintf(result->operation, sizeof(result->operation), "%s", "scope.finalize_current_read");
@@ -13381,196 +14426,922 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── detect_changes ───────────────────────────────────────────── */
 
-/* Find symbols defined in a file and add them to the impacted array. */
-static void detect_add_impacted_symbols(cbm_store_t *store, const char *project, const char *file,
-                                        yyjson_mut_doc *doc, yyjson_mut_val *impacted) {
-    cbm_node_t *nodes = NULL;
-    int ncount = 0;
-    cbm_store_find_nodes_by_file(store, project, file, &nodes, &ncount);
-    for (int i = 0; i < ncount; i++) {
-        if (nodes[i].label && strcmp(nodes[i].label, "File") != 0 &&
-            strcmp(nodes[i].label, "Folder") != 0 && strcmp(nodes[i].label, "Project") != 0) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_strcpy(doc, item, "name", nodes[i].name ? nodes[i].name : "");
-            yyjson_mut_obj_add_strcpy(doc, item, "label", nodes[i].label);
-            yyjson_mut_obj_add_strcpy(doc, item, "file", file);
-            yyjson_mut_arr_add_val(impacted, item);
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+    size_t string_bytes;
+} detect_path_roster_t;
+
+static void detect_path_roster_free(detect_path_roster_t *roster) {
+    if (!roster) {
+        return;
+    }
+    for (size_t i = 0; i < roster->count; i++) {
+        free(roster->items[i]);
+    }
+    free(roster->items);
+    memset(roster, 0, sizeof(*roster));
+}
+
+static bool detect_path_roster_push(detect_path_roster_t *roster, const char *path, size_t len,
+                                    size_t max_retained_bytes) {
+    if (!roster || !path || len == 0 || len == SIZE_MAX || max_retained_bytes == 0) {
+        return false;
+    }
+    size_t added_string_bytes = len + SKIP_ONE;
+    if (added_string_bytes > max_retained_bytes ||
+        roster->string_bytes > max_retained_bytes - added_string_bytes) {
+        return false;
+    }
+    if (roster->count == roster->capacity) {
+        size_t capacity = roster->capacity ? roster->capacity : MCP_COL_16;
+        if (roster->capacity) {
+            if (capacity > SIZE_MAX / PAIR_LEN) {
+                return false;
+            }
+            capacity *= PAIR_LEN;
+        }
+        if (capacity > SIZE_MAX / sizeof(*roster->items)) {
+            return false;
+        }
+        size_t array_bytes = capacity * sizeof(*roster->items);
+        if (array_bytes > max_retained_bytes ||
+            roster->string_bytes + added_string_bytes > max_retained_bytes - array_bytes) {
+            return false;
+        }
+        char **items = realloc(roster->items, capacity * sizeof(*roster->items));
+        if (!items) {
+            return false;
+        }
+        roster->items = items;
+        roster->capacity = capacity;
+    }
+    if (roster->capacity > SIZE_MAX / sizeof(*roster->items)) {
+        return false;
+    }
+    size_t retained_array_bytes = roster->capacity * sizeof(*roster->items);
+    if (retained_array_bytes > max_retained_bytes ||
+        roster->string_bytes + added_string_bytes >
+            max_retained_bytes - retained_array_bytes) {
+        return false;
+    }
+    char *copy = malloc(len + SKIP_ONE);
+    if (!copy) {
+        return false;
+    }
+    memcpy(copy, path, len);
+    copy[len] = '\0';
+    roster->items[roster->count++] = copy;
+    roster->string_bytes += added_string_bytes;
+    return true;
+}
+
+static bool detect_path_roster_append_z(detect_path_roster_t *roster, const char *data, size_t len,
+                                        size_t max_count, size_t max_retained_bytes) {
+    if (!roster || (!data && len != 0) || (len != 0 && data[len - SKIP_ONE] != '\0')) {
+        return false;
+    }
+    size_t start = 0;
+    while (start < len) {
+        size_t end = start;
+        while (end < len && data[end] != '\0') {
+            end++;
+        }
+        if (end == start || end >= len || roster->count == max_count ||
+            !detect_path_roster_push(roster, data + start, end - start,
+                                     max_retained_bytes)) {
+            return false;
+        }
+        start = end + SKIP_ONE;
+    }
+    return true;
+}
+
+static int detect_path_compare(const void *left, const void *right) {
+    const char *const *a = left;
+    const char *const *b = right;
+    return strcmp(*a, *b);
+}
+
+static void detect_path_roster_sort_unique(detect_path_roster_t *roster) {
+    if (!roster || roster->count < PAIR_LEN) {
+        return;
+    }
+    qsort(roster->items, roster->count, sizeof(*roster->items), detect_path_compare);
+    size_t write = 1;
+    for (size_t read = 1; read < roster->count; read++) {
+        if (strcmp(roster->items[write - SKIP_ONE], roster->items[read]) == 0) {
+            roster->string_bytes -= strlen(roster->items[read]) + SKIP_ONE;
+            free(roster->items[read]);
+            continue;
+        }
+        roster->items[write++] = roster->items[read];
+    }
+    roster->count = write;
+}
+
+/* Merge two canonical path rosters without ever retaining a (max_count + 1)th
+ * unique path. Both inputs are sorted/unique; ownership of every retained
+ * string moves into `roster`, while duplicate source strings are freed. The
+ * count and retained-byte proofs run before allocation or ownership changes. */
+static bool detect_path_roster_merge_unique(detect_path_roster_t *roster,
+                                            detect_path_roster_t *source, size_t max_count,
+                                            size_t max_retained_bytes) {
+    if (!roster || !source || max_count == 0 || max_retained_bytes == 0) {
+        return false;
+    }
+    size_t left = 0;
+    size_t right = 0;
+    size_t merged_count = 0;
+    size_t merged_string_bytes = 0;
+    while (left < roster->count || right < source->count) {
+        const char *selected = NULL;
+        if (left == roster->count) {
+            selected = source->items[right++];
+        } else if (right == source->count) {
+            selected = roster->items[left++];
+        } else {
+            int order = strcmp(roster->items[left], source->items[right]);
+            if (order < 0) {
+                selected = roster->items[left++];
+            } else if (order > 0) {
+                selected = source->items[right++];
+            } else {
+                selected = roster->items[left++];
+                right++;
+            }
+        }
+        if (merged_count == max_count) {
+            return false;
+        }
+        size_t selected_bytes = strlen(selected) + SKIP_ONE;
+        if (selected_bytes > max_retained_bytes ||
+            merged_string_bytes > max_retained_bytes - selected_bytes) {
+            return false;
+        }
+        merged_string_bytes += selected_bytes;
+        merged_count++;
+    }
+    if (merged_count > SIZE_MAX / sizeof(*roster->items)) {
+        return false;
+    }
+    size_t array_bytes = merged_count * sizeof(*roster->items);
+    if (array_bytes > max_retained_bytes ||
+        merged_string_bytes > max_retained_bytes - array_bytes) {
+        return false;
+    }
+    char **merged = merged_count ? calloc(merged_count, sizeof(*merged)) : NULL;
+    if (merged_count && !merged) {
+        return false;
+    }
+
+    left = 0;
+    right = 0;
+    size_t write = 0;
+    while (left < roster->count || right < source->count) {
+        if (left == roster->count) {
+            merged[write++] = source->items[right++];
+        } else if (right == source->count) {
+            merged[write++] = roster->items[left++];
+        } else {
+            int order = strcmp(roster->items[left], source->items[right]);
+            if (order < 0) {
+                merged[write++] = roster->items[left++];
+            } else if (order > 0) {
+                merged[write++] = source->items[right++];
+            } else {
+                merged[write++] = roster->items[left++];
+                free(source->items[right++]);
+            }
         }
     }
-    cbm_store_free_nodes(nodes, ncount);
+    free(roster->items);
+    free(source->items);
+    roster->items = merged;
+    roster->count = merged_count;
+    roster->capacity = merged_count;
+    roster->string_bytes = merged_string_bytes;
+    memset(source, 0, sizeof(*source));
+    return write == merged_count;
+}
+
+#ifdef ASTRO_SPAWN
+static bool detect_capture_git_paths(const char *stage, const char *const *argv,
+                                     detect_path_roster_t *roster, size_t max_count,
+                                     size_t max_retained_bytes, char *error, size_t error_cap) {
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t spawn_error = {0};
+    int status = cbm_spawn_capture_bounded(argv, max_retained_bytes, &data, &len, &spawn_error);
+    if (status != CBM_SPAWN_OK) {
+        snprintf(error, error_cap, "%s failed: code=%s exit=%d message=%s remediation=%s", stage,
+                 spawn_error.code_name ? spawn_error.code_name : "CBM_SPAWN_UNKNOWN",
+                 spawn_error.exit_code, spawn_error.message ? spawn_error.message : "unavailable",
+                 spawn_error.remediation ? spawn_error.remediation : "repair Git and retry");
+        free(data);
+        return false;
+    }
+    detect_path_roster_t source = {0};
+    bool ok = detect_path_roster_append_z(&source, data, len, max_count, max_retained_bytes);
+    if (!ok) {
+        snprintf(error, error_cap,
+                 "%s returned a malformed/over-bound NUL path stream or exhausted memory", stage);
+    } else {
+        detect_path_roster_sort_unique(&source);
+        ok = detect_path_roster_merge_unique(roster, &source, max_count, max_retained_bytes);
+        if (!ok) {
+            snprintf(error, error_cap,
+                     "%s made the canonical changed-file roster exceed changed_file_max or "
+                     "exhausted memory",
+                     stage);
+        }
+    }
+    detect_path_roster_free(&source);
+    free(data);
+    return ok;
+}
+
+static bool detect_capture_git_oid(const char *stage, const char *const *argv, char out[65],
+                                   char *error, size_t error_cap) {
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t spawn_error = {0};
+    int status = cbm_spawn_capture_bounded(argv, 66, &data, &len, &spawn_error);
+    if (status != CBM_SPAWN_OK) {
+        snprintf(error, error_cap, "%s failed: code=%s exit=%d message=%s remediation=%s", stage,
+                 spawn_error.code_name ? spawn_error.code_name : "CBM_SPAWN_UNKNOWN",
+                 spawn_error.exit_code, spawn_error.message ? spawn_error.message : "unavailable",
+                 spawn_error.remediation ? spawn_error.remediation : "repair Git and retry");
+        free(data);
+        return false;
+    }
+    size_t hash_len = len;
+    if (hash_len > 0 && data[hash_len - 1] == '\n') {
+        hash_len--;
+        if (hash_len > 0 && data[hash_len - 1] == '\r') {
+            hash_len--;
+        }
+    }
+    bool valid = (hash_len == 40 || hash_len == 64) && len - hash_len <= PAIR_LEN;
+    for (size_t i = 0; valid && i < hash_len; i++) {
+        valid = (data[i] >= '0' && data[i] <= '9') || (data[i] >= 'a' && data[i] <= 'f');
+    }
+    if (!valid) {
+        snprintf(error, error_cap, "%s returned a non-canonical Git object id", stage);
+        free(data);
+        return false;
+    }
+    memcpy(out, data, hash_len);
+    out[hash_len] = '\0';
+    free(data);
+    return true;
+}
+#endif
+
+static bool detect_path_roster_equal(const detect_path_roster_t *left,
+                                     const detect_path_roster_t *right) {
+    if (!left || !right || left->count != right->count) {
+        return false;
+    }
+    for (size_t i = 0; i < left->count; i++) {
+        if (strcmp(left->items[i], right->items[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    yyjson_doc *doc;
+    const char *project;
+    const char *base_ref;
+    const char *scope;
+    int depth;
+    int changed_file_max;
+    int impact_max_symbols;
+    int reach_max_nodes_per_symbol;
+    size_t result_max_bytes;
+} detect_changes_request_t;
+
+static void detect_changes_request_free(detect_changes_request_t *request) {
+    if (request && request->doc) {
+        yyjson_doc_free(request->doc);
+        request->doc = NULL;
+    }
+}
+
+static char *detect_changes_error_result(const char *code, const char *stage,
+                                         const char *message, const char *remediation) {
+    cbm_log_error("mcp.detect_changes.refused", "code", code, "stage", stage, "message",
+                  message, "remediation", remediation);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    bool complete =
+        yyjson_mut_obj_add_str(doc, root, "schema", "cbm.detect_changes.error.v1") &&
+        yyjson_mut_obj_add_str(doc, root, "status", "error") &&
+        yyjson_mut_obj_add_str(doc, root, "code", code) &&
+        yyjson_mut_obj_add_str(doc, root, "stage", stage) &&
+        yyjson_mut_obj_add_str(doc, root, "message", message) &&
+        yyjson_mut_obj_add_str(doc, root, "remediation", remediation);
+    char *json = complete ? yy_doc_to_str(doc) : NULL;
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return NULL;
+    }
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+static int detect_argument_name_index(const char *name) {
+    static const char *const names[] = {
+        "project",          "scope",              "depth",
+        "changed_file_max", "impact_max_symbols", "reach_max_nodes_per_symbol",
+        "result_max_bytes", "base_branch",        "since",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(name, names[i]) == 0) {
+            return (int)i;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+static bool detect_positive_integer(yyjson_val *value, uint64_t maximum, uint64_t *out) {
+    uint64_t parsed = 0;
+    if (value && yyjson_is_uint(value)) {
+        parsed = yyjson_get_uint(value);
+    } else if (value && yyjson_is_sint(value) && yyjson_get_sint(value) > 0) {
+        parsed = (uint64_t)yyjson_get_sint(value);
+    } else {
+        return false;
+    }
+    if (parsed == 0 || parsed > maximum) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+static bool detect_json_string(yyjson_val *value, bool allow_absent, const char **out) {
+    if (!value) {
+        *out = NULL;
+        return allow_absent;
+    }
+    if (!yyjson_is_str(value) || yyjson_get_len(value) == 0 ||
+        strlen(yyjson_get_str(value)) != yyjson_get_len(value)) {
+        return false;
+    }
+    *out = yyjson_get_str(value);
+    return true;
+}
+
+static bool detect_changes_parse_request(const char *args, detect_changes_request_t *out,
+                                         char *stage, size_t stage_cap, char *message,
+                                         size_t message_cap) {
+    memset(out, 0, sizeof(*out));
+    snprintf(stage, stage_cap, "%s", "arguments");
+    if (!args) {
+        snprintf(message, message_cap, "%s", "detect_changes arguments are missing");
+        return false;
+    }
+    out->doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = out->doc ? yyjson_doc_get_root(out->doc) : NULL;
+    if (!out->doc || !yyjson_is_obj(root)) {
+        snprintf(message, message_cap, "%s",
+                 "detect_changes arguments must be one valid JSON object");
+        return false;
+    }
+
+    uint16_t seen = 0;
+    size_t idx;
+    size_t max;
+    yyjson_val *key;
+    yyjson_val *value;
+    yyjson_obj_foreach(root, idx, max, key, value) {
+        const char *name = yyjson_get_str(key);
+        int name_index = name && strlen(name) == yyjson_get_len(key)
+                             ? detect_argument_name_index(name)
+                             : CBM_NOT_FOUND;
+        if (name_index == CBM_NOT_FOUND) {
+            snprintf(stage, stage_cap, "%s", "arguments.closed_fields");
+            snprintf(message, message_cap,
+                     "detect_changes received an unknown or embedded-NUL argument key");
+            return false;
+        }
+        uint16_t bit = (uint16_t)(UINT16_C(1) << (uint16_t)name_index);
+        if ((seen & bit) != 0) {
+            snprintf(stage, stage_cap, "arguments.%s", name);
+            snprintf(message, message_cap,
+                     "detect_changes arguments cannot contain duplicate object keys");
+            return false;
+        }
+        seen = (uint16_t)(seen | bit);
+        (void)value;
+    }
+
+    yyjson_val *project_value = yyjson_obj_get(root, "project");
+    if (!detect_json_string(project_value, false, &out->project)) {
+        snprintf(stage, stage_cap, "%s", "arguments.project");
+        snprintf(message, message_cap, "%s",
+                 "project is required and must be one non-empty string without embedded NUL");
+        return false;
+    }
+    if (!detect_json_string(yyjson_obj_get(root, "scope"), true, &out->scope)) {
+        snprintf(stage, stage_cap, "%s", "arguments.scope");
+        snprintf(message, message_cap, "%s", "scope must be files or symbols");
+        return false;
+    }
+    if (!out->scope) {
+        out->scope = "symbols";
+    }
+    if (strcmp(out->scope, "files") != 0 && strcmp(out->scope, "symbols") != 0) {
+        snprintf(stage, stage_cap, "%s", "arguments.scope");
+        snprintf(message, message_cap, "%s", "scope must be files or symbols");
+        return false;
+    }
+
+    uint64_t parsed = MCP_DEFAULT_BFS_DEPTH;
+    yyjson_val *depth_value = yyjson_obj_get(root, "depth");
+    if (depth_value && !detect_positive_integer(depth_value, UINT64_C(16), &parsed)) {
+        snprintf(stage, stage_cap, "%s", "arguments.depth");
+        snprintf(message, message_cap, "depth must be a positive JSON integer in 1..16");
+        return false;
+    }
+    out->depth = (int)parsed;
+
+    const char *bound_names[] = {"changed_file_max", "impact_max_symbols",
+                                 "reach_max_nodes_per_symbol", "result_max_bytes"};
+    uint64_t maxima[] = {(uint64_t)INT_MAX, (uint64_t)INT_MAX, (uint64_t)INT_MAX,
+                         (uint64_t)SIZE_MAX};
+    uint64_t bounds[4] = {0};
+    for (size_t i = 0; i < sizeof(bound_names) / sizeof(bound_names[0]); i++) {
+        if (!detect_positive_integer(yyjson_obj_get(root, bound_names[i]), maxima[i],
+                                     &bounds[i])) {
+            snprintf(stage, stage_cap, "arguments.%s", bound_names[i]);
+            snprintf(message, message_cap,
+                     "%s is required and must be a positive JSON integer no greater than %llu",
+                     bound_names[i], (unsigned long long)maxima[i]);
+            return false;
+        }
+    }
+    out->changed_file_max = (int)bounds[0];
+    out->impact_max_symbols = (int)bounds[1];
+    out->reach_max_nodes_per_symbol = (int)bounds[2];
+    out->result_max_bytes = (size_t)bounds[3];
+
+    const char *base_branch = NULL;
+    const char *since = NULL;
+    if (!detect_json_string(yyjson_obj_get(root, "base_branch"), true, &base_branch)) {
+        snprintf(stage, stage_cap, "%s", "arguments.base_branch");
+        snprintf(message, message_cap,
+                 "base_branch must be one non-empty string without embedded NUL");
+        return false;
+    }
+    if (!detect_json_string(yyjson_obj_get(root, "since"), true, &since)) {
+        snprintf(stage, stage_cap, "%s", "arguments.since");
+        snprintf(message, message_cap, "since must be one non-empty string without embedded NUL");
+        return false;
+    }
+    out->base_ref = since ? since : (base_branch ? base_branch : "main");
+    size_t project_bytes = strlen(out->project);
+    size_t base_ref_bytes = strlen(out->base_ref);
+    size_t scope_bytes = strlen(out->scope);
+    if (project_bytes > out->result_max_bytes ||
+        base_ref_bytes > out->result_max_bytes - project_bytes ||
+        scope_bytes > out->result_max_bytes - project_bytes - base_ref_bytes) {
+        snprintf(stage, stage_cap, "%s", "arguments.result_max_bytes");
+        snprintf(message, message_cap,
+                 "result_max_bytes cannot retain the required echoed project/base/scope identity");
+        return false;
+    }
+    return true;
+}
+
+/* Find every measured constellation defined in a file and add it to the impacted array. */
+static bool detect_add_impacted_symbols(cbm_store_t *store, const char *project, const char *file,
+                                        int max_nodes, size_t max_retained_bytes,
+                                        yyjson_mut_doc *doc, yyjson_mut_val *impacted,
+                                        int *mapped_count, size_t *retained_bytes, char *error,
+                                        size_t error_cap) {
+    cbm_node_identity_t *nodes = NULL;
+    int ncount = 0;
+    size_t identity_bytes = 0;
+    if (mapped_count) {
+        *mapped_count = 0;
+    }
+    if (retained_bytes) {
+        *retained_bytes = 0;
+    }
+    if (cbm_store_find_node_identities_by_file(store, project, file, max_nodes,
+                                               max_retained_bytes, &nodes, &ncount,
+                                               &identity_bytes) != CBM_STORE_OK) {
+        snprintf(error, error_cap,
+                 "detect_changes exact identity query failed for %.400s: sqlite_code=%d detail=%.400s",
+                 file, cbm_store_error_code(store), cbm_store_error(store));
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < ncount; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        if (!item || nodes[i].id <= 0 || (i > 0 && nodes[i - SKIP_ONE].id >= nodes[i].id) ||
+            !nodes[i].atom_id || nodes[i].atom_id[0] == '\0' ||
+            !nodes[i].name || nodes[i].name[0] == '\0' || !nodes[i].qualified_name ||
+            nodes[i].qualified_name[0] == '\0' || !nodes[i].label || nodes[i].label[0] == '\0' ||
+            !nodes[i].file_path || nodes[i].file_path[0] == '\0' ||
+            strcmp(nodes[i].file_path, file) != 0 ||
+            !yyjson_mut_obj_add_int(doc, item, "node_id", nodes[i].id) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "atom_id", nodes[i].atom_id) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "name", nodes[i].name) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "qualified_name", nodes[i].qualified_name) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "label", nodes[i].label) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "file", nodes[i].file_path) ||
+            !yyjson_mut_arr_add_val(impacted, item)) {
+            snprintf(error, error_cap,
+                     "detect_changes exact identity row %d for %.400s is invalid or could not be encoded",
+                     i, file);
+            ok = false;
+            break;
+        }
+    }
+    if (ok && mapped_count) {
+        *mapped_count = ncount;
+    }
+    if (ok && retained_bytes) {
+        *retained_bytes = identity_bytes;
+    }
+    cbm_store_free_node_identities(nodes, ncount);
+    return ok;
 }
 
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
-    char *project = get_project_arg(args);
-    char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
-    char *since = cbm_mcp_get_string_arg(args, "since");
-    char *scope = cbm_mcp_get_string_arg(args, "scope");
-    int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_BFS_DEPTH);
-    depth = clamp_mcp_depth(depth, "detect_changes");
-
-    /* scope: "files" = just changed files, "symbols" = files + symbols (default) */
-    bool want_symbols = !scope || strcmp(scope, "symbols") == 0 || strcmp(scope, "impact") == 0;
-
-    /* `since` (e.g. "HEAD~10", "v0.5.0") is the documented diff base but was
-     * previously parsed and never used: it takes precedence over base_branch.
-     * Route it through base_branch so the shared shell-arg validation and the
-     * existing `<base>...HEAD` (three-dot) diff apply unchanged — `since` thus
-     * adopts the same merge-base semantics base_branch already uses. */
-    if (since && since[0]) {
-        free(base_branch);
-        base_branch = since; /* transfer ownership */
-        since = NULL;
+    detect_changes_request_t request = {0};
+    char argument_stage[CBM_SZ_128] = {0};
+    char argument_message[CBM_SZ_512] = {0};
+    if (!detect_changes_parse_request(args, &request, argument_stage, sizeof(argument_stage),
+                                      argument_message, sizeof(argument_message))) {
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ARGUMENT_INVALID", argument_stage, argument_message,
+            "send the exact closed detect_changes inputSchema returned by tools/list; no "
+            "control default is substituted except the advertised scope/depth/base ref defaults");
     }
-    free(since); /* no-op after the swap (since is NULL); frees it otherwise */
+    const char *project = request.project;
+    const char *base_branch = request.base_ref;
+    const char *scope_name = request.scope;
+    int depth = request.depth;
+    int changed_file_max = request.changed_file_max;
+    int impact_max_symbols = request.impact_max_symbols;
+    int reach_max_nodes_per_symbol = request.reach_max_nodes_per_symbol;
+    size_t result_max_bytes = request.result_max_bytes;
 
-    if (!base_branch) {
-        base_branch = heap_strdup("main");
-    }
+    /* scope: "files" = only the canonical changed-file roster; "symbols" =
+     * files plus exact measured node-map identities (default). */
+    bool want_symbols = strcmp(scope_name, "symbols") == 0;
 
-    /* Reject shell metacharacters, and a leading '-', in the user-supplied
-     * branch name. base_branch is spliced into `git diff --name-only
-     * "<base>"...HEAD`; a value starting with '-' would be read by git as an
-     * option rather than a ref (e.g. `--output=<path>` writes the diff to an
-     * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
-        free(project);
-        free(base_branch);
-        free(scope);
-        return cbm_mcp_text_result("base_branch contains invalid characters", true);
+    /* Every Git operation below receives this ref as one exact argv element;
+     * shell metacharacters are ordinary ref bytes and are never re-parsed.
+     * A leading '-' is still inadmissible because Git itself would interpret
+     * the resulting revision expression as an option rather than a ref. */
+    if (base_branch[0] == '-') {
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ARGUMENT_INVALID", "arguments.base_ref",
+            "the selected since/base_branch ref begins with '-' and is ambiguous with a Git option",
+            "pass one nonempty Git ref that cannot be parsed as an option");
     }
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
         char *err = build_no_store_error(srv, project);
-        char *res = cbm_mcp_text_result(err, true);
+        char *res = detect_changes_error_result(
+            "CBM_DETECT_CHANGES_PROJECT_UNAVAILABLE", "project_store",
+            err ? err : "the exact indexed project store is unavailable",
+            "repair the exact project/store binding and retry the unchanged request");
         free(err);
-        free(project);
-        free(base_branch);
-        free(scope);
+        detect_changes_request_free(&request);
         return res;
     }
 
     if (!validate_search_path_arg(root_path)) {
         free(root_path);
-        free(project);
-        free(base_branch);
-        free(scope);
-        return cbm_mcp_text_result("project path contains invalid characters", true);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_PROJECT_UNAVAILABLE", "project_root",
+            "the exact indexed project root cannot be represented by the Git observation path",
+            "repair the persisted project root identity and reindex before retrying");
     }
 
-    /* Get changed files via git (-C avoids cd + quoting issues on Windows).
-     * Three sources are merged:
-     *   1. committed changes vs base   (diff <base>...HEAD)
-     *   2. unstaged tracked changes    (diff)
-     *   3. untracked + staged-new files (status --porcelain) — these are
-     *      invisible to `git diff` and were silently missed before, so a
-     *      brand-new file never appeared until a manual re-index (#520).
-     * status --porcelain prefixes each path with a 2-char code + space
-     * ("?? path", "A  path"); the prefix is stripped when parsing below. */
-    char cmd[CBM_SZ_2K];
-#ifdef _WIN32
-    snprintf(cmd, sizeof(cmd),
-             "git -C \"%s\" diff --name-only \"%s\"...HEAD 2>NUL & "
-             "git -C \"%s\" diff --name-only 2>NUL & "
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>NUL",
-             root_path, base_branch, root_path, root_path);
-#else
-    snprintf(cmd, sizeof(cmd),
-             "{ git -C '%s' diff --name-only '%s'...HEAD 2>/dev/null; "
-             "git -C '%s' diff --name-only 2>/dev/null; "
-             "git --no-optional-locks -C '%s' status --porcelain "
-             "--untracked-files=normal 2>/dev/null; } | sort -u",
-             root_path, base_branch, root_path, root_path);
-#endif
-
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        char errmsg[CBM_SZ_256];
-        snprintf(errmsg, sizeof(errmsg),
-                 "git diff failed: cannot execute command (%s). Check that git is installed.",
-                 strerror(errno));
+    /* Capture every Git source as its own exact shell-free argv operation. All
+     * four must succeed; no downstream command can mask an earlier failure.
+     * `-z` makes every valid path (including whitespace/newlines) binary-clean.
+     * Canonical sorting/deduplication happens in this process on both hosts. */
+    detect_path_roster_t paths = {0};
+    detect_path_roster_t verify_paths = {0};
+    char resolved_base_oid[65] = {0};
+    char resolved_head_oid[65] = {0};
+    char git_error[CBM_SZ_1K] = {0};
+#ifdef ASTRO_SPAWN
+    size_t base_len = strlen(base_branch);
+    if (base_len > SIZE_MAX - sizeof("...HEAD") ||
+        base_len > SIZE_MAX - sizeof("^{commit}")) {
         free(root_path);
-        free(project);
-        free(base_branch);
-        free(scope);
-        return cbm_mcp_text_result(errmsg, true);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ARGUMENT_INVALID", "arguments.base_ref",
+            "detect_changes base ref length is not representable",
+            "shorten the exact Git ref without changing its resolved commit identity");
     }
+    char *base_spec = malloc(base_len + sizeof("...HEAD"));
+    char *base_commit_spec = malloc(base_len + sizeof("^{commit}"));
+    if (!base_spec || !base_commit_spec) {
+        free(base_spec);
+        free(base_commit_spec);
+        free(root_path);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ALLOCATION_FAILED", "git_ref_allocation",
+            "detect_changes could not allocate the exact base ref",
+            "free memory and retry the unchanged request");
+    }
+    memcpy(base_spec, base_branch, base_len);
+    memcpy(base_spec + base_len, "...HEAD", sizeof("...HEAD"));
+    memcpy(base_commit_spec, base_branch, base_len);
+    memcpy(base_commit_spec + base_len, "^{commit}", sizeof("^{commit}"));
+    const char *const base_oid_argv[] = {"git", "-C", root_path, "rev-parse", "--verify",
+                                         base_commit_spec, NULL};
+    const char *const head_oid_argv[] = {"git", "-C", root_path, "rev-parse", "--verify",
+                                         "HEAD^{commit}", NULL};
+    const char *const committed_argv[] = {"git", "-C", root_path, "diff", "--name-only", "-z",
+                                          base_spec, NULL};
+    const char *const unstaged_argv[] = {"git", "-C", root_path, "diff", "--name-only", "-z",
+                                        NULL};
+    const char *const staged_argv[] = {"git", "-C", root_path, "diff", "--cached",
+                                      "--name-only", "-z", NULL};
+    const char *const untracked_argv[] = {"git", "--no-optional-locks", "-C", root_path,
+                                         "ls-files", "--others", "--exclude-standard", "-z",
+                                         NULL};
+    bool git_ok = detect_capture_git_oid("git base object", base_oid_argv, resolved_base_oid,
+                                         git_error, sizeof(git_error)) &&
+                  detect_capture_git_oid("git HEAD object", head_oid_argv, resolved_head_oid,
+                                         git_error, sizeof(git_error)) &&
+                  detect_capture_git_paths("git committed diff", committed_argv, &paths,
+                                           (size_t)changed_file_max, result_max_bytes, git_error,
+                                           sizeof(git_error)) &&
+                  detect_capture_git_paths("git unstaged diff", unstaged_argv, &paths,
+                                           (size_t)changed_file_max, result_max_bytes, git_error,
+                                           sizeof(git_error)) &&
+                  detect_capture_git_paths("git staged diff", staged_argv, &paths,
+                                           (size_t)changed_file_max, result_max_bytes, git_error,
+                                           sizeof(git_error)) &&
+                  detect_capture_git_paths("git untracked roster", untracked_argv, &paths,
+                                           (size_t)changed_file_max, result_max_bytes, git_error,
+                                           sizeof(git_error));
+    detect_path_roster_sort_unique(&paths);
+    if (git_ok && paths.count > (size_t)changed_file_max) {
+        snprintf(git_error, sizeof(git_error),
+                 "detect_changes canonical changed-file roster exceeds changed_file_max");
+        git_ok = false;
+    }
+    char verified_base_oid[65] = {0};
+    char verified_head_oid[65] = {0};
+    git_ok = git_ok &&
+             detect_capture_git_paths("git committed diff verification", committed_argv,
+                                      &verify_paths, (size_t)changed_file_max, result_max_bytes,
+                                      git_error,
+                                      sizeof(git_error)) &&
+             detect_capture_git_paths("git unstaged diff verification", unstaged_argv,
+                                      &verify_paths, (size_t)changed_file_max, result_max_bytes,
+                                      git_error,
+                                      sizeof(git_error)) &&
+             detect_capture_git_paths("git staged diff verification", staged_argv, &verify_paths,
+                                      (size_t)changed_file_max, result_max_bytes, git_error,
+                                      sizeof(git_error)) &&
+             detect_capture_git_paths("git untracked roster verification", untracked_argv,
+                                      &verify_paths, (size_t)changed_file_max, result_max_bytes,
+                                      git_error,
+                                      sizeof(git_error)) &&
+             detect_capture_git_oid("git base object verification", base_oid_argv,
+                                    verified_base_oid, git_error, sizeof(git_error)) &&
+             detect_capture_git_oid("git HEAD object verification", head_oid_argv,
+                                    verified_head_oid, git_error, sizeof(git_error));
+    detect_path_roster_sort_unique(&verify_paths);
+    if (git_ok && (verify_paths.count > (size_t)changed_file_max ||
+                   !detect_path_roster_equal(&paths, &verify_paths) ||
+                   strcmp(resolved_base_oid, verified_base_oid) != 0 ||
+                   strcmp(resolved_head_oid, verified_head_oid) != 0)) {
+        snprintf(git_error, sizeof(git_error),
+                 "detect_changes Git state changed between its two exact observations");
+        git_ok = false;
+    }
+    free(base_spec);
+    free(base_commit_spec);
+    detect_path_roster_free(&verify_paths);
+    if (!git_ok) {
+        detect_path_roster_free(&paths);
+        free(root_path);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_GIT_OBSERVATION_FAILED", "git_observation", git_error,
+            "repair the exact Git ref/repository state or raise result_max_bytes only when the "
+            "complete changed-file stream is intentionally admissible, then retry");
+    }
+#else
+    detect_path_roster_free(&paths);
+    detect_path_roster_free(&verify_paths);
+    free(root_path);
+    detect_changes_request_free(&request);
+    return detect_changes_error_result(
+        "CBM_DETECT_CHANGES_SPAWN_UNAVAILABLE", "git_observation",
+        "detect_changes requires the Astrolabe shell-free spawn contract",
+        "run the native Astrolabe worker built with ASTRO_SPAWN");
+#endif
+    detect_path_roster_sort_unique(&paths);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        detect_path_roster_free(&paths);
+        free(root_path);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ALLOCATION_FAILED", "result_document",
+            "detect_changes could not allocate its result document",
+            "free memory and retry the unchanged request");
+    }
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root_obj);
-
     yyjson_mut_val *changed = yyjson_mut_arr(doc);
     yyjson_mut_val *impacted = yyjson_mut_arr(doc);
+    yyjson_mut_val *mappings = yyjson_mut_arr(doc);
+
+    if (!root_obj || !changed || !impacted || !mappings) {
+        detect_path_roster_free(&paths);
+        yyjson_mut_doc_free(doc);
+        free(root_path);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ALLOCATION_FAILED", "result_values",
+            "detect_changes could not allocate its result document values",
+            "free memory and retry the unchanged request");
+    }
+    yyjson_mut_doc_set_root(doc, root_obj);
 
     /* resolve_store already called via get_project_root above */
     cbm_store_t *store = srv->store;
 
-    char line[CBM_SZ_1K];
     int file_count = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    uint64_t mapped_total = 0;
+    size_t retained_identity_bytes = 0;
+    for (size_t path_index = 0; path_index < paths.count; path_index++) {
+        const char *path_line = paths.items[path_index];
+        if (!yyjson_mut_arr_add_strcpy(doc, changed, path_line)) {
+            detect_path_roster_free(&paths);
+            yyjson_mut_doc_free(doc);
+            free(root_path);
+            detect_changes_request_free(&request);
+            return detect_changes_error_result(
+                "CBM_DETECT_CHANGES_ALLOCATION_FAILED", "changed_file_result",
+                "detect_changes could not allocate the exact changed-file result",
+                "free memory and retry the unchanged request");
         }
-        if (len == 0) {
-            continue;
-        }
-
-        /* `git status --porcelain` prefixes each path with a two-character
-         * status code and a space ("?? path", "A  path", " M path"). The two
-         * `git diff --name-only` sources emit bare paths. Strip the porcelain
-         * prefix when present so all three sources yield clean paths; for a
-         * rename ("R  old -> new") keep the post-arrow destination path. */
-        char *path_line = line;
-        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
-            strchr(" MADRCU?!", line[1])) {
-            path_line = line + PAIR_LEN + SKIP_ONE;
-            char *arrow = strstr(path_line, " -> ");
-            if (arrow) {
-                enum { ARROW_LEN = 4 }; /* length of " -> " */
-                path_line = arrow + ARROW_LEN;
-            }
-        }
-        if (path_line[0] == '\0') {
-            continue;
-        }
-
-        yyjson_mut_arr_add_strcpy(doc, changed, path_line);
         file_count++;
 
-        if (want_symbols) {
-            detect_add_impacted_symbols(store, project, path_line, doc, impacted);
+        int mapped_count = 0;
+        int remaining_nodes = impact_max_symbols - (int)mapped_total;
+        size_t identity_bytes = 0;
+        char identity_error[CBM_SZ_1K] = {0};
+        size_t remaining_identity_bytes =
+            retained_identity_bytes < result_max_bytes
+                ? result_max_bytes - retained_identity_bytes
+                : 0;
+        if (want_symbols &&
+            (remaining_identity_bytes == 0 ||
+             !detect_add_impacted_symbols(store, project, path_line, remaining_nodes,
+                                          remaining_identity_bytes, doc, impacted, &mapped_count,
+                                          &identity_bytes, identity_error,
+                                          sizeof(identity_error)))) {
+            detect_path_roster_free(&paths);
+            yyjson_mut_doc_free(doc);
+            free(root_path);
+            detect_changes_request_free(&request);
+            return detect_changes_error_result(
+                remaining_identity_bytes == 0 ? "CBM_DETECT_CHANGES_RESULT_BOUND_EXCEEDED"
+                                              : "CBM_DETECT_CHANGES_IDENTITY_FAILED",
+                "identity_projection",
+                remaining_identity_bytes == 0
+                    ? "detect_changes exhausted result_max_bytes before the complete identity roster"
+                    : identity_error,
+                "raise the explicit result_max_bytes only when the complete identity roster is "
+                "intentionally admissible, or repair the exact indexed identity row");
+        }
+        retained_identity_bytes += identity_bytes;
+        if ((uint64_t)mapped_count > UINT64_MAX - mapped_total) {
+            detect_path_roster_free(&paths);
+            yyjson_mut_doc_free(doc);
+            free(root_path);
+            detect_changes_request_free(&request);
+            return detect_changes_error_result(
+                "CBM_DETECT_CHANGES_ACCOUNTING_OVERFLOW", "mapped_symbol_count",
+                "detect_changes mapped-symbol count overflowed",
+                "reduce the admitted impact roster and retry the exact request");
+        }
+        mapped_total += (uint64_t)mapped_count;
+        if (mapped_total > (uint64_t)impact_max_symbols) {
+            detect_path_roster_free(&paths);
+            yyjson_mut_doc_free(doc);
+            free(root_path);
+            detect_changes_request_free(&request);
+            return detect_changes_error_result(
+                "CBM_DETECT_CHANGES_IMPACT_BOUND_EXCEEDED", "mapped_symbol_count",
+                "detect_changes impacted-symbol roster exceeds caller impact_max_symbols",
+                "raise impact_max_symbols only when the complete mapped roster is intentionally "
+                "admissible");
+        }
+        yyjson_mut_val *mapping = yyjson_mut_obj(doc);
+        if (!mapping || !yyjson_mut_obj_add_strcpy(doc, mapping, "file", path_line) ||
+            !yyjson_mut_obj_add_int(doc, mapping, "node_count", mapped_count) ||
+            !yyjson_mut_obj_add_bool(doc, mapping, "symbols_requested", want_symbols) ||
+            !yyjson_mut_arr_add_val(mappings, mapping)) {
+            detect_path_roster_free(&paths);
+            yyjson_mut_doc_free(doc);
+            free(root_path);
+            detect_changes_request_free(&request);
+            return detect_changes_error_result(
+                "CBM_DETECT_CHANGES_ALLOCATION_FAILED", "mapping_result",
+                "detect_changes could not encode the changed-file mapping evidence",
+                "free memory and retry the unchanged request");
         }
     }
-    int git_status = cbm_pclose(fp);
+    detect_path_roster_free(&paths);
 
-    bool is_error = false;
-    if (git_status != 0 && file_count == 0) {
-        char hint_buf[CBM_SZ_256];
-        snprintf(hint_buf, sizeof(hint_buf),
-                 "git diff exited with status %d. Check that branch '%s' exists.", git_status,
-                 base_branch);
-        yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
-        is_error = true;
+    if (!yyjson_mut_obj_add_strcpy(doc, root_obj, "schema", "cbm.detect_changes.v2") ||
+        !yyjson_mut_obj_add_strcpy(doc, root_obj, "project", project) ||
+        !yyjson_mut_obj_add_strcpy(doc, root_obj, "resolved_base_ref", base_branch) ||
+        !yyjson_mut_obj_add_strcpy(doc, root_obj, "resolved_base_oid", resolved_base_oid) ||
+        !yyjson_mut_obj_add_strcpy(doc, root_obj, "resolved_head_oid", resolved_head_oid) ||
+        !yyjson_mut_obj_add_int(doc, root_obj, "git_observation_passes", PAIR_LEN) ||
+        !yyjson_mut_obj_add_int(doc, root_obj, "changed_file_max", changed_file_max) ||
+        !yyjson_mut_obj_add_val(doc, root_obj, "changed_files", changed) ||
+        !yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count) ||
+        !yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted) ||
+        !yyjson_mut_obj_add_val(doc, root_obj, "changed_file_mappings", mappings) ||
+        !yyjson_mut_obj_add_int(doc, root_obj, "depth", depth) ||
+        !yyjson_mut_obj_add_int(doc, root_obj, "impact_max_symbols", impact_max_symbols) ||
+        !yyjson_mut_obj_add_int(doc, root_obj, "reach_max_nodes_per_symbol",
+                                reach_max_nodes_per_symbol) ||
+        !yyjson_mut_obj_add_uint(doc, root_obj, "result_max_bytes",
+                                (uint64_t)result_max_bytes) ||
+        !yyjson_mut_obj_add_strcpy(doc, root_obj, "scope", scope_name)) {
+        yyjson_mut_doc_free(doc);
+        free(root_path);
+        detect_changes_request_free(&request);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_ALLOCATION_FAILED", "result_finalize",
+            "detect_changes could not finalize its exact result",
+            "free memory and retry the unchanged request");
     }
 
-    yyjson_mut_obj_add_val(doc, root_obj, "changed_files", changed);
-    yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
-    yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
-    yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
-
-    char *json = yy_doc_to_str(doc);
+    size_t payload_bytes = 0;
+    char *json = yy_doc_to_str_with_len(doc, &payload_bytes);
     yyjson_mut_doc_free(doc);
     free(root_path);
-    free(project);
-    free(base_branch);
-    free(scope);
+    detect_changes_request_free(&request);
 
-    char *result = cbm_mcp_text_result(json, is_error);
+    if (!json) {
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_SERIALIZATION_FAILED", "payload_serialization",
+            "detect_changes could not serialize its exact result",
+            "repair invalid persisted UTF-8 or free memory, then retry the unchanged request");
+    }
+    if (payload_bytes > result_max_bytes) {
+        free(json);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_RESULT_BOUND_EXCEEDED", "native_payload_bytes",
+            "the complete native detect_changes payload exceeds result_max_bytes",
+            "raise result_max_bytes only when the complete canonical payload is intentionally "
+            "admissible");
+    }
+    char *result = cbm_mcp_text_result(json, false);
     free(json);
+    if (!result) {
+        return NULL;
+    }
+    if (strlen(result) > result_max_bytes) {
+        free(result);
+        return detect_changes_error_result(
+            "CBM_DETECT_CHANGES_RESULT_BOUND_EXCEEDED", "native_envelope_bytes",
+            "the complete native detect_changes MCP envelope exceeds result_max_bytes",
+            "raise result_max_bytes only when the complete mirrored payload is intentionally "
+            "admissible");
+    }
     return result;
 }
 
@@ -13965,11 +15736,9 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     free(b64);
     if (owns_mutation_store) {
         cbm_store_close_result_t close_result;
-        if (!close_local_store_exact(&store, "ingest_traces.finish", project,
-                                     &close_result)) {
+        if (!close_local_store_exact(&store, "ingest_traces.finish", project, &close_result)) {
             free(json);
-            json = build_local_store_close_error("ingest_traces.finish", project,
-                                                 &close_result);
+            json = build_local_store_close_error("ingest_traces.finish", project, &close_result);
             is_error = true;
         }
     }

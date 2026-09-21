@@ -660,7 +660,7 @@ fn tools_list(runner: &CbmToolRunner) -> AnyResult<Value> {
                     && description.contains("PC-03/PC-43")
             }),
         "ISSUE_557_564_FSV_OPTIMIZER_END_TO_END_COST_SCOPE_AMBIGUOUS",
-        &optimizer[0],
+        optimizer[0],
     )?;
     require(
         schema["properties"]["candidate_slot_ids"]["description"]
@@ -987,18 +987,32 @@ fn verify_status_payload(
     }))
 }
 
-fn expect_refusal(
-    runner: &CbmToolRunner,
+struct RefusalRequest<'a> {
+    runner: &'a CbmToolRunner,
     id: u64,
-    case: &str,
-    arguments: &Value,
-    expected_code: &str,
-    expected_preflight_stage: Option<&str>,
-    cache_dir: &Path,
-    project: &str,
-    slot_ids: &[u16],
+    case: &'a str,
+    arguments: &'a Value,
+    expected_code: &'a str,
+    expected_preflight_stage: Option<&'a str>,
+    cache_dir: &'a Path,
+    project: &'a str,
+    slot_ids: &'a [u16],
     layout: CandidateLayout,
-) -> AnyResult<Value> {
+}
+
+fn expect_refusal(request: RefusalRequest<'_>) -> AnyResult<Value> {
+    let RefusalRequest {
+        runner,
+        id,
+        case,
+        arguments,
+        expected_code,
+        expected_preflight_stage,
+        cache_dir,
+        project,
+        slot_ids,
+        layout,
+    } = request;
     let before = physical_state(cache_dir, project, slot_ids, layout)?;
     println!(
         "{}",
@@ -1073,8 +1087,7 @@ fn run(root: PathBuf) -> AnyResult<()> {
             cache_readback.display()
         ),
     )?;
-    let executable = std::env::current_exe()?;
-    initialize_cbm_host_process(executable.to_str())?;
+    initialize_cbm_host_process()?;
     let runner = CbmToolRunner::new_default()?;
     let tools = tools_list(&runner)?;
 
@@ -1242,18 +1255,18 @@ fn run(root: PathBuf) -> AnyResult<()> {
         replay_receipts.len(),
     )?;
     replay_receipts[1]["slot_id"] = replay_receipts[0]["slot_id"].clone();
-    let duplicate_replay_edge = expect_refusal(
-        &runner,
-        55_756_405,
-        "duplicate_selection_replay_slot",
-        &duplicate_replay,
-        "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_DUPLICATE_SLOT",
-        Some(RECEIPT_PARSE_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let duplicate_replay_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_405,
+        case: "duplicate_selection_replay_slot",
+        arguments: &duplicate_replay,
+        expected_code: "ASTRO_OPTIMIZER_COMPRESSION_RECEIPT_DUPLICATE_SLOT",
+        expected_preflight_stage: Some(RECEIPT_PARSE_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut duplicate_query = commission_args.clone();
     let queries = duplicate_query["candidate_request"]["queries"]
@@ -1265,48 +1278,48 @@ fn run(root: PathBuf) -> AnyResult<()> {
         queries.len(),
     )?;
     queries[1]["cx_id"] = queries[0]["cx_id"].clone();
-    let duplicate_query_edge = expect_refusal(
-        &runner,
-        55_756_410,
-        "duplicate_query_cx_id",
-        &duplicate_query,
-        "CALYX_COMPRESSION_ADMISSION_REFUSED",
-        Some(OPERATION_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let duplicate_query_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_410,
+        case: "duplicate_query_cx_id",
+        arguments: &duplicate_query,
+        expected_code: "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        expected_preflight_stage: Some(OPERATION_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut duplicate_slot = commission_args.clone();
     duplicate_slot["candidate_slot_ids"] = json!([input.slot_ids[0], input.slot_ids[0]]);
-    let duplicate_slot_edge = expect_refusal(
-        &runner,
-        55_756_411,
-        "duplicate_candidate_slot",
-        &duplicate_slot,
-        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_DUPLICATE",
-        Some(SLOT_PARSE_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let duplicate_slot_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_411,
+        case: "duplicate_candidate_slot",
+        arguments: &duplicate_slot,
+        expected_code: "ASTRO_OPTIMIZER_COMPRESSION_SLOT_DUPLICATE",
+        expected_preflight_stage: Some(SLOT_PARSE_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut single_candidate = commission_args.clone();
     single_candidate["candidate_slot_ids"] = json!([input.slot_ids[0]]);
-    let single_candidate_edge = expect_refusal(
-        &runner,
-        55_756_412,
-        "single_candidate_commission",
-        &single_candidate,
-        "ASTRO_OPTIMIZER_COMPRESSION_SLOT_COUNT_INVALID",
-        Some(SLOT_COUNT_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let single_candidate_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_412,
+        case: "single_candidate_commission",
+        arguments: &single_candidate,
+        expected_code: "ASTRO_OPTIMIZER_COMPRESSION_SLOT_COUNT_INVALID",
+        expected_preflight_stage: Some(SLOT_COUNT_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut query_limit = commission_args.clone();
     let query_count = query_limit["candidate_request"]["queries"]
@@ -1320,18 +1333,18 @@ fn run(root: PathBuf) -> AnyResult<()> {
     )?;
     query_limit["candidate_request"]["work_limits"]["maximum_held_out_queries"] =
         json!(query_count - 1);
-    let query_limit_edge = expect_refusal(
-        &runner,
-        55_756_413,
-        "held_out_query_exact_minus_one_limit",
-        &query_limit,
-        "CALYX_COMPRESSION_ADMISSION_REFUSED",
-        Some(OPERATION_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let query_limit_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_413,
+        case: "held_out_query_exact_minus_one_limit",
+        arguments: &query_limit,
+        expected_code: "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        expected_preflight_stage: Some(OPERATION_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut lifecycle_limit = commission_args.clone();
     let lifecycle_searches =
@@ -1341,64 +1354,64 @@ fn run(root: PathBuf) -> AnyResult<()> {
             .ok_or("lifecycle packed-search fixture limit is not positive")?;
     lifecycle_limit["candidate_request"]["work_limits"]["maximum_total_packed_searches"] =
         json!(lifecycle_searches - 1);
-    let lifecycle_limit_edge = expect_refusal(
-        &runner,
-        55_756_414,
-        "lifecycle_packed_search_exact_minus_one_limit",
-        &lifecycle_limit,
-        "CALYX_COMPRESSION_ADMISSION_REFUSED",
-        Some(OPERATION_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let lifecycle_limit_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_414,
+        case: "lifecycle_packed_search_exact_minus_one_limit",
+        arguments: &lifecycle_limit,
+        expected_code: "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        expected_preflight_stage: Some(OPERATION_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut invalid_runs = commission_args.clone();
     invalid_runs["candidate_request"]["measured_runs"] = json!(2);
-    let invalid_runs_edge = expect_refusal(
-        &runner,
-        55_756_415,
-        "measured_runs_below_schema_minimum",
-        &invalid_runs,
-        "ASTRO_MCP_ARGUMENT_BOUND_INVALID",
-        None,
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let invalid_runs_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_415,
+        case: "measured_runs_below_schema_minimum",
+        arguments: &invalid_runs,
+        expected_code: "ASTRO_MCP_ARGUMENT_BOUND_INVALID",
+        expected_preflight_stage: None,
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut invalid_backend = commission_args.clone();
     invalid_backend["candidate_request"]["requested_backend"] = json!("cuda");
-    let invalid_backend_edge = expect_refusal(
-        &runner,
-        55_756_416,
-        "unsupported_cuda_backend",
-        &invalid_backend,
-        "CALYX_COMPRESSION_ADMISSION_REFUSED",
-        Some(OPERATION_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let invalid_backend_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_416,
+        case: "unsupported_cuda_backend",
+        arguments: &invalid_backend,
+        expected_code: "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        expected_preflight_stage: Some(OPERATION_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let mut invalid_gates = commission_args.clone();
     invalid_gates["candidate_request"]["gates"]["maximum_mean_cosine_error"] = json!(0.75);
     invalid_gates["candidate_request"]["gates"]["maximum_cosine_error"] = json!(0.5);
-    let invalid_gates_edge = expect_refusal(
-        &runner,
-        55_756_417,
-        "incoherent_cosine_error_gates",
-        &invalid_gates,
-        "CALYX_COMPRESSION_ADMISSION_REFUSED",
-        Some(OPERATION_PREFLIGHT_STAGE),
-        &input.cache_dir,
-        &input.project,
-        &input.slot_ids,
-        CandidateLayout::CompressedWithRawSidecar,
-    )?;
+    let invalid_gates_edge = expect_refusal(RefusalRequest {
+        runner: &runner,
+        id: 55_756_417,
+        case: "incoherent_cosine_error_gates",
+        arguments: &invalid_gates,
+        expected_code: "CALYX_COMPRESSION_ADMISSION_REFUSED",
+        expected_preflight_stage: Some(OPERATION_PREFLIGHT_STAGE),
+        cache_dir: &input.cache_dir,
+        project: &input.project,
+        slot_ids: &input.slot_ids,
+        layout: CandidateLayout::CompressedWithRawSidecar,
+    })?;
 
     let final_state = physical_state(
         &input.cache_dir,

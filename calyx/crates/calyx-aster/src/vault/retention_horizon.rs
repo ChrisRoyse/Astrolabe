@@ -1,4 +1,4 @@
-use super::{AsterVault, encode};
+use super::{AsterVault, CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED, encode};
 use crate::timetravel::RetentionHorizon;
 use calyx_core::{CalyxError, Clock, Result};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -10,17 +10,17 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
-    pub fn retention_horizon(&self) -> RetentionHorizon {
+    pub fn retention_horizon(&self) -> Result<RetentionHorizon> {
         self.retention_horizon
             .lock()
             .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .map_err(|_| retention_lock_error())
     }
 
     pub fn set_retention_horizon(&self, horizon: RetentionHorizon) -> Result<()> {
         horizon.validate()?;
         self.with_durable_commit_lock(|| {
-            let old = self.retention_horizon();
+            let old = self.retention_horizon()?;
             if old == horizon {
                 return Ok(());
             }
@@ -28,10 +28,31 @@ where
                 durable.write_retention_horizon_manifest(&horizon)?;
             }
             if let Err(error) = self.commit_retention_horizon_ledger(&old, &horizon) {
+                if self.durable.is_some()
+                    && error.code == CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED
+                {
+                    // The Ledger row is already in the durable WAL. Reverting
+                    // the manifest here would publish two contradictory
+                    // durable control generations. Keep the new manifest/live
+                    // value and require the caller to reopen the terminal
+                    // handle, which reconstructs that exact new generation.
+                    self.replace_retention_horizon(horizon.clone())?;
+                    return Err(error);
+                }
                 if let Some(durable) = &self.durable
                     && let Err(rollback) = durable.write_retention_horizon_manifest(&old)
                 {
-                    eprintln!("calyx retention horizon manifest rollback failed: {rollback}");
+                    let terminal = CalyxError {
+                        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                        message: format!(
+                            "retention horizon Ledger commit failed before a completed publication ([{}] {}), and restoring the prior manifest also failed ([{}] {}); the live and durable control generation cannot be proven equal",
+                            error.code, error.message, rollback.code, rollback.message
+                        ),
+                        remediation: "discard this handle, preserve the vault, and reopen it to reconstruct the exact durable manifest and Ledger generation before any further operation",
+                    };
+                    self.rows
+                        .latch_terminal_durable_fault_requires_reopen(terminal.clone());
+                    return Err(terminal);
                 }
                 return Err(error);
             }

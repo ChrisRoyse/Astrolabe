@@ -73,21 +73,44 @@ const ASTROLABE_ARCHITECTURE_OUTPUTS: [&str; 12] = [
     "signal_ranking",
 ];
 
+/// Every potentially corpus-scale clustering control is caller-owned. Selecting
+/// clusters without all five values is a refusal; there are no hidden defaults.
+pub(crate) const ARCHITECTURE_CLUSTER_CONTROL_FIELDS: [&str; 5] = [
+    "resolution",
+    "cluster_max_nodes",
+    "cluster_max_edges",
+    "cluster_max_result_bytes",
+    "cluster_max_move_visits",
+];
+
 pub(crate) struct ArchitectureRequestPlan {
     pub(crate) cbm_args_json: Option<String>,
     pub(crate) astrolabe_outputs: BTreeSet<&'static str>,
+    /// Caller-owned UTF-8 byte ceiling for the final logical architecture
+    /// payload (`content[0].text` / `structuredContent`), excluding only the
+    /// generic MCP envelope framing that duplicates that same payload.
+    pub(crate) cluster_result_byte_bound: Option<u64>,
 }
 
 impl ArchitectureRequestPlan {
     pub(crate) fn parse(args: &Map<String, Value>) -> Result<Self, ToolFault> {
         for (name, value) in args {
-            if !matches!(name.as_str(), "project" | "path" | "aspects") {
+            if !matches!(name.as_str(), "project" | "path" | "aspects")
+                && !ARCHITECTURE_CLUSTER_CONTROL_FIELDS.contains(&name.as_str())
+            {
                 return Err(ToolFault::new(
                     "ASTRO_ARCHITECTURE_ARGUMENT_UNKNOWN",
                     format!("get_architecture received unknown argument {name:?}"),
-                    "remove the unknown field or use project, path, and aspects exactly as advertised by tools/list",
+                    "remove the unknown field or use project, path, aspects, and the explicit clustering controls exactly as advertised by tools/list",
                 )
-                .with_argument(name, "project|path|aspects", value));
+                .with_argument(
+                    name,
+                    format!(
+                        "project|path|aspects|{}",
+                        ARCHITECTURE_CLUSTER_CONTROL_FIELDS.join("|")
+                    ),
+                    value,
+                ));
             }
         }
         let project = args.get("project").ok_or_else(|| {
@@ -97,31 +120,40 @@ impl ArchitectureRequestPlan {
                 "pass the exact project name returned by list_projects",
             )
         })?;
-        if project.as_str().is_none_or(str::is_empty) {
+        if project
+            .as_str()
+            .is_none_or(|project| project.is_empty() || project.contains('\0'))
+        {
             return Err(argument_type_fault(
                 "ASTRO_ARCHITECTURE_PROJECT_INVALID",
                 "get_architecture",
                 "project",
-                "a non-empty JSON string",
+                "a non-empty JSON string without an embedded NUL",
                 project,
             ));
         }
         if let Some(path) = args.get("path")
-            && path.as_str().is_none()
+            && path.as_str().is_none_or(|path| path.contains('\0'))
         {
             return Err(argument_type_fault(
                 "ASTRO_ARCHITECTURE_PATH_INVALID",
                 "get_architecture",
                 "path",
-                "a JSON string",
+                "a JSON string without an embedded NUL",
                 path,
             ));
         }
 
         let Some(aspects_value) = args.get("aspects") else {
-            // The legacy omission contract remains CBM's complete architecture,
-            // but Astrolabe-only reads are opt-in so the default never opens
-            // unrelated Config/Vault families or recomputes agreement edges.
+            if let Some(field) = ARCHITECTURE_CLUSTER_CONTROL_FIELDS
+                .iter()
+                .find(|field| args.contains_key(**field))
+            {
+                return Err(cluster_control_scope_fault(field, args));
+            }
+            // Omission is intentionally narrow: CBM serves overview only, while
+            // Astrolabe-only reads remain opt-in. File-tree and clustering work
+            // are never implicit.
             return Ok(Self {
                 cbm_args_json: Some(serde_json::to_string(&Value::Object(args.clone())).map_err(
                     |error| {
@@ -133,6 +165,7 @@ impl ArchitectureRequestPlan {
                     },
                 )?),
                 astrolabe_outputs: BTreeSet::new(),
+                cluster_result_byte_bound: None,
             });
         };
         let aspects = aspects_value.as_array().ok_or_else(|| {
@@ -144,9 +177,32 @@ impl ArchitectureRequestPlan {
                 aspects_value,
             )
         })?;
+        if aspects.is_empty() {
+            return Err(argument_type_fault(
+                "ASTRO_ARCHITECTURE_ASPECTS_INVALID",
+                "get_architecture",
+                "aspects",
+                "a non-empty array of unique advertised aspect strings",
+                aspects_value,
+            ));
+        }
+        let max_aspects = CBM_ARCHITECTURE_ASPECTS.len() - 1 + ASTROLABE_ARCHITECTURE_ASPECTS.len();
+        if aspects.len() > max_aspects {
+            return Err(ToolFault::new(
+                "ASTRO_ARCHITECTURE_ASPECTS_TOO_MANY",
+                format!(
+                    "get_architecture received {} aspect values; the closed public contract admits at most {max_aspects}",
+                    aspects.len()
+                ),
+                "remove redundant selectors and request at most the advertised maxItems value",
+            )
+            .with_detail("observed_count", aspects.len())
+            .with_detail("maximum_count", max_aspects));
+        }
 
         let mut cbm_aspects = Vec::new();
         let mut astrolabe_outputs = BTreeSet::new();
+        let mut selected_aspects = BTreeSet::new();
         for aspect in aspects {
             let Some(aspect) = aspect.as_str().filter(|aspect| !aspect.is_empty()) else {
                 return Err(argument_type_fault(
@@ -157,6 +213,14 @@ impl ArchitectureRequestPlan {
                     aspect,
                 ));
             };
+            if !selected_aspects.insert(aspect) {
+                return Err(ToolFault::new(
+                    "ASTRO_ARCHITECTURE_ASPECT_DUPLICATE",
+                    format!("get_architecture aspect {aspect:?} appears more than once"),
+                    "supply each requested architecture aspect exactly once",
+                )
+                .with_detail("observed_aspect", aspect));
+            }
             if CBM_ARCHITECTURE_ASPECTS.contains(&aspect) {
                 if !cbm_aspects.contains(&aspect) {
                     cbm_aspects.push(aspect);
@@ -198,6 +262,37 @@ impl ArchitectureRequestPlan {
             };
             astrolabe_outputs.insert(output);
         }
+        if selected_aspects.contains("all") && selected_aspects.len() != 1 {
+            return Err(ToolFault::new(
+                "ASTRO_ARCHITECTURE_ALL_AMBIGUOUS",
+                "get_architecture aspect all cannot be combined with another selector",
+                "request all by itself, or list the exact individual aspects without all",
+            )
+            .with_detail(
+                "observed_aspects",
+                selected_aspects.iter().copied().collect::<Vec<_>>(),
+            ));
+        }
+        let clusters_selected =
+            selected_aspects.contains("clusters") || selected_aspects.contains("all");
+        validate_cluster_controls(args, clusters_selected)?;
+        let cluster_result_byte_bound = if clusters_selected {
+            Some(
+                args.get("cluster_max_result_bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        argument_type_fault(
+                            "ASTRO_ARCHITECTURE_CLUSTER_CONTROL_INVALID",
+                            "get_architecture",
+                            "cluster_max_result_bytes",
+                            "a positive JSON integer no greater than u64::MAX",
+                            args.get("cluster_max_result_bytes").unwrap_or(&Value::Null),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
 
         if !astrolabe_outputs.is_empty()
             && args
@@ -235,8 +330,103 @@ impl ArchitectureRequestPlan {
         Ok(Self {
             cbm_args_json,
             astrolabe_outputs,
+            cluster_result_byte_bound,
         })
     }
+}
+
+fn validate_cluster_controls(
+    args: &Map<String, Value>,
+    clusters_selected: bool,
+) -> Result<(), ToolFault> {
+    if !clusters_selected {
+        if let Some(field) = ARCHITECTURE_CLUSTER_CONTROL_FIELDS
+            .iter()
+            .find(|field| args.contains_key(**field))
+        {
+            return Err(cluster_control_scope_fault(field, args));
+        }
+        return Ok(());
+    }
+    for field in ARCHITECTURE_CLUSTER_CONTROL_FIELDS {
+        if !args.contains_key(field) {
+            return Err(ToolFault::new(
+                "ASTRO_ARCHITECTURE_CLUSTER_CONTROL_REQUIRED",
+                format!("clustered architecture omitted mandatory control {field:?}"),
+                "supply resolution, cluster_max_nodes, cluster_max_edges, cluster_max_result_bytes, and cluster_max_move_visits explicitly whenever aspects includes clusters or all",
+            )
+            .with_detail("missing_control", field));
+        }
+    }
+    if !args
+        .get("resolution")
+        .and_then(Value::as_f64)
+        .is_some_and(|value| value.is_finite() && value > 0.0)
+    {
+        return Err(argument_type_fault(
+            "ASTRO_ARCHITECTURE_CLUSTER_RESOLUTION_INVALID",
+            "get_architecture",
+            "resolution",
+            "a finite JSON number greater than zero",
+            args.get("resolution").unwrap_or(&Value::Null),
+        ));
+    }
+    for field in ["cluster_max_nodes", "cluster_max_edges"] {
+        let value = args.get(field).unwrap_or(&Value::Null);
+        if !value
+            .as_u64()
+            .is_some_and(|value| (1..=2_147_483_647).contains(&value))
+        {
+            return Err(argument_type_fault(
+                "ASTRO_ARCHITECTURE_CLUSTER_BOUND_INVALID",
+                "get_architecture",
+                field,
+                "a positive integer no greater than 2147483647",
+                value,
+            ));
+        }
+    }
+    let result_bytes = args
+        .get("cluster_max_result_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
+    if result_bytes.is_none() {
+        return Err(argument_type_fault(
+            "ASTRO_ARCHITECTURE_CLUSTER_BOUND_INVALID",
+            "get_architecture",
+            "cluster_max_result_bytes",
+            "a positive integer representable by the native result serializer",
+            args.get("cluster_max_result_bytes").unwrap_or(&Value::Null),
+        ));
+    }
+    if !args
+        .get("cluster_max_move_visits")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0)
+    {
+        return Err(argument_type_fault(
+            "ASTRO_ARCHITECTURE_CLUSTER_BOUND_INVALID",
+            "get_architecture",
+            "cluster_max_move_visits",
+            "a positive unsigned 64-bit integer",
+            args.get("cluster_max_move_visits").unwrap_or(&Value::Null),
+        ));
+    }
+    Ok(())
+}
+
+fn cluster_control_scope_fault(field: &str, args: &Map<String, Value>) -> ToolFault {
+    ToolFault::new(
+        "ASTRO_ARCHITECTURE_CLUSTER_CONTROL_WITHOUT_CLUSTER",
+        format!("clustering control {field:?} was supplied without selecting clusters or all"),
+        "remove every clustering control for a narrow architecture read, or explicitly select clusters/all and provide all five controls",
+    )
+    .with_argument(
+        field,
+        "present only with aspects containing clusters or all",
+        args.get(field).unwrap_or(&Value::Null),
+    )
 }
 
 /// Execute only explicitly requested Astrolabe reads, in a stable output order.

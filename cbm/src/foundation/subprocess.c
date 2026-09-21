@@ -10,6 +10,7 @@
 #include "log.h"       /* cbm_log_warn — structured fail-closed handle-scope error (#438) */
 #include "platform.h"  /* cbm_now_ms */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -42,6 +43,144 @@
 static bool cbm_env_truthy(const char *name) {
     const char *value = getenv(name);
     return value && value[0] && strcmp(value, "0") != 0;
+}
+
+/* CreateProcessW accepts at most 32,767 UTF-16 code units including the NUL.
+ * Four UTF-8 bytes per UTF-16 unit is a conservative structural transport cap,
+ * not a measured workload budget. */
+enum { CBM_WIN_COMMAND_LINE_MAX_WCHARS = 32767 };
+#define CBM_WIN_COMMAND_LINE_MAX_UTF8_BYTES \
+    ((size_t)CBM_WIN_COMMAND_LINE_MAX_WCHARS * 4u)
+
+static bool cbm_win_utf8_application_path_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
+        return true;
+    }
+    if (strncmp(path, "\\\\?\\UNC\\", 8) == 0) {
+        return path[8] != '\0';
+    }
+    if (strncmp(path, "\\\\?\\", 4) == 0) {
+        return ((path[4] >= 'A' && path[4] <= 'Z') ||
+                (path[4] >= 'a' && path[4] <= 'z')) &&
+               path[5] == ':' && (path[6] == '\\' || path[6] == '/');
+    }
+    return path[0] == '\\' && path[1] == '\\' && path[2] != '\0' && path[2] != '?' &&
+           path[2] != '.';
+}
+
+static int cbm_win_spawn_refused(cbm_proc_result_t *out, const char *code, const char *stage,
+                                 DWORD native_error, const char *application,
+                                 const char *message, const char *remediation) {
+    char native_error_text[32];
+    snprintf(native_error_text, sizeof(native_error_text), "%lu", (unsigned long)native_error);
+    cbm_log_error("subprocess.win.spawn_refused", "code", code, "stage", stage,
+                  "win32_error", native_error_text, "application",
+                  application ? application : "<null>", "message", message, "remediation",
+                  remediation);
+    out->outcome = CBM_PROC_SPAWN_FAILED;
+    out->exit_code = -1;
+    out->term_signal = 0;
+    return -1;
+}
+
+static int cbm_win_log_spawn_refused(cbm_proc_result_t *out, const char *code,
+                                     const char *stage, DWORD native_error,
+                                     const char *application, const char *log_path,
+                                     const char *message, const char *remediation) {
+    char native_error_text[32];
+    snprintf(native_error_text, sizeof(native_error_text), "%lu", (unsigned long)native_error);
+    cbm_log_error("subprocess.win.spawn_refused", "code", code, "stage", stage,
+                  "win32_error", native_error_text, "application",
+                  application ? application : "<null>", "log_path",
+                  log_path ? log_path : "<null>", "message", message, "remediation",
+                  remediation);
+    out->outcome = CBM_PROC_SPAWN_FAILED;
+    out->exit_code = -1;
+    out->term_signal = 0;
+    return -1;
+}
+
+/* A failed pre-spawn must not strand a requested delete-on-exit log. Delete the
+ * exact already-widened path once, then independently read the namespace back.
+ * PRESENT or an unevaluable readback is preserving: never retry through another
+ * spelling or claim cleanup from DeleteFileW's return value alone. */
+static void cbm_win_cleanup_failed_spawn_log(const char *log_path, const wchar_t *wide_log,
+                                             const char *spawn_stage) {
+    SetLastError(ERROR_SUCCESS);
+    BOOL deleted = DeleteFileW(wide_log);
+    DWORD delete_error = deleted ? ERROR_SUCCESS : GetLastError();
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD attributes = GetFileAttributesW(wide_log);
+    DWORD readback_error =
+        attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+
+    char delete_error_text[32];
+    char readback_error_text[32];
+    snprintf(delete_error_text, sizeof(delete_error_text), "%lu",
+             (unsigned long)delete_error);
+    snprintf(readback_error_text, sizeof(readback_error_text), "%lu",
+             (unsigned long)readback_error);
+    if (attributes == INVALID_FILE_ATTRIBUTES &&
+        (readback_error == ERROR_FILE_NOT_FOUND || readback_error == ERROR_PATH_NOT_FOUND)) {
+        cbm_log_info("subprocess.win.log_cleanup", "code",
+                     "CBM_SUBPROCESS_LOG_CLEANUP_VERIFIED_ABSENT", "stage", spawn_stage,
+                     "log_path", log_path, "delete_win32_error", delete_error_text,
+                     "readback_win32_error", readback_error_text, "message",
+                     "the failed-spawn log path is absent after exact cleanup readback");
+        return;
+    }
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        cbm_log_error("subprocess.win.log_cleanup", "code",
+                      "CBM_SUBPROCESS_LOG_CLEANUP_PRESERVED_PRESENT", "stage", spawn_stage,
+                      "log_path", log_path, "delete_win32_error", delete_error_text,
+                      "readback_win32_error", readback_error_text, "message",
+                      "the failed-spawn log remains present after its one exact cleanup attempt",
+                      "remediation",
+                      "inspect and remove the reported exact log only after confirming no process owns it");
+        return;
+    }
+    cbm_log_error("subprocess.win.log_cleanup", "code",
+                  "CBM_SUBPROCESS_LOG_CLEANUP_READBACK_FAILED", "stage", spawn_stage,
+                  "log_path", log_path, "delete_win32_error", delete_error_text,
+                  "readback_win32_error", readback_error_text, "message",
+                  "the failed-spawn log cleanup result could not be read back", "remediation",
+                  "preserve the reported path and inspect the Win32 readback error before cleanup");
+}
+
+static wchar_t *cbm_win_utf8_to_wide_strict(const char *value, DWORD *native_error) {
+    *native_error = ERROR_SUCCESS;
+    if (!value) {
+        *native_error = ERROR_INVALID_PARAMETER;
+        return NULL;
+    }
+    int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
+    if (needed <= 0) {
+        DWORD error = GetLastError();
+        *native_error = error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION;
+        return NULL;
+    }
+    if (needed > CBM_WIN_COMMAND_LINE_MAX_WCHARS ||
+        (size_t)needed > SIZE_MAX / sizeof(wchar_t)) {
+        *native_error = ERROR_INSUFFICIENT_BUFFER;
+        return NULL;
+    }
+    wchar_t *wide = malloc((size_t)needed * sizeof(*wide));
+    if (!wide) {
+        *native_error = ERROR_OUTOFMEMORY;
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide, needed) != needed) {
+        DWORD error = GetLastError();
+        free(wide);
+        *native_error = error != ERROR_SUCCESS ? error : ERROR_NO_UNICODE_TRANSLATION;
+        return NULL;
+    }
+    return wide;
 }
 #endif
 
@@ -163,11 +302,13 @@ static void cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
  * On overflow: sets *ovf, stops writing, and returns pos UNCHANGED — callers detect
  * the overflow via the *ovf flag (not via the return value). */
 static size_t cbm_cmdline_put(char *buf, size_t cap, size_t pos, char c, bool *ovf) {
-    if (pos + 1 >= cap) {
+    if (cap == 0 || pos >= cap - 1) {
         *ovf = true;
         return pos;
     }
-    buf[pos] = c;
+    if (buf) {
+        buf[pos] = c;
+    }
     return pos + 1;
 }
 
@@ -195,6 +336,10 @@ static size_t cbm_cmdline_append_arg(char *buf, size_t cap, size_t pos, const ch
         if (*p == '\0') {
             /* Trailing backslashes precede the closing quote: double them so the
              * quote stays a delimiter, not an escaped literal. */
+            if (nbs > (SIZE_MAX - 1) / 2) {
+                *ovf = true;
+                return pos;
+            }
             for (size_t k = 0; k < nbs * 2; k++) {
                 pos = cbm_cmdline_put(buf, cap, pos, '\\', ovf);
             }
@@ -202,6 +347,10 @@ static size_t cbm_cmdline_append_arg(char *buf, size_t cap, size_t pos, const ch
         }
         if (*p == '"') {
             /* N backslashes then a quote -> 2N+1 backslashes then an escaped quote. */
+            if (nbs > (SIZE_MAX - 2) / 2) {
+                *ovf = true;
+                return pos;
+            }
             for (size_t k = 0; k < nbs * 2 + 1; k++) {
                 pos = cbm_cmdline_put(buf, cap, pos, '\\', ovf);
             }
@@ -248,31 +397,133 @@ bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv) {
 
 #ifdef _WIN32
 
+static bool cbm_win_cmdline_required_capacity(const char *const *argv, size_t *capacity) {
+    if (!argv || !capacity) {
+        return false;
+    }
+    size_t pos = 0;
+    bool ovf = false;
+    for (int i = 0; argv[i]; i++) {
+        pos = cbm_cmdline_append_arg(NULL, SIZE_MAX, pos, argv[i], i == 0, &ovf);
+        if (ovf) {
+            return false;
+        }
+    }
+    if (pos == SIZE_MAX) {
+        return false;
+    }
+    *capacity = pos + 1;
+    return true;
+}
+
 static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     const char *bin = opts->bin;
     const char *const default_argv[] = {bin, NULL};
     const char *const *argv = opts->argv ? opts->argv : default_argv;
 
-    char cmdline[8192];
-    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), argv)) {
-        out->outcome = CBM_PROC_SPAWN_FAILED;
-        out->exit_code = -1;
-        out->term_signal = 0;
-        return -1;
+    if (!cbm_win_utf8_application_path_absolute(bin)) {
+        return cbm_win_spawn_refused(
+            out, "CBM_SUBPROCESS_APPLICATION_PATH_NOT_ABSOLUTE", "application_path",
+            ERROR_BAD_PATHNAME, bin,
+            "the process application identity is not one exact absolute Windows path",
+            "bind the absolute shipping executable path before requesting a child process");
     }
-    /* Spawn via CreateProcessW with a WIDE command line. CreateProcessA would
-     * re-interpret our UTF-8 cmdline bytes through the ANSI code page (CP_ACP),
-     * re-mangling a non-ASCII repo path at the parent->worker boundary — so the
-     * worker's own wide-argv read could never recover it (#423/#20). */
-    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
-    if (!wcmd) {
-        out->outcome = CBM_PROC_SPAWN_FAILED;
-        out->exit_code = -1;
-        out->term_signal = 0;
-        return -1;
+    DWORD application_error = ERROR_SUCCESS;
+    wchar_t *wbin = cbm_utf8_to_wide_path_checked(bin, &application_error);
+    if (!wbin) {
+        const char *code = "CBM_SUBPROCESS_APPLICATION_PATH_PREPARATION_FAILED";
+        const char *message =
+            "the exact executable path could not be prepared as a native Windows path";
+        const char *remediation =
+            "inspect the reported Win32 path error and bind the ordinary shipping executable";
+        if (application_error == ERROR_NOT_ENOUGH_MEMORY ||
+            application_error == ERROR_OUTOFMEMORY) {
+            code = "CBM_SUBPROCESS_APPLICATION_PATH_ALLOCATION_FAILED";
+            message = "memory allocation failed while preparing the exact executable path";
+            remediation = "free memory and retry without changing the executable identity";
+        } else if (application_error == ERROR_FILENAME_EXCED_RANGE ||
+                   application_error == ERROR_INSUFFICIENT_BUFFER) {
+            code = "CBM_SUBPROCESS_APPLICATION_PATH_TOO_LONG";
+            message = "the exact executable path exceeds the native Windows path limit";
+            remediation = "place the shipping executable within the native Windows path limit";
+        } else if (application_error == ERROR_NO_UNICODE_TRANSLATION) {
+            code = "CBM_SUBPROCESS_APPLICATION_PATH_ENCODING_FAILED";
+            message = "the exact executable path is not valid UTF-8";
+            remediation = "bind one absolute UTF-8 shipping executable path";
+        }
+        return cbm_win_spawn_refused(out, code, "application_path", application_error, bin,
+                                     message, remediation);
+    }
+    size_t application_wchars = wcslen(wbin) + 1;
+    if (application_wchars > CBM_WIN_COMMAND_LINE_MAX_WCHARS) {
+        free(wbin);
+        return cbm_win_spawn_refused(
+            out, "CBM_SUBPROCESS_APPLICATION_PATH_TOO_LONG", "application_path",
+            ERROR_INSUFFICIENT_BUFFER, bin,
+            "the exact executable path exceeds the CreateProcessW application-name limit",
+            "place the shipping executable within the native Windows path limit");
     }
 
+    size_t cmdline_cap = 0;
+    if (!cbm_win_cmdline_required_capacity(argv, &cmdline_cap) ||
+        cmdline_cap > CBM_WIN_COMMAND_LINE_MAX_UTF8_BYTES) {
+        free(wbin);
+        return cbm_win_spawn_refused(
+            out, "CBM_SUBPROCESS_COMMAND_LINE_TOO_LONG", "command_line_size",
+            ERROR_INSUFFICIENT_BUFFER, bin,
+            "the exact child argument vector cannot fit in a Windows process command line",
+            "shorten the exact argument paths; do not remove or truncate worker arguments");
+    }
+    char *cmdline = malloc(cmdline_cap);
+    if (!cmdline) {
+        free(wbin);
+        return cbm_win_spawn_refused(
+            out, "CBM_SUBPROCESS_COMMAND_LINE_ALLOCATION_FAILED", "command_line_allocation",
+            ERROR_OUTOFMEMORY, bin,
+            "memory allocation failed while encoding the exact child argument vector",
+            "free memory and retry without changing the worker argument contract");
+    }
+    if (!cbm_build_win_cmdline(cmdline, cmdline_cap, argv)) {
+        free(cmdline);
+        free(wbin);
+        return cbm_win_spawn_refused(
+            out, "CBM_SUBPROCESS_COMMAND_LINE_ENCODING_FAILED", "command_line_encoding",
+            ERROR_INSUFFICIENT_BUFFER, bin,
+            "the exact child argument vector changed size while it was being encoded",
+            "keep the immutable argument vector live through process creation and retry");
+    }
+
+    DWORD command_error = ERROR_SUCCESS;
+    wchar_t *wcmd = cbm_win_utf8_to_wide_strict(cmdline, &command_error);
+    free(cmdline);
+    if (!wcmd) {
+        const char *code = "CBM_SUBPROCESS_COMMAND_LINE_ENCODING_FAILED";
+        const char *message = "the exact child argument vector is not valid UTF-8";
+        const char *remediation = "supply every worker argument as exact valid UTF-8";
+        if (command_error == ERROR_OUTOFMEMORY) {
+            code = "CBM_SUBPROCESS_COMMAND_LINE_ALLOCATION_FAILED";
+            message = "memory allocation failed while widening the exact child argument vector";
+            remediation = "free memory and retry without changing the worker argument contract";
+        } else if (command_error == ERROR_INSUFFICIENT_BUFFER) {
+            code = "CBM_SUBPROCESS_COMMAND_LINE_TOO_LONG";
+            message = "the exact child argument vector exceeds the Windows command-line limit";
+            remediation = "shorten the exact argument paths; do not truncate worker arguments";
+        }
+        free(wbin);
+        return cbm_win_spawn_refused(out, code, "command_line_utf8", command_error, bin,
+                                     message, remediation);
+    }
+
+    /* Spawn via CreateProcessW with an explicit WIDE application identity and a
+     * separate WIDE command line. CreateProcessA would
+     * re-interpret our UTF-8 cmdline bytes through the ANSI code page (CP_ACP),
+     * re-mangling a non-ASCII repo path at the parent->worker boundary — so the
+     * worker's own wide-argv read could never recover it (#423/#20). Passing
+     * wbin as lpApplicationName makes executable selection independent of
+     * command-line token parsing while argv[0] remains byte-equivalent. */
+
     HANDLE hlog = INVALID_HANDLE_VALUE;
+    wchar_t *wlog = NULL;
     /* Use the EXTENDED startup info so we can attach a PROC_THREAD_ATTRIBUTE_HANDLE_LIST
      * that scopes inheritance to exactly the log handle (#438). Its first member IS a
      * STARTUPINFOW, so &six.StartupInfo is the CreateProcessW startup pointer either way. */
@@ -283,28 +534,63 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
          * ("\\?\") widened path so a log under a deep store (<store>/logs/…)
          * opens instead of failing at MAX_PATH — which would drop the worker's
          * stdout/stderr and the exit-capture the reap surfaces on failure. */
-        wchar_t *wlog = cbm_utf8_to_wide_path(opts->log_file);
-        if (wlog) {
-            /* #435: the log handle MUST be created inheritable, or the child never
-             * receives it. CreateProcessW hands a handle to the child as a std
-             * handle (STARTF_USESTDHANDLES) only when the handle itself is
-             * inheritable AND bInheritHandles=TRUE. With NULL security attributes
-             * this handle was NON-inheritable, so the worker's stdout/stderr were
-             * wired to an invalid child handle: the log file stayed 0 bytes and
-             * GET /api/logs never showed a single worker pipeline line (indexing
-             * still succeeded because the graph is written straight to the store,
-             * not via the log — which is why the empty log went unnoticed until
-             * #435). bInheritHandle=TRUE fixes the actual defect. FILE_SHARE_WRITE
-             * additionally lets the parent open the file for reading to tail it
-             * while the worker still holds it open for write, so progress streams
-             * live instead of only surfacing after the worker exits. */
-            SECURITY_ATTRIBUTES sa = {
-                .nLength = sizeof(sa), .lpSecurityDescriptor = NULL, .bInheritHandle = TRUE};
-            hlog = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            free(wlog);
+        DWORD log_path_error = ERROR_SUCCESS;
+        wlog = cbm_utf8_to_wide_path_checked(opts->log_file, &log_path_error);
+        if (!wlog) {
+            const char *code = "CBM_SUBPROCESS_LOG_PATH_PREPARATION_FAILED";
+            const char *message =
+                "the requested worker log path could not be prepared as a native Windows path";
+            const char *remediation =
+                "inspect the reported Win32 path error and the exact requested log path";
+            if (log_path_error == ERROR_NOT_ENOUGH_MEMORY ||
+                log_path_error == ERROR_OUTOFMEMORY) {
+                code = "CBM_SUBPROCESS_LOG_PATH_ALLOCATION_FAILED";
+                message = "memory allocation failed while preparing the requested worker log path";
+                remediation = "free memory and retry without dropping worker-log redirection";
+            } else if (log_path_error == ERROR_FILENAME_EXCED_RANGE ||
+                       log_path_error == ERROR_INSUFFICIENT_BUFFER) {
+                code = "CBM_SUBPROCESS_LOG_PATH_TOO_LONG";
+                message = "the requested worker log path exceeds the native Windows path limit";
+                remediation = "shorten the exact log path; do not run the worker without its log";
+            } else if (log_path_error == ERROR_NO_UNICODE_TRANSLATION) {
+                code = "CBM_SUBPROCESS_LOG_PATH_ENCODING_FAILED";
+                message = "the requested worker log path is not valid UTF-8";
+                remediation = "supply one exact valid UTF-8 log path";
+            }
+            free(wcmd);
+            free(wbin);
+            return cbm_win_log_spawn_refused(out, code, "log_path", log_path_error, bin,
+                                             opts->log_file, message, remediation);
         }
-        if (hlog != INVALID_HANDLE_VALUE) {
+        /* #435: the log handle MUST be created inheritable, or the child never
+         * receives it. CreateProcessW hands a handle to the child as a std
+         * handle (STARTF_USESTDHANDLES) only when the handle itself is
+         * inheritable AND bInheritHandles=TRUE. With NULL security attributes
+         * this handle was NON-inheritable, so the worker's stdout/stderr were
+         * wired to an invalid child handle: the log file stayed 0 bytes and
+         * GET /api/logs never showed a single worker pipeline line (indexing
+         * still succeeded because the graph is written straight to the store,
+         * not via the log — which is why the empty log went unnoticed until
+         * #435). bInheritHandle=TRUE fixes the actual defect. FILE_SHARE_WRITE
+         * additionally lets the parent open the file for reading to tail it
+         * while the worker still holds it open for write, so progress streams
+         * live instead of only surfacing after the worker exits. */
+        SECURITY_ATTRIBUTES sa = {
+            .nLength = sizeof(sa), .lpSecurityDescriptor = NULL, .bInheritHandle = TRUE};
+        hlog = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hlog == INVALID_HANDLE_VALUE) {
+            DWORD log_open_error = GetLastError();
+            free(wlog);
+            free(wcmd);
+            free(wbin);
+            return cbm_win_log_spawn_refused(
+                out, "CBM_SUBPROCESS_LOG_OPEN_FAILED", "log_open", log_open_error, bin,
+                opts->log_file,
+                "the requested worker log could not be created for exact stdout/stderr redirection",
+                "inspect the reported Win32 error and make the exact log directory writable");
+        }
+        {
             /* #438: because the log handle is now inheritable (#435), a bare
              * CreateProcessW(bInheritHandles=TRUE) would leak EVERY inheritable
              * handle in the parent into this child — a second concurrent index
@@ -369,9 +655,12 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
                 free(attr_list);
                 CloseHandle(hlog);
                 if (opts->log_file && opts->delete_log_on_exit) {
-                    (void)cbm_unlink(opts->log_file);
+                    cbm_win_cleanup_failed_spawn_log(opts->log_file, wlog,
+                                                     "handle_scope");
                 }
+                free(wlog);
                 free(wcmd);
+                free(wbin);
                 out->outcome = CBM_PROC_SPAWN_FAILED;
                 out->exit_code = -1;
                 out->term_signal = 0;
@@ -393,9 +682,11 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     six.StartupInfo.cb = attr_list ? sizeof(six) : sizeof(six.StartupInfo);
 
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, inherit, create_flags, NULL, NULL,
+    BOOL ok = CreateProcessW(wbin, wcmd, NULL, NULL, inherit, create_flags, NULL, NULL,
                              &six.StartupInfo, &pi);
+    DWORD create_error = ok ? ERROR_SUCCESS : GetLastError();
     free(wcmd);
+    free(wbin);
     if (attr_list) {
         DeleteProcThreadAttributeList(attr_list);
         free(attr_list);
@@ -404,11 +695,16 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         CloseHandle(hlog);
     }
     if (!ok) {
-        out->outcome = CBM_PROC_SPAWN_FAILED;
-        out->exit_code = -1;
-        out->term_signal = 0;
-        return -1;
+        if (opts->log_file && opts->delete_log_on_exit) {
+            cbm_win_cleanup_failed_spawn_log(opts->log_file, wlog, "CreateProcessW");
+        }
+        free(wlog);
+        return cbm_win_spawn_refused(
+            out, "CBM_SUBPROCESS_CREATE_PROCESS_FAILED", "CreateProcessW", create_error, bin,
+            "Windows refused to create the exact configured executable process",
+            "inspect the reported Win32 error and the bound executable path; do not retry through PATH or argv discovery");
     }
+    free(wlog);
     if (opts->on_spawn) {
         opts->on_spawn((long)pi.dwProcessId, opts->spawn_ud);
     }

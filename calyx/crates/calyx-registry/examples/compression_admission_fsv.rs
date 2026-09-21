@@ -176,6 +176,7 @@ const MODE_ENV: &str = "ASTROLABE_COMPRESSION_FSV_MODE";
 const MODE_HELP: &str = "`exercise`, `readback`, `production`, `prepare_mcp`, `readback_mcp`, `point_read_cost`, `point_read_cost_readback`, `base_record_replay_prepare`, `base_record_replay_readback`, `base_record_media_replay_prepare`, `base_record_media_replay_compress`, or `base_record_media_replay_readback`";
 const COMPRESSION_WORK_MODEL: &str = "calyx.registry.compression_work.v3";
 type AnyResult<T> = Result<T, Box<dyn Error>>;
+type RawUnmanifestedSlotReadback = (SlotStateReadback, Vec<(Vec<u8>, Vec<u8>)>);
 
 #[derive(Clone)]
 struct Registered {
@@ -2055,7 +2056,7 @@ fn preflight_production_source(
             format!("production preflight row {node_id} violated project/dimension/order"),
         )?;
         require(
-            !blob.iter().any(|byte| *byte == 0x80),
+            !blob.contains(&0x80),
             format!("production preflight row {node_id} contains forbidden int8 -128"),
         )?;
         production_stream_hash_row(&mut stream_hash, node_id, &project, &blob);
@@ -2112,7 +2113,7 @@ fn decode_cbm_i8_vector(blob: &[u8]) -> AnyResult<Vec<f32>> {
         "CBM node vector does not have 768 bytes",
     )?;
     require(
-        !blob.iter().any(|byte| *byte == 0x80),
+        !blob.contains(&0x80),
         "CBM node vector contains -128 outside its [-127,127] source contract",
     )?;
     Ok(blob
@@ -3964,7 +3965,7 @@ fn raw_unmanifested_slot_state(
     vault_dir: &Path,
     vault: &AsterVault<SystemClock>,
     slot_id: SlotId,
-) -> AnyResult<(SlotStateReadback, Vec<(Vec<u8>, Vec<u8>)>)> {
+) -> AnyResult<RawUnmanifestedSlotReadback> {
     let raw_cf_path = vault_dir
         .join("cf")
         .join(ColumnFamily::slot_raw(slot_id).name());

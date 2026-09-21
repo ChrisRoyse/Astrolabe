@@ -6,6 +6,11 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "colbert_compression_fsv"
+path = "examples/colbert_compression_fsv.rs"
+required-features = ["ml-runtime"]
+
 [features]
 default = []
 # The neural embedding runtimes (candle-local BERT, ONNX/fastembed, qwen3,

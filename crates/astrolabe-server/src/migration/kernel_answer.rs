@@ -2,21 +2,19 @@
 //!
 //! `get_kernel` serves the kernel context in four modes: `read` (the scope-summary
 //! members — qualified name, kernel weight, grounded flag, provenance — with their
-//! recall metrics), `gaps` (the ungrounded members that still need grounding),
-//! `quadrant` (the coverage-vs-importance scatter), and `build`. `read`/`gaps`/
-//! `quadrant` serve the persisted kernel members (the S-lens scope-summary rollup
-//! and the persisted `KernelArtifact`).
+//! diagnostic graph-coverage metrics), `gaps` (the ungrounded members that still
+//! need grounding), `quadrant` (the coverage-vs-importance scatter), and `build`.
+//! Every read mode selects one atomically published complete kernel generation;
+//! the `read` scope members and S20 index are derived under the same retained
+//! snapshot rather than joining separately published metadata.
 //!
 //! `build` recomputes the feedback-vertex-set kernel over the vault association
 //! graph on demand (#410): it opens the project's shadow vault read-write and runs
-//! the same anchor-trust-grounded `astrolabe_ingest::build_and_persist_kernel` the
-//! shadow import runs at index time (the `GraphProjectionCsr -> KernelGraph` vault
-//! adapter it consumes landed under #343), persisting the `KernelArtifact` +
-//! projection into the vault Kernel CF and serving a labeled `status:"built"`
-//! summary. When the graph genuinely yields no kernel (empty graph, no typed edges,
-//! an unreachable recall gate) it fails closed with a coded
-//! `{code, message, remediation}` carrying the real build-layer reason rather than
-//! fabricating a build.
+//! the same retained-snapshot composite publisher the shadow import runs at index
+//! time. An explicit real `kernel_admission` corpus is mandatory, and visibility
+//! changes only when the artifact, complete S20 member HNSW, real-query corpus,
+//! graph-routed recall report, manifest, pointer, and Ledger evidence commit and
+//! read back as one generation.
 //!
 //! `kernel_answer` runs the hop-attenuated answer walk (the pinned `0.9` per-hop
 //! attenuation, the ledger-required gate, the honest deficit refusal, implemented
@@ -36,7 +34,8 @@ pub(crate) const ASTRO_GET_KERNEL_UNAVAILABLE: &str = "ASTRO_GET_KERNEL_UNAVAILA
 /// Refusal: the requested scope is absent from the persisted kernel context.
 pub(crate) const ASTRO_GET_KERNEL_SCOPE_UNKNOWN: &str = "ASTRO_GET_KERNEL_SCOPE_UNKNOWN";
 /// Refusal: the on-demand FVS kernel build over the vault association graph
-/// produced no kernel (empty graph, no typed edges, or an unreachable recall gate).
+/// produced no kernel (empty graph, no typed edges, or an unreachable validity or
+/// compactness contract).
 pub(crate) const ASTRO_KERNEL_BUILD_UNAVAILABLE: &str = "ASTRO_KERNEL_BUILD_UNAVAILABLE";
 /// Refusal: the kernel member index could not be read for the project — a vault,
 /// artifact, or index-build failure (#882). Distinct from
@@ -46,6 +45,12 @@ pub(crate) const ASTRO_KERNEL_BUILD_UNAVAILABLE: &str = "ASTRO_KERNEL_BUILD_UNAV
 pub(crate) const ASTRO_KERNEL_INDEX_UNAVAILABLE: &str = "ASTRO_KERNEL_INDEX_UNAVAILABLE";
 /// Refusal: the process-local exact-generation index cache cannot be evaluated.
 pub(crate) const ASTRO_KERNEL_INDEX_CACHE_POISONED: &str = "ASTRO_KERNEL_INDEX_CACHE_POISONED";
+/// Refusal: the resident-generation LRU clock cannot advance without losing
+/// its total ordering.
+pub(crate) const ASTRO_KERNEL_INDEX_CACHE_CLOCK_OVERFLOW: &str =
+    "ASTRO_KERNEL_INDEX_CACHE_CLOCK_OVERFLOW";
+/// Refusal: a measured phase duration is not representable in the receipt.
+pub(crate) const ASTRO_KERNEL_ANSWER_TIMING_OVERFLOW: &str = "ASTRO_KERNEL_ANSWER_TIMING_OVERFLOW";
 /// Refusal: `kernel_answer` requires a non-empty query.
 pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_REQUIRED: &str = "ASTRO_KERNEL_ANSWER_QUERY_REQUIRED";
 /// Refusal: the query carried no token the frozen embedding table knows, so it
@@ -57,12 +62,41 @@ pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_OOV: &str = "ASTRO_KERNEL_ANSWER_QUER
 /// projection to answer from — the answer-path substrate is absent until a kernel
 /// is built (`get_kernel mode="build"`).
 pub(crate) const ASTRO_KERNEL_ANSWER_ADAPTER_PENDING: &str = "ASTRO_KERNEL_ANSWER_ADAPTER_PENDING";
+/// Refusal: a persisted kernel artifact was built from a different graph,
+/// anchor-trust roster, or build configuration than the current read snapshot.
+pub(crate) const ASTRO_KERNEL_SOURCE_IDENTITY_STALE: &str = "ASTRO_KERNEL_SOURCE_IDENTITY_STALE";
+/// Refusal: the physical shadow-vault path could not be classified as present
+/// or absent. Treating a metadata fault as absence would hide a broken kernel.
+pub(crate) const ASTRO_KERNEL_VAULT_STATE_UNREADABLE: &str = "ASTRO_KERNEL_VAULT_STATE_UNREADABLE";
+
+fn kernel_vault_present(vault_dir: &Path, project: &str, stage: &str) -> Result<bool, DynError> {
+    vault_dir.try_exists().map_err(|error| {
+        Box::new(
+            ToolFault::new(
+                ASTRO_KERNEL_VAULT_STATE_UNREADABLE,
+                format!(
+                    "cannot classify shadow vault {} for project {project:?} during {stage}: {error}",
+                    vault_dir.display()
+                ),
+                "repair the named vault path so its physical presence can be read exactly, then retry the unchanged kernel operation",
+            )
+            .with_detail("project", project)
+            .with_detail("stage", stage)
+            .with_detail("vault_dir", vault_dir.display().to_string())
+            .with_detail("os_error", error.to_string()),
+        ) as DynError
+    })
+}
 
 const GET_KERNEL_MODES: [&str; 4] = ["read", "gaps", "quadrant", "build"];
-type KernelIndexLoad = Result<
-    std::sync::Arc<astrolabe_weave::LoadedKernelMemberIndex>,
-    astrolabe_weave::search::SearchError,
->;
+struct VerifiedKernelIndexLoad {
+    index: astrolabe_weave::LoadedKernelMemberIndex,
+    source: astrolabe_weave::KernelMemberIndexSourceVerification,
+    generation_id: String,
+}
+
+type KernelIndexLoad =
+    Result<std::sync::Arc<VerifiedKernelIndexLoad>, astrolabe_weave::search::SearchError>;
 type KernelIndexLoadCell = OnceLock<KernelIndexLoad>;
 
 #[derive(Default)]
@@ -72,13 +106,22 @@ struct KernelIndexCache {
 }
 
 impl KernelIndexCache {
-    fn load_cell(&mut self, key: String) -> std::sync::Arc<KernelIndexLoadCell> {
-        self.clock = self.clock.saturating_add(1);
+    fn load_cell(
+        &mut self,
+        key: String,
+    ) -> Result<std::sync::Arc<KernelIndexLoadCell>, astrolabe_weave::search::SearchError> {
+        let capacity = kernel_index_cache_entries()?;
+        self.clock = self.clock.checked_add(1).ok_or_else(|| {
+            astrolabe_weave::search::SearchError::new(
+                ASTRO_KERNEL_INDEX_CACHE_CLOCK_OVERFLOW,
+                "kernel index cache LRU clock exhausted u64; resident-generation order cannot be advanced without aliasing an older access",
+                "restart the Astrolabe server to create a fresh cache generation before serving another kernel answer",
+            )
+        })?;
         if let Some((cell, last_used)) = self.entries.get_mut(&key) {
             *last_used = self.clock;
-            return std::sync::Arc::clone(cell);
+            return Ok(std::sync::Arc::clone(cell));
         }
-        let capacity = kernel_index_cache_entries();
         if self.entries.len() >= capacity
             && let Some(oldest) = self
                 .entries
@@ -91,7 +134,7 @@ impl KernelIndexCache {
         let cell = std::sync::Arc::new(OnceLock::new());
         self.entries
             .insert(key, (std::sync::Arc::clone(&cell), self.clock));
-        cell
+        Ok(cell)
     }
 }
 
@@ -102,11 +145,24 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     let Some(args_obj) = args.as_object() else {
         return tool_error_result("get_kernel arguments must be a JSON object");
     };
-    // #459: a fleet scope (fleet:<language>:<version>) is cross-project — it is
-    // served from the fleet catalog vault and needs neither project nor dial.
+    // #1151: a fleet scope is cross-project and resolves only through the
+    // independently verified atomic fleet catalog generation.
     if let Some(scope_id) = string_arg(args_obj, "scope")
         && is_fleet_scope(scope_id)
     {
+        if args_obj.contains_key(KERNEL_ADMISSION_ARG) {
+            return ToolFault::new(
+                "ASTRO_KERNEL_ADMISSION_WITHOUT_BUILD",
+                "kernel_admission was supplied for a fleet-scope read",
+                "remove kernel_admission for fleet reads; it is accepted only by a project-scoped get_kernel mode=\"build\"",
+            )
+            .with_argument(
+                KERNEL_ADMISSION_ARG,
+                "absent for fleet scope",
+                args_obj.get(KERNEL_ADMISSION_ARG).unwrap_or(&Value::Null),
+            )
+            .into_result();
+        }
         let scope_id = scope_id.to_owned();
         return handle_get_kernel_fleet(args_obj, &scope_id);
     }
@@ -124,6 +180,19 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
             "{ASTRO_GET_KERNEL_MODE_UNSUPPORTED}: get_kernel mode {mode:?} is not available; remediation: use mode=\"read\", mode=\"gaps\", mode=\"quadrant\", or mode=\"build\""
         ));
     }
+    if mode != "build" && args_obj.contains_key(KERNEL_ADMISSION_ARG) {
+        return ToolFault::new(
+            "ASTRO_KERNEL_ADMISSION_WITHOUT_BUILD",
+            format!("kernel_admission was supplied for get_kernel mode {mode:?}"),
+            "remove kernel_admission or request mode=\"build\"; read/gaps/quadrant resolve the already-admitted current generation",
+        )
+        .with_argument(
+            KERNEL_ADMISSION_ARG,
+            "present only when mode is build",
+            args_obj.get(KERNEL_ADMISSION_ARG).unwrap_or(&Value::Null),
+        )
+        .into_result();
+    }
     let scope = string_arg(args_obj, "scope").map(ToOwned::to_owned);
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     if let Some(refusal) = shadow_graph_freshness_refusal(&cache_dir, &project, "get_kernel")? {
@@ -131,19 +200,62 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     }
 
     if mode == "build" {
-        // #410: recompute the anchor-trust-grounded feedback-vertex-set kernel over
-        // the vault association graph on demand — the exact index-time build the
-        // shadow import runs (`persist_index_time_kernel_artifact` ->
-        // `astrolabe_ingest::build_and_persist_kernel`, consuming the #343
-        // GraphProjectionCsr -> KernelGraph adapter that landed long ago), executed
-        // here against the persisted vault. Open the shadow vault read-write so the
-        // rebuilt KernelArtifact + projection persist into the Kernel CF; the persist
-        // layer is fail-closed on its own bytes (reads them back, refuses on
-        // divergence). A scope that genuinely cannot yield a kernel surfaces as a
-        // coded fail-closed refusal carrying the real build-layer reason — never a
-        // fabricated build.
+        if scope.is_some() {
+            return ToolFault::new(
+                "ASTRO_KERNEL_BUILD_SCOPE_UNSUPPORTED",
+                "get_kernel mode=\"build\" received a scope even though the only production kernel-generation contract is the complete whole-repository graph",
+                "remove scope and rebuild the whole-repository kernel; scoped/fleet kernels use separate explicit producers and are never inferred by ignoring an argument",
+            )
+            .with_argument(
+                "scope",
+                "absent when mode is build",
+                args_obj.get("scope").unwrap_or(&Value::Null),
+            )
+            .into_result();
+        }
+        // #410/#1148: run the same retained-snapshot complete-generation publisher
+        // as shadow import. The graph projection is a mandatory input and is never
+        // materialized here. The shared per-project mutation lock remains held from
+        // explicit admission parsing through atomic publication and independent
+        // pointer/manifest/Ledger readback.
+        let kernel_admission = match parse_kernel_admission_request(args_obj) {
+            Ok(Some(admission)) => admission,
+            Ok(None) => {
+                return ToolFault::new(
+                    astrolabe_weave::ASTRO_KERNEL_ADMISSION_REQUIRED,
+                    "get_kernel mode=\"build\" requires an explicit real-query kernel_admission object",
+                    "supply nonempty independently authored queries plus every explicit graph-routed recall/work control; no current corpus is inherited by an operator-requested build",
+                )
+                .with_argument(
+                    KERNEL_ADMISSION_ARG,
+                    "required closed kernel_admission object for mode=build",
+                    &Value::Null,
+                )
+                .into_result();
+            }
+            Err(fault) => return fault.into_result(),
+        };
         let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&cache_dir, &project)?;
-        if !vault_dir.exists() {
+        let Some(shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
+            return ToolFault::new(
+                "ASTRO_SHADOW_IMPORT_BUSY",
+                format!(
+                    "a shadow publication or kernel build for project {project:?} is already active at {}",
+                    shadow_import_lock_path(&cache_dir, &project).display()
+                ),
+                "retry after that exact project mutation owner completes",
+            )
+            .with_detail("project", project.clone())
+            .with_detail(
+                "lock_path",
+                shadow_import_lock_path(&cache_dir, &project)
+                    .display()
+                    .to_string(),
+            )
+            .into_result();
+        };
+        shadow_import_lock.assert_owns(&cache_dir, &project)?;
+        if !kernel_vault_present(&vault_dir, &project, "get_kernel_build")? {
             return tool_json_error_result(json!({
                 "schema": "astrolabe.get_kernel.v1",
                 "status": "refused",
@@ -157,38 +269,57 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
                 "freshness": "not_evaluated",
             }));
         }
-        // Writable handles open every CF (the with-access contract ignores a CF
-        // selection when not read-only), which the build + persist path requires
-        // (Base/Graph to project, Anchors for the trust map, Kernel + Ledger to
-        // persist the artifact inside the verified chain).
-        let vault = open_shadow_vault_writable(&vault_dir, &vault_id, &vault_salt, Vec::new())?;
-        let summary = persist_index_time_kernel_artifact(&vault, &vault_dir, &project);
-        let response = get_kernel_build_response_json(&project, &summary);
-        return if response.get("status").and_then(Value::as_str) == Some("built") {
-            tool_json_result(response)
-        } else {
-            tool_json_error_result(response)
-        };
+        // One latest-state handle spans exactly the source and publication CFs:
+        // Graph+Kernel for the persisted projection, Anchors+Kv for effective
+        // trust, S20+Compression for the complete vector binding, and
+        // Kernel+Ledger+TimeIndex for the one atomic generation commit. No
+        // historical MVCC rows are restored.
+        let vault = open_shadow_vault_writable_latest_selected(
+            &vault_dir,
+            &vault_id,
+            &vault_salt,
+            vec![
+                ColumnFamily::Graph,
+                ColumnFamily::Anchors,
+                ColumnFamily::Kv,
+                ColumnFamily::Kernel,
+                ColumnFamily::slot(astrolabe_weave::search::SLOT_NAME_SEMANTIC),
+                ColumnFamily::Compression,
+                ColumnFamily::Ledger,
+                ColumnFamily::TimeIndex,
+            ],
+        )?;
+        let publication = persist_index_time_kernel_artifact(
+            &vault,
+            &vault_dir,
+            &project,
+            Some(&kernel_admission),
+            KernelAdmissionContract::ExplicitRequired,
+        )?;
+        return tool_json_result(get_kernel_build_response_json(
+            &project,
+            &publication.receipt,
+        )?);
     }
-
-    let kernel_context = read_kernel_context_metadata(&cache_dir, &project)?;
 
     // #39: gaps + quadrant serve the flattened cross-scope grounding-gap views
     // owned by `kernel_gaps`. gaps ranks the ungrounded members by persisted
     // kernel weight; quadrant classifies every member into the coverage-vs-
-    // importance scatter. Both read back the same persisted kernel-context
-    // metadata and fail closed when the scope summaries are unavailable.
+    // importance scatter. Both resolve their members and evidence from one
+    // complete current generation rather than separately published context.
     if mode == "gaps" || mode == "quadrant" {
         // #365/#540: the persisted KernelArtifact is the sole source of truth for
         // gap/quadrant reads. A missing or unreadable artifact is a state failure,
         // never permission to substitute a degraded scope summary.
         match read_project_kernel_artifact(&cache_dir, &project) {
-            Ok(Some(artifact)) => {
-                return if mode == "gaps" {
-                    tool_json_result(artifact_gap_report_value(&project, &artifact))
+            Ok(Some(generation)) => {
+                let mut response = if mode == "gaps" {
+                    artifact_gap_report_value(&project, &generation.artifact)
                 } else {
-                    tool_json_result(artifact_quadrant_value(&project, &artifact))
+                    artifact_quadrant_value(&project, &generation.artifact)
                 };
+                attach_kernel_generation_evidence(&mut response, &generation)?;
+                return tool_json_result(response);
             }
             Ok(None) => {
                 return tool_json_error_result(json!({
@@ -217,33 +348,60 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         }
     }
 
-    let summaries = match kernel_context_scope_summaries(&kernel_context) {
-        Some(summaries) => summaries,
-        None => {
-            let reason = kernel_context
-                .get("scope_summaries")
-                .and_then(|value| value.get("reason"))
-                .and_then(Value::as_str)
-                .unwrap_or("kernel context scope summaries unavailable");
+    // One retained vault snapshot selects the artifact, complete S20 index, and
+    // member-derived scope summaries. A separately persisted kernel-context
+    // document is not a generation selector and must never be joined here.
+    let state = match read_kernel_index_state(&cache_dir, &project) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            return tool_json_error_result(json!({
+                "schema": "astrolabe.get_kernel.v1",
+                "status": "refused",
+                "mode": mode,
+                "project": project,
+                "code": astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
+                "message": format!("project {project:?} has no complete persisted kernel artifact/member-index generation"),
+                "remediation": "run index_repository with calyx=\"shadow\" and explicit kernel_admission so one complete graph-bound artifact, S20 member index, real-query corpus, and recall report are atomically published before reading the kernel",
+                "trust": "not_evaluated",
+                "freshness": "not_evaluated",
+            }));
+        }
+        Err(error) => {
+            return tool_json_error_result(json!({
+                "schema": "astrolabe.get_kernel.v1",
+                "status": "refused",
+                "mode": mode,
+                "project": project,
+                "code": ASTRO_KERNEL_INDEX_UNAVAILABLE,
+                "message": format!("complete kernel generation could not be read for project {project:?}: {error}"),
+                "remediation": "repair the shadow vault and its current pointer/manifest/artifact/S20 index/query/report/Ledger generation, then retry; no metadata or legacy-index substitute is served",
+                "trust": "not_evaluated",
+                "freshness": "not_evaluated",
+            }));
+        }
+    };
+    let summaries = match scope_summaries_from_collection(&state.scope_summaries) {
+        Ok(summaries) => summaries,
+        Err(error) => {
             return tool_json_error_result(json!({
                 "schema": "astrolabe.get_kernel.v1",
                 "status": "refused",
                 "mode": mode,
                 "code": ASTRO_GET_KERNEL_UNAVAILABLE,
-                "message": reason,
-                "remediation": "rerun index_repository with calyx=\"shadow\" so the kernel scope summaries are persisted before requesting get_kernel",
-                "trust": "provisional",
+                "message": format!("the current complete generation produced an invalid member-derived scope summary: {error}"),
+                "remediation": "repair the current artifact member/identity join and republish one complete generation",
+                "trust": "not_evaluated",
                 "freshness": "not_evaluated",
             }));
         }
     };
 
-    let selected: Vec<&Value> = match &scope {
+    let selected: Vec<&ValidatedScopeSummary> = match &scope {
         Some(scope_id) => {
-            let matched: Vec<&Value> = summaries
+            let matched: Vec<&ValidatedScopeSummary> = summaries
                 .iter()
                 .filter(|summary| {
-                    summary.get("scope_id").and_then(Value::as_str) == Some(scope_id.as_str())
+                    summary.json.get("scope_id").and_then(Value::as_str) == Some(scope_id.as_str())
                 })
                 .collect();
             if matched.is_empty() {
@@ -267,38 +425,22 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         .iter()
         .map(|summary| get_kernel_scope_json(summary, mode))
         .collect::<Vec<_>>();
-    let all_grounded = selected.iter().all(|summary| {
-        summary.get("grounded_member_count").and_then(Value::as_u64)
-            == summary.get("total_member_count").and_then(Value::as_u64)
-    });
-    let total_gaps: u64 = selected
+    let all_grounded = selected
         .iter()
-        .map(|summary| scope_gap_count(summary))
-        .sum();
-
-    // #365/#882: the served index.json reports the embedding-backed index only
-    // when its physical manifest was actually built for this generation. A
-    // membership manifest is capability ABSENCE, reported as such; a config,
-    // vault, artifact, or index-build failure is a state failure and propagates
-    // as a coded refusal. Neither is ever laundered into a served index.
-    let index = match read_kernel_index_state(&cache_dir, &project) {
-        Ok(Some(index)) => index,
-        Ok(None) => kernel_index_absent_value(
-            None,
-            &format!(
-                "project {project:?} has no persisted kernel artifact, so no member index exists"
-            ),
-        ),
-        Err(error) => {
+        .all(|summary| summary.grounded_member_count == summary.total_member_count);
+    let total_gaps = match selected.iter().try_fold(0_u64, |total, summary| {
+        total.checked_add(scope_gap_count(summary))
+    }) {
+        Some(total) => total,
+        None => {
             return tool_json_error_result(json!({
                 "schema": "astrolabe.get_kernel.v1",
                 "status": "refused",
                 "mode": mode,
-                "project": project,
-                "code": ASTRO_KERNEL_INDEX_UNAVAILABLE,
-                "message": format!("kernel member index could not be read for project {project:?}: {error}"),
-                "remediation": "repair the shadow vault and its persisted Kernel artifact, then retry get_kernel; no membership-manifest substitute is served for a read failure",
-                "trust": "provisional",
+                "code": ASTRO_GET_KERNEL_UNAVAILABLE,
+                "message": "the exact scope-summary gap total is not representable as u64",
+                "remediation": "repair the scope-summary collection and republish one representable complete generation",
+                "trust": "not_evaluated",
                 "freshness": "not_evaluated",
             }));
         }
@@ -313,77 +455,95 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         "scope_count": scopes_json.len(),
         "gap_count": total_gaps,
         "scopes": scopes_json,
-        "index": index,
+        "index": state.index,
         "trust": if all_grounded { "verified" } else { "provisional" },
         "freshness": "fresh",
-        "provenance": format!("kernel_context.scope_summaries (astrolabe.scope_summary.v1) of {project}"),
+        "provenance": format!("complete-kernel-generation member-derived scope summary of {project}"),
     }))
 }
 
-/// Reshapes the index-time kernel-artifact persist summary
+/// Reshapes the index-time complete-generation persist summary
 /// ([`persist_index_time_kernel_artifact`]) into the `get_kernel mode="build"`
 /// response (#410). A `persisted` summary serves `status:"built"` carrying the real
-/// member/node/recall/readback fields the build produced and read back; any other
-/// status is a fail-closed refusal carrying the build layer's real reason under
-/// [`ASTRO_KERNEL_BUILD_UNAVAILABLE`] — never a fabricated build.
-fn get_kernel_build_response_json(project: &str, summary: &Value) -> Value {
-    let status = summary
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("unavailable");
-    if status == "persisted" {
-        return json!({
+/// source/FVS/S20/query/report/pointer/readback fields the build produced and read back. Build
+/// failures never reach this serializer: [`persist_index_time_kernel_artifact`]
+/// returns a typed [`ASTRO_KERNEL_GENERATION_FAILED`] fault instead.
+fn get_kernel_build_response_json(project: &str, summary: &Value) -> Result<Value, DynError> {
+    if summary.get("schema").and_then(Value::as_str) != Some(KERNEL_ARTIFACT_PERSIST_SCHEMA)
+        || summary.get("status").and_then(Value::as_str) != Some("persisted")
+    {
+        return Err(kernel_generation_fault(
+            project,
+            &kernel_artifact_scope_id(project),
+            "response_validation",
+            None,
+            format!("unexpected successful kernel summary: {summary}"),
+            None,
+            "repair the kernel generation result serializer so it emits the exact persisted schema before retrying",
+        ));
+    }
+    Ok(json!({
             "schema": "astrolabe.get_kernel.v1",
             "status": "built",
             "mode": "build",
             "project": project,
+            "published": summary.get("published"),
             "scope_id": summary.get("scope_id"),
+            "generation_id": summary.get("generation_id"),
+            "source_generation_identity": summary.get("source_generation_identity"),
             "members_hash": summary.get("members_hash"),
             "member_count": summary.get("member_count"),
             "node_count": summary.get("node_count"),
-            "recall_permille": summary.get("recall_permille"),
-            "recall_gated": summary.get("recall_gated"),
+            "graph_coverage": summary.get("graph_coverage"),
+            "compactness": summary.get("compactness"),
+            "fvs_validity": summary.get("fvs_validity"),
             "anchor_grounded": summary.get("anchor_grounded"),
             "trusted_anchor_count": summary.get("trusted_anchor_count"),
+            "source_identity": summary.get("source_identity"),
+            "source_identity_readback": summary.get("source_identity_readback"),
             "rows_readback_verified": summary.get("rows_readback_verified"),
+            "readback_rows": summary.get("readback_rows"),
+            "decoded_rows_verified": summary.get("decoded_rows_verified"),
             "ledger_paired": summary.get("ledger_paired"),
             "commit_seq": summary.get("commit_seq"),
             "ledger_ref": summary.get("ledger_ref"),
+            "ledger_physical_tiers": summary.get("ledger_physical_tiers"),
+            "manifest": summary.get("manifest"),
+            "pointer": summary.get("pointer"),
+            "retired_generation_id": summary.get("retired_generation_id"),
+            "query_admission": summary.get("query_admission"),
+            "member_index": summary.get("member_index"),
+            "flush": summary.get("flush"),
             "trust": summary.get("trust"),
             "freshness": summary.get("freshness"),
             "provenance": summary.get("provenance"),
-        });
-    }
-    // `unavailable` (or an unexpected summary shape): the build produced no kernel.
-    // Surface the persist layer's real reason verbatim rather than the retired
-    // ADAPTER_PENDING stub.
-    let reason = summary
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("kernel build did not persist a kernel artifact for this project");
-    json!({
-        "schema": "astrolabe.get_kernel.v1",
-        "status": "refused",
-        "mode": "build",
-        "project": project,
-        "code": ASTRO_KERNEL_BUILD_UNAVAILABLE,
-        "message": reason,
-        "remediation": "the vault association graph yielded no kernel (empty graph, no typed edges, an empty anchor set, or an unreachable recall gate); rerun index_repository with calyx=\"shadow\" over a corpus with typed associations and anchors, then retry get_kernel mode=\"build\"",
-        "trust": "provisional",
-        "freshness": "not_evaluated",
-    })
+    }))
 }
 
-/// Reads the persisted whole-repo `KernelArtifact` for a project back out of the
-/// vault Kernel CF (#365), read-only and independent of the index-time write path.
-/// `Ok(None)` when no kernel artifact was persisted for the project; callers
-/// surface that absence explicitly and never substitute another representation.
-pub(crate) fn read_project_kernel_artifact(
+/// Resolves the current whole-repo artifact, real-query corpus, recall report,
+/// manifest, and pointer as one read-only composite generation (#365/#1148).
+/// `Ok(None)` means the project's shadow vault is absent. An existing vault
+/// without a complete current pointer is an incomplete generation and fails
+/// closed; no legacy fixed alias is substituted. Gaps/quadrant do not execute
+/// vector search, so this reader verifies the member descriptor but deliberately
+/// does not materialize bindings or HNSW bytes. Its work is bounded by artifact,
+/// query/report, manifest, and descriptor bytes rather than `O(K*D)` index bytes.
+struct ProjectKernelArtifactRead {
+    artifact: astrolabe_kernel::KernelArtifact,
+    query_corpus: astrolabe_weave::KernelRecallQueryCorpus,
+    graph_routed_report: astrolabe_kernel::GraphRoutedRecallReport,
+    manifest: astrolabe_weave::KernelGenerationManifest,
+    pointer: astrolabe_weave::KernelGenerationPointer,
+    descriptor: astrolabe_weave::KernelMemberIndexDescriptor,
+    rows_verified: usize,
+}
+
+fn read_project_kernel_artifact(
     cache_dir: &Path,
     project: &str,
-) -> Result<Option<astrolabe_kernel::KernelArtifact>, DynError> {
+) -> Result<Option<ProjectKernelArtifactRead>, DynError> {
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
-    if !vault_dir.exists() {
+    if !kernel_vault_present(&vault_dir, project, "read_project_kernel_artifact")? {
         return Ok(None);
     }
     let vault = open_shadow_vault_read_only(
@@ -393,44 +553,159 @@ pub(crate) fn read_project_kernel_artifact(
         vec![
             ColumnFamily::Kernel,
             ColumnFamily::Graph,
-            ColumnFamily::Base,
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Slot(astrolabe_weave::search::SLOT_NAME_SEMANTIC),
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
         ],
     )?;
+    let read_lease = vault.retain_latest_snapshot();
+    let read_seq = read_lease.seq();
     let scope_id = kernel_artifact_scope_id(project);
-    let artifact = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?;
-    Ok(artifact)
+    let artifact_read =
+        astrolabe_weave::read_current_kernel_generation_artifact(&vault, project, &scope_id)?
+            .ok_or_else(|| {
+            astrolabe_weave::search::SearchError::new(
+                astrolabe_weave::ASTRO_KERNEL_GENERATION_INCOMPLETE,
+                format!(
+                    "shadow vault {} for project {project:?} exists but has no current complete kernel generation for scope {scope_id:?}",
+                    vault_dir.display(),
+                ),
+                "rebuild and atomically publish the complete artifact/index/query/report generation; an existing shadow vault without its required current pointer is not an unindexed-project absence",
+            )
+            })?;
+    let descriptor_read = astrolabe_weave::read_current_kernel_generation_descriptor(
+        &vault,
+        project,
+        &scope_id,
+        &artifact_read.artifact.members_hash,
+    )?
+    .ok_or_else(|| {
+        astrolabe_weave::search::SearchError::new(
+            astrolabe_weave::ASTRO_KERNEL_GENERATION_INCOMPLETE,
+            format!(
+                "current complete kernel generation for project {project:?} scope {scope_id:?} lost its member descriptor"
+            ),
+            "repair and atomically republish the complete generation; descriptor absence is never treated as a membership-only success",
+        )
+    })?;
+    if descriptor_read.manifest != artifact_read.manifest
+        || descriptor_read.pointer != artifact_read.pointer
+    {
+        return Err(format!(
+            "{ASTRO_KERNEL_SOURCE_IDENTITY_STALE}: artifact and member descriptor resolved different current generation headers under retained seq {read_seq}; remediation: preserve and repair the composite pointer/manifest"
+        )
+        .into());
+    }
+    if vault.latest_seq() != read_seq {
+        return Err(format!(
+            "{ASTRO_KERNEL_SOURCE_IDENTITY_STALE}: vault moved from retained read sequence {read_seq} to {} while resolving the current complete generation; remediation: retry against one stable current generation",
+            vault.latest_seq()
+        )
+        .into());
+    }
+    drop(read_lease);
+    Ok(Some(ProjectKernelArtifactRead {
+        artifact: artifact_read.artifact,
+        query_corpus: artifact_read.query_corpus,
+        graph_routed_report: artifact_read.graph_routed_report,
+        manifest: artifact_read.manifest,
+        pointer: artifact_read.pointer,
+        descriptor: descriptor_read.descriptor,
+        // Artifact/header validation accounts for 12 unique physical rows;
+        // descriptor generation+alias adds two. Binding/HNSW bytes are
+        // deliberately not read by gaps/quadrant.
+        rows_verified: artifact_read.rows_verified + 2,
+    }))
 }
 
-/// Renders the honest capability-absence view of a kernel member index (#882).
-///
-/// A kernel whose members carry no persisted S18 vectors has **no** semantic
-/// member index. That is an absent capability, not a degraded one, so this value
-/// carries `status:"absent"` and the same [`astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT`]
-/// code `kernel_scoped_semantic_query` refuses with — never a `provisional`
-/// membership manifest dressed as an index. `freshness` is `not_evaluated`
-/// because nothing was measured.
-pub(crate) fn kernel_index_absent_value(
-    index: Option<&astrolabe_weave::KernelMemberIndex>,
-    reason: &str,
-) -> Value {
-    json!({
-        "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
-        "status": "absent",
-        "code": astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
-        "configured_index_kind": "embedding_backed_hnsw",
-        "active_index_kind": index.map(|index| index.index_kind.as_str()),
-        "members_hash": index.map(|index| index.members_hash.clone()),
-        "base_seq": index.map(|index| index.base_seq),
-        "indexed_member_count": index.map_or(0, |index| index.indexed_member_count),
-        "missing_vector_members": index.map(|index| index.missing_vector_members.clone()),
-        "message": reason,
-        "remediation": "re-run index_repository with calyx=\"shadow\" so the kernel members carry persisted S18 code-semantic vectors, then rebuild the kernel with get_kernel mode=\"build\"; a membership manifest is not a substitute for the semantic member index",
-        "trust": "not_evaluated",
-        "freshness": "not_evaluated",
-    })
+fn attach_kernel_generation_evidence(
+    response: &mut Value,
+    generation: &ProjectKernelArtifactRead,
+) -> Result<(), DynError> {
+    let object = response.as_object_mut().ok_or_else(|| -> DynError {
+        "ASTRO_GET_KERNEL_RESPONSE_INVALID: kernel response is not an object"
+            .to_string()
+            .into()
+    })?;
+    object.insert(
+        "generation".to_string(),
+        json!({
+            "generation_id": generation.manifest.generation_id,
+            "manifest": generation.manifest,
+            "pointer": generation.pointer,
+            "query_corpus": generation.query_corpus,
+            "graph_routed_report": generation.graph_routed_report,
+            "decoded_rows_verified": generation.rows_verified,
+            "member_index": {
+                "descriptor": &generation.descriptor,
+                "binding_count": generation.descriptor.binding_count,
+                "read_scope": "descriptor_only_no_hnsw_materialization",
+            },
+            "artifact_source_identity": generation.artifact.source_identity,
+            "fvs_validity": generation.artifact.fvs_validity,
+            "compactness": generation.artifact.compactness,
+            "graph_coverage": generation.artifact.graph_coverage,
+        }),
+    );
+    Ok(())
 }
 
-/// Reads the persisted kernel artifact **and** builds its embedding-backed member
+/// Produces serving evidence from the already-verified complete-generation
+/// source binding and the manifest-bound CSR. The generation reader has
+/// independently point-read the durable Graph/Anchors/Kv generations and exact
+/// projection manifest before this helper is called.
+pub(crate) fn bounded_kernel_source_evidence(
+    csr: &astrolabe_ingest::GraphProjectionCsr,
+    artifact: &astrolabe_kernel::KernelArtifact,
+    manifest: &astrolabe_weave::KernelGenerationManifest,
+    snapshot: u64,
+) -> Result<Value, DynError> {
+    let projection = &manifest.generation_source_binding.projection_manifest;
+    let observed_source_fingerprint = hex_lower(&csr.source_fingerprint_blake3);
+    if observed_source_fingerprint != projection.source_fingerprint_blake3
+        || csr.nodes.len() != projection.node_count
+        || csr.edges.len() != projection.edge_count
+        || csr.association_edge_count != projection.association_edge_count
+        || artifact.source_identity != manifest.artifact_source_identity
+    {
+        return Err(Box::new(
+            ToolFault::new(
+                ASTRO_KERNEL_SOURCE_IDENTITY_STALE,
+                format!(
+                    "manifest-bound kernel source differs at snapshot {snapshot}: expected_fingerprint={}, observed_fingerprint={observed_source_fingerprint}, expected_nodes={}, observed_nodes={}, expected_edges={}, observed_edges={}, expected_association_edges={}, observed_association_edges={}",
+                    projection.source_fingerprint_blake3,
+                    projection.node_count,
+                    csr.nodes.len(),
+                    projection.edge_count,
+                    csr.edges.len(),
+                    projection.association_edge_count,
+                    csr.association_edge_count,
+                ),
+                "preserve the current generation and rebuild it from one exact Graph/Anchors/Kv source binding; serving never substitutes a stale projection or artifact",
+            )
+            .with_detail("read_snapshot_seq", snapshot)
+            .with_detail("generation_id", &manifest.generation_id)
+            .with_detail("expected_projection_manifest", json!(projection))
+            .with_detail("artifact_source_identity", json!(&artifact.source_identity)),
+        ));
+    }
+    Ok(json!({
+        "schema": "astrolabe.kernel_source_readback.v2",
+        "read_snapshot_seq": snapshot,
+        "generation_id": &manifest.generation_id,
+        "source_identity": &artifact.source_identity,
+        "generation_source_binding": &manifest.generation_source_binding,
+        "projection_source_fingerprint_blake3": observed_source_fingerprint,
+        "projection_node_count": csr.nodes.len(),
+        "projection_edge_count": csr.edges.len(),
+        "projection_association_edge_count": csr.association_edge_count,
+        "verified": true,
+    }))
+}
+
+/// Reads the persisted kernel artifact and its complete embedding-backed member
 /// index for one project through a single read-only vault handle (#365/#344/#882).
 ///
 /// One open per request, for one generation: the artifact read and the member
@@ -439,102 +714,162 @@ pub(crate) fn kernel_index_absent_value(
 ///
 /// Fail-closed contract (#882): every config, vault, artifact, and index-build
 /// failure is returned as an `Err` and surfaces as a coded refusal. `Ok(None)`
-/// means no kernel artifact is persisted at all. A built index that is a labeled
-/// [`astrolabe_weave::KernelIndexKind::MembershipManifestOnly`] returns the
-/// capability-absence value — it is never reported as an equivalent index, and
-/// the embedding-backed view is served only when the physical manifest exists and
-/// its `members_hash` matches the artifact the same handle just read.
+/// means the project's shadow vault is absent. Membership-only or partial
+/// descriptors are invalid production state and return a structured error. The
+/// embedding-backed view is served only when its complete physical roster,
+/// source binding, and `members_hash` match the artifact read by this same handle.
+pub(crate) struct ProjectKernelIndexState {
+    pub(crate) index: Value,
+    pub(crate) scope_summaries: Value,
+}
+
 pub(crate) fn read_kernel_index_state(
     cache_dir: &Path,
     project: &str,
-) -> Result<Option<Value>, DynError> {
+) -> Result<Option<ProjectKernelIndexState>, DynError> {
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
-    if !vault_dir.exists() {
+    if !kernel_vault_present(&vault_dir, project, "read_kernel_index_state")? {
         return Ok(None);
     }
     let vault = open_shadow_vault_read_only(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Kernel],
+        vec![
+            ColumnFamily::Kernel,
+            ColumnFamily::Base,
+            ColumnFamily::Graph,
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Slot(astrolabe_weave::search::SLOT_NAME_SEMANTIC),
+            ColumnFamily::Compression,
+            ColumnFamily::Ledger,
+        ],
     )?;
+    let read_lease = vault.retain_latest_snapshot();
+    let read_seq = read_lease.seq();
     let scope_id = kernel_artifact_scope_id(project);
-    let Some(artifact) = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?
-    else {
-        return Ok(None);
-    };
-
-    let Some(index) = astrolabe_weave::read_persisted_kernel_member_index(
+    let generation = astrolabe_weave::read_current_kernel_generation(&vault, project, &scope_id)?
+        .ok_or_else(|| {
+            astrolabe_weave::search::SearchError::new(
+                astrolabe_weave::ASTRO_KERNEL_GENERATION_INCOMPLETE,
+                format!(
+                    "shadow vault {} for project {project:?} exists but has no current complete kernel generation for scope {scope_id:?}",
+                    vault_dir.display(),
+                ),
+                "rebuild and atomically publish the complete artifact/index/query/report generation; no partial or legacy member index is served",
+            )
+        })?;
+    let csr = astrolabe_ingest::read_graph_projection_csr_bound_at(
         &vault,
-        project,
-        &scope_id,
-        &artifact.members_hash,
-    )?
-    else {
-        return Ok(Some(kernel_index_absent_value(
-            None,
-            "the kernel artifact exists but its exact persisted member-index generation is absent",
-        )));
-    };
+        astrolabe_ingest::GraphProjectionKind::KernelGraph,
+        read_seq,
+        &astrolabe_ingest::GraphProjectionReadBinding {
+            graph_content_generation: generation
+                .manifest
+                .generation_source_binding
+                .graph_content_generation,
+            manifest: generation
+                .manifest
+                .generation_source_binding
+                .projection_manifest
+                .clone(),
+        },
+    )?;
+    let kernel_source_verification =
+        bounded_kernel_source_evidence(&csr, &generation.artifact, &generation.manifest, read_seq)?;
+    let scope_summaries =
+        scope_summaries_from_kernel_artifact(&vault, project, &generation.artifact)?;
+    let index = &generation.index;
 
     if index.descriptor.index_kind != astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw {
-        return Ok(Some(kernel_index_absent_value(
-            None,
-            &format!(
-                "{} of {} kernel member(s) carry a persisted S18 code-semantic vector, so no \
-                 embedding-backed member index exists for members_hash {}",
-                index.descriptor.indexed_member_count, artifact.member_count, artifact.members_hash
+        return Err(astrolabe_weave::search::SearchError::new(
+            astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
+            format!(
+                "obsolete membership-only index found for members_hash {}; current serving requires one S20 name-semantic vector/HNSW row for all {} members",
+                generation.artifact.members_hash, generation.artifact.member_count
             ),
-        )));
+            "rebuild and atomically publish the complete current S20 member-index generation; no membership-only substitute is served",
+        )
+        .into());
     }
     // The index is content-addressed by members_hash; serving it against a
     // different artifact would silently answer from another generation.
-    if index.descriptor.members_hash != artifact.members_hash {
+    if index.descriptor.members_hash != generation.artifact.members_hash {
         return Err(format!(
             "{}: kernel member index members_hash {} does not match the artifact members_hash {} \
              read through the same vault handle",
             astrolabe_weave::ASTRO_KERNEL_INDEX_STALE,
             index.descriptor.members_hash,
-            artifact.members_hash
+            generation.artifact.members_hash
         )
         .into());
     }
+    let source_verification = astrolabe_weave::verify_kernel_member_index_source_at_latest(
+        &vault,
+        &vault_dir,
+        &index.descriptor,
+    )?;
+    if vault.latest_seq() != read_seq {
+        return Err(format!(
+            "{ASTRO_KERNEL_SOURCE_IDENTITY_STALE}: vault moved from retained read sequence {read_seq} to {} while resolving the complete artifact/index generation; remediation: retry against one stable current generation",
+            vault.latest_seq()
+        )
+        .into());
+    }
+    drop(read_lease);
 
-    Ok(Some(json!({
+    let index = json!({
         "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
         "status": "served",
         "index_kind": index.descriptor.index_kind.as_str(),
         "selection_reason": "persisted checksum-validated Calyx HNSW for this artifact's exact project/scope/members_hash/base_seq",
+        "generation_id": generation.manifest.generation_id,
+        "source_generation_identity": generation.manifest.source_generation_identity,
+        "manifest": generation.manifest,
+        "pointer": generation.pointer,
+        "query_corpus": generation.query_corpus,
+        "graph_routed_report": generation.graph_routed_report,
+        "decoded_rows_verified": generation.rows_verified,
+        "artifact_source_identity": generation.artifact.source_identity,
+        "fvs_validity": generation.artifact.fvs_validity,
+        "compactness": generation.artifact.compactness,
+        "graph_coverage": generation.artifact.graph_coverage,
         "members_hash": index.descriptor.members_hash,
-        "member_count": artifact.member_count,
+        "member_count": generation.artifact.member_count,
         "indexed_member_count": index.descriptor.indexed_member_count,
         "missing_vector_members": index.descriptor.missing_vector_members,
         "semantic_dim": index.descriptor.semantic_dim,
         "base_seq": index.descriptor.base_seq,
         "binding_count": index.descriptor.binding_count,
         "bindings_blake3": index.descriptor.bindings_blake3,
+        "source_binding_seq": index.descriptor.source_binding_seq,
+        "source_final_verification_seq": index.descriptor.source_final_verification_seq,
+        "source_binding": index.descriptor.source_binding,
+        "source_read_verification": source_verification,
+        "kernel_source_verification": kernel_source_verification,
         "hnsw_artifact_bytes": index.descriptor.hnsw_artifact_bytes,
         "hnsw_artifact_blake3": index.descriptor.hnsw_artifact_blake3,
         "backend": "hnsw",
         "trust": "verified",
         "freshness": "fresh",
         "provenance": [
-            format!("kernel-artifact:scope={}", artifact.scope_id),
-            "vault:slot(SLOT_CODE_SEMANTIC)".to_string(),
-            "astrolabe_weave::read_persisted_kernel_member_index(#996)".to_string(),
+            format!("kernel-generation:{}", generation.manifest.generation_id),
+            "vault:slot(S20_NAME_SEMANTIC)".to_string(),
+            "astrolabe_weave::read_current_kernel_generation(pointer+manifest+eight rows)".to_string(),
         ],
-    })))
+    });
+    Ok(Some(ProjectKernelIndexState {
+        index,
+        scope_summaries,
+    }))
 }
 
 /// Reshapes one persisted scope-summary into the `get_kernel` per-scope view.
 /// `read` carries every member; `gaps` carries only the ungrounded members.
-fn get_kernel_scope_json(summary: &Value, mode: &str) -> Value {
-    let members = summary
-        .get("members")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let member_views = members
+fn get_kernel_scope_json(summary: &ValidatedScopeSummary, mode: &str) -> Value {
+    let member_views = summary
+        .members
         .iter()
         .filter(|member| {
             mode != "gaps" || member.get("grounded").and_then(Value::as_bool) != Some(true)
@@ -551,43 +886,181 @@ fn get_kernel_scope_json(summary: &Value, mode: &str) -> Value {
         .collect::<Vec<_>>();
 
     json!({
-        "scope_id": summary.get("scope_id"),
-        "summary_hash": summary.get("summary_hash"),
-        "member_count": summary.get("total_member_count"),
-        "grounded_member_count": summary.get("grounded_member_count"),
+        "scope_id": summary.json.get("scope_id"),
+        "summary_hash": summary.json.get("summary_hash"),
+        "member_count": summary.total_member_count,
+        "grounded_member_count": summary.grounded_member_count,
         "gap_count": scope_gap_count(summary),
-        "grounded_fraction_millipoints": summary.get("grounded_fraction_millipoints"),
-        "recall": summary.get("recall"),
-        "recall_millipoints": summary.get("recall_millipoints"),
+        "grounded_fraction_millipoints": summary.json.get("grounded_fraction_millipoints"),
+        "graph_coverage": summary.json.get("graph_coverage"),
+        "graph_coverage_millipoints": summary.json.get("graph_coverage_millipoints"),
         "members": member_views,
-        "trust": summary.get("trust"),
-        "freshness": summary.get("freshness"),
+        "trust": summary.json.get("trust"),
+        "freshness": summary.json.get("freshness"),
     })
 }
 
-fn scope_gap_count(summary: &Value) -> u64 {
-    let total = summary
-        .get("total_member_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let grounded = summary
-        .get("grounded_member_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    total.saturating_sub(grounded)
+fn scope_gap_count(summary: &ValidatedScopeSummary) -> u64 {
+    summary.total_member_count - summary.grounded_member_count
 }
 
-/// Extracts the persisted `scope_summaries.summaries` array from a kernel context
-/// document, or `None` when scope summaries were not built (unavailable/empty).
-fn kernel_context_scope_summaries(kernel_context: &Value) -> Option<Vec<Value>> {
-    let scope_summaries = kernel_context.get("scope_summaries")?;
-    if scope_summaries.get("status").and_then(Value::as_str) == Some("unavailable") {
-        return None;
+#[derive(Clone)]
+struct ValidatedScopeSummary {
+    json: Value,
+    members: Vec<Value>,
+    grounded_member_count: u64,
+    total_member_count: u64,
+}
+
+/// Reconstructs and byte-semantically validates a complete, nonempty
+/// member-derived scope-summary collection. Serving never defaults missing
+/// counts/members or clamps contradictory persisted measurements.
+fn scope_summaries_from_collection(
+    scope_summaries: &Value,
+) -> Result<Vec<ValidatedScopeSummary>, String> {
+    if scope_summaries.get("schema").and_then(Value::as_str)
+        != Some(SCOPE_SUMMARY_COLLECTION_SCHEMA)
+        || scope_summaries
+            .get("summary_schema")
+            .and_then(Value::as_str)
+            != Some(SCOPE_SUMMARY_SCHEMA)
+        || scope_summaries.get("status").and_then(Value::as_str) != Some("built")
+        || scope_summaries.get("skipped_count").and_then(Value::as_u64) != Some(0)
+    {
+        return Err("collection schema/status/summary_schema/skipped_count is not the complete built contract".to_string());
     }
-    scope_summaries
+    let summaries = scope_summaries
         .get("summaries")
         .and_then(Value::as_array)
-        .map(|summaries| summaries.to_vec())
+        .filter(|summaries| !summaries.is_empty())
+        .ok_or_else(|| "collection has no nonempty summaries array".to_string())?;
+    if scope_summaries.get("summary_count").and_then(Value::as_u64)
+        != u64::try_from(summaries.len()).ok()
+    {
+        return Err("collection summary_count does not equal the summaries roster".to_string());
+    }
+
+    let mut scope_ids = BTreeSet::new();
+    let mut rebuilt = Vec::with_capacity(summaries.len());
+    let mut validated = Vec::with_capacity(summaries.len());
+    for (ordinal, summary) in summaries.iter().enumerate() {
+        if summary.get("schema").and_then(Value::as_str) != Some(SCOPE_SUMMARY_SCHEMA)
+            || summary.get("freshness").and_then(Value::as_str) != Some("fresh")
+        {
+            return Err(format!(
+                "summary ordinal {ordinal} has an invalid schema/freshness"
+            ));
+        }
+        let scope_id = required_nonempty_summary_string(summary, ordinal, "scope_id")?;
+        if !scope_ids.insert(scope_id.to_string()) {
+            return Err(format!("scope_id {scope_id:?} occurs more than once"));
+        }
+        let dirty_region_hash =
+            required_nonempty_summary_string(summary, ordinal, "dirty_region_hash")?;
+        let trust = summary
+            .get("trust")
+            .and_then(Value::as_str)
+            .filter(|trust| matches!(*trust, "verified" | "provisional"))
+            .ok_or_else(|| format!("summary ordinal {ordinal} has invalid trust"))?;
+        let members = summary
+            .get("members")
+            .and_then(Value::as_array)
+            .filter(|members| !members.is_empty())
+            .ok_or_else(|| format!("summary ordinal {ordinal} has no members"))?;
+        let mut member_ids = BTreeSet::new();
+        let mut typed_members = Vec::with_capacity(members.len());
+        for (member_ordinal, member) in members.iter().enumerate() {
+            let symbol_id = required_nonempty_summary_string(member, member_ordinal, "symbol_id")?;
+            if !member_ids.insert(symbol_id.to_string()) {
+                return Err(format!(
+                    "summary {scope_id:?} repeats member symbol_id {symbol_id:?}"
+                ));
+            }
+            let qualified_name =
+                required_nonempty_summary_string(member, member_ordinal, "qualified_name")?;
+            let provenance_ref =
+                required_nonempty_summary_string(member, member_ordinal, "provenance_ref")?;
+            let kernel_weight = member
+                .get("kernel_weight")
+                .and_then(Value::as_u64)
+                .filter(|weight| *weight <= 1_000)
+                .ok_or_else(|| {
+                    format!("summary {scope_id:?} member {symbol_id:?} has invalid kernel_weight")
+                })?;
+            let grounded = member
+                .get("grounded")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "summary {scope_id:?} member {symbol_id:?} has no boolean grounded value"
+                    )
+                })?;
+            typed_members.push(ScopeSummaryMember::new(
+                symbol_id,
+                qualified_name,
+                kernel_weight,
+                grounded,
+                provenance_ref,
+            ));
+        }
+        let graph_coverage = match summary.get("graph_coverage") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let covered = value
+                    .get("covered")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("summary {scope_id:?} has invalid covered count"))?;
+                let total = value
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .filter(|total| *total > 0)
+                    .ok_or_else(|| format!("summary {scope_id:?} has invalid coverage total"))?;
+                if covered > total || covered.checked_mul(1_000).is_none() {
+                    return Err(format!(
+                        "summary {scope_id:?} coverage is contradictory or not representable"
+                    ));
+                }
+                Some(ScopeGraphCoverageMeasurement { covered, total })
+            }
+        };
+        let observed = summarize_scope_kernel(&ScopeSummaryInput::new(
+            scope_id,
+            dirty_region_hash,
+            trust == "verified",
+            typed_members,
+            graph_coverage,
+        ));
+        let total_member_count = u64::try_from(observed.total_member_count)
+            .map_err(|_| format!("summary {scope_id:?} member count exceeds u64"))?;
+        let grounded_member_count = u64::try_from(observed.grounded_member_count)
+            .map_err(|_| format!("summary {scope_id:?} grounded count exceeds u64"))?;
+        rebuilt.push(observed);
+        validated.push(ValidatedScopeSummary {
+            json: summary.clone(),
+            members: members.clone(),
+            grounded_member_count,
+            total_member_count,
+        });
+    }
+    if scope_summaries_json(&rebuilt, 0) != *scope_summaries {
+        return Err(
+            "collection bytes do not equal the independently rebuilt canonical summaries"
+                .to_string(),
+        );
+    }
+    Ok(validated)
+}
+
+fn required_nonempty_summary_string<'a>(
+    value: &'a Value,
+    ordinal: usize,
+    field: &str,
+) -> Result<&'a str, String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("row ordinal {ordinal} has no nonempty {field}"))
 }
 
 pub(crate) fn handle_kernel_answer(args_json: &str) -> Result<String, DynError> {
@@ -595,8 +1068,9 @@ pub(crate) fn handle_kernel_answer(args_json: &str) -> Result<String, DynError> 
     let Some(args_obj) = args.as_object() else {
         return tool_error_result("kernel_answer arguments must be a JSON object");
     };
-    // #459: fleet-scope answers serve from the fleet catalog vault (declared
-    // exemplar retrieval with per-repo citations); project/dial not required.
+    // #1151: fleet scopes resolve through their atomic artifact/index/query/
+    // report generation. They never fall through to a project/dial reader or
+    // the retained historical fixed-row fleet artifact.
     if let Some(scope_id) = string_arg(args_obj, "scope")
         && is_fleet_scope(scope_id)
     {
@@ -681,15 +1155,16 @@ pub(crate) struct KernelAnswerInputs {
 /// reference is ever fabricated — a node the provenance store does not cover stays
 /// unprovenanced and the engine refuses to serve it as an entry.
 ///
-/// `Ok(None)` when the project has no persisted kernel artifact or graph projection
-/// (nothing to answer from); the caller fails closed with a coded dependency error.
+/// `Ok(None)` only when the project's shadow vault is absent. Once the vault
+/// exists, a missing current generation or graph projection is corrupt/incomplete
+/// state and returns a coded error rather than masquerading as an unindexed project.
 pub(crate) fn build_kernel_answer_inputs(
     cache_dir: &Path,
     project: &str,
     query: &str,
 ) -> Result<Option<KernelAnswerInputs>, DynError> {
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
-    if !vault_dir.exists() {
+    if !kernel_vault_present(&vault_dir, project, "build_kernel_answer_inputs")? {
         return Ok(None);
     }
     let vault = open_shadow_vault_read_only(
@@ -699,31 +1174,58 @@ pub(crate) fn build_kernel_answer_inputs(
         vec![
             ColumnFamily::Graph,
             ColumnFamily::Kernel,
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Slot(astrolabe_weave::search::SLOT_NAME_SEMANTIC),
+            ColumnFamily::Compression,
             // Composite projection and retained-snapshot provenance both bind
             // their exact Ledger rows. Query ranking itself reads Kernel only.
             ColumnFamily::Ledger,
         ],
     )?;
+    let read_lease = vault.retain_latest_snapshot();
+    let read_seq = read_lease.seq();
     let scope_id = kernel_artifact_scope_id(project);
-    let Some(artifact) = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?
-    else {
-        return Ok(None);
-    };
-    let Some(csr) = astrolabe_ingest::read_graph_projection_csr(
+    let generation = astrolabe_weave::read_current_kernel_generation_artifact(
+        &vault, project, &scope_id,
+    )?
+    .ok_or_else(|| {
+        astrolabe_weave::search::SearchError::new(
+            astrolabe_weave::ASTRO_KERNEL_GENERATION_INCOMPLETE,
+            format!(
+                "shadow vault {} for project {project:?} exists but has no current complete kernel generation for scope {scope_id:?}",
+                vault_dir.display(),
+            ),
+            "rebuild and atomically publish the complete artifact/index/query/report generation before serving kernel answers",
+        )
+    })?;
+    let csr = astrolabe_ingest::read_graph_projection_csr_bound_at(
         &vault,
         astrolabe_ingest::GraphProjectionKind::KernelGraph,
-    )?
-    else {
-        return Ok(None);
-    };
+        read_seq,
+        &astrolabe_ingest::GraphProjectionReadBinding {
+            graph_content_generation: generation
+                .manifest
+                .generation_source_binding
+                .graph_content_generation,
+            manifest: generation
+                .manifest
+                .generation_source_binding
+                .projection_manifest
+                .clone(),
+        },
+    )?;
+    let kernel_source_verification =
+        bounded_kernel_source_evidence(&csr, &generation.artifact, &generation.manifest, read_seq)?;
 
     // Per-node provenance references and the ledger head are required persisted
     // inputs. Store read failure is terminal; a zero-ledger substitute would make
     // the eventual refusal indistinguishable from genuine ungrounded state.
     let (node_provenance, ledger) =
-        kernel_answer_provenance(cache_dir, project, &vault, &artifact)?;
+        kernel_answer_provenance(cache_dir, project, &vault, &generation.artifact)?;
 
-    let member_by_id: BTreeMap<CxId, &astrolabe_kernel::KernelMember> = artifact
+    let member_by_id: BTreeMap<CxId, &astrolabe_kernel::KernelMember> = generation
+        .artifact
         .members
         .iter()
         .map(|member| (member.id, member))
@@ -762,8 +1264,23 @@ pub(crate) fn build_kernel_answer_inputs(
     // #880: the kernel members are the pre-selected high-value population; WHICH
     // of them this question reaches is resolved against the exact-generation
     // member index, so two unrelated queries cannot select the same entry.
-    let (matched_ids, query_resolution) =
-        resolve_query_candidates(&vault, project, &artifact, query)?;
+    let (matched_ids, mut query_resolution) =
+        resolve_query_candidates(&vault, &vault_dir, project, &generation, query)?;
+    query_resolution
+        .as_object_mut()
+        .ok_or("ASTRO_KERNEL_QUERY_RESOLUTION_INVALID: query-resolution evidence is not an object")?
+        .insert(
+            "kernel_source_verification".to_string(),
+            kernel_source_verification,
+        );
+    if vault.latest_seq() != read_seq {
+        return Err(format!(
+            "{ASTRO_KERNEL_SOURCE_IDENTITY_STALE}: vault moved from retained answer sequence {read_seq} to {} while selecting the complete generation; remediation: retry the query against one stable current generation",
+            vault.latest_seq()
+        )
+        .into());
+    }
+    drop(read_lease);
 
     Ok(Some(KernelAnswerInputs {
         nodes,
@@ -784,32 +1301,34 @@ pub(crate) fn build_kernel_answer_inputs(
 /// silent truncation can hide a grounded candidate from the entry gate.
 ///
 /// Fail-closed, never a global-weight fallback:
-/// - [`ASTRO_KERNEL_ANSWER_QUERY_OOV`] when the query yields no S18 vector.
+/// - [`ASTRO_KERNEL_ANSWER_QUERY_OOV`] when the query yields no S20 vector.
 /// - [`astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT`] when the members carry no
-///   persisted S18 vectors, so nothing can be ranked.
+///   persisted S20 vectors, so nothing can be ranked.
 /// - A stale index, a dimension mismatch, or a table load failure propagates the
 ///   underlying coded error verbatim.
 fn resolve_query_candidates<C>(
     vault: &AsterVault<C>,
+    vault_panel_root: &Path,
     project: &str,
-    artifact: &astrolabe_kernel::KernelArtifact,
+    generation: &astrolabe_weave::CurrentKernelGenerationArtifact,
     query: &str,
 ) -> Result<(Vec<CxId>, Value), DynError>
 where
     C: Clock,
 {
     use astrolabe_panel::{StaticEmbeddingInput, encode_static_embedding_slot};
-    use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
+    use astrolabe_weave::search::SLOT_NAME_SEMANTIC;
     use astrolabe_weave::search_index::split_identifier_tokens;
 
     let total_started = std::time::Instant::now();
     let usage_before = vault.process_usage_snapshot()?;
-    // Embed the query into S18 with the frozen table the corpus was measured
+    // Embed the query into S20 with the exact production input shape whose
+    // encoder identity is persisted beside the admitted real-query corpus.
     // with. This deliberately happens before touching project index state: an
     // OOV query refuses without loading or constructing an unrelated index.
     let table_started = std::time::Instant::now();
     let table = astrolabe_panel::shared_default_static_embedding_table()?;
-    let table_resolution_ms = elapsed_millis(table_started.elapsed());
+    let table_resolution_ms = elapsed_millis(table_started.elapsed())?;
     let encoding_started = std::time::Instant::now();
     let input = StaticEmbeddingInput {
         body_tokens: split_identifier_tokens(query),
@@ -817,43 +1336,66 @@ where
         name: query.to_string(),
         qualified_name: query.to_string(),
     };
-    let encoded = encode_static_embedding_slot(SLOT_CODE_SEMANTIC, &input, table)?;
+    let encoded = encode_static_embedding_slot(SLOT_NAME_SEMANTIC, &input, table)?;
     let SlotVector::Dense {
         data: query_vector, ..
     } = encoded
     else {
         return Err(format!(
             "{ASTRO_KERNEL_ANSWER_QUERY_OOV}: query {query:?} carries no token the frozen \
-             code-semantic embedding table knows, so it reaches no kernel member; remediation: \
+             name-semantic embedding table knows, so it reaches no kernel member; remediation: \
              rephrase the query using identifiers or vocabulary the indexed corpus contains"
         )
         .into());
     };
-    let query_encoding_ms = elapsed_millis(encoding_started.elapsed());
+    let query_encoding_ms = elapsed_millis(encoding_started.elapsed())?;
 
     let descriptor_started = std::time::Instant::now();
-    let descriptor = astrolabe_weave::read_persisted_kernel_member_index_descriptor(
+    let descriptor_read = astrolabe_weave::read_current_kernel_generation_descriptor(
         vault,
         project,
-        &artifact.scope_id,
-        &artifact.members_hash,
+        &generation.artifact.scope_id,
+        &generation.artifact.members_hash,
     )?
     .ok_or_else(|| {
         astrolabe_weave::search::SearchError::new(
             astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
             format!(
-                "kernel artifact {} has no persisted member-index generation",
-                artifact.members_hash
+                "complete kernel generation {} has no current member-index descriptor",
+                generation.manifest.generation_id
             ),
-            "Rebuild the kernel so descriptor/map/HNSW rows are published before serving queries.",
+            "Rebuild the kernel so artifact/descriptor/map/HNSW/query/report rows are atomically published before serving queries.",
         )
     })?;
-    let descriptor_read_ms = elapsed_millis(descriptor_started.elapsed());
-    let cache_key = kernel_index_cache_key(&descriptor)?;
+    if descriptor_read.manifest.generation_id != generation.manifest.generation_id
+        || descriptor_read.pointer != generation.pointer
+    {
+        return Err(astrolabe_weave::search::SearchError::new(
+            astrolabe_weave::ASTRO_KERNEL_GENERATION_CORRUPT,
+            format!(
+                "kernel request selected artifact generation {} but descriptor generation {}",
+                generation.manifest.generation_id, descriptor_read.manifest.generation_id
+            ),
+            "Retry only after one current composite pointer selects every artifact/index/query/report row; no cross-generation join is served.",
+        )
+        .into());
+    }
+    let descriptor = descriptor_read.descriptor;
+    let request_source_verification = astrolabe_weave::verify_kernel_member_index_source_at_latest(
+        vault,
+        vault_panel_root,
+        &descriptor,
+    )?;
+    let descriptor_read_ms = elapsed_millis(descriptor_started.elapsed())?;
+    let cache_key = format!(
+        "{}:{}",
+        generation.manifest.generation_id,
+        kernel_index_cache_key(&descriptor)?
+    );
     let cache = KERNEL_INDEX_CACHE.get_or_init(|| Mutex::new(KernelIndexCache::default()));
     let (load_cell, cache_entries) = {
         let mut cache = cache.lock().map_err(|_| kernel_index_cache_poisoned())?;
-        let cell = cache.load_cell(cache_key);
+        let cell = cache.load_cell(cache_key)?;
         (cell, cache.entries.len())
     };
     let artifact_load_started = std::time::Instant::now();
@@ -861,36 +1403,67 @@ where
     let index = load_cell
         .get_or_init(|| {
             artifact_loaded_this_query = true;
-            let loaded = astrolabe_weave::read_persisted_kernel_member_index(
+            let current = astrolabe_weave::read_current_kernel_generation(
                 vault,
                 project,
-                &artifact.scope_id,
-                &artifact.members_hash,
+                &generation.artifact.scope_id,
             )?
             .ok_or_else(|| {
                 astrolabe_weave::search::SearchError::new(
                     astrolabe_weave::ASTRO_KERNEL_INDEX_ABSENT,
-                    "member-index descriptor disappeared before full artifact load".to_string(),
-                    "Preserve the vault and rebuild the exact kernel generation.",
+                    "complete kernel generation disappeared before full HNSW load".to_string(),
+                    "Preserve the vault and rebuild the exact complete kernel generation.",
                 )
             })?;
-            Ok(std::sync::Arc::new(loaded))
+            if current.manifest.generation_id != generation.manifest.generation_id
+                || current.pointer != generation.pointer
+            {
+                return Err(astrolabe_weave::search::SearchError::new(
+                    astrolabe_weave::ASTRO_KERNEL_GENERATION_CORRUPT,
+                    format!(
+                        "kernel request selected generation {} but HNSW load selected {}",
+                        generation.manifest.generation_id, current.manifest.generation_id
+                    ),
+                    "Retry only after one stable composite pointer selects the entire generation.",
+                ));
+            }
+            let source = astrolabe_weave::verify_kernel_member_index_source_at_latest(
+                vault,
+                vault_panel_root,
+                &current.index.descriptor,
+            )?;
+            Ok(std::sync::Arc::new(VerifiedKernelIndexLoad {
+                index: current.index,
+                source,
+                generation_id: current.manifest.generation_id,
+            }))
         })
         .clone()?;
+    if index.generation_id != generation.manifest.generation_id {
+        return Err(astrolabe_weave::search::SearchError::new(
+            astrolabe_weave::ASTRO_KERNEL_GENERATION_CORRUPT,
+            format!(
+                "kernel cache selected generation {} for request generation {}",
+                index.generation_id, generation.manifest.generation_id
+            ),
+            "Clear the process by restarting Astrolabe and inspect the composite generation cache key; a different generation is never served.",
+        )
+        .into());
+    }
     let index_cache_hit = !artifact_loaded_this_query;
-    let index_artifact_load_ms = elapsed_millis(artifact_load_started.elapsed());
-    let k = index.descriptor.indexed_member_count as u64;
+    let index_artifact_load_ms = elapsed_millis(artifact_load_started.elapsed())?;
+    let k = index.index.descriptor.indexed_member_count as u64;
     let ranking_started = std::time::Instant::now();
     let ranked = astrolabe_weave::kernel_query_loaded_members(
-        &index,
-        &artifact.members_hash,
+        &index.index,
+        &generation.artifact.members_hash,
         &query_vector,
         k,
         k,
     )?;
-    let ann_ranking_ms = elapsed_millis(ranking_started.elapsed());
+    let ann_ranking_ms = elapsed_millis(ranking_started.elapsed())?;
     let process_usage = vault.process_usage_snapshot()?.phase_since(usage_before);
-    let total_ms = elapsed_millis(total_started.elapsed());
+    let total_ms = elapsed_millis(total_started.elapsed())?;
 
     let mut matched_ids: Vec<CxId> = Vec::with_capacity(ranked.matches.len());
     let mut ranked_json: Vec<Value> = Vec::with_capacity(ranked.matches.len());
@@ -907,14 +1480,31 @@ where
         "schema": "astrolabe.kernel_answer_query_resolution.v1",
         "entry_selection": "query_ranked_kernel_member_index",
         "query": query,
-        "embedded_slot": SLOT_CODE_SEMANTIC.get(),
+        "embedded_slot": SLOT_NAME_SEMANTIC.get(),
+        "generation_id": generation.manifest.generation_id,
+        "source_generation_identity": generation.manifest.source_generation_identity,
+        "query_encoder_identity": generation.query_corpus.encoder,
+        "admission_query_corpus_hash": generation.query_corpus.corpus_hash,
+        "admission_query_corpus": generation.query_corpus,
+        "graph_routed_report_hash": generation.graph_routed_report.report_hash,
+        "graph_routed_report": generation.graph_routed_report,
+        "artifact_source_identity": generation.artifact.source_identity,
+        "fvs_validity": generation.artifact.fvs_validity,
+        "compactness": generation.artifact.compactness,
+        "generation_manifest": generation.manifest,
+        "generation_pointer": generation.pointer,
         "query_vector_dim": query_vector.len(),
-        "index_kind": index.descriptor.index_kind.as_str(),
+        "index_kind": index.index.descriptor.index_kind.as_str(),
         "members_hash": ranked.members_hash,
         "base_seq": ranked.base_seq,
-        "descriptor_bindings_blake3": index.descriptor.bindings_blake3,
-        "descriptor_hnsw_artifact_blake3": index.descriptor.hnsw_artifact_blake3,
-        "hnsw_artifact_bytes": index.descriptor.hnsw_artifact_bytes,
+        "descriptor_bindings_blake3": index.index.descriptor.bindings_blake3,
+        "descriptor_hnsw_artifact_blake3": index.index.descriptor.hnsw_artifact_blake3,
+        "hnsw_artifact_bytes": index.index.descriptor.hnsw_artifact_bytes,
+        "source_binding_seq": index.index.descriptor.source_binding_seq,
+        "source_final_verification_seq": index.index.descriptor.source_final_verification_seq,
+        "source_binding": index.index.descriptor.source_binding,
+        "source_read_verification": request_source_verification,
+        "cache_load_source_verification": index.source,
         "index_cache_hit": index_cache_hit,
         "index_artifact_loads_this_query": u64::from(artifact_loaded_this_query),
         "hnsw_rebuilds_this_query": 0,
@@ -943,22 +1533,22 @@ where
         },
         "cache": {
             "knob_registry_version": KERNEL_ANSWER_KNOB_REGISTRY_VERSION,
-            "capacity_entries": kernel_index_cache_entries(),
+            "capacity_entries": kernel_index_cache_entries()?,
             "resident_generation_cells": cache_entries,
             "single_flight": true,
         },
-        "member_count": artifact.member_count,
+        "member_count": generation.artifact.member_count,
         "indexed_member_count": ranked.indexed_member_count,
-        "missing_vector_members": index.descriptor.missing_vector_members,
+        "missing_vector_members": index.index.descriptor.missing_vector_members,
         "ranked_member_count": matched_ids.len(),
         "unresolved_symbol_ids": [],
         "ranked_members": ranked_json,
         "trust": "verified",
         "freshness": "fresh",
         "provenance": [
-            format!("kernel-artifact:scope={}", artifact.scope_id),
-            "vault:Kernel/member-index descriptor+bindings+HNSW".to_string(),
-            "astrolabe_weave::kernel_query_loaded_members(#996)".to_string(),
+            format!("kernel-generation:{}", generation.manifest.generation_id),
+            "vault:Kernel/current-pointer+manifest+artifact+S20-member-index+admission".to_string(),
+            "astrolabe_weave::kernel_query_loaded_members(complete composite generation)".to_string(),
         ],
     });
     Ok((matched_ids, evidence))
@@ -980,16 +1570,52 @@ fn kernel_index_cache_poisoned() -> astrolabe_weave::search::SearchError {
     )
 }
 
-fn kernel_index_cache_entries() -> usize {
-    KERNEL_ANSWER_KNOBS
+fn kernel_index_cache_entries() -> Result<usize, astrolabe_weave::search::SearchError> {
+    let entries = KERNEL_ANSWER_KNOBS
         .iter()
         .find(|knob| knob.name == KNOB_ANSWER_INDEX_CACHE_ENTRIES)
-        .expect("kernel answer index-cache knob is declared")
-        .default as usize
+        .ok_or_else(|| {
+            astrolabe_weave::search::SearchError::new(
+                ASTRO_KERNEL_INDEX_UNAVAILABLE,
+                format!(
+                    "kernel answer knob registry {} does not declare {:?}",
+                    KERNEL_ANSWER_KNOB_REGISTRY_VERSION, KNOB_ANSWER_INDEX_CACHE_ENTRIES
+                ),
+                "restore the complete immutable kernel-answer knob registry before serving cached generations",
+            )
+        })?
+        .default;
+    if entries == 0 {
+        return Err(astrolabe_weave::search::SearchError::new(
+            ASTRO_KERNEL_INDEX_UNAVAILABLE,
+            "kernel answer index-cache capacity is zero, so no resident generation can be admitted",
+            "set the immutable cache-capacity knob to a positive value before serving kernel answers",
+        ));
+    }
+    usize::try_from(entries).map_err(|_| {
+        astrolabe_weave::search::SearchError::new(
+            ASTRO_KERNEL_INDEX_UNAVAILABLE,
+            format!(
+                "kernel answer index-cache capacity {entries} is not representable as usize"
+            ),
+            "set the immutable cache-capacity knob to a positive value representable on this target",
+        )
+    })
 }
 
-fn elapsed_millis(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+fn elapsed_millis(
+    duration: std::time::Duration,
+) -> Result<u64, astrolabe_weave::search::SearchError> {
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        astrolabe_weave::search::SearchError::new(
+            ASTRO_KERNEL_ANSWER_TIMING_OVERFLOW,
+            format!(
+                "kernel answer phase duration {}ms is not representable as u64",
+                duration.as_millis()
+            ),
+            "restart the operation with a receipt format capable of representing the measured duration",
+        )
+    })
 }
 
 /// Joins per-`CxId` provenance references and the serving-vault ledger head out of
@@ -1086,7 +1712,7 @@ fn serve_kernel_answer(
                 &inputs.nodes,
                 &inputs.edges,
                 &inputs.matched_ids,
-            );
+            )?;
             persist_reproduce_fixture(cache_dir, project, &answer_id, entry)?;
             tool_json_result(served_kernel_answer_json(
                 project,
@@ -1179,18 +1805,17 @@ pub(crate) fn reproduce_fixture_entry_json(
     nodes: &[astrolabe_kernel::AnswerNode],
     edges: &[astrolabe_kernel::AnswerEdge],
     matched_ids: &[CxId],
-) -> Value {
+) -> Result<Value, DynError> {
     let recorded_artifact =
-        String::from_utf8(astrolabe_provenance::recorded_kernel_answer_bytes(recorded))
-            .expect("recorded kernel answer bytes are UTF-8");
-    json!({
+        String::from_utf8(astrolabe_provenance::recorded_kernel_answer_bytes(recorded))?;
+    Ok(json!({
         "recorded_artifact": recorded_artifact,
         "graph": {
             "nodes": nodes.iter().map(reproduce_fixture_node_json).collect::<Vec<_>>(),
             "edges": edges.iter().map(reproduce_fixture_edge_json).collect::<Vec<_>>(),
             "matched_ids": matched_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         },
-    })
+    }))
 }
 
 fn reproduce_fixture_node_json(node: &astrolabe_kernel::AnswerNode) -> Value {

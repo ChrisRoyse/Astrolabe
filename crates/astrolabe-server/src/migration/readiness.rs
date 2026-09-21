@@ -33,7 +33,7 @@ pub(crate) fn readiness_status_json_at(
             "assay_sufficiency:not_persisted",
             "run measure_bits sufficiency for the requested axis and persist the panel/axis deficit card",
         ),
-        readiness_kernel_recall_tier(&kernel_context, effective_scope),
+        readiness_kernel_retrieval_recall_tier(&kernel_context, effective_scope),
         readiness_configured_tier(
             &readiness_measurements,
             "calibrated",
@@ -351,7 +351,7 @@ pub(crate) fn readiness_tier_row_matches(row: &Value, tier: &str, scope: &str, a
     scope_matches && axis_matches
 }
 
-pub(crate) fn readiness_kernel_recall_tier(kernel_context: &Value, scope: &str) -> Value {
+pub(crate) fn readiness_kernel_retrieval_recall_tier(kernel_context: &Value, scope: &str) -> Value {
     let summaries = kernel_context
         .get("scope_summaries")
         .and_then(|scope_summaries| scope_summaries.get("summaries"))
@@ -363,36 +363,49 @@ pub(crate) fn readiness_kernel_recall_tier(kernel_context: &Value, scope: &str) 
     }) else {
         return readiness_unavailable_tier(
             "kernel_exists",
-            "kernel recall >= 0.95, tested",
+            "graph-routed answer recall admitted against exact full-corpus ground truth",
             "kernel_context.scope_summaries:scope_missing",
-            "index with explicit kernel scope metadata and recall readback for the requested scope",
+            "build the complete source-bound kernel generation and persist its graph-routed recall report for this scope",
         );
     };
-    let recall_millipoints = summary
-        .get("recall_millipoints")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            summary
-                .get("recall")
-                .and_then(Value::as_object)
-                .and_then(|recall| {
-                    recall
-                        .get("recalled")
-                        .and_then(Value::as_u64)
-                        .zip(recall.get("total").and_then(Value::as_u64))
-                })
-                .and_then(|(recalled, total)| {
-                    (total > 0).then_some(recalled.saturating_mul(1000) / total)
-                })
-        });
-    let Some(recall_millipoints) = recall_millipoints else {
+    let Some(recall) = summary
+        .get("graph_routed_recall")
+        .and_then(Value::as_object)
+    else {
         return readiness_unavailable_tier(
             "kernel_exists",
-            "kernel recall >= 0.95, tested",
-            "kernel_context.scope_summaries:recall_missing",
-            "persist tested kernel recall for this scope before using readiness as an autonomy gate",
+            "graph-routed answer recall admitted against exact full-corpus ground truth",
+            "kernel_context.scope_summaries:graph_routed_recall_missing",
+            "run graph-routed recall against held-out generation-bound queries and exact brute-force full-corpus cosine, then persist and independently read back the report",
         );
     };
+    let recall_millipoints = recall.get("recall_millipoints").and_then(Value::as_u64);
+    let query_count = recall.get("query_count").and_then(Value::as_u64);
+    let report_hash = recall.get("report_hash").and_then(Value::as_str);
+    let admitted = recall.get("admitted").and_then(Value::as_bool);
+    let (Some(recall_millipoints), Some(query_count), Some(report_hash), Some(admitted)) =
+        (recall_millipoints, query_count, report_hash, admitted)
+    else {
+        return readiness_unavailable_tier(
+            "kernel_exists",
+            "graph-routed answer recall admitted against exact full-corpus ground truth",
+            "kernel_context.scope_summaries:graph_routed_recall_incomplete",
+            "repair and republish the complete graph-routed recall report; aggregate recall without query count, report hash, and admission decision is not evidence",
+        );
+    };
+    if query_count == 0
+        || report_hash.len() != 64
+        || !report_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return readiness_unavailable_tier(
+            "kernel_exists",
+            "graph-routed answer recall admitted against exact full-corpus ground truth",
+            "kernel_context.scope_summaries:graph_routed_recall_invalid",
+            "repair and republish a nonempty graph-routed recall report with a canonical lowercase report hash",
+        );
+    }
     let provenance_refs = summary
         .get("members")
         .and_then(Value::as_array)
@@ -406,18 +419,19 @@ pub(crate) fn readiness_kernel_recall_tier(kernel_context: &Value, scope: &str) 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let pass = recall_millipoints >= 950;
+    let pass = admitted;
     json!({
         "tier": "kernel_exists",
         "pass": pass,
         "measured": true,
         "value": {
             "scope_id": scope,
-            "recall": summary.get("recall").cloned().unwrap_or(Value::Null),
+            "graph_routed_recall": recall,
             "recall_millipoints": recall_millipoints,
+            "query_count": query_count,
+            "report_hash": report_hash,
         },
-        "required": "kernel recall >= 0.95, tested",
-        "required_millipoints": 950,
+        "required": "graph-routed answer recall admitted against exact full-corpus ground truth",
         "provenance_refs": provenance_refs,
         "source": "kernel_context.scope_summaries",
         "freshness": summary.get("freshness").and_then(Value::as_str).unwrap_or("fresh"),
@@ -425,7 +439,7 @@ pub(crate) fn readiness_kernel_recall_tier(kernel_context: &Value, scope: &str) 
         "cheapest_fix": if pass {
             Value::Null
         } else {
-            Value::String("increase or repair the scoped kernel until persisted recall_millipoints is at least 950".to_string())
+            Value::String("repair the exact graph-routed retrieval deficit named by the persisted report; graph coverage cannot substitute for answer recall".to_string())
         },
     })
 }

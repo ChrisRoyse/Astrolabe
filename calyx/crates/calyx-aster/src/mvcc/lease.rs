@@ -3,6 +3,9 @@
 use calyx_core::{CalyxError, Result, Seq, Ts};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// The vault-wide MVCC sequence has no representable successor.
+pub const CALYX_ASTER_MVCC_SEQUENCE_EXHAUSTED: &str = "CALYX_ASTER_MVCC_SEQUENCE_EXHAUSTED";
+
 /// Vault-wide monotonic sequence allocator.
 #[derive(Debug)]
 pub struct SeqAllocator {
@@ -20,9 +23,20 @@ impl SeqAllocator {
     }
 
     /// Allocates the next write sequence.
-    pub fn allocate(&self) -> Seq {
+    pub fn allocate(&self) -> Result<Seq> {
         self.allocated.store(true, Ordering::Release);
-        self.current.fetch_add(1, Ordering::AcqRel) + 1
+        self.current
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|current| CalyxError {
+                code: CALYX_ASTER_MVCC_SEQUENCE_EXHAUSTED,
+                message: format!(
+                    "MVCC sequence is exhausted at {current}; no sequence was allocated"
+                ),
+                remediation: "preserve the vault and migrate it to a wider sequence representation before any further write",
+            })
     }
 
     /// Returns the latest committed sequence.

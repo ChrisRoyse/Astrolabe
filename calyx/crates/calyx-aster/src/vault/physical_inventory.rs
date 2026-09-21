@@ -10,7 +10,7 @@
 use super::{AsterVault, encode};
 use crate::cf::ColumnFamily;
 use crate::compaction::StorageTier;
-use crate::manifest::VaultManifest;
+use crate::manifest::{ManifestStore, VaultManifest};
 use crate::sst::SstReader;
 use crate::storage_names::{SstName, classify_sst, wal_segment_index};
 use calyx_core::{CalyxError, Clock, Result, Seq};
@@ -145,11 +145,36 @@ pub struct PhysicalCommitInventory {
     pub total_physical_bytes: u64,
 }
 
+/// Exact framed-WAL evidence for one retained durable commit.
+///
+/// Unlike [`PhysicalCommitInventory`], this receipt does not claim that the
+/// commit has been checkpointed into generation-owned SST and manifest bytes.
+/// `wal_replay_floor_seq` lets the caller prove whether the commit is still an
+/// uncheckpointed WAL-tail generation (`seq > wal_replay_floor_seq`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalWalCommitInventory {
+    pub seq: Seq,
+    pub wal_replay_floor_seq: Seq,
+    pub column_families: Vec<ColumnFamily>,
+    pub rows: Vec<PhysicalCommitRowDigest>,
+    pub wal_record: PhysicalCommitComponent,
+}
+
 #[derive(Debug)]
 struct BuiltComponent {
     component: PhysicalCommitComponent,
     absolute_path: PathBuf,
 }
+
+#[derive(Debug)]
+struct DecodedWalCommit {
+    column_families: Vec<ColumnFamily>,
+    rows: Vec<encode::WriteRow>,
+    wal: BuiltComponent,
+}
+
+type ExpectedSstRows<'a> = BTreeMap<&'a [u8], (usize, &'a [u8])>;
+type ExpectedSstRowsByCf<'a> = BTreeMap<ColumnFamily, ExpectedSstRows<'a>>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +190,82 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Reads one exact framed WAL commit without requiring a checkpoint.
+    ///
+    /// The returned replay floor distinguishes an uncheckpointed WAL-tail
+    /// generation (`seq > wal_replay_floor_seq`) from a retained WAL record
+    /// that has already been checkpointed. Writable handles take the existing
+    /// exclusive durable-commit snapshot. Read-only handles instead require
+    /// their retained shared commit snapshot and positively enforce the exact
+    /// selected-CF capability, so this readback never tries to upgrade its own
+    /// lock or opens a second vault generation.
+    ///
+    /// Structural cost (issue #1147; PC-03/04/07/13/41/43) is
+    /// `O(A + D_wal + H + B + P + R log C)` time and
+    /// `O(P + R + decoded key bytes)` memory. `A` is the current manifest plus
+    /// referenced immutable-asset validation, `D_wal` is the canonical segment
+    /// roster, `H` is the framing-header walk to `seq`, `B` is the exact framed
+    /// range hashed, `P` is its decoded payload, `R` is its row count, and `C`
+    /// is its exact CF count. The tip path validates final-segment EOF. The
+    /// decoded commit and retained commit-lock generation are invariant across
+    /// the one WAL read. Production values are unmeasured; this manual fixture
+    /// is correctness evidence and supplies no cost bound. Cost-hypothesis
+    /// owner: #1147; expires at the first production-size receipt.
+    pub fn physical_wal_commit_inventory(
+        &self,
+        seq: Seq,
+        expected_cfs: &[ColumnFamily],
+    ) -> Result<PhysicalWalCommitInventory> {
+        let expected_cfs = canonical_cf_set(expected_cfs)?;
+        if self.read_only {
+            let root = self.durable_root.as_deref().ok_or_else(|| {
+                inventory_error(
+                    "read-only WAL commit inventory requires a durable Aster vault root",
+                )
+            })?;
+            if self._read_snapshot_guard.is_none() {
+                return Err(inventory_error(
+                    "read-only WAL commit inventory requires the retained shared commit snapshot",
+                ));
+            }
+            for cf in &expected_cfs {
+                self.rows.ensure_cf_selected(*cf)?;
+            }
+            return self.physical_wal_commit_inventory_under_snapshot(root, seq, expected_cfs);
+        }
+        if self.durable.is_none() {
+            return Err(inventory_error(
+                "WAL commit inventory requires a durable Aster vault; volatile vaults have no physical source of truth",
+            ));
+        }
+        self.with_durable_commit_lock(|| {
+            let root = self
+                .durable
+                .as_ref()
+                .expect("durability checked before acquiring the commit snapshot")
+                .root();
+            self.physical_wal_commit_inventory_under_snapshot(root, seq, expected_cfs)
+        })
+    }
+
+    fn physical_wal_commit_inventory_under_snapshot(
+        &self,
+        root: &Path,
+        seq: Seq,
+        expected_cfs: Vec<ColumnFamily>,
+    ) -> Result<PhysicalWalCommitInventory> {
+        let wal_replay_floor_seq = wal_replay_floor_seq(root)?;
+        let decoded = self.read_decoded_wal_commit_under_snapshot(root, seq, expected_cfs)?;
+        validate_component_set(std::slice::from_ref(&decoded.wal))?;
+        Ok(PhysicalWalCommitInventory {
+            seq,
+            wal_replay_floor_seq,
+            column_families: decoded.column_families,
+            rows: physical_row_digests(decoded.rows),
+            wal_record: decoded.wal.component,
+        })
+    }
+
     /// Reads the exact physical generation for one retained durable commit.
     ///
     /// This is a post-commit read, not a receipt conversion: Aster reopens the
@@ -216,70 +317,23 @@ where
                 "physical commit inventory requires a durable Aster vault; volatile vaults have no physical source of truth",
             )
         })?;
-        if seq == 0 {
-            return Err(inventory_error(
-                "physical commit inventory sequence must be nonzero",
-            ));
-        }
         let latest_seq = self.latest_seq();
         let durable_tip = durable.durable_tip_seq()?;
-        if seq > latest_seq || seq > durable_tip {
+        if seq > durable_tip {
             return Err(inventory_error(format!(
                 "physical commit inventory requested future seq {seq}: live seq {latest_seq}, durable WAL tip {durable_tip}"
             )));
         }
         let at_common_tip = seq == latest_seq && seq == durable_tip;
-
         let expected_cfs = canonical_cf_set(expected_cfs)?;
         let root = durable.root();
-        let wal_dir = root.join("wal");
-        let record = if at_common_tip {
-            crate::wal::read_tip_record(&wal_dir, seq)?
-        } else {
-            crate::wal::read_record_by_seq(&wal_dir, seq)?
-        };
-        validate_wal_location(root, &record.segment_path)?;
-        let wal_length = record
-            .end_offset
-            .checked_sub(record.start_offset)
-            .ok_or_else(|| inventory_error("WAL record byte range is inverted"))?;
-        if wal_length == 0 {
-            return Err(inventory_error("WAL record byte range is empty"));
-        }
-        let wal_sha256 = hash_file_range(
-            &record.segment_path,
-            record.start_offset,
-            wal_length,
-            "WAL commit",
-        )?;
-        let write_rows = encode::decode_write_batch(&record.payload)?;
-        let actual_cfs = write_rows
-            .iter()
-            .map(|row| row.cf)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if actual_cfs != expected_cfs {
-            return Err(inventory_error(format!(
-                "commit {seq} CF set differs from the exact request: expected [{}], decoded WAL [{}]",
-                cf_names(&expected_cfs),
-                cf_names(&actual_cfs)
-            )));
-        }
+        let DecodedWalCommit {
+            column_families: expected_cfs,
+            rows: write_rows,
+            wal,
+        } = self.read_decoded_wal_commit_under_snapshot(root, seq, expected_cfs)?;
         let expected_rows_by_cf = expected_sst_rows_by_cf(&write_rows);
-
-        let wal_name = utf8_file_name(&record.segment_path, "WAL segment")?;
-        let mut built = vec![BuiltComponent {
-            component: PhysicalCommitComponent {
-                role: PhysicalCommitComponentRole::WalRecord,
-                container: PhysicalCommitContainer::Vault,
-                relative_path: format!("wal/{wal_name}"),
-                offset: record.start_offset,
-                length: wal_length,
-                sha256: wal_sha256,
-            },
-            absolute_path: record.segment_path.clone(),
-        }];
+        let mut built = vec![wal];
 
         for cf in &expected_cfs {
             let expected_rows = expected_rows_by_cf.get(cf).ok_or_else(|| {
@@ -318,19 +372,7 @@ where
                 .checked_add(item.component.length)
                 .ok_or_else(|| inventory_error("physical component byte total overflow"))?;
         }
-        let rows = write_rows
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, row)| PhysicalCommitRowDigest {
-                ordinal,
-                cf: row.cf,
-                key_sha256: sha256_bytes(&row.key),
-                value_length: row.value.len() as u64,
-                value_sha256: sha256_bytes(&row.value),
-                tombstoned: crate::mvcc::is_tombstone_value(&row.value),
-                key: row.key,
-            })
-            .collect();
+        let rows = physical_row_digests(write_rows);
 
         Ok(PhysicalCommitInventory {
             seq,
@@ -342,12 +384,84 @@ where
         })
     }
 
+    fn read_decoded_wal_commit_under_snapshot(
+        &self,
+        root: &Path,
+        seq: Seq,
+        expected_cfs: Vec<ColumnFamily>,
+    ) -> Result<DecodedWalCommit> {
+        if seq == 0 {
+            return Err(inventory_error(
+                "physical WAL commit inventory sequence must be nonzero",
+            ));
+        }
+        let latest_seq = self.latest_seq();
+        if seq > latest_seq {
+            return Err(inventory_error(format!(
+                "physical WAL commit inventory requested future seq {seq}: live seq {latest_seq}"
+            )));
+        }
+        let wal_dir = root.join("wal");
+        let record = if seq == latest_seq {
+            crate::wal::read_tip_record(&wal_dir, seq)?
+        } else {
+            crate::wal::read_record_by_seq(&wal_dir, seq)?
+        };
+        validate_wal_location(root, &record.segment_path)?;
+        let wal_length = record
+            .end_offset
+            .checked_sub(record.start_offset)
+            .ok_or_else(|| inventory_error("WAL record byte range is inverted"))?;
+        if wal_length == 0 {
+            return Err(inventory_error("WAL record byte range is empty"));
+        }
+        let wal_sha256 = hash_file_range(
+            &record.segment_path,
+            record.start_offset,
+            wal_length,
+            "WAL commit",
+        )?;
+        let rows = encode::decode_write_batch(&record.payload)?;
+        let actual_cfs = rows
+            .iter()
+            .map(|row| row.cf)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for cf in &actual_cfs {
+            self.rows.ensure_cf_selected(*cf)?;
+        }
+        if actual_cfs != expected_cfs {
+            return Err(inventory_error(format!(
+                "commit {seq} CF set differs from the exact request: expected [{}], decoded WAL [{}]",
+                cf_names(&expected_cfs),
+                cf_names(&actual_cfs)
+            )));
+        }
+        let wal_name = utf8_file_name(&record.segment_path, "WAL segment")?;
+        Ok(DecodedWalCommit {
+            column_families: expected_cfs,
+            rows,
+            wal: BuiltComponent {
+                component: PhysicalCommitComponent {
+                    role: PhysicalCommitComponentRole::WalRecord,
+                    container: PhysicalCommitContainer::Vault,
+                    relative_path: format!("wal/{wal_name}"),
+                    offset: record.start_offset,
+                    length: wal_length,
+                    sha256: wal_sha256,
+                },
+                absolute_path: record.segment_path.clone(),
+            },
+        })
+    }
+
     fn read_commit_sst(
         &self,
         seq: Seq,
         cf: ColumnFamily,
         expected_index: usize,
-        expected_rows: &BTreeMap<&[u8], (usize, &[u8])>,
+        expected_rows: &ExpectedSstRows<'_>,
     ) -> Result<BuiltComponent> {
         let locations = match &self.durable_tiering_policy {
             Some(policy) => {
@@ -512,10 +626,44 @@ fn canonical_cf_set(expected_cfs: &[ColumnFamily]) -> Result<Vec<ColumnFamily>> 
     Ok(canonical)
 }
 
-fn expected_sst_rows_by_cf(
-    write_rows: &[encode::WriteRow],
-) -> BTreeMap<ColumnFamily, BTreeMap<&[u8], (usize, &[u8])>> {
-    let mut by_cf = BTreeMap::<ColumnFamily, BTreeMap<&[u8], (usize, &[u8])>>::new();
+fn wal_replay_floor_seq(root: &Path) -> Result<Seq> {
+    let current = root.join("CURRENT");
+    match fs::metadata(&current) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(inventory_error(format!(
+                    "CURRENT is not a regular file at {}",
+                    current.display()
+                )));
+            }
+            Ok(ManifestStore::open(root).load_current()?.durable_seq)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(inventory_io_error(
+            "inspect CURRENT for WAL replay floor",
+            &current,
+            error,
+        )),
+    }
+}
+
+fn physical_row_digests(rows: Vec<encode::WriteRow>) -> Vec<PhysicalCommitRowDigest> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(ordinal, row)| PhysicalCommitRowDigest {
+            ordinal,
+            cf: row.cf,
+            key_sha256: sha256_bytes(&row.key),
+            value_length: row.value.len() as u64,
+            value_sha256: sha256_bytes(&row.value),
+            tombstoned: crate::mvcc::is_tombstone_value(&row.value),
+            key: row.key,
+        })
+        .collect()
+}
+
+fn expected_sst_rows_by_cf(write_rows: &[encode::WriteRow]) -> ExpectedSstRowsByCf<'_> {
+    let mut by_cf = ExpectedSstRowsByCf::new();
     for (ordinal, row) in write_rows.iter().enumerate() {
         by_cf
             .entry(row.cf)

@@ -98,6 +98,7 @@ impl DurableVault {
         for (seq, rows) in batches.iter() {
             summaries.extend(self.write_rows(*seq, rows)?);
             self.advance_checkpointed_derived_content(*seq, rows);
+            self.advance_checkpointed_cf_content_generations(*seq, rows)?;
         }
         let last_seq = batches.last().map_or(0, |(seq, _)| *seq);
         self.write_manifest(last_seq)?;

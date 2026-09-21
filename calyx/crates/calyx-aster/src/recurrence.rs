@@ -144,13 +144,14 @@ where
     C: Clock,
 {
     vault.with_recurrence_write_lock(|| {
+        let evaluation_seq = vault.snapshot();
         // Decode the persisted Base row losslessly so the immutable per-slot
-        // hashes survive the frequency-scalar rewrite. `build_append` operates
+        // hashes survive the frequency-scalar rewrite. `build_append_at` operates
         // on the logical constellation (it only needs cx_id + scalars), and the
         // resulting scalar map is carried back onto the lossless record so the
         // committed Base row re-emits the stored slot hashes byte-for-byte.
         let base_bytes = vault
-            .read_cf_at(vault.snapshot(), ColumnFamily::Base, &base_key(cx_id))?
+            .read_cf_at(evaluation_seq, ColumnFamily::Base, &base_key(cx_id))?
             .ok_or_else(|| {
                 CalyxError::stale_derived("recurrence append requires an existing constellation")
             })?;
@@ -160,8 +161,9 @@ where
                 "recurrence Base row for cx {cx_id} belongs to another vault"
             )));
         }
-        let append = build_append(
+        let append = build_append_at(
             vault,
+            evaluation_seq,
             record.constellation().clone(),
             t_k,
             context,
@@ -172,31 +174,9 @@ where
         record
             .scalars_mut()
             .clone_from(&append.updated_base.scalars);
-        vault.commit_recurrence_batch(append.recurrence_rows, Some(record))?;
+        vault.commit_recurrence_batch(evaluation_seq, append.recurrence_rows, Some(record))?;
         Ok(occurrence_id)
     })
-}
-
-pub(crate) fn build_append<C>(
-    vault: &AsterVault<C>,
-    base: Constellation,
-    t_k: EpochSecs,
-    context: OccurrenceContext,
-    observed_at: EpochSecs,
-    retention: RetentionPolicy,
-) -> Result<RecurrenceAppend>
-where
-    C: Clock,
-{
-    build_append_at(
-        vault,
-        vault.snapshot(),
-        base,
-        t_k,
-        context,
-        observed_at,
-        retention,
-    )
 }
 
 pub(crate) fn build_append_at<C>(

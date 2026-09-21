@@ -56,10 +56,11 @@ where
         self.rows.latest_only_readback_status()
     }
 
-    /// Handle-local generation for the logical content of one column family.
-    /// Unlike the vault-global commit sequence, this remains stable when a
-    /// disjoint CF is mutated and advances before a mutation to this CF becomes
-    /// visible.
+    /// Durable generation for the logical content of one column family.
+    /// Unlike the vault-global commit sequence, this remains stable across
+    /// reopen when a disjoint CF is mutated and advances before a mutation to
+    /// this CF becomes visible. Legacy manifests conservatively bind every CF
+    /// to their durable tip until the first v1.1 manifest is published.
     pub fn cf_content_generation(&self, cf: ColumnFamily) -> Result<Seq> {
         self.rows.cf_content_generation(cf)
     }

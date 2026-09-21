@@ -38,7 +38,7 @@ pub struct MultiVectorCompressionConfig {
 
 impl MultiVectorCompressionConfig {
     pub(super) fn validate(self, token_dim: u32) -> calyx_core::Result<()> {
-        if token_dim == 0 || token_dim % 4 != 0 {
+        if token_dim == 0 || !token_dim.is_multiple_of(4) {
             return Err(multivector_error(
                 CALYX_MULTIVECTOR_PACK_INVALID,
                 format!(
@@ -52,7 +52,9 @@ impl MultiVectorCompressionConfig {
                 "max_tokens must be greater than zero",
             ));
         }
-        if self.max_token_dim == 0 || self.max_token_dim % 4 != 0 || token_dim > self.max_token_dim
+        if self.max_token_dim == 0
+            || !self.max_token_dim.is_multiple_of(4)
+            || token_dim > self.max_token_dim
         {
             return Err(multivector_error(
                 CALYX_MULTIVECTOR_PACK_INVALID,

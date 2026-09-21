@@ -74,6 +74,13 @@ impl LedgerCfStore for LedgerSnapshot {
         Ok(self.rows.clone())
     }
 
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        let Ok(index) = usize::try_from(seq) else {
+            return Ok(None);
+        };
+        Ok(self.rows.get(index).filter(|row| row.seq == seq).cloned())
+    }
+
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> Result<()> {
         Err(CalyxError::ledger_append_only_violation(format!(
             "erase ledger snapshot rejected append for seq {seq}"

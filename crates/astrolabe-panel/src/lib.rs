@@ -67,6 +67,8 @@ pub const PANEL_SCHEMA_ID_V5: &str = "astro.panel.v5";
 pub const PANEL_SCHEMA_ID_V6: &str = "astro.panel.v6";
 /// Panel schema id emitted by the v7 runtime-module-complete semantic roster.
 pub const PANEL_SCHEMA_ID_V7: &str = "astro.panel.v7";
+/// Panel schema id emitted by the v8 source-manifest-complete semantic roster.
+pub const PANEL_SCHEMA_ID_V8: &str = "astro.panel.v8";
 /// First Astrolabe panel version.
 pub const DEFAULT_PANEL_VERSION: u32 = 1;
 /// Second Astrolabe panel version — adds the S23 `layer_role` frozen slot (#180a).
@@ -81,8 +83,12 @@ pub const PANEL_V5_VERSION: u32 = 5;
 pub const PANEL_V6_VERSION: u32 = 6;
 /// Seventh Astrolabe panel version — typed runtime-module request atom coverage.
 pub const PANEL_V7_VERSION: u32 = 7;
+/// Eighth Astrolabe panel version — complete typed project-source atom coverage.
+pub const PANEL_V8_VERSION: u32 = 8;
 /// Current exhaustive code-memory panel version.
-pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V7_VERSION;
+pub const CURRENT_SEMANTIC_PANEL_VERSION: u32 = PANEL_V8_VERSION;
+/// Universal v8 name-semantic slot used by kernel discovery for every graph atom.
+pub const S20_NAME_SEMANTIC_SLOT_ID: SlotId = SlotId::new(20);
 /// Frozen seed registry schema identifier.
 pub const ASTRO_SEED_REGISTRY_SCHEMA: &str = "astro.seed_registry.v1";
 /// Frozen seed registry artifact kind.
@@ -847,6 +853,14 @@ pub static PANEL_V6_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
 /// byte-identical; S200-S204 add exact runtime-module request measurements.
 pub static PANEL_V7_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
     let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
+    slots.extend(semantic::SEMANTIC_SLOT_SPECS_V7.iter().copied());
+    slots
+});
+
+/// Frozen v8 slot roster. Existing physical slot specifications stay
+/// byte-identical; S205-S210 cover every retained Project source atom.
+pub static PANEL_V8_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut slots = PANEL_V2_SLOTS.iter().copied().collect::<Vec<_>>();
     slots.extend(semantic::SEMANTIC_SLOT_SPECS.iter().copied());
     slots
 });
@@ -886,6 +900,11 @@ pub fn default_panel_v7_slots() -> &'static [PanelSlotSpec] {
     &PANEL_V7_SLOTS
 }
 
+/// Returns the frozen v8 roster including complete Project source atoms.
+pub fn default_panel_v8_slots() -> &'static [PanelSlotSpec] {
+    &PANEL_V8_SLOTS
+}
+
 /// Returns the frozen slot roster for a panel roster version.
 ///
 /// Fails closed for a version that has no frozen roster rather than silently
@@ -899,10 +918,11 @@ pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> 
         PANEL_V5_VERSION => Ok(&PANEL_V5_SLOTS),
         PANEL_V6_VERSION => Ok(&PANEL_V6_SLOTS),
         PANEL_V7_VERSION => Ok(&PANEL_V7_SLOTS),
+        PANEL_V8_VERSION => Ok(&PANEL_V8_SLOTS),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen slot roster"),
-            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 or 4 (S0-S185), 5 (S0-S195), 6 (S0-S199), or 7 (S0-S204).",
+            "Measure with panel version 1 (S0-S22), 2 (S0-S23), 3 or 4 (S0-S185), 5 (S0-S195), 6 (S0-S199), 7 (S0-S204), or 8 (S0-S210).",
         )),
     }
 }
@@ -917,23 +937,35 @@ pub fn schema_id_for_version(version: u32) -> PanelResult<&'static str> {
         PANEL_V5_VERSION => Ok(PANEL_SCHEMA_ID_V5),
         PANEL_V6_VERSION => Ok(PANEL_SCHEMA_ID_V6),
         PANEL_V7_VERSION => Ok(PANEL_SCHEMA_ID_V7),
+        PANEL_V8_VERSION => Ok(PANEL_SCHEMA_ID_V8),
         other => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
             format!("panel version {other} has no frozen schema id"),
-            "Measure with panel version 1, 2, 3, 4, 5, 6, or 7.",
+            "Measure with panel version 1, 2, 3, 4, 5, 6, 7, or 8.",
         )),
     }
 }
 
-/// Returns the canonical SHA-256 witness for every frozen slot contract in a
-/// panel version.
+/// Returns the canonical SHA-256 witness for every frozen slot contract and,
+/// beginning with v8, the complete label-class applicability matrix.
 ///
 /// The manifest is explicitly length-delimited and includes the slot id/key,
 /// physical shape, modality, full norm policy, lifecycle flags, and frozen lens
 /// id. It is intentionally independent of Serde so a diagnostic JSON change
 /// cannot silently move the persisted coverage contract.
 pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
-    const MANIFEST_SCHEMA: &[u8] = b"astro.panel.slot-manifest.v1";
+    const MANIFEST_SCHEMA_V1: &[u8] = b"astro.panel.slot-manifest.v1";
+    const MANIFEST_SCHEMA_V2: &[u8] = b"astro.panel.slot-manifest.v2";
+    const LABEL_CLASSES: [(LabelClass, &[u8]); 8] = [
+        (LabelClass::Callable, b"callable"),
+        (LabelClass::TypeDeclaration, b"type_declaration"),
+        (LabelClass::Value, b"value"),
+        (LabelClass::ModuleFile, b"module_file"),
+        (LabelClass::RouteChannel, b"route_channel"),
+        (LabelClass::StructuredResource, b"structured_resource"),
+        (LabelClass::Section, b"section"),
+        (LabelClass::Structural, b"structural"),
+    ];
 
     fn append_part(bytes: &mut Vec<u8>, part: &[u8]) {
         bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
@@ -943,7 +975,14 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
     let slots = slots_for_version(version)?;
     let schema_id = schema_id_for_version(version)?;
     let mut bytes = Vec::with_capacity(slots.len() * 128);
-    append_part(&mut bytes, MANIFEST_SCHEMA);
+    append_part(
+        &mut bytes,
+        if version >= PANEL_V8_VERSION {
+            MANIFEST_SCHEMA_V2
+        } else {
+            MANIFEST_SCHEMA_V1
+        },
+    );
     append_part(&mut bytes, schema_id.as_bytes());
     append_part(&mut bytes, &version.to_be_bytes());
     append_part(&mut bytes, &(slots.len() as u64).to_be_bytes());
@@ -974,6 +1013,31 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
         let lens_id = FrozenLensContract::for_slot_version(spec, version)?.lens_id();
         append_part(&mut bytes, lens_id.as_bytes());
     }
+    if version >= PANEL_V8_VERSION {
+        let roster = slots
+            .iter()
+            .map(PanelSlotSpec::slot_id)
+            .collect::<BTreeSet<_>>();
+        append_part(&mut bytes, &(LABEL_CLASSES.len() as u64).to_be_bytes());
+        for (class, label) in LABEL_CLASSES {
+            let applicable = applicable_slot_ids_for_class_versioned(class, version);
+            if let Some(slot_id) = applicable.iter().find(|slot_id| !roster.contains(slot_id)) {
+                return Err(PanelError::new(
+                    ASTRO_PANEL_CONTRACT_INVALID,
+                    format!(
+                        "panel v{version} applicability class {class:?} references absent slot S{}",
+                        slot_id.get()
+                    ),
+                    "Add the slot to the same frozen panel roster or remove the invalid applicability rule before publishing its manifest.",
+                ));
+            }
+            append_part(&mut bytes, label);
+            append_part(&mut bytes, &(applicable.len() as u64).to_be_bytes());
+            for slot_id in applicable {
+                append_part(&mut bytes, &slot_id.to_be_bytes());
+            }
+        }
+    }
     Ok(sha256_digest(&[&bytes]))
 }
 
@@ -982,7 +1046,7 @@ pub fn panel_slot_manifest_sha256(version: u32) -> PanelResult<[u8; 32]> {
 /// Older rosters are byte-identical prefixes, so their consumers see the same
 /// physical slot specification while later semantic slots additionally resolve.
 pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
-    PANEL_V7_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
+    PANEL_V8_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
 }
 
 /// Returns the default frozen contracts for every v1 slot.
@@ -1023,7 +1087,7 @@ pub enum LabelClass {
     StructuredResource,
     /// Documentation section atoms.
     Section,
-    /// Project/branch/folder metadata that does not receive panel measurements.
+    /// Project/branch/folder metadata; v8 measures its universal S20 name vector.
     Structural,
 }
 
@@ -1078,9 +1142,9 @@ pub fn applicable_slot_ids(label: SymbolLabel) -> BTreeSet<SlotId> {
 /// Returns the applicable slot ids for a domain label under a panel roster version.
 ///
 /// For the v2 roster this adds S23 `layer_role` to the classes with a behavioral
-/// surface (Callable, TypeDeclaration, ModuleFile, RouteChannel). Value-class atoms
-/// (Field/Constant/Property) and structural atoms have no behavioral surface, so S23
-/// stays *not applicable* and their readout carries an explicit `Absent{NotApplicable}`.
+/// surface (Callable, TypeDeclaration, ModuleFile, RouteChannel). Beginning with v8,
+/// S20 `name_semantic` applies to every class so the complete graph has one uniform,
+/// generation-bound semantic vector space for kernel discovery.
 pub fn applicable_slot_ids_versioned(label: SymbolLabel, version: u32) -> BTreeSet<SlotId> {
     applicable_slot_ids_for_class_versioned(label_class(label), version)
 }
@@ -1093,6 +1157,9 @@ pub fn applicable_slot_ids_for_class_versioned(
     let mut set = applicable_slot_ids_for_class(class);
     if version >= PANEL_V2_VERSION && layer_role_applies_to_class(class) {
         set.insert(S23_LAYER_ROLE_SLOT.slot_id());
+    }
+    if version >= PANEL_V8_VERSION {
+        set.insert(S20_NAME_SEMANTIC_SLOT_ID);
     }
     set
 }
@@ -1324,7 +1391,7 @@ fn absent_reason_label(reason: &AbsentReason) -> String {
 /// space; this bridges a gated lens key to its frozen [`SlotId`] so a per-repo
 /// admission set can be applied to a readout without touching the frozen roster.
 pub fn slot_spec_by_key(key: &str) -> Option<&'static PanelSlotSpec> {
-    PANEL_V7_SLOTS.iter().find(|slot| slot.key == key)
+    PANEL_V8_SLOTS.iter().find(|slot| slot.key == key)
 }
 
 impl PanelReadout {

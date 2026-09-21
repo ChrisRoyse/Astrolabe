@@ -74,8 +74,7 @@ typedef struct {
     uint64_t db_path_bytes;
     uint32_t cached_statement_count;
     uint32_t finalize_error_count;
-    cbm_store_finalize_error_t
-        finalize_errors[CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT];
+    cbm_store_finalize_error_t finalize_errors[CBM_STORE_CLOSE_CACHED_STATEMENT_COUNT];
     uint64_t outstanding_statement_count;
     uint64_t first_outstanding_sql_bytes;
     uint32_t first_outstanding_sql_available;
@@ -175,6 +174,18 @@ typedef struct {
     uint64_t end_byte;
     const char *properties_json; /* JSON string, NULL → "{}" */
 } cbm_node_t;
+
+/* Compact identity projection used by bounded change-impact discovery. It is
+ * deliberately distinct from cbm_node_t so a caller that needs only identity
+ * cannot accidentally pay for or retain the full node/source/property shape. */
+typedef struct {
+    int64_t id;
+    const char *atom_id;
+    const char *name;
+    const char *qualified_name;
+    const char *label;
+    const char *file_path;
+} cbm_node_identity_t;
 
 typedef struct {
     int64_t id;
@@ -399,8 +410,9 @@ cbm_store_verify_status_t cbm_store_open_path_project_query_verified(
  * its content-bound project root and requiring content-bound DELETE mode.  A
  * receipt miss verifies a byte- and hash-bound scratch snapshot before all
  * source-family guards are released. */
-cbm_store_verify_status_t cbm_store_verify_path_project_snapshot(
-    const char *db_path, const char *project, cbm_store_verify_result_t *result);
+cbm_store_verify_status_t cbm_store_verify_path_project_snapshot(const char *db_path,
+                                                                 const char *project,
+                                                                 cbm_store_verify_result_t *result);
 
 /* Verify the complete frozen DB/WAL family and exact project/root provenance
  * without opening the live source, while accepting either valid WAL or DELETE
@@ -427,9 +439,8 @@ cbm_store_verify_status_t cbm_store_open_path_project_writer_existing(
  * exclusive ownership before re-hashing the live family, so a pathname or WAL
  * generation change is refused before journal normalization can begin. */
 cbm_store_verify_status_t cbm_store_open_path_project_writer_existing_bound(
-    const char *db_path, const char *project,
-    const cbm_store_verify_result_t *expected_family, cbm_store_t **out_store,
-    cbm_store_verify_result_t *result);
+    const char *db_path, const char *project, const cbm_store_verify_result_t *expected_family,
+    cbm_store_t **out_store, cbm_store_verify_result_t *result);
 
 /* Verify and open the graph state consumed by cbm_gbuf_load_from_db.  This uses
  * the same source-family freeze, byte/hash-checked snapshot, and race-free
@@ -465,8 +476,7 @@ cbm_store_t *cbm_store_open(const char *project);
  * prepared statement that survives SQLite's virtual-table disconnect is
  * reported and left owned by the unchanged store pointer; it is never silently
  * finalized or converted into a sqlite3_close_v2 zombie. */
-cbm_store_close_status_t cbm_store_close(cbm_store_t **store,
-                                         cbm_store_close_result_t *result);
+cbm_store_close_status_t cbm_store_close(cbm_store_t **store, cbm_store_close_result_t *result);
 
 /* Close a transient owner whose surrounding legacy API has no result channel.
  * Any non-OK result is logged with the complete close record and terminates the
@@ -591,6 +601,17 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
+/* Narrow identity-only roster for detect_changes, strictly ordered by positive
+ * node id. Allocation is refused before the retained compact rows plus strings
+ * exceed max_retained_bytes. `retained_bytes` is the exact live row/string
+ * total (excluding allocator overhead). Release with
+ * cbm_store_free_node_identities. */
+int cbm_store_find_node_identities_by_file(cbm_store_t *s, const char *project,
+                                           const char *file_path, int max_count,
+                                           size_t max_retained_bytes,
+                                           cbm_node_identity_t **out, int *count,
+                                           size_t *retained_bytes);
+void cbm_store_free_node_identities(cbm_node_identity_t *rows, int count);
 
 /* Batch lookup: map qualified names → node IDs.
  * qns[i] is resolved; out_ids[i] receives the ID or 0 if not found.
@@ -614,11 +635,19 @@ int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char
 /* True when path is a non-empty scope after normalization (issue #604). */
 bool cbm_store_arch_path_scoped(const char *path);
 
-/* When scoped, writes normalized directory prefix into norm_out. Returns false if unscoped. */
+/* When scoped, writes the complete normalized directory prefix into norm_out.
+ * Returns false for an unscoped path, allocation failure, or an undersized
+ * output buffer; it never writes a truncated prefix. */
 bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz);
 
-/* True when architecture aspect `name` belongs to the "overview" subset:
- * every aspect EXCEPT the large per-file listing (file_tree). Shared by both
+/* Allocating form used by request paths that must distinguish an unscoped path
+ * (0) from failure (CBM_STORE_ERR).  A scoped result returns 1 and transfers a
+ * malloc-owned string through norm_out. */
+int cbm_store_normalize_arch_path_alloc(const char *path, char **norm_out);
+
+/* True when architecture aspect `name` belongs to the narrow "overview"
+ * subset: every aspect EXCEPT the large per-file listing (file_tree) and the
+ * O(N+E) complete clustering projection (clusters). Shared by both
  * aspect gates — want_aspect (store.c) and aspect_wanted (mcp.c) — so the
  * two sites cannot drift. */
 bool cbm_store_arch_aspect_in_overview(const char *name);
@@ -801,11 +830,21 @@ typedef struct {
     const char *reason;
 } cbm_package_layer_t;
 
+/* Representative display metadata per cluster. Complete community identity is
+ * carried only by member_atom_ids; top_nodes is deliberately bounded. */
+#define CBM_CLUSTER_MAX_TOPNODES 5
+
 typedef struct {
     int id;
     const char *label;
     int members;
     double cohesion;
+    /* Complete stable roster, sorted by canonical atom_id.  This is the
+     * identity-bearing community membership; top_nodes is only a ranked
+     * display of at most CBM_CLUSTER_MAX_TOPNODES representative member names
+     * and is not an identity substitute. */
+    const char **member_atom_ids;
+    int member_atom_id_count;
     const char **top_nodes;
     int top_node_count;
     const char **packages;
@@ -845,9 +884,49 @@ typedef struct {
     int file_tree_count;
 } cbm_architecture_info_t;
 
+/* Caller-owned admission controls for an explicitly requested cluster
+ * projection. There are no policy defaults. resolution must be finite and
+ * positive; max_nodes/max_edges are in [1, INT_MAX]; max_move_visits is in
+ * [1, UINT64_MAX]; max_result_bytes is in [1, SIZE_MAX] and bounds the
+ * shipping C MCP's complete successful architecture payload after every
+ * native field is constructed.  Specifically, it bounds the compact UTF-8
+ * architecture-object bytes copied verbatim into content[0].text and parsed
+ * into structuredContent; it does not bound the outer MCP envelope or the
+ * separately measured canonical cluster-result hash preimage.  A mixed Rust
+ * host that augments the native object must independently enforce the same
+ * caller bound after its final augmentation. The store layer records but
+ * cannot enforce this serialization-layer bound; direct non-MCP callers must
+ * perform the same final-payload measurement themselves. The shipping MCP
+ * names are respectively resolution, cluster_max_nodes, cluster_max_edges,
+ * cluster_max_move_visits, and cluster_max_result_bytes; the shipping MCP
+ * requires all five whenever aspects selects clusters or all. The result-byte
+ * control is an output-publication bound, not an allocation/work budget;
+ * max_nodes, max_edges, and max_move_visits own those separate admissions. */
+typedef struct {
+    double resolution;
+    uint64_t max_nodes;
+    uint64_t max_edges;
+    uint64_t max_move_visits;
+    uint64_t max_result_bytes;
+} cbm_arch_cluster_options_t;
+
+/* Exact native non-`all` selector cardinality. The Rust host may publish a
+ * larger overlay only after validating this native boundary and replacing it
+ * with its own exact extended-vocabulary cardinality. */
+#define CBM_ARCH_MAX_ASPECTS 12
+
+/* aspect_count is in [0, CBM_ARCH_MAX_ASPECTS], tokens are unique, and `all`
+ * is the sole selector when present. The compatibility entry point has no
+ * cluster controls and therefore refuses
+ * aspects containing clusters/all. Use the options form for explicit
+ * clustering; passing options without clusters/all is also invalid. */
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
                                const char **aspects, int aspect_count,
                                cbm_architecture_info_t *out);
+int cbm_store_get_architecture_with_options(cbm_store_t *s, const char *project, const char *path,
+                                            const char **aspects, int aspect_count,
+                                            const cbm_arch_cluster_options_t *cluster_options,
+                                            cbm_architecture_info_t *out);
 void cbm_store_architecture_free(cbm_architecture_info_t *out);
 
 /* ── ADR (Architecture Decision Record) ────────────────────────── */
@@ -921,12 +1000,93 @@ typedef struct {
     int community;
 } cbm_louvain_result_t;
 
-/* Multi-level Leiden community detection (Traag, Waltman & van Eck 2019,
- * arXiv:1810.08473): local moving + refinement + aggregation, repeated until
- * the partition can no longer be coarsened. Refinement guarantees every
- * reported community is internally connected. The resolution parameter
- * controls granularity (higher -> more, smaller communities); 1.0 is standard.
- * Allocates *out (length *out_count == node_count); the caller frees it. */
+/* Machine-readable receipt for the complete architecture-cluster projection.
+ * The store owns no pointers through this type: callers receive a value copy
+ * and may retain it after the architecture result is freed.  `present` is
+ * true after any requested cluster operation, including a refused one. */
+typedef struct {
+    bool present;
+    bool converged;
+    bool connectivity_verified;
+    bool complete_coverage_verified;
+    uint64_t requested_node_count;
+    uint64_t included_node_count;
+    uint64_t excluded_node_count;
+    uint64_t requested_edge_count;
+    uint64_t included_edge_count;
+    uint64_t excluded_edge_count;
+    uint64_t canonical_typed_edge_count;
+    uint64_t weighted_undirected_edge_count;
+    uint64_t undirected_fold_count;
+    uint64_t duplicate_edge_count;
+    uint64_t self_loop_count;
+    uint64_t community_count;
+    uint64_t level_count;
+    uint64_t level_bound; /* derived initial-N strict-contraction proof bound */
+    uint64_t move_visit_count;
+    uint64_t move_visit_cap;
+    uint64_t refine_visit_count;
+    uint64_t refine_visit_bound; /* derived sum of one node pass per executed level */
+    uint64_t refine_merge_count;
+    uint64_t relabel_visit_count;      /* exact map-initialization and assignment node visits */
+    uint64_t aggregate_visit_count;    /* completed primary node/adjacency element visits */
+    uint64_t allocation_attempt_count; /* all owned projection/algorithm/result heap attempts */
+    uint64_t observed_node_label_count;
+    uint64_t node_bound;
+    uint64_t edge_bound;
+    uint64_t result_byte_bound;
+    uint64_t canonical_result_bytes; /* framed native result hash preimage; not the payload bound */
+    uint64_t architecture_payload_bytes; /* final C MCP serializer fills; store returns 0 */
+    double resolution;
+    double objective;
+    char status[16];
+    char algorithm[32];
+    char algorithm_version[16];
+    char projection_schema[64];
+    char result_schema[64];
+    char result_byte_bound_scope[64]; /* `c_architecture_payload_utf8` */
+    char node_label_selection[32];
+    char edge_type_roster[32];
+    char seed[16];
+    char objective_function[32];
+    char move_rule[64];
+    char refinement_rule[64];
+    char aggregation_rule[48];
+    char edge_transform[64];
+    char move_phase_status[16];
+    char refine_phase_status[16];
+    char relabel_phase_status[16];
+    char aggregate_phase_status[16];
+    char readback_phase_status[16];
+    char source_sha256[65];
+    char projection_sha256[65];
+    char result_sha256[65];
+    char node_label_roster_sha256[65];
+    char error_code[64];
+    char error_stage[32];
+    char error_message[256];
+    char error_remediation[256];
+} cbm_cluster_receipt_t;
+
+/* Copies the last requested cluster operation's receipt.  Returns
+ * CBM_STORE_ERR for invalid arguments; `out->present == false` means no
+ * cluster operation has been requested on this store since open. */
+int cbm_store_get_cluster_receipt(cbm_store_t *s, cbm_cluster_receipt_t *out);
+
+/* Multi-level deterministic Leiden modularity variant based on Traag, Waltman
+ * & van Eck 2019 (arXiv:1810.08473): strict-gain local moving, the paper's R/T
+ * well-connectedness refinement gates with a canonical maximum-gain choice,
+ * and refinement-based aggregation seeded by the move partition. It does not
+ * claim stochastic Leiden's subset-optimality guarantee; every published
+ * community is instead independently read back as internally connected. The resolution parameter
+ * controls granularity (higher -> more, smaller communities); it must be finite
+ * and strictly positive. Duplicate node IDs, unknown endpoints, arithmetic
+ * overflow, allocation failure, disconnected readback, and any violated
+ * strict-contraction invariant are hard errors. Allocates *out sorted by
+ * node_id (length *out_count == node_count);
+ * the caller frees it. This low-level compatibility API uses UINT64_MAX as the
+ * move-counter representation ceiling; the shipping architecture API instead
+ * requires its caller to provide cluster_max_move_visits explicitly. */
 int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
 
@@ -980,8 +1140,8 @@ typedef struct {
  * the cbm_cosine_i8 SQL function joined with the nodes table.
  * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
-                             int keyword_count, int limit, cbm_vector_result_t **out,
-                             int *out_count, cbm_index_capability_t *observed_capability);
+                            int keyword_count, int limit, cbm_vector_result_t **out, int *out_count,
+                            cbm_index_capability_t *observed_capability);
 
 /* Free vector search results. */
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);

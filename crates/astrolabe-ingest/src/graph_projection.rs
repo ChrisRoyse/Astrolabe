@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 
 use astrolabe_domain::EdgeKind;
-use calyx_aster::cf::{ColumnFamily, prefix_range};
+use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range};
 use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
 use calyx_aster::vault::{AsterVault, encode::WriteRow};
 use calyx_core::{Clock, CxId, Seq};
@@ -39,12 +39,13 @@ const PROJECTION_REMEDIATION: &str =
 const SIM_EDGE_ROW_BASE_PREFIX: &[u8] = b"astrolabe:sim-edge:";
 const SIM_EDGE_ROW_V2_PREFIX: &[u8] = b"astrolabe:sim-edge:v2:";
 const SCHEMA_SIM_EDGE_ROW: &str = "astrolabe-sim-edge-v2";
-// Ledger subject prefix of the SIM_* persistence group commit (weave writes
-// `SubjectId::Query("astrolabe-sim-edges:{dump_hash}")`). Every persisted SIM
-// row is attested by the newest such commit; a projection built from SIM rows
-// that carries no matching ledger attestation is refused.
-const SIM_EDGE_LEDGER_SUBJECT_PREFIX: &[u8] = b"astrolabe-sim-edges:";
-const PROJECTION_SCHEMA: &str = "astrolabe-graph-projection-csr-v1";
+const SIM_SOURCE_ATTESTATION_SCHEMA: &str = "astrolabe.sim_source_attestation.v1";
+const SIM_SOURCE_ATTESTATION_LEDGER_SCHEMA: &str = "astrolabe.sim_source_attestation_ledger.v1";
+const SIM_SOURCE_ATTESTATION_PREFIX: &[u8] = b"astrolabe:sim-source-attestation:v1:";
+const SIM_SOURCE_ATTESTATION_SUBJECT_PREFIX: &str = "astrolabe-sim-source-attestation:v1";
+const SIM_FAMILY_DUMP_SCHEMA: &[u8] = b"astrolabe.sim_family_persisted_dump.v1";
+const PROJECTION_SCHEMA: &str = "astrolabe-graph-projection-csr-v2";
+const SOURCE_FINGERPRINT_SCHEMA: &[u8] = b"astrolabe.graph_projection_source_fingerprint.v2";
 const MANIFEST_VERSION: u32 = 1;
 const SEGMENT_MAGIC: &[u8; 8] = b"ASTROCSR";
 // v2 (#393): each CSR edge additionally carries its source edge row's ledger
@@ -417,10 +418,43 @@ pub struct CompositeKernelProjectionVerifyReport {
     pub representative_sim_only_edge: Option<SimOnlyKernelEdgeEvidence>,
 }
 
+/// Point-readable identity for one persisted projection manifest. This binds
+/// the exact manifest bytes (including every segment length/hash) without
+/// materializing the CSR or scanning the raw Graph source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphProjectionManifestIdentity {
+    pub schema: String,
+    pub projection_schema: String,
+    pub csr_manifest_version: u32,
+    pub projection: String,
+    pub source_fingerprint_blake3: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub association_edge_count: usize,
+    pub segment_count: usize,
+    pub manifest_key_hex: String,
+    pub manifest_bytes: u64,
+    pub manifest_blake3: String,
+    pub manifest_sha256: String,
+}
+
+/// Exact point-readable source binding used by bounded ordinary CSR reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphProjectionReadBinding {
+    pub graph_content_generation: Seq,
+    pub manifest: GraphProjectionManifestIdentity,
+}
+
 #[derive(Clone, Debug)]
 struct SourceEdges {
     rows: Vec<SourceEdgeRow>,
     fingerprint: [u8; 32],
+    /// Exact MVCC snapshot whose Graph rows were scanned.
+    source_snapshot: Seq,
+    /// Durable Graph content generation before and after the source scan.
+    graph_content_generation: Seq,
     /// Typed CBM structural edge rows scanned from Graph CF.
     typed_edge_rows: usize,
     /// Persisted SIM_* similarity edge rows folded into the composite graph.
@@ -458,18 +492,123 @@ struct SourceEdgeRow {
 
 /// Deserialize view of the persisted `astrolabe-sim-edge-v2` wire row.
 ///
-/// Mirrors only the fields the composite projection needs from
-/// `astrolabe_weave::sim_rows::SimEdgeGraphRow` (the authoritative writer);
-/// serde ignores the remaining fields. Kept in lock-step with the persisted
-/// schema tag [`SCHEMA_SIM_EDGE_ROW`], validated on read.
+/// Mirrors the complete authoritative
+/// `astrolabe_weave::sim_rows::SimEdgeGraphRow` wire schema. Strict decoding is
+/// required because the terminal family digest binds the exact raw bytes while
+/// the projection separately validates their decoded meaning.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SimEdgeSourceRow {
     schema: String,
     family: String,
     source_id: String,
     target_id: String,
+    #[serde(rename = "source_qn")]
+    _source_qn: String,
+    #[serde(rename = "target_qn")]
+    _target_qn: String,
+    slot: u16,
     etype: u16,
+    metric: String,
     weight_bits: u32,
+    threshold_bits: u32,
+    props: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum SimSourceFamily {
+    Struct,
+    Semantic,
+    Api,
+    Profile,
+}
+
+impl SimSourceFamily {
+    const ALL: [Self; 4] = [Self::Struct, Self::Semantic, Self::Api, Self::Profile];
+
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Struct => "SIM_STRUCT",
+            Self::Semantic => "SIM_SEMANTIC",
+            Self::Api => "SIM_API",
+            Self::Profile => "SIM_PROFILE",
+        }
+    }
+
+    fn from_wire_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|family| family.wire_name() == name)
+    }
+
+    const fn sort_index(self) -> u8 {
+        match self {
+            Self::Struct => 0,
+            Self::Semantic => 1,
+            Self::Api => 2,
+            Self::Profile => 3,
+        }
+    }
+
+    const fn slot(self) -> u16 {
+        match self {
+            Self::Struct => 1,
+            Self::Semantic => 18,
+            Self::Api => 4,
+            Self::Profile => 21,
+        }
+    }
+
+    const fn edge_kind(self) -> EdgeKind {
+        match self {
+            Self::Semantic => EdgeKind::SemanticallyRelated,
+            Self::Struct | Self::Api | Self::Profile => EdgeKind::SimilarTo,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimSourceAttestation {
+    schema: String,
+    family: String,
+    row_count: u64,
+    total_bytes: u64,
+    content_blake3: String,
+    ledger_seq: u64,
+    ledger_hash: String,
+    actor: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimSourceAttestationLedgerPayload {
+    schema: String,
+    family: String,
+    row_count: u64,
+    total_bytes: u64,
+    content_blake3: String,
+}
+
+#[derive(Debug)]
+struct SimFamilySourceRows {
+    rows: Vec<(Vec<u8>, Vec<u8>, SimEdgeSourceRow)>,
+    row_count: u64,
+    total_bytes: u64,
+    content_hasher: blake3::Hasher,
+}
+
+impl SimFamilySourceRows {
+    fn new() -> Self {
+        let mut content_hasher = blake3::Hasher::new();
+        frame_hash(&mut content_hasher, SIM_FAMILY_DUMP_SCHEMA);
+        Self {
+            rows: Vec::new(),
+            row_count: 0,
+            total_bytes: 0,
+            content_hasher,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -503,6 +642,19 @@ struct ProjectionUpdatePlan {
     tombstoned_keys: Vec<Vec<u8>>,
     rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
     entry: GraphProjectionMaterializeEntry,
+}
+
+struct ProjectionCommitReadbackExpectation<'a> {
+    kind: GraphProjectionKind,
+    commit_seq: Seq,
+    ledger_ref: &'a calyx_core::LedgerRef,
+    subject: &'a SubjectId,
+    payload: &'a [u8],
+    actor: &'a ActorId,
+    desired: &'a ProjectionBytes,
+    segment_is_stale: &'a [bool],
+    manifest_written: bool,
+    tombstoned_keys: &'a [Vec<u8>],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -595,8 +747,9 @@ where
 }
 
 /// Reads and verifies a projection and its complete typed+similarity source at
-/// one caller-retained MVCC sequence.  This is the discovery-safe variant: no
-/// helper is permitted to acquire a newer snapshot mid-read.
+/// the caller-retained current MVCC sequence. This is the discovery-safe
+/// variant: no helper is permitted to acquire a newer snapshot mid-read, and a
+/// source generation that advances during the read is refused.
 pub fn read_graph_projection_csr_at<C>(
     vault: &AsterVault<C>,
     kind: GraphProjectionKind,
@@ -624,6 +777,134 @@ where
             Ok(Some(csr))
         }
     }
+}
+
+/// Reads and validates only the immutable projection-manifest point row.
+///
+/// # Cost contract (#1064)
+///
+/// This performs one Kernel CF point read and `O(S)` validation over the
+/// manifest's region roster, where `S <= 256` by the one-byte region scheme. It
+/// performs no Graph scan and no CSR segment read. The retained snapshot, exact
+/// manifest bytes, projection kind, and canonical region order are invariant.
+pub fn read_graph_projection_manifest_identity_at<C>(
+    vault: &AsterVault<C>,
+    kind: GraphProjectionKind,
+    snapshot: Seq,
+) -> IngestResult<Option<GraphProjectionManifestIdentity>>
+where
+    C: Clock,
+{
+    let key = manifest_key(kind);
+    let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::Kernel, &key)? else {
+        return Ok(None);
+    };
+    let manifest: ProjectionManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        projection_corrupt(format!(
+            "decode {} CSR manifest identity point row: {error}",
+            kind.name()
+        ))
+    })?;
+    validate_manifest(kind, &manifest)?;
+    let manifest_bytes = u64::try_from(bytes.len())
+        .map_err(|_| projection_corrupt("projection manifest byte length exceeds u64"))?;
+    Ok(Some(GraphProjectionManifestIdentity {
+        schema: "astrolabe.graph_projection_manifest_identity.v1".to_string(),
+        projection_schema: manifest.schema,
+        csr_manifest_version: manifest.csr_manifest_version,
+        projection: manifest.projection,
+        source_fingerprint_blake3: manifest.source_fingerprint_blake3,
+        node_count: manifest.node_count,
+        edge_count: manifest.edge_count,
+        association_edge_count: manifest.association_edge_count,
+        segment_count: manifest.segment_count,
+        manifest_key_hex: hex_key(&key),
+        manifest_bytes,
+        manifest_blake3: blake3::hash(&bytes).to_hex().to_string(),
+        manifest_sha256: sha256_hex(&bytes),
+    }))
+}
+
+/// Reads only the manifest-bound CSR segments after proving the exact durable
+/// Graph generation has not changed. Unlike the deep verification reader, this
+/// performs no raw Graph or Ledger scan.
+///
+/// # Cost contract (#1064)
+///
+/// Two Graph-generation probes and two manifest point reads are `O(1)`; segment
+/// decode/hash work is `O(N+E)` because the caller requested the actual CSR.
+/// The retained snapshot, durable Graph generation, exact manifest bytes, and
+/// canonical segment roster are invariant across the read (PC-02/03/38/40/43).
+pub fn read_graph_projection_csr_bound_at<C>(
+    vault: &AsterVault<C>,
+    kind: GraphProjectionKind,
+    snapshot: Seq,
+    expected: &GraphProjectionReadBinding,
+) -> IngestResult<GraphProjectionCsr>
+where
+    C: Clock,
+{
+    if vault.latest_seq() != snapshot {
+        return Err(projection_corrupt(format!(
+            "{} bounded CSR read requires the current retained snapshot; expected {snapshot}, observed {}",
+            kind.name(),
+            vault.latest_seq()
+        )));
+    }
+    let graph_generation_before = vault.cf_content_generation(ColumnFamily::Graph)?;
+    let manifest_before = read_graph_projection_manifest_identity_at(vault, kind, snapshot)?
+        .ok_or_else(|| {
+            projection_corrupt(format!(
+                "{} bounded CSR read found no projection manifest",
+                kind.name()
+            ))
+        })?;
+    if graph_generation_before != expected.graph_content_generation
+        || manifest_before != expected.manifest
+    {
+        return Err(projection_corrupt(format!(
+            "{} bounded CSR source differs before segment read: expected_graph_generation={}, observed_graph_generation={graph_generation_before}, expected_manifest={:?}, observed_manifest={manifest_before:?}",
+            kind.name(),
+            expected.graph_content_generation,
+            expected.manifest,
+        )));
+    }
+    let csr = match load_persisted_projection_at(vault, kind, false, snapshot)? {
+        PersistedProjectionState::Complete(csr) => csr,
+        PersistedProjectionState::Missing => {
+            return Err(projection_corrupt(format!(
+                "{} bounded CSR manifest exists but segment set is absent",
+                kind.name()
+            )));
+        }
+        PersistedProjectionState::Incomplete => {
+            return Err(projection_corrupt(format!(
+                "{} bounded CSR segment set is incomplete",
+                kind.name()
+            )));
+        }
+    };
+    let graph_generation_after = vault.cf_content_generation(ColumnFamily::Graph)?;
+    let manifest_after = read_graph_projection_manifest_identity_at(vault, kind, snapshot)?
+        .ok_or_else(|| {
+            projection_corrupt(format!(
+                "{} bounded CSR manifest disappeared during segment read",
+                kind.name()
+            ))
+        })?;
+    let latest_after = vault.latest_seq();
+    if graph_generation_after != expected.graph_content_generation
+        || manifest_after != expected.manifest
+        || latest_after != snapshot
+    {
+        return Err(projection_corrupt(format!(
+            "{} bounded CSR source changed during segment read: expected_snapshot={snapshot}, observed_latest={latest_after}, expected_graph_generation={}, observed_graph_generation={graph_generation_after}, expected_manifest={:?}, observed_manifest={manifest_after:?}",
+            kind.name(),
+            expected.graph_content_generation,
+            expected.manifest,
+        )));
+    }
+    Ok(csr)
 }
 
 /// Independently verifies the persisted composite kernel projection against all
@@ -888,7 +1169,23 @@ where
     C: Clock,
 {
     let source = read_source_edges(vault)?;
-    match load_persisted_projection(vault, kind, true)? {
+    let projection_snapshot = vault.latest_seq();
+    if vault.cf_content_generation(ColumnFamily::Graph)? != source.graph_content_generation {
+        return Err(projection_corrupt(format!(
+            "{} Graph source changed before persisted projection inspection",
+            kind.name()
+        )));
+    }
+    let persisted = load_persisted_projection_at(vault, kind, true, projection_snapshot)?;
+    if vault.latest_seq() != projection_snapshot
+        || vault.cf_content_generation(ColumnFamily::Graph)? != source.graph_content_generation
+    {
+        return Err(projection_corrupt(format!(
+            "{} source or persisted projection state changed during ensure inspection",
+            kind.name()
+        )));
+    }
+    match persisted {
         PersistedProjectionState::Complete(csr)
             if csr.source_fingerprint_blake3 == source.fingerprint =>
         {
@@ -915,7 +1212,30 @@ where
     C: Clock,
 {
     let snapshot = vault.latest_seq();
+    if source.source_snapshot > snapshot {
+        return Err(projection_corrupt(format!(
+            "{} source snapshot {} is newer than current snapshot {snapshot}",
+            kind.name(),
+            source.source_snapshot
+        )));
+    }
+    let graph_generation_before = vault.cf_content_generation(ColumnFamily::Graph)?;
+    if graph_generation_before != source.graph_content_generation {
+        return Err(projection_corrupt(format!(
+            "{} source Graph generation {} is stale against current generation {graph_generation_before}",
+            kind.name(),
+            source.graph_content_generation
+        )));
+    }
     let mut plan = plan_projection_update(vault, snapshot, kind, options, source)?;
+    let graph_generation_after_plan = vault.cf_content_generation(ColumnFamily::Graph)?;
+    if graph_generation_after_plan != source.graph_content_generation {
+        return Err(projection_corrupt(format!(
+            "{} Graph generation changed while planning projection publication: expected {}, observed {graph_generation_after_plan}",
+            kind.name(),
+            source.graph_content_generation
+        )));
+    }
     let wrote_rows = !plan.rows.is_empty();
     if wrote_rows {
         let payload = serde_json::to_vec(&json!({
@@ -929,22 +1249,49 @@ where
             "segments_tombstoned": plan.entry.segments_tombstoned,
             "manifest_written": plan.entry.manifest_written,
         }))?;
-        vault.write_cf_batch_with_ledger_entry(
-            std::mem::take(&mut plan.rows),
-            EntryKind::Kernel,
-            SubjectId::Query(kind.name().as_bytes().to_vec()),
-            payload,
-            ActorId::Service(ASTROLABE_PROJECTION_ACTOR.to_string()),
-        )?;
+        let subject = SubjectId::Query(kind.name().as_bytes().to_vec());
+        let actor = ActorId::Service(ASTROLABE_PROJECTION_ACTOR.to_string());
+        let (commit, ()) = vault
+            .write_cf_batch_with_ledger_entry_with_row_digests_and_derived_if_seq(
+                snapshot,
+                std::mem::take(&mut plan.rows),
+                EntryKind::Kernel,
+                subject.clone(),
+                payload.clone(),
+                actor.clone(),
+                |_ledger_ref, _| Ok((Vec::new(), ())),
+            )?;
         plan.entry.rows_readback_verified = verify_projection_commit_readback(
             vault,
-            kind,
-            &plan.desired,
-            &plan.segment_is_stale,
-            plan.entry.manifest_written,
-            &plan.tombstoned_keys,
+            &ProjectionCommitReadbackExpectation {
+                kind,
+                commit_seq: commit.seq,
+                ledger_ref: &commit.ledger_ref,
+                subject: &subject,
+                payload: &payload,
+                actor: &actor,
+                desired: &plan.desired,
+                segment_is_stale: &plan.segment_is_stale,
+                manifest_written: plan.entry.manifest_written,
+                tombstoned_keys: &plan.tombstoned_keys,
+            },
         )?;
+        let graph_generation_after_commit = vault.cf_content_generation(ColumnFamily::Graph)?;
+        if graph_generation_after_commit != source.graph_content_generation {
+            return Err(projection_corrupt(format!(
+                "{} Graph generation changed across projection commit: expected {}, observed {graph_generation_after_commit}",
+                kind.name(),
+                source.graph_content_generation
+            )));
+        }
         plan.entry.ledger_paired = true;
+    } else if vault.latest_seq() != snapshot
+        || vault.cf_content_generation(ColumnFamily::Graph)? != source.graph_content_generation
+    {
+        return Err(projection_corrupt(format!(
+            "{} source or persisted projection state changed during no-op publication decision",
+            kind.name()
+        )));
     }
 
     Ok(plan.entry)
@@ -1075,16 +1422,21 @@ where
 /// acked as verified on trust.
 fn verify_projection_commit_readback<C>(
     vault: &AsterVault<C>,
-    kind: GraphProjectionKind,
-    desired: &ProjectionBytes,
-    segment_is_stale: &[bool],
-    manifest_written: bool,
-    tombstoned_keys: &[Vec<u8>],
+    expected: &ProjectionCommitReadbackExpectation<'_>,
 ) -> IngestResult<usize>
 where
     C: Clock,
 {
-    let commit_seq = vault.latest_seq();
+    let kind = expected.kind;
+    let commit_seq = expected.commit_seq;
+    let ledger_ref = expected.ledger_ref;
+    let expected_subject = expected.subject;
+    let expected_payload = expected.payload;
+    let expected_actor = expected.actor;
+    let desired = expected.desired;
+    let segment_is_stale = expected.segment_is_stale;
+    let manifest_written = expected.manifest_written;
+    let tombstoned_keys = expected.tombstoned_keys;
     let mut rows_verified = 0;
     for (segment, stale) in desired.segments.iter().zip(segment_is_stale) {
         if !*stale {
@@ -1125,28 +1477,47 @@ where
         rows_verified += 1;
     }
 
-    let (_key, ledger_bytes) = calyx_aster::ledger_view::newest_pairable_ledger(
-        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
-    )?
-    .ok_or_else(|| projection_readback(kind, "Ledger CF empty at projection commit snapshot"))?;
+    let ledger_bytes = vault
+        .read_cf_at(
+            commit_seq,
+            ColumnFamily::Ledger,
+            &ledger_key(ledger_ref.seq),
+        )?
+        .ok_or_else(|| {
+            projection_readback(
+                kind,
+                "paired Ledger row absent at projection commit snapshot",
+            )
+        })?;
     let entry = decode(&ledger_bytes)?;
+    if entry.seq != ledger_ref.seq || entry.entry_hash != ledger_ref.hash {
+        return Err(projection_readback(
+            kind,
+            "paired ledger entry differs from the exact commit receipt",
+        ));
+    }
     if entry.kind != EntryKind::Kernel {
         return Err(projection_readback(
             kind,
             "paired ledger entry has the wrong entry kind",
         ));
     }
-    if !matches!(&entry.actor, ActorId::Service(actor) if actor == ASTROLABE_PROJECTION_ACTOR) {
+    if &entry.actor != expected_actor {
         return Err(projection_readback(
             kind,
             "paired ledger entry names the wrong actor",
         ));
     }
-    if !matches!(&entry.subject, SubjectId::Query(subject) if subject.as_slice() == kind.name().as_bytes())
-    {
+    if &entry.subject != expected_subject {
         return Err(projection_readback(
             kind,
             "paired ledger entry names the wrong subject",
+        ));
+    }
+    if entry.payload.as_slice() != expected_payload {
+        return Err(projection_readback(
+            kind,
+            "paired ledger entry carries the wrong projection payload",
         ));
     }
 
@@ -1171,7 +1542,15 @@ fn read_source_edges_at<C>(vault: &AsterVault<C>, snapshot: Seq) -> IngestResult
 where
     C: Clock,
 {
+    let latest_before = vault.latest_seq();
+    if latest_before != snapshot {
+        return Err(projection_corrupt(format!(
+            "projection source scan requires the current retained snapshot; requested {snapshot}, current snapshot is {latest_before}"
+        )));
+    }
+    let graph_content_generation = vault.cf_content_generation(ColumnFamily::Graph)?;
     let mut hasher = blake3::Hasher::new();
+    frame_hash(&mut hasher, SOURCE_FINGERPRINT_SCHEMA);
 
     // Family 1 — typed CBM structural edge rows (`astrolabe:edge:v1:`).
     let typed = vault.scan_cf_range_at(
@@ -1210,10 +1589,19 @@ where
 
     // Family 2 — persisted SIM_* similarity edge rows (`astrolabe:sim-edge:*`).
     let sim_edge_rows = read_similarity_source_edges(vault, snapshot, &mut hasher, &mut out)?;
+    let observed_graph_generation = vault.cf_content_generation(ColumnFamily::Graph)?;
+    let latest_after = vault.latest_seq();
+    if observed_graph_generation != graph_content_generation || latest_after != snapshot {
+        return Err(projection_corrupt(format!(
+            "source changed during projection scan: expected_snapshot={snapshot}, observed_snapshot={latest_after}, expected_graph_generation={graph_content_generation}, observed_graph_generation={observed_graph_generation}"
+        )));
+    }
 
     Ok(SourceEdges {
         rows: out,
         fingerprint: *hasher.finalize().as_bytes(),
+        source_snapshot: snapshot,
+        graph_content_generation,
         typed_edge_rows,
         sim_edge_rows,
     })
@@ -1266,6 +1654,13 @@ fn source_edges_from_final_graph<C>(
 where
     C: Clock,
 {
+    if vault.latest_seq() != snapshot {
+        return Err(projection_corrupt(format!(
+            "direct-ingest final-state projection requires current snapshot {snapshot}, observed {}",
+            vault.latest_seq()
+        )));
+    }
+    let graph_content_generation = vault.cf_content_generation(ColumnFamily::Graph)?;
     let mut overlay = BTreeMap::<&[u8], Option<&[u8]>>::new();
     for row in ledger_bound_rows
         .iter()
@@ -1281,9 +1676,11 @@ where
     }
 
     let mut hasher = blake3::Hasher::new();
+    frame_hash(&mut hasher, SOURCE_FINGERPRINT_SCHEMA);
     let mut typed = Vec::new();
     let mut resolved = BTreeMap::<String, CxId>::new();
-    let mut pending_sim = Vec::<(Vec<u8>, SimEdgeSourceRow)>::new();
+    let mut sim_groups = empty_sim_family_groups();
+    let mut final_sim_markers = BTreeMap::<SimSourceFamily, Vec<u8>>::new();
     {
         let mut observe = |key: &[u8], value: &[u8]| -> IngestResult<()> {
             if key.starts_with(EDGE_ROW_PREFIX) {
@@ -1341,18 +1738,15 @@ where
                     )));
                 }
             } else if key.starts_with(SIM_EDGE_ROW_BASE_PREFIX) {
-                frame_hash(&mut hasher, key);
-                frame_hash(&mut hasher, value);
-                if !key.starts_with(SIM_EDGE_ROW_V2_PREFIX) {
+                collect_sim_family_row(&mut sim_groups, key.to_vec(), value.to_vec())?;
+            } else if key.starts_with(SIM_SOURCE_ATTESTATION_PREFIX) {
+                let family = sim_source_attestation_family_from_key(key)?;
+                if final_sim_markers.insert(family, value.to_vec()).is_some() {
                     return Err(projection_corrupt(format!(
-                        "SIM edge row {} carries an unknown astrolabe:sim-edge version",
-                        hex_key(key)
+                        "direct-ingest final Graph state contains duplicate {} SIM source markers",
+                        family.wire_name()
                     )));
                 }
-                let row = serde_json::from_slice::<SimEdgeSourceRow>(value).map_err(|error| {
-                    projection_corrupt(format!("decode SIM edge row {}: {error}", hex_key(key)))
-                })?;
-                pending_sim.push((key.to_vec(), row));
             }
             Ok(())
         };
@@ -1398,53 +1792,33 @@ where
     }
 
     let typed_edge_rows = typed.len();
-    let sim_edge_rows = pending_sim.len();
-    if !pending_sim.is_empty() {
-        let (ledger_seq, ledger_hash) = newest_sim_edge_ledger_attestation(vault, snapshot)?;
-        for (key, row) in pending_sim {
-            if row.schema != SCHEMA_SIM_EDGE_ROW {
-                return Err(projection_corrupt(format!(
-                    "SIM edge row {} carries schema {:?}, expected {SCHEMA_SIM_EDGE_ROW}",
-                    hex_key(&key),
-                    row.schema
-                )));
-            }
-            let kind = edge_kind_from_code(row.etype).ok_or_else(|| {
-                projection_corrupt(format!(
-                    "SIM edge row {} has unknown etype {}",
-                    hex_key(&key),
-                    row.etype
-                ))
-            })?;
-            if !matches!(kind, EdgeKind::SimilarTo | EdgeKind::SemanticallyRelated) {
-                return Err(projection_corrupt(format!(
-                    "SIM edge row {} (family {:?}) carries non-similarity edge kind {:?}",
-                    hex_key(&key),
-                    row.family,
-                    kind
-                )));
-            }
-            let weight = f32::from_bits(row.weight_bits);
-            validate_edge_weight(weight, "SIM edge weight")?;
-            let src = resolve_sim_endpoint(&resolved, &row.source_id, &key, "source")?;
-            let dst = resolve_sim_endpoint(&resolved, &row.target_id, &key, "target")?;
-            typed.push(SourceEdgeRow {
-                src,
-                dst,
-                etype: row.etype,
-                weight,
-                kind,
-                ledger_seq,
-                ledger_hash,
-                props: serde_json::Value::Null,
-                family: SourceFamily::Similarity,
-            });
-        }
+    let sim_edge_rows = sim_groups.values().try_fold(0usize, |total, group| {
+        total
+            .checked_add(group.rows.len())
+            .ok_or_else(|| projection_corrupt("direct-ingest SIM source row count overflow"))
+    })?;
+    append_verified_sim_groups(
+        vault,
+        snapshot,
+        &resolved,
+        &mut sim_groups,
+        Some(&final_sim_markers),
+        &mut hasher,
+        &mut typed,
+    )?;
+    let observed_graph_generation = vault.cf_content_generation(ColumnFamily::Graph)?;
+    let latest_after = vault.latest_seq();
+    if observed_graph_generation != graph_content_generation || latest_after != snapshot {
+        return Err(projection_corrupt(format!(
+            "source changed during direct-ingest final-state projection planning: expected_snapshot={snapshot}, observed_snapshot={latest_after}, expected_graph_generation={graph_content_generation}, observed_graph_generation={observed_graph_generation}"
+        )));
     }
 
     Ok(SourceEdges {
         rows: typed,
         fingerprint: *hasher.finalize().as_bytes(),
+        source_snapshot: snapshot,
+        graph_content_generation,
         typed_edge_rows,
         sim_edge_rows,
     })
@@ -1459,8 +1833,8 @@ where
 /// unknown `astrolabe:sim-edge:` version segment, a wrong row schema, a family
 /// whose edge kind is not a similarity edge, a non-finite or out-of-range
 /// weight, a source/target stable atom id that is unmapped in the
-/// persisted node map, or SIM rows that exist without their group-commit ledger
-/// attestation.
+/// persisted node map, or SIM rows whose exact family dump lacks a matching
+/// terminal marker and point-readable Ledger attestation.
 fn read_similarity_source_edges<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
@@ -1475,68 +1849,369 @@ where
         ColumnFamily::Graph,
         &prefix_range(SIM_EDGE_ROW_BASE_PREFIX),
     )?;
-    if raw.is_empty() {
-        return Ok(0);
-    }
-
-    // Resolve endpoints and attest the family only when SIM rows are present.
-    let resolved = crate::sqlite_import::read_global_atom_cx_ids_at(vault, snapshot)?;
-    let (ledger_seq, ledger_hash) = newest_sim_edge_ledger_attestation(vault, snapshot)?;
-
-    let mut count = 0usize;
+    let mut groups = empty_sim_family_groups();
     for (key, value) in raw {
-        frame_hash(hasher, &key);
-        frame_hash(hasher, &value);
-        if !key.starts_with(SIM_EDGE_ROW_V2_PREFIX) {
-            return Err(projection_corrupt(format!(
-                "SIM edge row {} carries an unknown astrolabe:sim-edge version; refusing to \
-                 build a projection that would silently omit a similarity source family",
-                hex_key(&key)
-            )));
+        collect_sim_family_row(&mut groups, key, value)?;
+    }
+    let row_count = groups.values().try_fold(0usize, |total, group| {
+        total
+            .checked_add(group.rows.len())
+            .ok_or_else(|| projection_corrupt("SIM source row count overflow"))
+    })?;
+    let resolved = if row_count == 0 {
+        BTreeMap::new()
+    } else {
+        crate::sqlite_import::read_global_atom_cx_ids_at(vault, snapshot)?
+    };
+    append_verified_sim_groups(vault, snapshot, &resolved, &mut groups, None, hasher, out)?;
+    Ok(row_count)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VerifiedSimFamilyAttestation {
+    ledger_seq: u64,
+    ledger_hash: [u8; 32],
+}
+
+fn empty_sim_family_groups() -> BTreeMap<SimSourceFamily, SimFamilySourceRows> {
+    SimSourceFamily::ALL
+        .into_iter()
+        .map(|family| (family, SimFamilySourceRows::new()))
+        .collect()
+}
+
+fn collect_sim_family_row(
+    groups: &mut BTreeMap<SimSourceFamily, SimFamilySourceRows>,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> IngestResult<()> {
+    if !key.starts_with(SIM_EDGE_ROW_V2_PREFIX) {
+        return Err(projection_corrupt(format!(
+            "SIM edge row {} carries an unknown astrolabe:sim-edge version; refusing to build a projection that would silently omit a similarity source family",
+            hex_key(&key)
+        )));
+    }
+    let row = serde_json::from_slice::<SimEdgeSourceRow>(&value).map_err(|error| {
+        projection_corrupt(format!("decode SIM edge row {}: {error}", hex_key(&key)))
+    })?;
+    let family = validate_sim_source_row(&key, &row)?;
+    let group = groups
+        .get_mut(&family)
+        .expect("complete fixed SIM family roster");
+    if group
+        .rows
+        .last()
+        .is_some_and(|(previous, _, _)| previous >= &key)
+    {
+        return Err(projection_corrupt(format!(
+            "{} SIM family rows are not strictly key-sorted at {}",
+            family.wire_name(),
+            hex_key(&key)
+        )));
+    }
+    frame_hash(&mut group.content_hasher, &key);
+    frame_hash(&mut group.content_hasher, &value);
+    group.row_count = group
+        .row_count
+        .checked_add(1)
+        .ok_or_else(|| projection_corrupt("SIM family row count overflow"))?;
+    group.total_bytes = group
+        .total_bytes
+        .checked_add(key.len() as u64)
+        .and_then(|total| total.checked_add(value.len() as u64))
+        .ok_or_else(|| projection_corrupt("SIM family byte count overflow"))?;
+    group.rows.push((key, value, row));
+    Ok(())
+}
+
+fn validate_sim_source_row(key: &[u8], row: &SimEdgeSourceRow) -> IngestResult<SimSourceFamily> {
+    if row.schema != SCHEMA_SIM_EDGE_ROW {
+        return Err(projection_corrupt(format!(
+            "SIM edge row {} carries schema {:?}, expected {SCHEMA_SIM_EDGE_ROW}",
+            hex_key(key),
+            row.schema
+        )));
+    }
+    let family = SimSourceFamily::from_wire_name(&row.family).ok_or_else(|| {
+        projection_corrupt(format!(
+            "SIM edge row {} names unknown family {:?}",
+            hex_key(key),
+            row.family
+        ))
+    })?;
+    if row.source_id.trim().is_empty() || row.target_id.trim().is_empty() {
+        return Err(projection_corrupt(format!(
+            "SIM edge row {} carries an empty stable endpoint identity",
+            hex_key(key)
+        )));
+    }
+    if row.slot != family.slot() || row.etype != family.edge_kind().code() || row.metric != "cosine"
+    {
+        return Err(projection_corrupt(format!(
+            "SIM edge row {} disagrees with {} family metadata",
+            hex_key(key),
+            family.wire_name()
+        )));
+    }
+    let expected_key = sim_source_row_key(family, &row.source_id, &row.target_id);
+    if key != expected_key.as_slice() {
+        return Err(projection_corrupt(format!(
+            "SIM edge row key {} does not match its decoded family/endpoints",
+            hex_key(key)
+        )));
+    }
+    let weight = f32::from_bits(row.weight_bits);
+    let threshold = f32::from_bits(row.threshold_bits);
+    validate_edge_weight(weight, "SIM edge weight")?;
+    validate_edge_weight(threshold, "SIM edge threshold")?;
+    let expected_props = BTreeMap::from([
+        ("family".to_string(), row.family.clone()),
+        ("metric".to_string(), row.metric.clone()),
+        ("source_atom_id".to_string(), row.source_id.clone()),
+        ("target_atom_id".to_string(), row.target_id.clone()),
+        ("slot_id".to_string(), row.slot.to_string()),
+        ("score".to_string(), format!("{weight:.9}")),
+        ("threshold".to_string(), format!("{threshold:.9}")),
+    ]);
+    if row.props != expected_props {
+        return Err(projection_corrupt(format!(
+            "SIM edge row {} carries properties inconsistent with its typed fields",
+            hex_key(key)
+        )));
+    }
+    Ok(family)
+}
+
+fn sim_source_row_key(family: SimSourceFamily, source_id: &str, target_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        SIM_EDGE_ROW_V2_PREFIX.len() + 1 + 4 + source_id.len() + 4 + target_id.len(),
+    );
+    key.extend_from_slice(SIM_EDGE_ROW_V2_PREFIX);
+    key.push(family.sort_index());
+    key.extend_from_slice(&(source_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(source_id.as_bytes());
+    key.extend_from_slice(&(target_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(target_id.as_bytes());
+    key
+}
+
+fn append_verified_sim_groups<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    resolved: &BTreeMap<String, CxId>,
+    groups: &mut BTreeMap<SimSourceFamily, SimFamilySourceRows>,
+    final_markers: Option<&BTreeMap<SimSourceFamily, Vec<u8>>>,
+    hasher: &mut blake3::Hasher,
+    out: &mut Vec<SourceEdgeRow>,
+) -> IngestResult<()>
+where
+    C: Clock,
+{
+    for family in SimSourceFamily::ALL {
+        let group = groups
+            .get_mut(&family)
+            .expect("complete fixed SIM family roster");
+        let marker_key = sim_source_attestation_key(family);
+        let marker_bytes = match final_markers {
+            Some(markers) => markers.get(&family).cloned(),
+            None => vault.read_cf_at(snapshot, ColumnFamily::Graph, &marker_key)?,
+        };
+        let Some(marker_bytes) = marker_bytes else {
+            if group.row_count != 0 {
+                return Err(projection_corrupt(format!(
+                    "{} has {} persisted SIM rows but no terminal source attestation marker",
+                    family.wire_name(),
+                    group.row_count
+                )));
+            }
+            continue;
+        };
+        let attestation =
+            verify_sim_family_attestation(vault, snapshot, family, group, &marker_bytes)?;
+        frame_hash(
+            hasher,
+            b"astrolabe.graph_projection.sim_family_attestation.v1",
+        );
+        frame_hash(hasher, &marker_key);
+        frame_hash(hasher, &marker_bytes);
+        for (key, value, row) in std::mem::take(&mut group.rows) {
+            frame_hash(hasher, &key);
+            frame_hash(hasher, &value);
+            let src = resolve_sim_endpoint(resolved, &row.source_id, &key, "source")?;
+            let dst = resolve_sim_endpoint(resolved, &row.target_id, &key, "target")?;
+            frame_resolved_sim_source(
+                hasher,
+                src,
+                dst,
+                attestation.ledger_seq,
+                &attestation.ledger_hash,
+            );
+            out.push(SourceEdgeRow {
+                src,
+                dst,
+                etype: row.etype,
+                weight: f32::from_bits(row.weight_bits),
+                kind: family.edge_kind(),
+                ledger_seq: attestation.ledger_seq,
+                ledger_hash: attestation.ledger_hash,
+                props: serde_json::Value::Null,
+                family: SourceFamily::Similarity,
+            });
         }
-        let row = serde_json::from_slice::<SimEdgeSourceRow>(&value).map_err(|error| {
-            projection_corrupt(format!("decode SIM edge row {}: {error}", hex_key(&key)))
-        })?;
-        if row.schema != SCHEMA_SIM_EDGE_ROW {
-            return Err(projection_corrupt(format!(
-                "SIM edge row {} carries schema {:?}, expected {SCHEMA_SIM_EDGE_ROW}",
-                hex_key(&key),
-                row.schema
-            )));
-        }
-        let kind = edge_kind_from_code(row.etype).ok_or_else(|| {
+    }
+    Ok(())
+}
+
+fn verify_sim_family_attestation<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    family: SimSourceFamily,
+    group: &SimFamilySourceRows,
+    marker_bytes: &[u8],
+) -> IngestResult<VerifiedSimFamilyAttestation>
+where
+    C: Clock,
+{
+    let marker: SimSourceAttestation = serde_json::from_slice(marker_bytes).map_err(|error| {
+        projection_corrupt(format!(
+            "decode {} terminal SIM source marker: {error}",
+            family.wire_name()
+        ))
+    })?;
+    let canonical_marker_bytes = serde_json::to_vec(&marker).map_err(|error| {
+        projection_corrupt(format!(
+            "encode canonical {} terminal SIM source marker: {error}",
+            family.wire_name()
+        ))
+    })?;
+    if canonical_marker_bytes.as_slice() != marker_bytes {
+        return Err(projection_corrupt(format!(
+            "{} terminal SIM source marker bytes are not canonical",
+            family.wire_name()
+        )));
+    }
+    let observed_content = hex_lower(group.content_hasher.finalize().as_bytes());
+    let marker_content = parse_hash_32(&marker.content_blake3)?;
+    let marker_ledger_hash = parse_hash_32(&marker.ledger_hash)?;
+    if marker.schema != SIM_SOURCE_ATTESTATION_SCHEMA
+        || marker.family != family.wire_name()
+        || marker.row_count != group.row_count
+        || marker.total_bytes != group.total_bytes
+        || marker.content_blake3 != observed_content
+        || hex_lower(&marker_content) != marker.content_blake3
+        || hex_lower(&marker_ledger_hash) != marker.ledger_hash
+    {
+        return Err(projection_corrupt(format!(
+            "{} terminal SIM source marker does not match the exact sorted family readback: marker_rows={}, observed_rows={}, marker_bytes={}, observed_bytes={}, marker_hash={}, observed_hash={observed_content}",
+            family.wire_name(),
+            marker.row_count,
+            group.row_count,
+            marker.total_bytes,
+            group.total_bytes,
+            marker.content_blake3,
+        )));
+    }
+    let ledger_bytes = vault
+        .read_cf_at(
+            snapshot,
+            ColumnFamily::Ledger,
+            &ledger_key(marker.ledger_seq),
+        )?
+        .ok_or_else(|| {
             projection_corrupt(format!(
-                "SIM edge row {} has unknown etype {}",
-                hex_key(&key),
-                row.etype
+                "{} terminal SIM marker names absent Ledger row {}",
+                family.wire_name(),
+                marker.ledger_seq
             ))
         })?;
-        if !matches!(kind, EdgeKind::SimilarTo | EdgeKind::SemanticallyRelated) {
-            return Err(projection_corrupt(format!(
-                "SIM edge row {} (family {:?}) carries non-similarity edge kind {:?}",
-                hex_key(&key),
-                row.family,
-                kind
-            )));
-        }
-        let weight = f32::from_bits(row.weight_bits);
-        validate_edge_weight(weight, "SIM edge weight")?;
-        let src = resolve_sim_endpoint(&resolved, &row.source_id, &key, "source")?;
-        let dst = resolve_sim_endpoint(&resolved, &row.target_id, &key, "target")?;
-        out.push(SourceEdgeRow {
-            src,
-            dst,
-            etype: row.etype,
-            weight,
-            kind,
-            ledger_seq,
-            ledger_hash,
-            props: serde_json::Value::Null,
-            family: SourceFamily::Similarity,
-        });
-        count += 1;
+    let entry = decode(&ledger_bytes)?;
+    let expected_payload = SimSourceAttestationLedgerPayload {
+        schema: SIM_SOURCE_ATTESTATION_LEDGER_SCHEMA.to_string(),
+        family: family.wire_name().to_string(),
+        row_count: group.row_count,
+        total_bytes: group.total_bytes,
+        content_blake3: observed_content,
+    };
+    let observed_payload: SimSourceAttestationLedgerPayload =
+        serde_json::from_slice(&entry.payload).map_err(|error| {
+            projection_corrupt(format!(
+                "decode {} terminal SIM Ledger payload: {error}",
+                family.wire_name()
+            ))
+        })?;
+    let expected_payload_bytes = serde_json::to_vec(&expected_payload).map_err(|error| {
+        projection_corrupt(format!(
+            "encode expected {} terminal SIM Ledger payload: {error}",
+            family.wire_name()
+        ))
+    })?;
+    let expected_subject = sim_source_attestation_subject(family, group);
+    if entry.seq != marker.ledger_seq
+        || entry.entry_hash != marker_ledger_hash
+        || entry.kind != EntryKind::Ingest
+        || entry.subject != expected_subject
+        || entry.actor != ActorId::Service(marker.actor.clone())
+        || observed_payload != expected_payload
+        || entry.payload != expected_payload_bytes
+    {
+        return Err(projection_corrupt(format!(
+            "{} terminal SIM Ledger row {} disagrees with marker kind/subject/payload/actor/ref",
+            family.wire_name(),
+            marker.ledger_seq
+        )));
     }
-    Ok(count)
+    Ok(VerifiedSimFamilyAttestation {
+        ledger_seq: marker.ledger_seq,
+        ledger_hash: marker_ledger_hash,
+    })
+}
+
+fn sim_source_attestation_key(family: SimSourceFamily) -> Vec<u8> {
+    let mut key = SIM_SOURCE_ATTESTATION_PREFIX.to_vec();
+    key.extend_from_slice(family.wire_name().as_bytes());
+    key
+}
+
+fn sim_source_attestation_family_from_key(key: &[u8]) -> IngestResult<SimSourceFamily> {
+    SimSourceFamily::ALL
+        .into_iter()
+        .find(|family| key == sim_source_attestation_key(*family))
+        .ok_or_else(|| {
+            projection_corrupt(format!(
+                "unknown SIM source attestation marker key {}",
+                hex_key(key)
+            ))
+        })
+}
+
+fn sim_source_attestation_subject(
+    family: SimSourceFamily,
+    group: &SimFamilySourceRows,
+) -> SubjectId {
+    SubjectId::Query(
+        format!(
+            "{SIM_SOURCE_ATTESTATION_SUBJECT_PREFIX}:{}:{}:{}:{}",
+            family.wire_name(),
+            group.row_count,
+            group.total_bytes,
+            hex_lower(group.content_hasher.finalize().as_bytes())
+        )
+        .into_bytes(),
+    )
+}
+
+fn frame_resolved_sim_source(
+    hasher: &mut blake3::Hasher,
+    src: CxId,
+    dst: CxId,
+    ledger_seq: u64,
+    ledger_hash: &[u8; 32],
+) {
+    frame_hash(hasher, b"astrolabe.graph_projection.resolved_sim_source.v1");
+    frame_hash(hasher, src.as_bytes());
+    frame_hash(hasher, dst.as_bytes());
+    frame_hash(hasher, &ledger_seq.to_be_bytes());
+    frame_hash(hasher, ledger_hash);
 }
 
 /// Resolves one SIM edge stable source-atom id to its `CxId` fail-closed.
@@ -1552,38 +2227,6 @@ fn resolve_sim_endpoint(
             hex_key(key),
             symbol_id
         ))
-    })
-}
-
-/// Recovers the newest SIM_* persistence group-commit ledger attestation
-/// (`SubjectId::Query("astrolabe-sim-edges:*")`) as `(seq, entry_hash)`. Fails
-/// closed when SIM rows exist but no such attestation is present — a SIM row set
-/// that cannot be tied to a real Ledger CF entry is never projected on trust.
-fn newest_sim_edge_ledger_attestation<C>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-) -> IngestResult<(u64, [u8; 32])>
-where
-    C: Clock,
-{
-    let mut best: Option<(u64, [u8; 32])> = None;
-    for (_key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
-        let entry = decode(&value)?;
-        let SubjectId::Query(subject) = &entry.subject else {
-            continue;
-        };
-        if !subject.starts_with(SIM_EDGE_LEDGER_SUBJECT_PREFIX) {
-            continue;
-        }
-        if best.is_none_or(|(seq, _)| entry.seq > seq) {
-            best = Some((entry.seq, entry.entry_hash));
-        }
-    }
-    best.ok_or_else(|| {
-        projection_corrupt(
-            "persisted SIM edge rows exist but no astrolabe-sim-edges ledger attestation was \
-             found; refusing to project unattested similarity edges into the kernel graph",
-        )
     })
 }
 
@@ -1862,18 +2505,6 @@ fn segment_projection(csr: &GraphProjectionCsr) -> IngestResult<Vec<(u8, Decoded
     Ok(segments)
 }
 
-fn load_persisted_projection<C>(
-    vault: &AsterVault<C>,
-    kind: GraphProjectionKind,
-    incomplete_ok: bool,
-) -> IngestResult<PersistedProjectionState>
-where
-    C: Clock,
-{
-    let snapshot = vault.latest_seq();
-    load_persisted_projection_at(vault, kind, incomplete_ok, snapshot)
-}
-
 fn load_persisted_projection_at<C>(
     vault: &AsterVault<C>,
     kind: GraphProjectionKind,
@@ -2029,6 +2660,39 @@ fn validate_manifest(kind: GraphProjectionKind, manifest: &ProjectionManifest) -
             manifest.regions.len()
         )));
     }
+    let source_fingerprint = parse_hash_32(&manifest.source_fingerprint_blake3)?;
+    if hex_lower(&source_fingerprint) != manifest.source_fingerprint_blake3 {
+        return Err(projection_corrupt(format!(
+            "{} manifest source fingerprint is not canonical lowercase hexadecimal",
+            kind.name()
+        )));
+    }
+    if manifest.association_edge_count > manifest.edge_count {
+        return Err(projection_corrupt(format!(
+            "{} manifest association edge count {} exceeds total edge count {}",
+            kind.name(),
+            manifest.association_edge_count,
+            manifest.edge_count
+        )));
+    }
+    if manifest.node_count == 0
+        && (manifest.edge_count != 0
+            || manifest.association_edge_count != 0
+            || manifest.segment_count != 0)
+    {
+        return Err(projection_corrupt(format!(
+            "{} empty manifest has nonempty edges/associations/segments",
+            kind.name()
+        )));
+    }
+    if manifest.node_count != 0 && manifest.segment_count == 0 {
+        return Err(projection_corrupt(format!(
+            "{} nonempty manifest has no regions",
+            kind.name()
+        )));
+    }
+    let mut region_nodes = 0_usize;
+    let mut region_edges = 0_usize;
     for pair in manifest.regions.windows(2) {
         if pair[0].region >= pair[1].region {
             return Err(projection_corrupt(format!(
@@ -2036,6 +2700,43 @@ fn validate_manifest(kind: GraphProjectionKind, manifest: &ProjectionManifest) -
                 kind.name()
             )));
         }
+    }
+    for region in &manifest.regions {
+        if region.node_count == 0 || region.total_bytes == 0 {
+            return Err(projection_corrupt(format!(
+                "{} manifest region {} has zero nodes or bytes",
+                kind.name(),
+                region.region
+            )));
+        }
+        let stream_hash = parse_hash_32(&region.stream_blake3)?;
+        if hex_lower(&stream_hash) != region.stream_blake3 {
+            return Err(projection_corrupt(format!(
+                "{} manifest region {} stream hash is not canonical lowercase hexadecimal",
+                kind.name(),
+                region.region
+            )));
+        }
+        region_nodes = region_nodes.checked_add(region.node_count).ok_or_else(|| {
+            projection_corrupt(format!(
+                "{} manifest region node count overflow",
+                kind.name()
+            ))
+        })?;
+        region_edges = region_edges.checked_add(region.edge_count).ok_or_else(|| {
+            projection_corrupt(format!(
+                "{} manifest region edge count overflow",
+                kind.name()
+            ))
+        })?;
+    }
+    if region_nodes != manifest.node_count || region_edges != manifest.edge_count {
+        return Err(projection_corrupt(format!(
+            "{} manifest region totals nodes={region_nodes}/{} edges={region_edges}/{} disagree with top-level counts",
+            kind.name(),
+            manifest.node_count,
+            manifest.edge_count
+        )));
     }
     Ok(())
 }

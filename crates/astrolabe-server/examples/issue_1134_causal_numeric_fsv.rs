@@ -684,8 +684,7 @@ fn run(payload_dir: PathBuf) -> AnyResult<()> {
             cache_readback.display()
         ),
     );
-    let executable = std::env::current_exe()?;
-    initialize_cbm_host_process(executable.to_str())?;
+    initialize_cbm_host_process()?;
     let runner = CbmToolRunner::new_default()?;
     let project = cbm_project_name_from_path(repo.to_str().ok_or("repo path is not UTF-8")?)?;
     let tools = tools_state(&runner)?;

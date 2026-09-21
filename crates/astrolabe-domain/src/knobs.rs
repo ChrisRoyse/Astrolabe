@@ -602,3 +602,41 @@ pub fn cli_log_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
 pub fn cli_stderr_log_level_floor() -> u32 {
     u32::try_from(CLI_STDERR_LOG_LEVEL_FLOOR_WARN).unwrap_or(2)
 }
+
+/// Registry for the non-mutating external worker capability process (#1146).
+pub const WORKER_CAPABILITY_KNOB_REGISTRY_VERSION: &str = "astrolabe-worker-capability-knobs-v1";
+/// Name of the process-completion budget for one capability challenge.
+pub const WORKER_CAPABILITY_TIMEOUT_MS_KNOB: &str = "worker_capability_timeout_ms";
+/// Provisional cold-process completion budget. This is not a corpus budget: the
+/// capability child reads only its own image identity and fixed build contract.
+pub const WORKER_CAPABILITY_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// Smallest admissible end-to-end capability deadline.
+pub const WORKER_CAPABILITY_MIN_TIMEOUT_MS: u64 = 1_000;
+/// Largest admissible capability deadline; it remains below Win32 `INFINITE`.
+pub const WORKER_CAPABILITY_MAX_TIMEOUT_MS: u64 = 600_000;
+const _: () = assert!(WORKER_CAPABILITY_MAX_TIMEOUT_MS < u32::MAX as u64);
+
+/// Complete declared knob registry for the external-worker capability process.
+pub const WORKER_CAPABILITY_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: WORKER_CAPABILITY_KNOB_REGISTRY_VERSION,
+    name: WORKER_CAPABILITY_TIMEOUT_MS_KNOB,
+    default: WORKER_CAPABILITY_DEFAULT_TIMEOUT_MS,
+    min: WORKER_CAPABILITY_MIN_TIMEOUT_MS,
+    max: WORKER_CAPABILITY_MAX_TIMEOUT_MS,
+    unit: "milliseconds",
+    source: "ASTROLABE #1146 owner hypothesis dated 2026-08-20; unmeasured provisional correctness bound that expires when the first production external-worker binding receipt records parent-observed capability wall time",
+    rationale: "the capability child performs no repository or corpus work, so an unbounded wait is always a fault; the provisional 30-second end-to-end process/pipe/cleanup bound must be replaced by a production percentile after the first external-host deployment records parent-observed capability wall time",
+}];
+
+/// Return the named external-worker capability declaration, if it exists.
+pub fn worker_capability_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    WORKER_CAPABILITY_KNOBS
+        .iter()
+        .find(|knob| knob.name == name)
+}
+
+/// Return the finite Win32 capability deadline from the registered declaration.
+pub fn worker_capability_timeout_ms() -> u32 {
+    u32::try_from(WORKER_CAPABILITY_DEFAULT_TIMEOUT_MS)
+        .expect("the registered worker capability timeout is finite and fits Win32 DWORD")
+}

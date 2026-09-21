@@ -45,10 +45,20 @@
 //!                              [--debt-threshold-repos <n>] [--farm-root <dir>]
 //!                              [--store-root <dir>] [--archaeology-root <dir>]
 //!                              [--astrolabe-bin <exe>] [--nomic-dir <dir>]
+//!                              --fleet-admission <external-query-log.json>
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--store-budget-bytes <n>] [--parallelism <n>]
 //!                              [--timeout-secs <n>] [--host-admission-timeout-secs <n>]
 //!                              [--at <unix-secs>]
+//! astrolabe-fleet compose      [--root <dir>] --store-root <dir>
+//!                              --scope <fleet-scope> [--repo <owner__repo> ...]
+//!                              --admission <external-query-log.json>
+//!                              [--sim-min-permille <n>] [--sim-top-k <n>]
+//!                              [--repo-graph-coverage-min-permille <n>]
+//!                              [--cross-repo-support-weight-permille <n>]
+//! astrolabe-fleet kernel-read  [--root <dir>] [--store-root <dir>]
+//!                              --scope <fleet-scope> [--raw]
+//!                              [--verify-provenance <n>]
 //! astrolabe-fleet ledger-scan  [--root <dir>] [--github-id <id>] [--event <name>] [--limit <n>]
 //! ```
 //!
@@ -593,8 +603,19 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                         "members_hash": kernel.members_hash,
                         "member_count": kernel.member_count,
                         "node_count": kernel.node_count,
-                        "recall_permille": kernel.recall.permille,
-                        "selected_cfs": ["kernel"],
+                        "graph_coverage_permille": kernel.graph_coverage.permille,
+                        "selected_cfs": [
+                            calyx_aster::cf::ColumnFamily::Graph.name(),
+                            calyx_aster::cf::ColumnFamily::Anchors.name(),
+                            calyx_aster::cf::ColumnFamily::Kv.name(),
+                            calyx_aster::cf::ColumnFamily::Kernel.name(),
+                            calyx_aster::cf::ColumnFamily::Compression.name(),
+                            calyx_aster::cf::ColumnFamily::Ledger.name(),
+                            calyx_aster::cf::ColumnFamily::slot(
+                                astrolabe_weave::search::SLOT_NAME_SEMANTIC,
+                            )
+                            .name(),
+                        ],
                         "full_compose_materialization": false,
                     },
                 })
@@ -728,7 +749,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                         "members_hash": kernel.members_hash,
                         "member_count": kernel.occurrences.len(),
                         "node_count": kernel.node_count,
-                        "recall_permille": kernel.recall_permille,
+                        "graph_coverage_permille": kernel.graph_coverage_permille,
                     },
                     "completion": completion,
                 })
@@ -762,6 +783,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "parallelism",
                 "timeout-secs",
                 "host-admission-timeout-secs",
+                "fleet-admission",
                 "at",
             ])?;
             let once = opts.flag("once");
@@ -868,10 +890,18 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 })?);
             }
 
+            let fleet_admission = read_fleet_admission(
+                opts.get("fleet-admission").ok_or_else(|| {
+                    usage(
+                        "grow needs --fleet-admission <external-query-log.json>; genuine query evidence is never synthesized or inferred",
+                    )
+                })?,
+            )?;
             let mut config = astrolabe_fleet::grow::GrowConfig::with_registry_defaults(
                 root.clone(),
                 farm,
                 pipeline,
+                fleet_admission,
             );
             if let Some(scope) = opts.get("scope") {
                 config.scope = scope.to_string();
@@ -1139,8 +1169,9 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "repo",
                 "sim-min-permille",
                 "sim-top-k",
-                "repo-recall-min-permille",
+                "repo-graph-coverage-min-permille",
                 "cross-repo-support-weight-permille",
+                "admission",
             ])?;
             let store_root =
                 PathBuf::from(opts.get("store-root").ok_or_else(|| {
@@ -1149,6 +1180,11 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let scope = opts
                 .get("scope")
                 .ok_or_else(|| usage("compose needs --scope <scope-id> (e.g. fleet:rust:v1)"))?;
+            let admission = read_fleet_admission(opts.get("admission").ok_or_else(|| {
+                usage(
+                    "compose needs --admission <external-query-log.json>; genuine external fleet queries and all work/recall/index controls are mandatory",
+                )
+            })?)?;
             let named = opts.get_all("repo");
             let projects: Vec<String> = if named.is_empty() {
                 let mut projects: Vec<String> = catalog
@@ -1179,12 +1215,13 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                     .parse::<u64>()
                     .map_err(|error| usage(&format!("--sim-top-k must be a u64: {error}")))?;
             }
-            if let Some(raw) = opts.get("repo-recall-min-permille") {
-                config.per_repo_recall_min_permille = raw.parse::<u64>().map_err(|error| {
-                    usage(&format!(
-                        "--repo-recall-min-permille must be a u64: {error}"
-                    ))
-                })?;
+            if let Some(raw) = opts.get("repo-graph-coverage-min-permille") {
+                config.per_repo_graph_coverage_min_permille =
+                    raw.parse::<u64>().map_err(|error| {
+                        usage(&format!(
+                            "--repo-graph-coverage-min-permille must be a u64: {error}"
+                        ))
+                    })?;
             }
             if let Some(raw) = opts.get("cross-repo-support-weight-permille") {
                 config.cross_repo_support_weight_permille =
@@ -1200,6 +1237,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 scope,
                 &projects,
                 &config,
+                &admission,
             )?;
             println!("{summary}");
             Ok(())
@@ -1209,7 +1247,40 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let scope = opts
                 .get("scope")
                 .ok_or_else(|| usage("kernel-read needs --scope <scope-id>"))?;
-            let (summary, raw) = astrolabe_fleet::compose::read_fleet_kernel(&catalog, scope)?;
+            let store_root = PathBuf::from(
+                opts.get("store-root")
+                    .unwrap_or(astrolabe_fleet::orchestrator::DEFAULT_STORE_ROOT),
+            );
+            let provenance_sample = opts
+                .get("verify-provenance")
+                .map(|sample| {
+                    sample.parse::<usize>().map_err(|error| {
+                        usage(&format!("--verify-provenance must be a usize: {error}"))
+                    })
+                })
+                .transpose()?;
+            if opts.flag("raw") && provenance_sample.is_some() {
+                return Err(usage(
+                    "kernel-read --raw cannot be combined with --verify-provenance because raw mode emits only exact kernel.json bytes",
+                ));
+            }
+            let (summary, raw, provenance) = match provenance_sample {
+                Some(sample_n) => {
+                    let (summary, raw, provenance) =
+                        astrolabe_fleet::compose::read_fleet_kernel_with_provenance(
+                            &catalog,
+                            &store_root,
+                            scope,
+                            sample_n,
+                        )?;
+                    (summary, raw, Some(provenance))
+                }
+                None => {
+                    let (summary, raw) =
+                        astrolabe_fleet::compose::read_fleet_kernel(&catalog, &store_root, scope)?;
+                    (summary, raw, None)
+                }
+            };
             if opts.flag("raw") {
                 use std::io::Write as _;
                 std::io::stdout()
@@ -1222,19 +1293,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 return Ok(());
             }
             let mut out = summary;
-            if let Some(sample) = opts.get("verify-provenance") {
-                let sample_n = sample.parse::<usize>().map_err(|error| {
-                    usage(&format!("--verify-provenance must be a usize: {error}"))
-                })?;
-                let store_root = PathBuf::from(opts.get("store-root").ok_or_else(|| {
-                    usage("kernel-read --verify-provenance needs --store-root <dir>")
-                })?);
-                let verify = astrolabe_fleet::compose::verify_member_provenance(
-                    &catalog,
-                    &store_root,
-                    scope,
-                    sample_n,
-                )?;
+            if let Some(verify) = provenance {
                 out["provenance"] = verify;
             }
             let command_metrics_after = current_process_metrics()?;
@@ -1482,6 +1541,26 @@ fn parse_record(line: &str) -> Result<RepoRecord, CalyxError> {
         message: format!("repo record JSON did not parse: {error}"),
         remediation: "pass one JSON object per record with the RepoRecord fields (github_id, full_name, clone_url, default_branch, stars, language, size_kb, pushed_at, optional license_spdx/etag)",
     })
+}
+
+fn read_fleet_admission(
+    path: &str,
+) -> Result<astrolabe_fleet::kernel_generation::FleetKernelAdmissionInput, CalyxError> {
+    let bytes = std::fs::read(path).map_err(|error| CalyxError {
+        code: astrolabe_fleet::kernel_generation::ASTRO_FLEET_ADMISSION_REQUIRED,
+        message: format!("read fleet admission file {path:?}: {error}"),
+        remediation: "pass one readable, explicit astrolabe.fleet_kernel_admission.v1 JSON file captured from a genuine external operator query log",
+    })?;
+    let admission = serde_json::from_slice::<
+        astrolabe_fleet::kernel_generation::FleetKernelAdmissionInput,
+    >(&bytes)
+    .map_err(|error| CalyxError {
+        code: astrolabe_fleet::kernel_generation::ASTRO_FLEET_ADMISSION_REQUIRED,
+        message: format!("decode fleet admission file {path:?}: {error}"),
+        remediation: "repair the explicit admission JSON; unknown, missing, synthetic, or graph-derived fields are never accepted",
+    })?;
+    admission.validate()?;
+    Ok(admission)
 }
 
 fn usage(what: &str) -> CalyxError {

@@ -23,11 +23,11 @@
 //!
 //! # #96 (no full-ledger rewalk per call)
 //!
-//! The steady-state lane ([`run_janitor_scrub_step`]) never re-walks the whole
-//! ledger: it verifies only `[checkpoint.verified_through, +budget)` per call, so
-//! its per-call cost is bounded by the registry knob, not by ledger height. The
-//! one deliberate full sweep is [`janitor_startup_verify`], a **one-time** boot
-//! integrity gate — not a per-call cost of the running lane.
+//! The steady-state lane ([`run_janitor_scrub_step`]) requests only
+//! `[checkpoint.verified_through, +budget)` plus one predecessor and an exact
+//! durable-head tip check. Each report exposes the actual copied-row and
+//! point-read counts. [`janitor_startup_verify`] deliberately repeats those
+//! bounded slices from genesis during the one-time boot integrity gate.
 //!
 //! # Self-observation convergence
 //!
@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
-use calyx_core::Clock;
+use calyx_core::{CalyxError, Clock};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde_json::json;
 
@@ -75,7 +75,7 @@ const CHECKPOINT_CORRUPT_REMEDIATION: &str = "The persisted FSV janitor checkpoi
 /// Service actor recorded on every janitor scrub ledger entry.
 pub const ASTROLABE_FSV_JANITOR_ACTOR: &str = "astrolabe-fsv-janitor";
 /// Schema tag stamped on the janitor scrub's Measure ledger payload.
-pub const FSV_JANITOR_SCRUB_LEDGER_SCHEMA: &str = "astrolabe-fsv-janitor-scrub-v1";
+pub const FSV_JANITOR_SCRUB_LEDGER_SCHEMA: &str = "astrolabe-fsv-janitor-scrub-v2";
 /// Ledger subject bytes identifying the janitor scrub series.
 const JANITOR_SUBJECT: &[u8] = b"astrolabe:fsv-janitor:scrub";
 
@@ -163,8 +163,8 @@ where
 /// - **nothing new** → returns [`JanitorStepReport::CaughtUp`] with no mutation;
 /// - **a non-empty verified slice** → commits the advanced checkpoint row plus a
 ///   Measure ledger entry in one group commit, reads both back through
-///   [`VaultMutationPlan::verify_committed`], and returns the resulting
-///   [`FsvAck`].
+///   [`VaultMutationPlan::verify_committed_with_ledger_ref`], and returns the
+///   resulting [`FsvAck`].
 ///
 /// # Errors
 ///
@@ -196,7 +196,9 @@ where
     // data range and later steps continue draining the remaining real tail.
     let new_checkpoint = if slice.caught_up {
         JanitorCheckpoint {
-            verified_through: slice.slice_end.saturating_add(1),
+            verified_through: slice.slice_end.checked_add(1).ok_or_else(|| {
+                CalyxError::ledger_corrupt("FSV janitor checkpoint overflow after scrub append")
+            })?,
         }
     } else {
         JanitorCheckpoint {
@@ -220,7 +222,8 @@ where
         &checkpoint_bytes,
     );
 
-    vault.write_cf_batch_with_ledger_entry(
+    let (commit_seq, ledger_ref) = vault.write_cf_batch_with_ledger_entry_if_seq(
+        slice.snapshot_seq,
         [(
             ColumnFamily::Kv,
             JANITOR_CHECKPOINT_KEY.to_vec(),
@@ -235,7 +238,7 @@ where
     // Write-ack-after-readback: re-read the persisted checkpoint row and the
     // paired Measure entry at the commit snapshot. Any divergence fails closed
     // and the step never reports a scrub.
-    let ack = plan.verify_committed(vault, vault.latest_seq())?;
+    let ack = plan.verify_committed_with_ledger_ref(vault, commit_seq, &ledger_ref)?;
 
     Ok(JanitorStepReport::Scrubbed {
         slice: Box::new(slice),
@@ -308,6 +311,12 @@ fn scrub_ledger_payload(
         "slice_start": slice.slice_start,
         "slice_end": slice.slice_end,
         "entries_verified": slice.entries_verified,
+        "snapshot_seq": slice.snapshot_seq,
+        "ledger_head_height": slice.ledger_head_height,
+        "ledger_head_tip_hash": slice.ledger_head_tip_hash,
+        "range_rows_copied": slice.range_rows_copied,
+        "predecessor_copied": slice.predecessor_copied,
+        "tip_point_read": slice.tip_point_read,
         "verified_through": checkpoint.verified_through,
         "caught_up": slice.caught_up,
     }))?)

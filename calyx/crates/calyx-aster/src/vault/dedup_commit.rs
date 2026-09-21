@@ -8,6 +8,7 @@ where
 {
     pub(crate) fn commit_recurrence_batch(
         &self,
+        expected_seq: Seq,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
         updated_base: Option<encode::BaseRecord>,
     ) -> Result<Seq> {
@@ -35,10 +36,10 @@ where
                     value,
                 }),
         );
-        self.commit_rows(&rows)
+        self.commit_rows_if_seq(expected_seq, rows, "recurrence append")
     }
 
-    pub(crate) fn commit_online_rows<I>(&self, rows: I) -> Result<Seq>
+    pub(crate) fn commit_online_rows<I>(&self, expected_seq: Seq, rows: I) -> Result<Seq>
     where
         I: IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
     {
@@ -50,24 +51,23 @@ where
                 value,
             })
             .collect::<Vec<_>>();
-        self.commit_rows(&rows)
+        self.commit_rows_if_seq(expected_seq, rows, "dedup anchor-conflict publication")
     }
 
     pub(crate) fn commit_dedup_ingest(
         &self,
+        expected_seq: Seq,
         mut constellation: Option<Constellation>,
-        updated_base: Option<(Seq, encode::BaseRecord)>,
+        updated_base: Option<encode::BaseRecord>,
         online_rows: Vec<(Vec<u8>, Vec<u8>)>,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
         subject: CxId,
         ledger_payload: Vec<u8>,
     ) -> Result<Seq> {
         self.with_durable_commit_lock(|| {
-            if let Some((expected_seq, _)) = updated_base.as_ref()
-                && self.latest_seq() != *expected_seq
-            {
+            if self.latest_seq() != expected_seq {
                 return Err(CalyxError::stale_derived(format!(
-                    "dedup recurrence evaluation snapshot {expected_seq} is stale at commit seq {}",
+                    "dedup evaluation snapshot {expected_seq} is stale at commit seq {}; no rows were written",
                     self.latest_seq()
                 )));
             }
@@ -106,7 +106,7 @@ where
             if let Some(cx) = constellation.as_ref() {
                 self.stage_constellation_rows(&mut rows, cx)?;
             }
-            if let Some((_, record)) = updated_base.as_ref() {
+            if let Some(record) = updated_base.as_ref() {
                 if record.vault_id() != self.vault_id {
                     return Err(CalyxError::vault_access_denied(
                         "dedup recurrence base update belongs to another vault",
@@ -132,10 +132,15 @@ where
                     value,
                 });
             }
-            let seq = self.commit_rows_locked(&rows)?;
+            let seq = if self.durable.is_some() {
+                self.commit_rows_locked(&rows)?
+            } else {
+                self.commit_rows_if_current_volatile(expected_seq, rows)?
+            };
             if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
             {
-                ledger_hook::commit_staged(hook, staged)?;
+                ledger_hook::commit_staged(hook, staged)
+                    .map_err(|error| self.reconcile_post_commit_ledger_hook_failure(seq, &error))?;
             }
             Ok(seq)
         })
@@ -143,6 +148,7 @@ where
 
     pub(crate) fn commit_dedup_undo(
         &self,
+        expected_seq: Seq,
         restored: Vec<Constellation>,
         updated_bases: Vec<Constellation>,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
@@ -150,6 +156,12 @@ where
         ledger_payload: Vec<u8>,
     ) -> Result<Seq> {
         self.with_durable_commit_lock(|| {
+            if self.latest_seq() != expected_seq {
+                return Err(CalyxError::stale_derived(format!(
+                    "dedup undo evaluation snapshot {expected_seq} is stale at commit seq {}; no rows were written",
+                    self.latest_seq()
+                )));
+            }
             let mut rows = Vec::new();
             let mut hook_guard = match &self.ledger_hook {
                 Some(hook) => Some(ledger_hook::lock_hook(hook)?),
@@ -202,10 +214,15 @@ where
                 });
             }
             let rows = latest_rows(rows);
-            let seq = self.commit_rows_locked(&rows)?;
+            let seq = if self.durable.is_some() {
+                self.commit_rows_locked(&rows)?
+            } else {
+                self.commit_rows_if_current_volatile(expected_seq, rows)?
+            };
             if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
             {
-                ledger_hook::commit_staged(hook, staged)?;
+                ledger_hook::commit_staged(hook, staged)
+                    .map_err(|error| self.reconcile_post_commit_ledger_hook_failure(seq, &error))?;
             }
             Ok(seq)
         })

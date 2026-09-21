@@ -297,6 +297,7 @@ impl CfRouter {
         V: AsRef<[u8]>,
     {
         for (cf, key, value) in rows {
+            self.ensure_selected_cf(cf)?;
             let row_bytes = Memtable::entry_size(key.as_ref(), value.as_ref());
             if row_bytes > self.memtable_byte_cap {
                 self.resource_counters.record_memtable_rejected();
@@ -664,6 +665,7 @@ impl CfRouter {
     }
 
     pub(super) fn ensure_cf(&mut self, cf: ColumnFamily) -> Result<()> {
+        self.ensure_selected_cf(cf)?;
         // The on-disk CF directory only needs creating the first time this
         // router handle sees the CF. `create_dir_all` was previously run on
         // EVERY put, and on Windows that filesystem syscall (~40 us/row) was
@@ -685,6 +687,28 @@ impl CfRouter {
             .or_insert_with(|| Memtable::new(self.memtable_byte_cap));
         self.levels.entry(cf).or_default();
         self.next_file.entry(cf).or_insert(1);
+        Ok(())
+    }
+
+    fn ensure_selected_cf(&self, cf: ColumnFamily) -> Result<()> {
+        if let Some(selected) = &self.selected_cfs
+            && !selected.contains(&cf)
+        {
+            let selected_names = selected
+                .iter()
+                .map(|selected_cf| selected_cf.name())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(CalyxError {
+                code: crate::mvcc::CALYX_ASTER_CF_NOT_SELECTED,
+                message: format!(
+                    "column family {} is outside this selected-CF router capability; selected=[{}]",
+                    cf.name(),
+                    selected_names
+                ),
+                remediation: "open a new vault handle whose selected_cfs explicitly includes every column family required by the operation",
+            });
+        }
         Ok(())
     }
 

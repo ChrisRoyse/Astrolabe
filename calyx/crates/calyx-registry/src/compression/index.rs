@@ -69,7 +69,7 @@ pub struct CompressedSlotIndex<'a, C: Clock> {
 /// Reads only the immutable manifest and validates it against a pure codec
 /// descriptor. Status, selection, and publication use this path so a metadata
 /// request cannot instantiate codec geometry (#1064 PC-43).
-pub(super) fn generation_identity_without_codec_at<C: Clock>(
+pub(crate) fn generation_identity_without_codec_at<C: Clock>(
     vault: &AsterVault<C>,
     slot: &Slot,
     lens: &LensSpec,
@@ -504,7 +504,7 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
             .collect::<BTreeMap<_, _>>();
         let mut observations = Vec::with_capacity(parsed_rows.len());
         for (cx_id, parsed) in parsed_rows {
-            let reconstructed = self.codec.decode_parsed(&parsed)?;
+            let reconstructed = self.codec.decode_parsed(parsed)?;
             let raw = raw_by_id.remove(cx_id).ok_or_else(|| {
                 compression_error(
                     CALYX_VECTOR_COMPRESSION_INVALID,
@@ -823,7 +823,7 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
             if validate_payloads {
                 self.codec.validate_payload(&parsed)?;
             }
-            self.validate_row_manifest(&parsed, &manifest, cx_id)?;
+            self.validate_row_manifest(&parsed, manifest, cx_id)?;
             if let Some(proofs) = &mut proofs {
                 let proof = proofs.remove(&cx_id).ok_or_else(|| {
                     compression_error(
@@ -873,7 +873,7 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
             }
         }
         if validate_raw_generation {
-            self.validate_raw_generation(snapshot, &manifest, &parsed_rows)?;
+            self.validate_raw_generation(snapshot, manifest, &parsed_rows)?;
         }
         Ok(parsed_rows)
     }

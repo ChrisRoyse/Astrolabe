@@ -25,24 +25,29 @@ pub fn resolved_constellation_read_cfs(panel: &Panel) -> Vec<ColumnFamily> {
 }
 
 impl VaultPanelState {
-    fn exact_slot(&self, slot_id: SlotId) -> Result<&Slot> {
-        let mut matching = self
-            .panel
-            .slots
-            .iter()
-            .filter(|slot| slot.slot_id == slot_id);
-        let slot = matching.next().ok_or_else(|| {
+    /// Returns one exact persisted panel slot through the lookup index built
+    /// once with the loaded panel/Registry interpretation. The method also
+    /// revalidates the frozen lens contract before the slot can select a raw or
+    /// compressed representation.
+    pub fn registered_slot(&self, slot_id: SlotId) -> Result<&Slot> {
+        let index = self.slot_indices.get(&slot_id).ok_or_else(|| {
             CalyxError::lens_unreachable(format!(
                 "persisted panel version {} has no slot {}",
                 self.panel.version,
                 slot_id.get()
             ))
         })?;
-        if matching.next().is_some() {
-            return Err(CalyxError::lens_frozen_violation(format!(
-                "persisted panel version {} contains duplicate slot id {}",
-                self.panel.version,
+        let slot = self.panel.slots.get(*index).ok_or_else(|| {
+            CalyxError::lens_frozen_violation(format!(
+                "persisted panel slot index {index} for slot {} is out of bounds",
                 slot_id.get()
+            ))
+        })?;
+        if slot.slot_id != slot_id {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "persisted panel slot index {index} resolves requested slot {} to slot {}",
+                slot_id.get(),
+                slot.slot_id.get()
             )));
         }
         let contract = self.registry.frozen_contract(slot.lens_id).ok_or_else(|| {
@@ -60,16 +65,15 @@ impl VaultPanelState {
                 contract.lens_id()
             )));
         }
-        if let Some(spec) = self.registry.lens_spec(slot.lens_id) {
-            if spec.lens_id() != slot.lens_id
+        if let Some(spec) = self.registry.lens_spec(slot.lens_id)
+            && (spec.lens_id() != slot.lens_id
                 || spec.output != slot.shape
-                || spec.quant_default != slot.quant
-            {
-                return Err(CalyxError::lens_frozen_violation(format!(
-                    "persisted slot {} does not match its exact LensSpec identity/shape/quant policy",
-                    slot.slot_key.key()
-                )));
-            }
+                || spec.quant_default != slot.quant)
+        {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "persisted slot {} does not match its exact LensSpec identity/shape/quant policy",
+                slot.slot_key.key()
+            )));
         }
         Ok(slot)
     }
@@ -133,7 +137,7 @@ where
         cx_id: CxId,
         slot_id: SlotId,
     ) -> Result<Option<SlotVector>> {
-        let slot = self.exact_slot(slot_id)?;
+        let slot = self.registered_slot(slot_id)?;
         let snapshot_lease = vault.retain_snapshot_at(snapshot);
         let manifest = self.compressed_manifest(vault, snapshot, slot_id)?;
         snapshot_lease.record_progress();
@@ -173,7 +177,7 @@ where
         if cx_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let slot = self.exact_slot(slot_id)?;
+        let slot = self.registered_slot(slot_id)?;
         let snapshot_lease = vault.retain_snapshot_at(snapshot);
         let manifest = self.compressed_manifest(vault, snapshot, slot_id)?;
         snapshot_lease.record_progress();
@@ -200,7 +204,7 @@ where
         snapshot: Seq,
         slot_id: SlotId,
     ) -> Result<Vec<(CxId, SlotVector)>> {
-        let slot = self.exact_slot(slot_id)?;
+        let slot = self.registered_slot(slot_id)?;
         let snapshot_lease = vault.retain_snapshot_at(snapshot);
         let manifest = self.compressed_manifest(vault, snapshot, slot_id)?;
         snapshot_lease.record_progress();

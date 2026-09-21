@@ -258,7 +258,10 @@ impl LedgerCfStore for AsterLedgerCfStore {
     }
 
     fn read_seq(&self, seq: u64) -> CalyxResult<Option<LedgerRow>> {
-        Ok(self.rows.iter().find(|row| row.seq == seq).cloned())
+        let Ok(index) = usize::try_from(seq) else {
+            return Ok(None);
+        };
+        Ok(self.rows.get(index).filter(|row| row.seq == seq).cloned())
     }
 
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> CalyxResult<()> {
@@ -288,16 +291,49 @@ impl AsterVaultLayout {
         vault: &Path,
         tiering_policy: Option<&TieringPolicy>,
     ) -> CalyxResult<Self> {
-        if !vault.is_dir() {
-            return Err(CalyxError::ledger_corrupt(format!(
-                "vault path {} is not an Aster vault directory",
-                vault.display()
-            )));
+        match std::fs::metadata(vault) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(CalyxError::ledger_corrupt(format!(
+                    "vault path {} is not an Aster vault directory",
+                    vault.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CalyxError::ledger_corrupt(format!(
+                    "vault path {} is absent",
+                    vault.display()
+                )));
+            }
+            Err(error) => {
+                return Err(CalyxError::disk_pressure(format!(
+                    "inspect Aster vault path {}: {error}",
+                    vault.display()
+                )));
+            }
         }
+
+        let wal_path = vault.join("wal");
+        let has_wal = match std::fs::metadata(&wal_path) {
+            Ok(metadata) if metadata.is_dir() => true,
+            Ok(_) => {
+                return Err(CalyxError::ledger_corrupt(format!(
+                    "vault WAL path {} is not a directory",
+                    wal_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(CalyxError::disk_pressure(format!(
+                    "inspect vault WAL path {}: {error}",
+                    wal_path.display()
+                )));
+            }
+        };
 
         let layout = Self {
             ledger_cf_dirs: ledger_cf_dirs(vault, tiering_policy)?,
-            has_wal: vault.join("wal").is_dir(),
+            has_wal,
             wal_replay_floor_seq: wal_replay_floor_seq(vault)?,
         };
         if layout.ledger_cf_dirs.is_empty() && !layout.has_wal {
@@ -351,7 +387,13 @@ fn ledger_cf_dirs(
 }
 
 fn wal_replay_floor_seq(vault: &Path) -> CalyxResult<u64> {
-    if !vault.join("CURRENT").exists() {
+    let current = vault.join("CURRENT");
+    if !current.try_exists().map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "inspect Ledger replay CURRENT {}: {error}",
+            current.display()
+        ))
+    })? {
         return Ok(0);
     }
     Ok(ManifestStore::open(vault).load_current()?.durable_seq)

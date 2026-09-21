@@ -95,6 +95,16 @@ impl KernelGraph {
                     "deduplicate symbol versions before building the kernel graph",
                 ));
             }
+            if node.frequency == 0 {
+                return Err(DomainError::new(
+                    ASTRO_KERNEL_GRAPH_INVALID,
+                    format!(
+                        "kernel graph node {} has zero frequency even though the contract is change_count + 1",
+                        node.id
+                    ),
+                    "persist a positive change_count-plus-one frequency for every graph node",
+                ));
+            }
         }
         for edge in &edges {
             if !edge.weight.is_finite() || !(0.0..=1.0).contains(&edge.weight) {

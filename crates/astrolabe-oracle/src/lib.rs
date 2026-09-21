@@ -16,14 +16,17 @@ pub mod gate;
 pub mod predict;
 
 pub use predict::{
-    ASTRO_ORACLE_GRAPH_INVALID, ASTRO_ORACLE_PREDICT_CONFIG_INVALID,
+    ASTRO_ORACLE_BACKTEST_ADMISSION_REQUIRED, ASTRO_ORACLE_GRAPH_INVALID,
+    ASTRO_ORACLE_GROUNDING_REQUIRED, ASTRO_ORACLE_PREDICT_CONFIG_INVALID,
     ASTRO_ORACLE_PREDICT_REQUEST_INVALID, BacktestCase, BacktestReport, Consequence,
     ConsequenceEdge, ConsequenceEdgeKind, ConsequenceGraph, GroundedRisk, ImpactOutcome,
-    ImpactPrediction, InsufficientReport, NodeEvidence, ORACLE_BACKTEST_TOP_K_SUCCESS_RATE,
-    ORACLE_INSUFFICIENT_REMEDIATION, ORACLE_PREDICT_KNOB_REGISTRY_VERSION, ORACLE_PREDICT_KNOBS,
+    ImpactPrediction, InsufficientReport, NodeEvidence,
+    ORACLE_BACKTEST_BASELINE_CANDIDATE_CONTRACT, ORACLE_BACKTEST_TOP_K_SUCCESS_PERMILLE,
+    ORACLE_BACKTEST_TOP_K_SUCCESS_RATE, ORACLE_INSUFFICIENT_REMEDIATION,
+    ORACLE_PREDICT_KNOB_REGISTRY_VERSION, ORACLE_PREDICT_KNOBS,
     ORACLE_SENSOR_DIRECT_CHANGE_HISTORY, OracleEvidence, PredictConfig, PredictRequest,
-    SensorDeficit, TestSelection, backtest_phase_gate, grounded_risk, oracle_predict_knob,
-    predict_impact, run_backtest,
+    SensorDeficit, TestSelection, backtest_phase_gate, grounded_risk, grounded_risk_required,
+    oracle_predict_knob, predict_impact, run_backtest,
 };
 
 pub use gate::{
@@ -54,14 +57,21 @@ pub use forecast::{
 
 pub use corpus::{
     ASTRO_ORACLE_CONFIG_INVALID, ASTRO_ORACLE_EVENT_INVALID, ASTRO_ORACLE_LEDGER_MISSING,
-    ASTRO_ORACLE_ROW_CORRUPT, AttributionConfig, ChangeEvent,
-    ORACLE_ATTRIBUTION_KNOB_REGISTRY_VERSION, ORACLE_ATTRIBUTION_KNOBS,
-    ORACLE_CORPUS_LEDGER_SCHEMA, ORACLE_OCCURRENCE_ROW_SCHEMA, ORACLE_PRECEDES_ROW_SCHEMA,
-    OccurrenceRecord, OccurrenceRowV1, OracleCorpus, OracleCorpusPersistReport, OracleError,
-    OutcomeEvent, PRECEDES_DIRECTION, PersistedOccurrenceRow, PersistedPrecedesEdgeRow,
-    PrecedesEdge, PrecedesEdgeRowV1, changes_from_git_archaeology, corpus_dump_bytes, mine_corpus,
-    mine_occurrences, oracle_attribution_knob, outcomes_from_anchor_rows, persist_corpus,
-    precedes_edges, raw_oracle_rows, read_occurrence_rows, read_precedes_edges,
+    ASTRO_ORACLE_ROW_CORRUPT, AttributionConfig, AttributionUnits, ChangeEvent, GitChangeInput,
+    GitChangeProjection, ORACLE_ATTRIBUTION_FRACTION_BITS,
+    ORACLE_ATTRIBUTION_KNOB_REGISTRY_VERSION, ORACLE_ATTRIBUTION_KNOBS, ORACLE_ATTRIBUTION_SCALE,
+    ORACLE_CHANGE_ROW_SCHEMA, ORACLE_CORPUS_BINDING_SCHEMA, ORACLE_CORPUS_LAYOUT_SCHEMA,
+    ORACLE_CORPUS_LEDGER_SCHEMA, ORACLE_CORPUS_SOURCE_BINDING_SCHEMA, ORACLE_OCCURRENCE_ROW_SCHEMA,
+    ORACLE_PRECEDES_ROW_SCHEMA, ORACLE_TIMEBASE_CONTRACT, OccurrenceRecord, OccurrenceRowV3,
+    OracleChangeRowV1, OracleCorpus, OracleCorpusBinding, OracleCorpusPersistReport,
+    OracleCorpusSourceBinding, OracleError, OracleTimebase, OutcomeEvent, OutcomeId,
+    PRECEDES_DIRECTION, PersistedOccurrenceRow, PersistedPrecedesEdgeRow, PrecedesEdge,
+    PrecedesEdgeRowV3, changes_from_git_archaeology, corpus_dump_bytes,
+    git_change_inputs_from_archaeology, mine_corpus, mine_occurrences, oracle_attribution_knob,
+    outcomes_from_anchor_rows, persist_corpus, precedes_edges, project_git_change_inputs,
+    raw_oracle_rows, read_git_change_inputs_at, read_occurrence_rows, read_occurrence_rows_at,
+    read_occurrence_rows_for_subjects_at, read_oracle_corpus_binding_at, read_precedes_edges,
+    try_read_oracle_corpus_binding_at,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

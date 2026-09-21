@@ -797,7 +797,7 @@ pub struct KernelGap {
 }
 
 /// A gap report over a built kernel: which members are ungrounded, and the
-/// grounded fraction / recall the kernel actually achieves.
+/// grounded fraction and diagnostic graph coverage the kernel achieves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelGapReport {
     /// Report schema tag.
@@ -812,8 +812,8 @@ pub struct KernelGapReport {
     pub gap_count: usize,
     /// Grounded fraction in permille.
     pub grounded_fraction_permille: u64,
-    /// Recall the kernel achieves in permille.
-    pub recall_permille: u64,
+    /// Diagnostic graph coverage the kernel achieves in permille.
+    pub graph_coverage_permille: u64,
     /// Whether the kernel has any Trusted anchor in scope at all.
     pub anchor_grounded: bool,
     /// The ungrounded members, ascending by id.
@@ -852,7 +852,7 @@ pub fn kernel_gap_report(artifact: &KernelArtifact) -> KernelGapReport {
         grounded_count,
         gap_count,
         grounded_fraction_permille,
-        recall_permille: artifact.recall.permille,
+        graph_coverage_permille: artifact.graph_coverage.permille,
         anchor_grounded: artifact.anchor_grounded,
         gaps,
         trust: if artifact.anchor_grounded && gap_count == 0 {

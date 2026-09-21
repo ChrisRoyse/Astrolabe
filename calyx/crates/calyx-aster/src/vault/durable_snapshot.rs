@@ -23,7 +23,9 @@ where
             message: "a volatile Aster vault has no durable bytes to snapshot".to_string(),
             remediation: "open the source vault with AsterVault::open before requesting a durable snapshot",
         })?;
-        if destination.exists() {
+        if destination.try_exists().map_err(|error| {
+            snapshot_io("probe durable snapshot destination", destination, error)
+        })? {
             return Err(CalyxError {
                 code: "CALYX_DURABLE_SNAPSHOT_DESTINATION_EXISTS",
                 message: format!(
@@ -84,7 +86,9 @@ fn initialize_snapshot_coordination_files(destination: &Path) -> Result<()> {
             remediation:
                 "discard the transaction-owned destination and inspect the snapshot path boundary",
         })?;
-        if !parent.is_dir() {
+        let parent_metadata = fs::metadata(parent)
+            .map_err(|error| snapshot_io("inspect snapshot coordination parent", parent, error))?;
+        if !parent_metadata.is_dir() {
             return Err(CalyxError {
                 code: "CALYX_DURABLE_SNAPSHOT_COORDINATION_PARENT_MISSING",
                 message: format!(

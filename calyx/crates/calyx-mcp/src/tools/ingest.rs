@@ -314,18 +314,22 @@ fn ingest_prepared_inputs(
         })?;
         if let Some(record) = existing {
             let stored = record.constellation();
-            verify_text_identity_fields(
+            verify_text_identity_fields(TextIdentityVerification {
                 cx_id,
-                stored.panel_version,
-                &stored.input_ref,
-                stored.modality,
-                &stored.metadata,
-                state.panel.version,
-                &plan.input_ref,
-                plan.modality,
-                &plan.metadata,
-                "idempotent MCP ingest replay",
-            )?;
+                stored: TextIdentityFields {
+                    panel_version: stored.panel_version,
+                    input_ref: &stored.input_ref,
+                    modality: stored.modality,
+                    metadata: &stored.metadata,
+                },
+                incoming: TextIdentityFields {
+                    panel_version: state.panel.version,
+                    input_ref: &plan.input_ref,
+                    modality: plan.modality,
+                    metadata: &plan.metadata,
+                },
+                context: "idempotent MCP ingest replay",
+            })?;
             plan.existing = Some(record);
             drop(plan.input.take());
         } else {
@@ -423,10 +427,7 @@ fn ingest_prepared_inputs(
     let mut existing_records = BTreeMap::<CxId, encode::BaseRecord>::new();
     for result in commit.existing_results {
         let cx_id = result.record.cx_id();
-        if !plans
-            .get(&cx_id)
-            .is_some_and(|plan| plan.existing.is_some())
-        {
+        if plans.get(&cx_id).is_none_or(|plan| plan.existing.is_none()) {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "MCP atomic ingest returned unplanned existing Base record for cx {cx_id}"
             ))
@@ -529,29 +530,38 @@ fn ingest_prepared_inputs(
     Ok(reports)
 }
 
-fn verify_text_identity_fields(
+struct TextIdentityFields<'a> {
+    panel_version: u32,
+    input_ref: &'a InputRef,
+    modality: Modality,
+    metadata: &'a BTreeMap<String, String>,
+}
+
+struct TextIdentityVerification<'a> {
     cx_id: CxId,
-    stored_panel_version: u32,
-    stored_ref: &InputRef,
-    stored_modality: Modality,
-    stored_metadata: &BTreeMap<String, String>,
-    incoming_panel_version: u32,
-    incoming_ref: &InputRef,
-    incoming_modality: Modality,
-    incoming_metadata: &BTreeMap<String, String>,
-    context: &str,
-) -> ToolResult<()> {
+    stored: TextIdentityFields<'a>,
+    incoming: TextIdentityFields<'a>,
+    context: &'a str,
+}
+
+fn verify_text_identity_fields(verification: TextIdentityVerification<'_>) -> ToolResult<()> {
+    let TextIdentityVerification {
+        cx_id,
+        stored,
+        incoming,
+        context,
+    } = verification;
     let mut changed = Vec::new();
-    if stored_panel_version != incoming_panel_version {
+    if stored.panel_version != incoming.panel_version {
         changed.push("panel_version");
     }
-    if !input_ref_matches_replay(stored_ref, incoming_ref) {
+    if !input_ref_matches_replay(stored.input_ref, incoming.input_ref) {
         changed.push("input_ref");
     }
-    if stored_modality != incoming_modality {
+    if stored.modality != incoming.modality {
         changed.push("modality");
     }
-    if stored_metadata != incoming_metadata {
+    if stored.metadata != incoming.metadata {
         changed.push("metadata");
     }
     if changed.is_empty() {

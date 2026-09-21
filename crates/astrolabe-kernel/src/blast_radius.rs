@@ -47,6 +47,8 @@ pub const REACH_PERMILLE_SCALE: u64 = 1_000;
 pub const ASTRO_CHANGE_REACH_KNOB_RANGE: &str = "ASTRO_CHANGE_REACH_KNOB_RANGE";
 /// Refusal raised when the changed symbol has no node row in the kernel graph.
 pub const ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL: &str = "ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL";
+/// Refusal raised when a complete reach aggregate cannot be represented.
+pub const ASTRO_CHANGE_REACH_ARITHMETIC: &str = "ASTRO_CHANGE_REACH_ARITHMETIC";
 
 const SOURCE: &str = "docs/astrolabe-blueprint.md#09-the-kernel--context-engine";
 
@@ -64,12 +66,18 @@ pub const KNOB_REACH_GAP_EXPOSURE_WEIGHT_PERMILLE: &str =
 pub const KNOB_REACH_KERNEL_MEMBERSHIP_BONUS_PERMILLE: &str =
     "kernel.reach.kernel_membership_bonus_permille";
 
+const DEFAULT_REACH_ATTENUATION_PERMILLE: u64 = 900;
+const DEFAULT_REACH_MAX_HOPS: u64 = 4;
+const DEFAULT_REACH_MIN_PERMILLE: u64 = 1;
+const DEFAULT_REACH_GAP_EXPOSURE_WEIGHT_PERMILLE: u64 = 700;
+const DEFAULT_REACH_KERNEL_MEMBERSHIP_BONUS_PERMILLE: u64 = 300;
+
 /// All change-reach knobs with their declared bounds.
 pub const CHANGE_REACH_KNOBS: &[U64KnobDeclaration] = &[
     U64KnobDeclaration {
         registry_version: CHANGE_REACH_KNOB_REGISTRY_VERSION,
         name: KNOB_REACH_ATTENUATION_PERMILLE,
-        default: 900,
+        default: DEFAULT_REACH_ATTENUATION_PERMILLE,
         min: 1,
         max: 1000,
         unit: "permille",
@@ -79,7 +87,7 @@ pub const CHANGE_REACH_KNOBS: &[U64KnobDeclaration] = &[
     U64KnobDeclaration {
         registry_version: CHANGE_REACH_KNOB_REGISTRY_VERSION,
         name: KNOB_REACH_MAX_HOPS,
-        default: 4,
+        default: DEFAULT_REACH_MAX_HOPS,
         min: 1,
         max: 16,
         unit: "hops",
@@ -89,7 +97,7 @@ pub const CHANGE_REACH_KNOBS: &[U64KnobDeclaration] = &[
     U64KnobDeclaration {
         registry_version: CHANGE_REACH_KNOB_REGISTRY_VERSION,
         name: KNOB_REACH_MIN_PERMILLE,
-        default: 1,
+        default: DEFAULT_REACH_MIN_PERMILLE,
         min: 1,
         max: 1000,
         unit: "permille",
@@ -99,7 +107,7 @@ pub const CHANGE_REACH_KNOBS: &[U64KnobDeclaration] = &[
     U64KnobDeclaration {
         registry_version: CHANGE_REACH_KNOB_REGISTRY_VERSION,
         name: KNOB_REACH_GAP_EXPOSURE_WEIGHT_PERMILLE,
-        default: 700,
+        default: DEFAULT_REACH_GAP_EXPOSURE_WEIGHT_PERMILLE,
         min: 0,
         max: 1000,
         unit: "permille",
@@ -109,7 +117,7 @@ pub const CHANGE_REACH_KNOBS: &[U64KnobDeclaration] = &[
     U64KnobDeclaration {
         registry_version: CHANGE_REACH_KNOB_REGISTRY_VERSION,
         name: KNOB_REACH_KERNEL_MEMBERSHIP_BONUS_PERMILLE,
-        default: 300,
+        default: DEFAULT_REACH_KERNEL_MEMBERSHIP_BONUS_PERMILLE,
         min: 0,
         max: 1000,
         unit: "permille",
@@ -137,13 +145,11 @@ impl ReachConfig {
     /// Returns the registry-default reach configuration.
     pub fn with_registry_defaults() -> Self {
         Self {
-            attenuation_permille: knob_default(KNOB_REACH_ATTENUATION_PERMILLE),
-            max_hops: knob_default(KNOB_REACH_MAX_HOPS),
-            min_reach_permille: knob_default(KNOB_REACH_MIN_PERMILLE),
-            gap_exposure_weight_permille: knob_default(KNOB_REACH_GAP_EXPOSURE_WEIGHT_PERMILLE),
-            kernel_membership_bonus_permille: knob_default(
-                KNOB_REACH_KERNEL_MEMBERSHIP_BONUS_PERMILLE,
-            ),
+            attenuation_permille: DEFAULT_REACH_ATTENUATION_PERMILLE,
+            max_hops: DEFAULT_REACH_MAX_HOPS,
+            min_reach_permille: DEFAULT_REACH_MIN_PERMILLE,
+            gap_exposure_weight_permille: DEFAULT_REACH_GAP_EXPOSURE_WEIGHT_PERMILLE,
+            kernel_membership_bonus_permille: DEFAULT_REACH_KERNEL_MEMBERSHIP_BONUS_PERMILLE,
         }
     }
 
@@ -164,19 +170,17 @@ impl ReachConfig {
     }
 }
 
-fn knob_default(name: &str) -> u64 {
-    CHANGE_REACH_KNOBS
-        .iter()
-        .find(|knob| knob.name == name)
-        .expect("change-reach knob is declared")
-        .default
-}
-
 fn check_range(name: &str, value: u64) -> Result<()> {
     let knob = CHANGE_REACH_KNOBS
         .iter()
         .find(|knob| knob.name == name)
-        .expect("change-reach knob is declared");
+        .ok_or_else(|| {
+            DomainError::new(
+                ASTRO_CHANGE_REACH_KNOB_RANGE,
+                format!("change-reach knob {name:?} has no registry declaration"),
+                "repair the static change-reach knob registry before measuring reach",
+            )
+        })?;
     if value < knob.min || value > knob.max {
         return Err(DomainError::new(
             ASTRO_CHANGE_REACH_KNOB_RANGE,
@@ -231,6 +235,91 @@ pub struct ChangeReach {
     pub gap_reach_permille: u64,
 }
 
+/// Canonical reach index compiled once from one immutable graph projection.
+///
+/// This ordered-map implementation constructs in
+/// `O(N log N + E log N)` time and `O(N + E)` space. Each changed-symbol
+/// measurement then reuses the same node roster and strongest-edge adjacency
+/// instead of rebuilding them, so a request covering `M` impacted symbols pays
+/// one graph compilation plus the actually traversed hop-bounded work per
+/// symbol. Production CSR replacement of these trees remains a tracked cost
+/// optimization; no fixture run is cited as production evidence (#1064 PC-41).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedChangeReachGraph {
+    node_ids: BTreeSet<CxId>,
+    out: BTreeMap<CxId, BTreeMap<CxId, u64>>,
+}
+
+impl PreparedChangeReachGraph {
+    /// Compiles an independently supplied canonical node/edge roster. Duplicate
+    /// nodes, missing endpoints, and invalid weights refuse rather than being
+    /// collapsed or clamped.
+    pub fn from_rosters<N, E>(nodes: N, edges: E) -> Result<Self>
+    where
+        N: IntoIterator<Item = CxId>,
+        E: IntoIterator<Item = (CxId, CxId, f32)>,
+    {
+        let mut node_ids = BTreeSet::new();
+        for id in nodes {
+            if !node_ids.insert(id) {
+                return Err(DomainError::new(
+                    ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL,
+                    format!("change-reach graph contains duplicate node {id}"),
+                    "rebuild the canonical projection with exactly one row per CxId",
+                ));
+            }
+        }
+        let mut out: BTreeMap<CxId, BTreeMap<CxId, u64>> = BTreeMap::new();
+        for (src, dst, weight) in edges {
+            if !node_ids.contains(&src) || !node_ids.contains(&dst) {
+                return Err(DomainError::new(
+                    ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL,
+                    format!("change-reach edge {src}->{dst} references a missing endpoint"),
+                    "repair and rebuild the canonical graph projection before measuring reach",
+                ));
+            }
+            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+                return Err(DomainError::new(
+                    ASTRO_CHANGE_REACH_KNOB_RANGE,
+                    format!("change-reach edge {src}->{dst} has invalid weight {weight}"),
+                    "repair the persisted projection edge weight into the finite [0,1] interval",
+                ));
+            }
+            if src == dst {
+                continue;
+            }
+            let weight = weight_to_permille(weight);
+            let slot = out.entry(src).or_default().entry(dst).or_insert(0);
+            if weight > *slot {
+                *slot = weight;
+            }
+        }
+        Ok(Self { node_ids, out })
+    }
+
+    /// Compiles one validated [`KernelGraph`].
+    pub fn from_kernel_graph(graph: &KernelGraph) -> Result<Self> {
+        Self::from_rosters(
+            graph.nodes().iter().map(|node| node.id),
+            graph
+                .edges()
+                .iter()
+                .map(|edge| (edge.src, edge.dst, edge.weight)),
+        )
+    }
+
+    /// Measures one changed symbol through this already-compiled graph.
+    pub fn measure(
+        &self,
+        from_id: CxId,
+        kernel_members: &BTreeSet<CxId>,
+        gap_members: &BTreeSet<CxId>,
+        config: &ReachConfig,
+    ) -> Result<ChangeReach> {
+        change_reach_prepared(self, from_id, kernel_members, gap_members, config)
+    }
+}
+
 /// Measures the blast-radius reach of a changed symbol through the kernel graph.
 ///
 /// Propagates outward from `from_id` along directed weighted edges up to the hop
@@ -249,33 +338,27 @@ pub fn change_reach(
     gap_members: &BTreeSet<CxId>,
     config: &ReachConfig,
 ) -> Result<ChangeReach> {
+    let prepared = PreparedChangeReachGraph::from_kernel_graph(graph)?;
+    change_reach_prepared(&prepared, from_id, kernel_members, gap_members, config)
+}
+
+/// Measures reach using a graph compiled once by
+/// [`PreparedChangeReachGraph::from_rosters`].
+pub fn change_reach_prepared(
+    graph: &PreparedChangeReachGraph,
+    from_id: CxId,
+    kernel_members: &BTreeSet<CxId>,
+    gap_members: &BTreeSet<CxId>,
+    config: &ReachConfig,
+) -> Result<ChangeReach> {
     config.validate()?;
 
-    let node_ids: BTreeSet<CxId> = graph.nodes().iter().map(|node| node.id).collect();
-    if !node_ids.contains(&from_id) {
+    if !graph.node_ids.contains(&from_id) {
         return Err(DomainError::new(
             ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL,
             format!("changed symbol {from_id} has no node in the kernel graph"),
             "map the changed file/symbol to a live kernel-graph symbol version before measuring its blast radius",
         ));
-    }
-
-    // Out-adjacency, strongest edge per (src, dst): parallel edges collapse to the
-    // maximum weight so the reach uses the strongest association between two nodes.
-    let mut out: BTreeMap<CxId, BTreeMap<CxId, u64>> = BTreeMap::new();
-    for edge in graph.edges() {
-        if edge.src == edge.dst {
-            continue; // a self-loop never carries reach outward
-        }
-        let weight = weight_to_permille(edge.weight);
-        let slot = out
-            .entry(edge.src)
-            .or_default()
-            .entry(edge.dst)
-            .or_insert(0);
-        if weight > *slot {
-            *slot = weight;
-        }
     }
 
     // Best reach per node, hop-bounded frontier propagation. reach[from] = 1000
@@ -286,7 +369,7 @@ pub fn change_reach(
     for hop in 1..=config.max_hops {
         let mut next: BTreeMap<CxId, u64> = BTreeMap::new();
         for (src, src_reach) in &frontier {
-            let Some(neighbors) = out.get(src) else {
+            let Some(neighbors) = graph.out.get(src) else {
                 continue;
             };
             for (dst, edge_weight) in neighbors {
@@ -294,9 +377,28 @@ pub fn change_reach(
                     continue;
                 }
                 // reach = src_reach · edge_weight/1000 · attenuation/1000.
-                let via_edge = src_reach.saturating_mul(*edge_weight) / REACH_PERMILLE_SCALE;
-                let reach =
-                    via_edge.saturating_mul(config.attenuation_permille) / REACH_PERMILLE_SCALE;
+                let via_edge = src_reach.checked_mul(*edge_weight).ok_or_else(|| {
+                    DomainError::new(
+                        ASTRO_CHANGE_REACH_ARITHMETIC,
+                        format!(
+                            "reach multiplication overflowed for source {src}: {src_reach} * {edge_weight}"
+                        ),
+                        "repair the bounded permille graph weights and retry the exact reach measurement",
+                    )
+                })? / REACH_PERMILLE_SCALE;
+                let reach = via_edge
+                    .checked_mul(config.attenuation_permille)
+                    .ok_or_else(|| {
+                        DomainError::new(
+                            ASTRO_CHANGE_REACH_ARITHMETIC,
+                            format!(
+                                "reach attenuation overflowed for source {src}: {via_edge} * {}",
+                                config.attenuation_permille
+                            ),
+                            "repair the bounded reach-knob registry and retry the exact measurement",
+                        )
+                    })?
+                    / REACH_PERMILLE_SCALE;
                 if reach < config.min_reach_permille {
                     continue;
                 }
@@ -338,17 +440,35 @@ pub fn change_reach(
         .collect();
     reached.sort_by_key(|node| node.id);
 
-    let reach_mass_permille = reached.iter().map(|node| node.reach_permille).sum();
-    let kernel_member_reach_permille = reached
-        .iter()
-        .filter(|node| node.kernel_member)
-        .map(|node| node.reach_permille)
-        .sum();
-    let gap_reach_permille = reached
-        .iter()
-        .filter(|node| node.gap)
-        .map(|node| node.reach_permille)
-        .sum();
+    let checked_sum = |label: &str, values: &mut dyn Iterator<Item = u64>| {
+        values
+            .try_fold(0_u64, |sum, value| sum.checked_add(value))
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_CHANGE_REACH_ARITHMETIC,
+                    format!("change-reach {label} is not representable as u64"),
+                    "reduce the admitted graph/reach roster or widen the declared persisted aggregate type",
+                )
+            })
+    };
+    let reach_mass_permille = checked_sum(
+        "total reach mass",
+        &mut reached.iter().map(|node| node.reach_permille),
+    )?;
+    let kernel_member_reach_permille = checked_sum(
+        "kernel-member reach mass",
+        &mut reached
+            .iter()
+            .filter(|node| node.kernel_member)
+            .map(|node| node.reach_permille),
+    )?;
+    let gap_reach_permille = checked_sum(
+        "gap reach mass",
+        &mut reached
+            .iter()
+            .filter(|node| node.gap)
+            .map(|node| node.reach_permille),
+    )?;
 
     Ok(ChangeReach {
         schema: CHANGE_REACH_SCHEMA,
@@ -365,7 +485,7 @@ pub fn change_reach(
 }
 
 /// The composed risk permille for a change: the oracle's grounded consequence
-/// probability elevated by the graph blast radius, clamped to `[base, 1000]`.
+/// probability elevated by the graph blast radius, bounded to `[base, 1000]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReachRisk {
     /// The oracle-grounded per-symbol consequence probability (permille) fed in.
@@ -395,10 +515,30 @@ pub fn reach_risk_permille(
     config: &ReachConfig,
 ) -> Result<ReachRisk> {
     config.validate()?;
-    let base = grounded_consequence_permille.min(REACH_PERMILLE_SCALE);
+    if grounded_consequence_permille > REACH_PERMILLE_SCALE {
+        return Err(DomainError::new(
+            ASTRO_CHANGE_REACH_ARITHMETIC,
+            format!(
+                "grounded consequence {grounded_consequence_permille} exceeds the {REACH_PERMILLE_SCALE}-permille scale"
+            ),
+            "supply the exact measured grounded consequence without clamping",
+        ));
+    }
+    let base = grounded_consequence_permille;
 
+    // The complete gap reach is an additive mass and may legitimately exceed
+    // one unit across several nodes. The model's declared exposure transform is
+    // therefore `min(total_mass, 1000)`, not a repair of malformed input.
     let gap_exposure_permille = reach.gap_reach_permille.min(REACH_PERMILLE_SCALE);
-    let gap_term = gap_exposure_permille.saturating_mul(config.gap_exposure_weight_permille)
+    let gap_term = gap_exposure_permille
+        .checked_mul(config.gap_exposure_weight_permille)
+        .ok_or_else(|| {
+            DomainError::new(
+                ASTRO_CHANGE_REACH_ARITHMETIC,
+                "gap-exposure weighting overflowed",
+                "repair the bounded permille measurement and knob registry",
+            )
+        })?
         / REACH_PERMILLE_SCALE;
     let membership_term = if reach.from_is_kernel_member {
         config.kernel_membership_bonus_permille
@@ -406,11 +546,31 @@ pub fn reach_risk_permille(
         0
     };
     let elevation_permille = gap_term
-        .saturating_add(membership_term)
+        .checked_add(membership_term)
+        .ok_or_else(|| {
+            DomainError::new(
+                ASTRO_CHANGE_REACH_ARITHMETIC,
+                "reach elevation addition overflowed",
+                "repair the bounded permille measurement and knob registry",
+            )
+        })?
         .min(REACH_PERMILLE_SCALE);
 
     let headroom = REACH_PERMILLE_SCALE - base;
-    let risk_permille = base + headroom.saturating_mul(elevation_permille) / REACH_PERMILLE_SCALE;
+    let elevated = headroom.checked_mul(elevation_permille).ok_or_else(|| {
+        DomainError::new(
+            ASTRO_CHANGE_REACH_ARITHMETIC,
+            "reach risk multiplication overflowed",
+            "repair the bounded permille measurement and knob registry",
+        )
+    })? / REACH_PERMILLE_SCALE;
+    let risk_permille = base.checked_add(elevated).ok_or_else(|| {
+        DomainError::new(
+            ASTRO_CHANGE_REACH_ARITHMETIC,
+            "reach risk addition overflowed",
+            "repair the bounded permille measurement and knob registry",
+        )
+    })?;
 
     Ok(ReachRisk {
         grounded_consequence_permille: base,
@@ -425,60 +585,106 @@ pub fn reach_risk_permille(
 /// runs (invariant 5): a recompute re-serializes to the same bytes, the FSV
 /// readback anchor for the served reach component.
 pub fn change_reach_artifact_bytes(reach: &ChangeReach) -> Vec<u8> {
-    let mut out = String::new();
-    out.push_str("schema=");
-    out.push_str(reach.schema);
-    out.push('\n');
-    out.push_str("from=");
-    out.push_str(&hex_lower(reach.from_id.as_bytes()));
-    out.push('\n');
-    out.push_str("from_kernel_member=");
-    out.push_str(if reach.from_is_kernel_member {
-        "1"
-    } else {
-        "0"
+    let mut out = Vec::new();
+    write_change_reach_artifact(reach, |bytes| out.extend_from_slice(bytes));
+    out
+}
+
+/// BLAKE3 of the exact canonical change-reach bytes, computed in one streaming
+/// pass without retaining a second corpus-sized serialization buffer.
+pub fn change_reach_artifact_blake3(reach: &ChangeReach) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    write_change_reach_artifact(reach, |bytes| {
+        hasher.update(bytes);
     });
-    out.push('\n');
-    out.push_str("from_gap=");
-    out.push_str(if reach.from_is_gap { "1" } else { "0" });
-    out.push('\n');
-    out.push_str("reached_count=");
-    out.push_str(&reach.reached_count.to_string());
-    out.push('\n');
-    out.push_str("reach_mass=");
-    out.push_str(&reach.reach_mass_permille.to_string());
-    out.push('\n');
-    out.push_str("kernel_member_reach=");
-    out.push_str(&reach.kernel_member_reach_permille.to_string());
-    out.push('\n');
-    out.push_str("gap_reach=");
-    out.push_str(&reach.gap_reach_permille.to_string());
-    out.push('\n');
+    *hasher.finalize().as_bytes()
+}
+
+fn write_change_reach_artifact(reach: &ChangeReach, mut write: impl FnMut(&[u8])) {
+    write(b"schema=");
+    write(reach.schema.as_bytes());
+    write(b"\nfrom=");
+    write_cx_hex(reach.from_id, &mut write);
+    write(b"\nfrom_kernel_member=");
+    write(if reach.from_is_kernel_member {
+        b"1"
+    } else {
+        b"0"
+    });
+    write(b"\nfrom_gap=");
+    write(if reach.from_is_gap { b"1" } else { b"0" });
+    write(b"\nreached_count=");
+    write_usize_decimal(reach.reached_count, &mut write);
+    write(b"\nreach_mass=");
+    write_u64_decimal(reach.reach_mass_permille, &mut write);
+    write(b"\nkernel_member_reach=");
+    write_u64_decimal(reach.kernel_member_reach_permille, &mut write);
+    write(b"\ngap_reach=");
+    write_u64_decimal(reach.gap_reach_permille, &mut write);
+    write(b"\n");
     for node in &reach.reached {
-        out.push_str("reached\t");
-        out.push_str(&hex_lower(node.id.as_bytes()));
-        out.push('\t');
-        out.push_str(&node.hop.to_string());
-        out.push('\t');
-        out.push_str(&node.reach_permille.to_string());
-        out.push('\t');
-        out.push_str(if node.kernel_member {
-            "member"
+        write(b"reached\t");
+        write_cx_hex(node.id, &mut write);
+        write(b"\t");
+        write_u64_decimal(node.hop, &mut write);
+        write(b"\t");
+        write_u64_decimal(node.reach_permille, &mut write);
+        write(b"\t");
+        write(if node.kernel_member {
+            b"member"
         } else {
-            "external"
+            b"external"
         });
-        out.push('\t');
-        out.push_str(if node.gap { "gap" } else { "grounded" });
-        out.push('\n');
+        write(b"\t");
+        write(if node.gap { b"gap" } else { b"grounded" });
+        write(b"\n");
     }
-    out.into_bytes()
+}
+
+fn write_cx_hex(id: CxId, write: &mut impl FnMut(&[u8])) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = [0u8; 32];
+    for (index, byte) in id.as_bytes().iter().copied().enumerate() {
+        encoded[index * 2] = HEX[(byte >> 4) as usize];
+        encoded[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    write(&encoded);
+}
+
+fn write_u64_decimal(mut value: u64, write: &mut impl FnMut(&[u8])) {
+    let mut encoded = [0u8; 20];
+    let mut cursor = encoded.len();
+    loop {
+        cursor -= 1;
+        encoded[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    write(&encoded[cursor..]);
+}
+
+fn write_usize_decimal(mut value: usize, write: &mut impl FnMut(&[u8])) {
+    let mut encoded = [0u8; 20];
+    let mut cursor = encoded.len();
+    loop {
+        cursor -= 1;
+        encoded[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    write(&encoded[cursor..]);
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push(char::from_digit((byte >> 4) as u32, 16).expect("nibble"));
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).expect("nibble"));
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }

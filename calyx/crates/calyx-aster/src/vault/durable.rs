@@ -18,6 +18,7 @@ use crate::timetravel::RetentionHorizon;
 use crate::wal::{GroupCommitBatcher, WalOptions, replay_dir, replay_dir_read_only_after};
 use calyx_core::{CalyxError, Panel, Result, SystemClock, TemporalPolicy};
 use calyx_ledger::CheckpointConfig;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -53,11 +54,17 @@ pub struct VaultOptions {
     /// Opens the vault as a read-only handle. Any write through this handle
     /// fails before WAL append or MVCC mutation.
     pub read_only: bool,
-    /// Restricts router recovery to a concrete CF set for read-only handles.
-    /// This keeps analytical/search reads from enumerating unrelated large CFs.
+    /// Restricts router recovery to a concrete CF set. This keeps analytical
+    /// reads and narrowly scoped generation writers from enumerating unrelated
+    /// large CFs. A write-capable selection is accepted only when the restored
+    /// ledger hook is enabled and both Ledger and TimeIndex are explicit.
     /// Any point, batch, or range read of a CF outside this set fails with
     /// `CALYX_ASTER_CF_NOT_SELECTED`; it never reports synthetic absence.
     pub selected_cfs: Option<Vec<ColumnFamily>>,
+    /// Explicit admission for a write-capable selected-CF handle. This is never
+    /// inferred from `read_only=false`; callers must opt into the narrow mode
+    /// and still include Ledger plus TimeIndex below.
+    pub writable_selected_cfs: bool,
 }
 
 impl Default for VaultOptions {
@@ -77,6 +84,7 @@ impl Default for VaultOptions {
             restore_ledger_hook: true,
             read_only: false,
             selected_cfs: None,
+            writable_selected_cfs: false,
         }
     }
 }
@@ -92,11 +100,19 @@ pub(super) struct DurableVault {
     retention_horizon: Mutex<RetentionHorizon>,
     panel: Option<Panel>,
     disk_pressure_guard: Option<DiskPressureGuard>,
+    /// Exact write capability retained for cross-process router refresh.
+    selected_cfs: Option<Vec<ColumnFamily>>,
     pending_checkpoint: Mutex<Vec<(u64, Vec<WriteRow>)>>,
     /// Max checkpointed seq whose batch wrote derived-search-content CF rows
     /// (issue #1100); persisted into every manifest write as
     /// `derived_content_seq`, clamped to that manifest's `durable_seq`.
     checkpointed_derived_content_seq: AtomicU64,
+    /// Exact last checkpointed mutation sequence for every CF this handle has
+    /// flushed. Manifest publication merges this bounded map with the current
+    /// durable manifest under the commit lock.
+    checkpointed_cf_content_generations: Mutex<BTreeMap<ColumnFamily, u64>>,
+    /// Exact manifest control generation last incorporated by this handle.
+    observed_manifest_seq: AtomicU64,
 }
 
 pub(super) struct RecoveredBatch {
@@ -123,10 +139,16 @@ impl RecoveryMode {
 pub(super) struct RecoveredBatches {
     pub batches: Vec<RecoveredBatch>,
     pub last_recovered_seq: u64,
+    pub manifest_seq: u64,
     pub wal_replay_floor_seq: u64,
     /// Durably recorded derived-content watermark floor for seqs at or below
     /// `wal_replay_floor_seq`; WAL replay re-derives the rest per batch.
     pub derived_content_floor_seq: u64,
+    /// Durable per-CF generation floor from the current manifest (legacy
+    /// manifests conservatively use their durable tip).
+    pub cf_content_generation_floor_seq: u64,
+    /// Exact per-CF generations above the floor, including the WAL tail.
+    pub cf_content_generations: BTreeMap<ColumnFamily, u64>,
     pub torn_tail: Option<crate::wal::TornTail>,
     pub temporal_policy: Option<TemporalPolicy>,
     pub dedup_policy: Option<DedupPolicy>,
@@ -166,12 +188,24 @@ impl DurableVault {
                 remediation: "persist residency with a write-capable open before opening read-only handles",
             });
         }
-        if options.selected_cfs.is_some() && !options.read_only {
+        if let Some(selected) = &options.selected_cfs
+            && !options.read_only
+            && (!options.writable_selected_cfs
+                || !options.restore_ledger_hook
+                || !selected.contains(&ColumnFamily::Ledger)
+                || !selected.contains(&ColumnFamily::TimeIndex))
+        {
             return Err(CalyxError {
                 code: "CALYX_VAULT_OPTIONS_INVALID",
-                message: "selected_cfs requires read_only=true to prevent partial write handles"
-                    .to_string(),
-                remediation: "open full write-capable vault handles without selected_cfs, or mark the handle read_only=true",
+                message: "write-capable selected_cfs requires writable_selected_cfs=true, restore_ledger_hook=true, and explicit Ledger plus TimeIndex column families".to_string(),
+                remediation: "explicitly opt into narrow writes and include every application CF the transaction may touch plus Ledger and TimeIndex, or open a full write-capable vault",
+            });
+        }
+        if options.writable_selected_cfs && (options.read_only || options.selected_cfs.is_none()) {
+            return Err(CalyxError {
+                code: "CALYX_VAULT_OPTIONS_INVALID",
+                message: "writable_selected_cfs=true requires a write-capable non-empty selected_cfs scope".to_string(),
+                remediation: "disable writable_selected_cfs for ordinary/read-only opens, or name the exact write scope",
             });
         }
         if options.selected_cfs.as_ref().is_some_and(Vec::is_empty) {
@@ -226,16 +260,26 @@ impl DurableVault {
             retention_horizon: Mutex::new(options.retention_horizon.clone()),
             panel: options.panel.clone(),
             disk_pressure_guard: options.disk_pressure_guard.clone(),
+            selected_cfs: options.selected_cfs.clone(),
             pending_checkpoint: Mutex::new(Vec::new()),
             checkpointed_derived_content_seq: AtomicU64::new(0),
+            checkpointed_cf_content_generations: Mutex::new(BTreeMap::new()),
+            observed_manifest_seq: AtomicU64::new(0),
         };
-        if durable.root.join("CURRENT").exists() {
+        let current_path = durable.root.join("CURRENT");
+        let current_present = current_path
+            .try_exists()
+            .map_err(|error| storage_error("inspect durable CURRENT", error))?;
+        if current_present {
             let manifest = crate::manifest::ManifestStore::open(&durable.root).load_current()?;
             durable
                 .checkpointed_derived_content_seq
                 .store(manifest.effective_derived_content_seq(), Ordering::Release);
+            durable
+                .observed_manifest_seq
+                .store(manifest.manifest_seq, Ordering::Release);
         }
-        if durable.panel.is_some() && !durable.root.join("CURRENT").exists() {
+        if durable.panel.is_some() && !current_present {
             durable.write_manifest_with_seq(1, 0)?;
         }
         Ok(durable)
@@ -247,7 +291,15 @@ impl DurableVault {
     ) -> Result<RecoveredBatches> {
         Self::validate_options(options)?;
         let root = root.as_ref();
-        if root.join("CURRENT").exists() {
+        let selected_cfs = options
+            .selected_cfs
+            .as_ref()
+            .map(|selected| selected.iter().copied().collect::<BTreeSet<_>>());
+        let current_present = root
+            .join("CURRENT")
+            .try_exists()
+            .map_err(|error| storage_error("inspect recovery CURRENT", error))?;
+        if current_present {
             let recovery = if options.read_only {
                 recover_vault_read_only(root)?
             } else {
@@ -262,21 +314,40 @@ impl DurableVault {
                     root,
                     options.tiering_policy.as_ref(),
                     recovery.manifest.durable_seq,
+                    selected_cfs.as_ref(),
                 )?
             } else {
                 Vec::new()
             };
+            let cf_content_generation_floor_seq = recovery
+                .manifest
+                .effective_cf_content_generation_floor_seq();
+            let mut cf_content_generations = recovery.manifest.decoded_cf_content_generations()?;
+            validate_replay_sequence(
+                recovery.manifest.durable_seq,
+                recovery.wal_records.iter().map(|record| record.seq),
+            )?;
             for record in recovery.wal_records {
+                let rows = decode_write_batch(&record.payload)?;
+                advance_cf_generation_map(
+                    &mut cf_content_generations,
+                    cf_content_generation_floor_seq,
+                    record.seq,
+                    &rows,
+                );
                 batches.push(RecoveredBatch {
                     seq: record.seq,
-                    rows: decode_write_batch(&record.payload)?,
+                    rows,
                 });
             }
             return Ok(RecoveredBatches {
                 batches,
                 last_recovered_seq: recovery.last_recovered_seq,
+                manifest_seq: recovery.manifest.manifest_seq,
                 wal_replay_floor_seq: recovery.manifest.durable_seq,
                 derived_content_floor_seq: recovery.manifest.effective_derived_content_seq(),
+                cf_content_generation_floor_seq,
+                cf_content_generations,
                 torn_tail: recovery.torn_tail,
                 temporal_policy: recovery.manifest.temporal_policy,
                 dedup_policy: recovery.manifest.dedup_policy,
@@ -291,6 +362,7 @@ impl DurableVault {
             replay_dir(root.join("wal"))?
         };
         let last_recovered_seq = replay.records.last().map_or(0, |record| record.seq);
+        validate_replay_sequence(0, replay.records.iter().map(|record| record.seq))?;
         // A vault does not need a CURRENT manifest before its router SSTs and
         // WAL are valid latest-state sources. Honor the caller's router mode in
         // this bootstrap state exactly as the manifested branch above does.
@@ -298,21 +370,30 @@ impl DurableVault {
         // must restore it: latest readers compose that tail over router SSTs,
         // while historical readers rebuild MVCC from the same committed rows.
         let mode = RecoveryMode::from_options(options);
-        let batches = replay
-            .records
-            .iter()
-            .map(|record| {
-                Ok(RecoveredBatch {
-                    seq: record.seq,
-                    rows: decode_write_batch(&record.payload)?,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let cf_content_generation_floor_seq = 0;
+        let mut cf_content_generations = BTreeMap::new();
+        let mut batches = Vec::with_capacity(replay.records.len());
+        for record in &replay.records {
+            let rows = decode_write_batch(&record.payload)?;
+            advance_cf_generation_map(
+                &mut cf_content_generations,
+                cf_content_generation_floor_seq,
+                record.seq,
+                &rows,
+            );
+            batches.push(RecoveredBatch {
+                seq: record.seq,
+                rows,
+            });
+        }
         Ok(RecoveredBatches {
             batches,
             last_recovered_seq,
+            manifest_seq: 0,
             wal_replay_floor_seq: 0,
             derived_content_floor_seq: 0,
+            cf_content_generation_floor_seq,
+            cf_content_generations,
             torn_tail: replay.torn_tail,
             temporal_policy: options.temporal_policy,
             dedup_policy: options.dedup_policy.clone(),
@@ -363,6 +444,19 @@ impl DurableVault {
         }
     }
 
+    fn advance_checkpointed_cf_content_generations(
+        &self,
+        seq: u64,
+        rows: &[WriteRow],
+    ) -> Result<()> {
+        let mut generations = self
+            .checkpointed_cf_content_generations
+            .lock()
+            .map_err(|_| CalyxError::backpressure("checkpointed CF generation lock poisoned"))?;
+        advance_cf_generation_map(&mut generations, 0, seq, rows);
+        Ok(())
+    }
+
     /// Watermark value a manifest written at `durable_seq` may vouch for.
     pub(super) fn derived_content_seq_for_manifest(&self, durable_seq: u64) -> u64 {
         self.checkpointed_derived_content_seq
@@ -401,9 +495,11 @@ impl DurableVault {
             ledger_checkpoint: self.ledger_checkpoint.clone(),
             temporal_policy: self.temporal_policy,
             dedup_policy: self.dedup_policy.clone(),
-            retention_horizon: self.retention_horizon(),
+            retention_horizon: self.retention_horizon()?,
             panel: self.panel.clone(),
             disk_pressure_guard: self.disk_pressure_guard.clone(),
+            selected_cfs: self.selected_cfs.clone(),
+            writable_selected_cfs: self.selected_cfs.is_some(),
             restore_mvcc_rows: mode == RecoveryMode::FullMvcc,
             ..VaultOptions::default()
         };
@@ -418,6 +514,19 @@ impl DurableVault {
         self.tiering_policy.as_ref()
     }
 
+    pub(super) fn selected_cfs(&self) -> Option<&[ColumnFamily]> {
+        self.selected_cfs.as_deref()
+    }
+
+    pub(super) fn observed_manifest_seq(&self) -> u64 {
+        self.observed_manifest_seq.load(Ordering::Acquire)
+    }
+
+    pub(in crate::vault) fn observe_manifest_seq(&self, manifest_seq: u64) {
+        self.observed_manifest_seq
+            .store(manifest_seq, Ordering::Release);
+    }
+
     pub(super) fn compaction_output_path(&self, cf: ColumnFamily, seq: u64) -> PathBuf {
         self.cf_dir(cf).join(format!("compacted-{seq:020}.sst"))
     }
@@ -427,6 +536,41 @@ impl DurableVault {
             || self.root.join("cf").join(cf.name()),
             |policy| policy.place_current_cf(cf).absolute_dir(),
         )
+    }
+}
+
+fn validate_replay_sequence(floor: u64, sequences: impl IntoIterator<Item = u64>) -> Result<()> {
+    let mut previous = floor;
+    for observed in sequences {
+        let expected = previous.checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "WAL sequence overflow after durable replay floor {previous}"
+            ))
+        })?;
+        if observed != expected {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "WAL sequence is not contiguous after durable replay floor {floor}: expected {expected}, observed {observed}"
+            )));
+        }
+        previous = observed;
+    }
+    Ok(())
+}
+
+fn advance_cf_generation_map(
+    generations: &mut BTreeMap<ColumnFamily, u64>,
+    floor: u64,
+    seq: u64,
+    rows: &[WriteRow],
+) {
+    if seq <= floor {
+        return;
+    }
+    for row in rows {
+        generations
+            .entry(row.cf)
+            .and_modify(|generation| *generation = (*generation).max(seq))
+            .or_insert(seq);
     }
 }
 

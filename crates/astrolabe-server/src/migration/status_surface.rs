@@ -456,9 +456,18 @@ fn scrub_project_with_import_owner(
     shadow_import_lock: &ShadowImportLock,
 ) -> Result<PeriodicScrubOutcome, DynError> {
     shadow_import_lock.assert_owns(cache_dir, project)?;
-    // Writable handle: the scrub advances the persisted JanitorCheckpoint and
-    // appends the witnessed Measure scrub record. selected_cfs=None (all CFs).
-    let vault = open_shadow_vault_writable(vault_dir, vault_id, vault_salt, Vec::new())?;
+    // The scrub reads/writes its Kv checkpoint and bounded Ledger slice; the
+    // paired Measure entry advances Ledger and TimeIndex in the same commit.
+    let vault = open_shadow_vault_writable_latest_selected(
+        vault_dir,
+        vault_id,
+        vault_salt,
+        vec![
+            ColumnFamily::Kv,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
+    )?;
     scrub_open_vault(&vault)
 }
 

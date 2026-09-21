@@ -93,6 +93,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
  "windows-sys",
 ]
@@ -111,15 +112,16 @@ dependencies = [
 name = "astrolabe-fleet"
 version = "0.1.0"
 dependencies = [
+ "astrolabe-anchors",
  "astrolabe-domain",
  "astrolabe-ingest",
  "astrolabe-kernel",
- "astrolabe-panel",
  "astrolabe-weave",
  "blake3",
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "calyx-sextant",
  "rusqlite",
  "serde",
  "serde_json",
@@ -162,6 +164,7 @@ version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
  "astrolabe-panel",
+ "blake3",
  "calyx-lodestar",
  "calyx-paths",
  "rayon",

@@ -69,10 +69,14 @@ typedef bool (*cbm_proc_cancel_cb)(void *ud);
 typedef void (*cbm_proc_spawn_cb)(long child_pid, void *ud);
 
 typedef struct {
-    const char *bin;             /* executable path; also argv[0] when argv is NULL */
+    const char *bin;             /* exact absolute executable path; Windows passes it separately
+                                  * as CreateProcessW lpApplicationName. Also argv[0] when argv is
+                                  * NULL; an explicit argv keeps its existing argv[0]. */
     const char *const *argv;     /* NULL-terminated argv; NULL => { bin, NULL } */
     const char *log_file;        /* child stdout+stderr are redirected here and tailed;
-                                  * NULL => discard child output, no tailing */
+                                  * NULL => discard child output, no tailing. A non-NULL
+                                  * path is required state: preparation/open failure refuses
+                                  * the spawn rather than continuing without diagnostics. */
     cbm_proc_log_cb on_log_line; /* optional per-line callback */
     void *log_ud;                /* user data for on_log_line */
     cbm_proc_progress_cb on_progress; /* required when quiet_timeout_ms > 0 */
@@ -86,9 +90,10 @@ typedef struct {
     bool delete_log_on_exit;     /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 
-/* Spawn opts->bin, supervise (tail + optional quiet-timeout), block until it ends,
- * and classify the result into *out. Returns 0 if a child was spawned and reaped
- * (out filled), or -1 if the spawn itself failed (out->outcome == CBM_PROC_SPAWN_FAILED). */
+/* Spawn the exact absolute opts->bin without PATH/current-image discovery,
+ * supervise (tail + optional quiet-timeout), block until it ends, and classify
+ * the result into *out. Returns 0 if a child was spawned and reaped (out filled),
+ * or -1 if the spawn itself failed (out->outcome == CBM_PROC_SPAWN_FAILED). */
 int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out);
 
 /* Pure outcome classifier — exposed so the platform-specific exit-code mapping

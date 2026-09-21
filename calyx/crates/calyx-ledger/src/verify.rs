@@ -1,6 +1,5 @@
 //! Ledger hash-chain verification.
 
-use std::collections::BTreeMap;
 use std::ops::Range;
 
 use calyx_core::{CalyxError, Result};
@@ -41,41 +40,46 @@ pub fn verify_chain(store: &dyn LedgerCfStore, range: Range<u64>) -> Result<Veri
             range.start, range.end
         )));
     }
-    if range.start == range.end {
-        return Ok(VerifyResult::Intact { count: 0 });
-    }
     let anchor = store.head_anchor()?;
-    if range.start == 0
-        && let Some(anchor) = &anchor
-        && range.end != anchor.height
+    if let Some(anchor) = &anchor
+        && range.end > anchor.height
     {
         return Ok(corrupt_result(
-            range.end.min(anchor.height),
+            anchor.height,
             format!(
-                "ledger head anchor mismatch: requested head {}, anchored head {}",
+                "ledger range end {} exceeds anchored head {}",
                 range.end, anchor.height
             ),
         ));
     }
-    let rows = store
-        .scan()?
-        .into_iter()
-        .map(|row| (row.seq, row.bytes))
-        .collect::<BTreeMap<_, _>>();
-    let mut expected_prev = match expected_prev_hash(&rows, range.start)? {
+    if range.start == range.end {
+        return Ok(VerifyResult::Intact { count: 0 });
+    }
+    let previous = if range.start == 0 {
+        None
+    } else {
+        store.read_seq(range.start - 1)?
+    };
+    let mut expected_prev = match expected_prev_hash(previous.as_ref(), range.start)? {
         StartHash::Ready(hash) => hash,
         StartHash::Corrupt(result) => return Ok(result),
     };
     let mut count = 0_u64;
 
     for seq in range.clone() {
-        let Some(bytes) = rows.get(&seq) else {
+        let Some(row) = store.read_seq(seq)? else {
             return Ok(corrupt_result(
                 seq,
                 format!("missing ledger row for seq {seq}"),
             ));
         };
-        let entry = match decode_unchecked(bytes) {
+        if row.seq != seq {
+            return Ok(corrupt_result(
+                seq,
+                format!("ledger read_seq({seq}) returned row seq {}", row.seq),
+            ));
+        }
+        let entry = match decode_unchecked(&row.bytes) {
             Ok(entry) => entry,
             Err(error) => {
                 return Ok(corrupt_result(
@@ -109,8 +113,7 @@ pub fn verify_chain(store: &dyn LedgerCfStore, range: Range<u64>) -> Result<Veri
         count += 1;
     }
 
-    if range.start == 0
-        && let Some(anchor) = &anchor
+    if let Some(anchor) = &anchor
         && range.end == anchor.height
         && expected_prev != anchor.tip_hash
     {
@@ -129,18 +132,27 @@ enum StartHash {
     Corrupt(VerifyResult),
 }
 
-fn expected_prev_hash(rows: &BTreeMap<u64, Vec<u8>>, start: u64) -> Result<StartHash> {
+fn expected_prev_hash(previous: Option<&LedgerRow>, start: u64) -> Result<StartHash> {
     if start == 0 {
         return Ok(StartHash::Ready([0; HASH_BYTES]));
     }
     let previous_seq = start - 1;
-    let Some(bytes) = rows.get(&previous_seq) else {
+    let Some(row) = previous else {
         return Ok(StartHash::Corrupt(corrupt_result(
             start,
             format!("missing ledger row for previous seq {previous_seq}"),
         )));
     };
-    let entry = match decode_unchecked(bytes) {
+    if row.seq != previous_seq {
+        return Ok(StartHash::Corrupt(corrupt_result(
+            start,
+            format!(
+                "ledger read_seq({previous_seq}) returned previous row seq {}",
+                row.seq
+            ),
+        )));
+    }
+    let entry = match decode_unchecked(&row.bytes) {
         Ok(entry) => entry,
         Err(error) => {
             return Ok(StartHash::Corrupt(corrupt_result(

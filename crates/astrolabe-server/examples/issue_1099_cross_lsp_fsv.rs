@@ -342,8 +342,10 @@ unsafe fn direct_cases() -> Value {
 }
 
 unsafe fn private_usage() -> usize {
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
     let ok = unsafe {
         K32GetProcessMemoryInfo(
             GetCurrentProcess(),
@@ -544,21 +546,7 @@ fn run_index_child(
             "preserve both paths and repair the native cache resolver before indexing",
         );
     }
-    let executable = std::env::current_exe().unwrap_or_else(|error| {
-        fail(
-            "ISSUE_1099_FSV_EXE_PATH_FAILED",
-            error,
-            "repair current executable discovery before production host initialization",
-        )
-    });
-    let executable_text = executable.to_str().unwrap_or_else(|| {
-        fail(
-            "ISSUE_1099_FSV_EXE_PATH_INVALID",
-            executable.display(),
-            "run the staged FSV artifact from a UTF-8 workspace path",
-        )
-    });
-    initialize_cbm_host_process(Some(executable_text)).unwrap_or_else(|error| {
+    initialize_cbm_host_process().unwrap_or_else(|error| {
         fail(
             "ISSUE_1099_FSV_HOST_INIT_FAILED",
             error,
@@ -826,21 +814,7 @@ fn main() {
             "use one absent direct payload child of the staged session",
         )
     });
-    let executable = std::env::current_exe().unwrap_or_else(|error| {
-        fail(
-            "ISSUE_1099_FSV_EXE_PATH_FAILED",
-            error,
-            "repair current executable discovery before production host initialization",
-        )
-    });
-    let executable = executable.to_str().unwrap_or_else(|| {
-        fail(
-            "ISSUE_1099_FSV_EXE_PATH_INVALID",
-            executable.display(),
-            "run the staged FSV artifact from a UTF-8 workspace path",
-        )
-    });
-    initialize_cbm_host_process(Some(executable)).unwrap_or_else(|error| {
+    initialize_cbm_host_process().unwrap_or_else(|error| {
         fail(
             "ISSUE_1099_FSV_HOST_INIT_FAILED",
             error,

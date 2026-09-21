@@ -10,35 +10,35 @@
 //! persisted data** — never invented labels:
 //!
 //! 1. **Kernel membership** (blueprint 5.9 / P7 "grounded labels harmonically
-//!    extended over the association graph"). The kernel build already persists a
-//!    [`KernelArtifact`] at index time (`persist_index_time_kernel_artifact` →
-//!    `build_and_persist_kernel`). Its members are the measured core of the
+//!    extended over the association graph"). The caller supplies the artifact
+//!    and composite projection selected and independently read back from one
+//!    atomic complete kernel generation. Its members are the measured core of the
 //!    codebase: each is a grounded, provenance-carrying architectural property.
 //!    Every kernel member becomes a [`KERNEL_CORE_LABEL`] seed whose confidence
-//!    is the member's own measured combined score (permille, clamped into the
-//!    seed domain — a measurement, not a magic constant, invariant 4), and whose
-//!    provenance references the exact persisted kernel artifact + member id.
+//!    is the member's own measured combined score (permille). A value outside
+//!    the declared seed domain is source drift and refuses before persistence;
+//!    it is never clamped into a different measurement. Provenance references
+//!    the exact persisted kernel artifact + member id.
 //! 2. **Caller-supplied grounded labels** (`extra_seeds`) — e.g. the server
 //!    folding in `AnchorKind::Label(..)` anchors. Kept decoupled so this crate
 //!    does not depend on `astrolabe-anchors`. Deduplicated against the kernel
 //!    seeds on `(label, symbol_id)`; kernel seeds win a collision.
 //!
-//! The label **graph** is the persisted composite kernel graph projection
-//! (`ensure_graph_projection_csr`): the same association graph the kernel was
-//! built over, so seeds and edges share one `CxId`-hex symbol space. Seeds and
+//! The label **graph** is that same persisted composite kernel graph projection,
+//! so seeds and edges share one `CxId`-hex symbol space. Seeds and
 //! edges are persisted through [`persist_label_graph`] (Graph CF rows, ledger
 //! paired, readback-verified) and propagation runs through
 //! [`propagate_labels_over_vault`] (Kernel CF label rows, ledger paired,
 //! readback-verified) — this module adds no new persistence path, only the
 //! honest seed derivation that feeds the existing verified ones.
 //!
-//! Honesty: a corpus with no kernel artifact and no caller seeds derives zero
-//! seeds; the graph reconciles to empty and propagation reports `zero_seed_scope`
-//! truthfully rather than inventing labels. Determinism: kernel members are
+//! Honesty: an absent/empty/mismatched artifact or projection is a refusal; the
+//! caller cannot substitute an empty label surface for a broken mandatory kernel
+//! generation. Determinism: kernel members are
 //! ascending by `CxId` and the CSR is deterministic, so the same vault yields
 //! byte-identical seed rows, edge rows, and propagated rows.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use astrolabe_kernel::{
     KernelArtifact, LabelGraphEdge, LabelPropagationConfig, LabelSeed,
@@ -47,16 +47,13 @@ use astrolabe_kernel::{
 use calyx_aster::vault::AsterVault;
 use calyx_core::Clock;
 
-use crate::graph_projection::{
-    GraphProjectionBuildOptions, GraphProjectionCsr, GraphProjectionKind,
-    ensure_graph_projection_csr,
-};
-use crate::kernel_artifact::read_persisted_kernel_artifact;
+use crate::graph_projection::GraphProjectionCsr;
+use crate::kernel_artifact::kernel_graph_from_projection_csr;
 use crate::label_propagation::{
     LabelGraphPersistReport, LivePropagationReport, persist_label_graph,
     propagate_labels_over_vault,
 };
-use crate::registry::IngestResult;
+use crate::registry::{IngestError, IngestResult};
 
 /// The grounded label name a persisted kernel member seeds. Fixed (never
 /// derived from user text), so the label space is closed and auditable: a symbol
@@ -66,6 +63,9 @@ pub const KERNEL_CORE_LABEL: &str = "kernel-core";
 
 /// Service actor recorded on the seed-graph and propagation ledger commits.
 pub const LABEL_SEED_ACTOR: &str = "astrolabe-label-seeds";
+/// The caller supplied an absent, empty, or source-mismatched composite kernel
+/// generation to the label producer.
+pub const ASTRO_KERNEL_LABEL_SOURCE_INVALID: &str = "ASTRO_KERNEL_LABEL_SOURCE_INVALID";
 
 /// Reason a scope produced no grounded seeds — surfaced so the caller can label
 /// the honest empty rather than guess. Distinct from the propagation report's
@@ -107,15 +107,15 @@ pub struct IndexTimeLabelReport {
 /// # Errors
 ///
 /// Propagates any vault, projection, persistence, or kernel refusal fail-closed.
-/// A scope with no kernel artifact and no caller seeds is **not** an error: it
-/// reconciles the label graph to empty and returns a report whose
-/// `seed_source_empty_reason` is [`NO_GROUNDED_LABEL_SOURCE`] and whose
-/// propagation carries `zero_seed_scope`.
+/// The artifact and projection are mandatory and must reproduce the exact
+/// persisted source/config identity; absence is never converted to an empty
+/// label surface.
 pub fn derive_and_propagate_index_time_labels<C>(
     vault: &AsterVault<C>,
     scope_id: &str,
+    artifact: &KernelArtifact,
+    projection: &GraphProjectionCsr,
     extra_seeds: &[LabelSeed],
-    options: &GraphProjectionBuildOptions,
     config: &LabelPropagationConfig,
     actor: impl Into<String>,
 ) -> IngestResult<IndexTimeLabelReport>
@@ -125,17 +125,30 @@ where
     let actor = actor.into();
 
     // #443 permanent sub-phase timing (env-gated `ASTRO_KERNEL_TIMING`): split
-    // the label_propagation phase into artifact read / seed derive / projection /
+    // the label_propagation phase into source validation / seed derive /
     // edge extraction / graph persist / propagation (the propagation flood is
     // further sub-timed inside `propagate_labels`). Silent by default.
     let mut timing = astrolabe_kernel::KernelPhaseTiming::start("label_propagation_wrap");
-    let artifact = read_persisted_kernel_artifact(vault, scope_id)?;
-    let kernel_seeds = artifact
-        .as_ref()
-        .map(|artifact| kernel_member_seeds(artifact, scope_id))
-        .unwrap_or_default();
+    if artifact.scope_id != scope_id || artifact.members.is_empty() {
+        return Err(IngestError::refused(
+            ASTRO_KERNEL_LABEL_SOURCE_INVALID,
+            format!(
+                "label propagation requires one nonempty composite artifact for scope {scope_id:?}; observed_scope={:?} observed_members={}",
+                artifact.scope_id,
+                artifact.members.len(),
+            ),
+            "preserve the staged publication and pass the artifact selected through the exact current composite pointer",
+        ));
+    }
+    let graph = kernel_graph_from_projection_csr(projection, &BTreeMap::new())?;
+    astrolabe_kernel::verify_kernel_source_projection_identity(
+        &graph,
+        &artifact.config,
+        &artifact.source_identity,
+    )?;
+    timing.lap("validate_source");
+    let kernel_seeds = kernel_member_seeds(artifact, scope_id)?;
     let kernel_member_seed_count = kernel_seeds.len();
-    timing.lap("read_artifact");
 
     // Merge, deduplicating on (label, symbol_id). Kernel seeds are added first so
     // they win any collision with a caller seed on the same (label, symbol);
@@ -156,25 +169,20 @@ where
         }
     }
 
-    let seed_source_empty_reason = if seeds.is_empty() {
-        Some(NO_GROUNDED_LABEL_SOURCE)
-    } else {
-        None
-    };
+    if seeds.is_empty() {
+        return Err(IngestError::refused(
+            ASTRO_KERNEL_LABEL_SOURCE_INVALID,
+            format!(
+                "validated composite artifact for scope {scope_id:?} produced no grounded label seeds"
+            ),
+            "repair the artifact member roster before running label propagation",
+        ));
+    }
+    let seed_source_empty_reason = None;
     timing.lap("seed_derive");
 
-    // Only materialize the projection when there is at least one seed: a seed set
-    // implies a real graph (kernel members come from it), and an empty scope must
-    // not pay to build a projection just to persist no edges.
-    let edges = if seeds.is_empty() {
-        Vec::new()
-    } else {
-        let csr = ensure_graph_projection_csr(vault, GraphProjectionKind::KernelGraph, options)?;
-        timing.lap("projection");
-        let edges = label_graph_edges_from_csr(&csr);
-        timing.lap("edges");
-        edges
-    };
+    let edges = label_graph_edges_from_csr(projection);
+    timing.lap("edges");
 
     let persist = persist_label_graph(vault, &seeds, &edges, &[], actor.clone())?;
     timing.lap("persist_graph");
@@ -197,23 +205,45 @@ where
 ///
 /// The symbol id is the member's `CxId` in lowercase hex (its durable version
 /// identity, the same space the graph projection edges use). The confidence is
-/// the member's measured combined score in permille, clamped into the seed
-/// domain `[MIN_SEED_CONFIDENCE_MILLIPOINTS, MAX_SEED_CONFIDENCE_MILLIPOINTS]`.
-pub fn kernel_member_seeds(artifact: &KernelArtifact, scope_id: &str) -> Vec<LabelSeed> {
+/// the member's exact measured combined score in permille. Any value outside
+/// `[MIN_SEED_CONFIDENCE_MILLIPOINTS, MAX_SEED_CONFIDENCE_MILLIPOINTS]` is a
+/// coded source refusal; label derivation never changes the measurement.
+///
+/// # Errors
+///
+/// Returns [`ASTRO_KERNEL_LABEL_SOURCE_INVALID`] with the exact scope, member,
+/// and observed score when a persisted artifact carries an invalid confidence.
+pub fn kernel_member_seeds(
+    artifact: &KernelArtifact,
+    scope_id: &str,
+) -> IngestResult<Vec<LabelSeed>> {
     artifact
         .members
         .iter()
         .map(|member| {
             let symbol_id = member.id.to_string();
-            let confidence = member.score_permille.clamp(
-                MIN_SEED_CONFIDENCE_MILLIPOINTS,
-                MAX_SEED_CONFIDENCE_MILLIPOINTS,
-            );
+            let confidence = member.score_permille;
+            if !(MIN_SEED_CONFIDENCE_MILLIPOINTS..=MAX_SEED_CONFIDENCE_MILLIPOINTS)
+                .contains(&confidence)
+            {
+                return Err(IngestError::refused(
+                    ASTRO_KERNEL_LABEL_SOURCE_INVALID,
+                    format!(
+                        "kernel label source for scope {scope_id:?} member {symbol_id} carries score_permille={confidence}, outside the exact seed domain {MIN_SEED_CONFIDENCE_MILLIPOINTS}..={MAX_SEED_CONFIDENCE_MILLIPOINTS}"
+                    ),
+                    "repair and atomically republish the kernel artifact from valid measured member scores; label propagation never clamps persisted measurements",
+                ));
+            }
             let provenance = format!(
                 "kernel-artifact:scope={scope_id};member={symbol_id};members_hash={}",
                 artifact.members_hash
             );
-            LabelSeed::new(symbol_id, KERNEL_CORE_LABEL, confidence, provenance)
+            Ok(LabelSeed::new(
+                symbol_id,
+                KERNEL_CORE_LABEL,
+                confidence,
+                provenance,
+            ))
         })
         .collect()
 }

@@ -53,7 +53,8 @@ typedef enum {
     CBM_SPAWN_E_WAIT = 7,           /* could not reap the child */
     CBM_SPAWN_E_EXIT = 8,           /* child ran and exited non-zero */
     CBM_SPAWN_E_ENVIRONMENT = 9,    /* exact child environment could not be built */
-    CBM_SPAWN_E_PROGRESS = 10       /* semantic stdout progress could not be published */
+    CBM_SPAWN_E_PROGRESS = 10,      /* semantic stdout progress could not be published */
+    CBM_SPAWN_E_OUTPUT_LIMIT = 11   /* stdout exceeded the caller's retained-byte bound */
 } cbm_spawn_code_t;
 
 /* Fail-closed error record: {code, message, remediation} plus the OS-level
@@ -98,6 +99,13 @@ typedef bool (*cbm_spawn_stdout_progress_cb)(uint64_t captured_bytes, void *ud);
  */
 int cbm_spawn_capture(const char *const *argv, char **out_data, size_t *out_len,
                       cbm_spawn_error_t *err);
+
+/* The same shell-free capture contract with a mandatory positive stdout byte
+ * bound. The child is terminated as soon as the next read would exceed the
+ * bound; no over-bound prefix is retained or returned. This is the producer
+ * boundary for commands whose output size is part of caller admission. */
+int cbm_spawn_capture_bounded(const char *const *argv, size_t stdout_limit, char **out_data,
+                              size_t *out_len, cbm_spawn_error_t *err);
 
 /* The same exact shell-free spawn contract, but capture stderr independently
  * rather than binding it to the null device. Both returned streams are

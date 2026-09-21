@@ -11,8 +11,8 @@ use astrolabe_domain::{
     cx_id_from_canonical, vault_salt,
 };
 use astrolabe_panel::semantic::{
-    SEMANTIC_RULES, SemanticFamily, SemanticKind, SemanticValue, is_semantic_presence_slot,
-    semantic_registry_sha256, semantic_rule, semantic_rule_by_slot,
+    SEMANTIC_RULES, SemanticFamily, SemanticKind, SemanticSourceType, SemanticValue,
+    is_semantic_presence_slot, semantic_registry_sha256, semantic_rule, semantic_rule_by_slot,
 };
 use astrolabe_panel::{
     CURRENT_SEMANTIC_PANEL_VERSION, PANEL_V3_VERSION, PANEL_V4_VERSION, PanelDriver, PanelInput,
@@ -107,7 +107,8 @@ pub const CBM_FILE_HASH_ROW_SCHEMA: &str = "astrolabe-file-hash-v1";
 const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
 const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_SEMANTIC_CONSTELLATION_ROW: &str = "astrolabe.semantic-constellation.v1";
-const SCHEMA_SEMANTIC_COVERAGE_ROW: &str = "astrolabe.semantic-coverage.v1";
+const SCHEMA_SEMANTIC_COVERAGE_ROW: &str = "astrolabe.semantic-coverage.v2";
+const SEMANTIC_SOURCE_ATOM_MANIFEST_SCHEMA: &str = "astrolabe.cbm.semantic-source-atom-manifest.v1";
 const SEMANTIC_CANONICAL_TAG: &str = "astrolabe.cbm.semantic-constellation.v1";
 /// Domain separator for panel-v4 node identity's complete semantic-input binding.
 const NODE_SEMANTIC_IDENTITY_TAG: &str = "astrolabe.cbm.node-semantic-identity.v1";
@@ -921,17 +922,18 @@ pub struct SqliteImportDeepVerifyCounts {
     pub edge_rows: usize,
     /// Non-node semantic Graph rows bound to their exact Base constellation.
     pub semantic_constellation_rows: usize,
-    /// Current per-project semantic coverage witnesses recomputed from Base state.
+    /// Current per-project semantic coverage witnesses reconstructed from raw Graph source rows
+    /// and independently compared with Base/Slot state.
     pub semantic_coverage_witness_rows: usize,
     /// Concrete semantic Slot CF rows whose bytes, Base hash, shape, and norm agree.
     pub semantic_slot_rows: usize,
-    /// Present semantic atoms recomputed from persisted Base slot rosters.
+    /// Present semantic atoms reconstructed from persisted raw Graph source rows.
     pub semantic_coverage_present: u64,
-    /// Present deterministic-encoder atoms recomputed from persisted state.
+    /// Present deterministic-encoder atoms proven equal across raw Graph and Base/Slot state.
     pub semantic_coverage_encoded: u64,
-    /// Present learned-embedder atoms recomputed from persisted state.
+    /// Present learned-embedder atoms proven equal across raw Graph and Base/Slot state.
     pub semantic_coverage_embedded: u64,
-    /// Present frozen imported-vector atoms recomputed from persisted state.
+    /// Present frozen imported-vector atoms proven equal across raw Graph and Base/Slot state.
     pub semantic_coverage_imported_vectors: u64,
     /// Persisted semantic atoms with no frozen classification. Always zero on success.
     pub semantic_coverage_uncovered: u64,
@@ -1265,6 +1267,169 @@ struct SemanticConstellationGraphRow {
     links: Vec<CxId>,
 }
 
+#[derive(Debug, Default)]
+struct SemanticSourceRowInventory {
+    family: Option<SemanticFamily>,
+    value_slots: [u128; 2],
+}
+
+#[derive(Clone, Copy)]
+struct SemanticSourceRowIdentity {
+    kind: &'static str,
+    id: i64,
+}
+
+impl std::fmt::Display for SemanticSourceRowIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.kind, self.id)
+    }
+}
+
+impl SemanticSourceRowInventory {
+    fn new(family: SemanticFamily) -> Self {
+        Self {
+            family: Some(family),
+            value_slots: [0; 2],
+        }
+    }
+
+    fn observe(&mut self, path: &str, source_type: SemanticSourceType) -> IngestResult<()> {
+        let family = self.family.ok_or_else(|| {
+            semantic_coverage_refusal(
+                "authoritative semantic source row has no family",
+                "Repair source-atom inventory construction before retrying the unchanged import.",
+            )
+        })?;
+        let rule = semantic_rule(family, path, source_type).ok_or_else(|| {
+            IngestError::refused(
+                ASTRO_SEMANTIC_COVERAGE_GAP,
+                format!(
+                    "authoritative source inventory has unregistered atom family={} path={path:?} type={}",
+                    family.as_str(),
+                    source_type.as_str()
+                ),
+                SEMANTIC_COVERAGE_REMEDIATION,
+            )
+        })?;
+        let canonical_rule = semantic_rule_by_slot(SlotId::new(rule.value_slot));
+        if !canonical_rule.is_some_and(|candidate| {
+            candidate.family == family
+                && candidate.path == path
+                && candidate.source_type == source_type
+        }) {
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "authoritative source atom family={} path={path:?} type={} does not own its resolved slot S{}",
+                    family.as_str(),
+                    source_type.as_str(),
+                    rule.value_slot
+                ),
+                "Repair the append-only registry so every typed source atom owns one collision-free slot.",
+            ));
+        }
+        let index = usize::from(rule.ordinal);
+        let word = index / 128;
+        let bit = index % 128;
+        let Some(word) = self.value_slots.get_mut(word) else {
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "authoritative source atom family={} path={path:?} resolved beyond the 256-dimensional frozen presence contract at ordinal {}",
+                    family.as_str(),
+                    rule.ordinal
+                ),
+                "Commission a versioned presence representation before adding source atom ordinal 256.",
+            ));
+        };
+        *word |= 1_u128 << bit;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SemanticSourceInventory {
+    family_constellations: BTreeMap<SemanticFamily, u64>,
+    rule_present: BTreeMap<u16, u64>,
+}
+
+impl SemanticSourceInventory {
+    fn observe_row(&mut self, row: SemanticSourceRowInventory) -> IngestResult<()> {
+        let family = row.family.ok_or_else(|| {
+            semantic_coverage_refusal(
+                "authoritative semantic source row has no family",
+                "Repair source-atom inventory construction before retrying the unchanged import.",
+            )
+        })?;
+        let family_count = self.family_constellations.entry(family).or_default();
+        *family_count = family_count.checked_add(1).ok_or_else(|| {
+            semantic_coverage_refusal(
+                format!("{} authoritative source row count overflow", family.as_str()),
+                "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+            )
+        })?;
+        for (word_index, mut word) in row.value_slots.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let ordinal = u16::try_from(word_index * 128 + bit).map_err(|_| {
+                    semantic_coverage_refusal(
+                        "authoritative source rule ordinal exceeds u16",
+                        "Commission a wider versioned presence identity before retrying the unchanged source.",
+                    )
+                })?;
+                let rule = SEMANTIC_RULES
+                    .get(usize::from(ordinal))
+                    .filter(|rule| rule.ordinal == ordinal)
+                    .ok_or_else(|| {
+                        semantic_coverage_refusal(
+                            format!(
+                                "authoritative source inventory contains unknown rule ordinal {ordinal}"
+                            ),
+                            "Repair the contiguous append-only registry before retrying the unchanged source.",
+                        )
+                    })?;
+                let present = self.rule_present.entry(rule.value_slot).or_default();
+                *present = present.checked_add(1).ok_or_else(|| {
+                    semantic_coverage_refusal(
+                        format!("{} authoritative source atom count overflow", family.as_str()),
+                        "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                    )
+                })?;
+                word &= word - 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn rule_counts(&self, panel_version: u32) -> IngestResult<BTreeMap<u16, u64>> {
+        let roster = slots_for_version(panel_version)?
+            .iter()
+            .map(|slot| slot.slot)
+            .collect::<BTreeSet<_>>();
+        for (slot, present) in &self.rule_present {
+            let rule = semantic_rule_by_slot(SlotId::new(*slot)).ok_or_else(|| {
+                semantic_coverage_refusal(
+                    format!(
+                        "authoritative source inventory contains unknown slot S{slot} present={present}"
+                    ),
+                    "Repair source-atom inventory construction before retrying the unchanged source.",
+                )
+            })?;
+            if !roster.contains(slot) {
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "authoritative source atom family={} path={:?} type={} resolves to S{}, absent from panel version {panel_version}",
+                        rule.family.as_str(),
+                        rule.path,
+                        rule.source_type.as_str(),
+                        rule.value_slot
+                    ),
+                    "Commission an append-only panel generation containing the exact typed rule before retrying the unchanged import.",
+                ));
+            }
+        }
+        Ok(self.rule_present.clone())
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct SemanticCoverageRuleCount {
     family: String,
@@ -1294,6 +1459,9 @@ struct SemanticCoverageWitness {
     source_schema_sha256: String,
     sqlite_fingerprint_sha256: String,
     slot_manifest_sha256: String,
+    source_atom_manifest_schema: String,
+    source_atom_manifest_sha256: String,
+    emitted_atom_manifest_sha256: String,
     constellations: u64,
     present: u64,
     encoded: u64,
@@ -1333,6 +1501,46 @@ fn semantic_coverage_canonical_bytes(witness: &SemanticCoverageWitness) -> Inges
     Ok(serde_json::to_vec(&sort_objects(value))?)
 }
 
+fn semantic_atom_manifest_sha256(
+    panel_version: u32,
+    family_constellations: &BTreeMap<SemanticFamily, u64>,
+    rule_present: &BTreeMap<u16, u64>,
+) -> [u8; 32] {
+    let mut canonical = Vec::with_capacity(SEMANTIC_RULES.len() * 64);
+    append_semantic_frame(
+        &mut canonical,
+        SEMANTIC_SOURCE_ATOM_MANIFEST_SCHEMA.as_bytes(),
+    );
+    append_semantic_frame(&mut canonical, &panel_version.to_be_bytes());
+    for family in SemanticFamily::ALL {
+        append_semantic_frame(&mut canonical, family.as_str().as_bytes());
+        append_semantic_frame(
+            &mut canonical,
+            &family_constellations
+                .get(&family)
+                .copied()
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+    }
+    for rule in SEMANTIC_RULES {
+        append_semantic_frame(&mut canonical, &rule.value_slot.to_be_bytes());
+        append_semantic_frame(&mut canonical, rule.family.as_str().as_bytes());
+        append_semantic_frame(&mut canonical, rule.path.as_bytes());
+        append_semantic_frame(&mut canonical, rule.source_type.as_str().as_bytes());
+        append_semantic_frame(&mut canonical, rule.kind.as_str().as_bytes());
+        append_semantic_frame(
+            &mut canonical,
+            &rule_present
+                .get(&rule.value_slot)
+                .copied()
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+    }
+    sha256_digest(&canonical)
+}
+
 #[derive(Debug, Default)]
 struct SemanticCoverageAccumulator {
     family_constellations: BTreeMap<SemanticFamily, u64>,
@@ -1341,7 +1549,13 @@ struct SemanticCoverageAccumulator {
 
 impl SemanticCoverageAccumulator {
     fn observe_slots(&mut self, family: SemanticFamily, slots: &[SlotId]) -> IngestResult<()> {
-        *self.family_constellations.entry(family).or_default() += 1;
+        let constellations = self.family_constellations.entry(family).or_default();
+        *constellations = constellations.checked_add(1).ok_or_else(|| {
+            semantic_coverage_refusal(
+                format!("{} emitted constellation count overflow", family.as_str()),
+                "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+            )
+        })?;
         for slot_id in slots {
             let rule = semantic_rule_by_slot(*slot_id).ok_or_else(|| {
                 semantic_coverage_refusal(
@@ -1359,7 +1573,13 @@ impl SemanticCoverageAccumulator {
                     "Repair typed row construction before publication and re-ingest the preserved source.",
                 ));
             }
-            *self.rule_present.entry(rule.value_slot).or_default() += 1;
+            let present = self.rule_present.entry(rule.value_slot).or_default();
+            *present = present.checked_add(1).ok_or_else(|| {
+                semantic_coverage_refusal(
+                    format!("emitted semantic atom count overflow for slot {slot_id}"),
+                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                )
+            })?;
         }
         Ok(())
     }
@@ -1392,11 +1612,77 @@ impl SemanticCoverageAccumulator {
 
     fn finish(
         self,
+        source: SemanticSourceInventory,
         project: &str,
         panel_version: u32,
         semantic_source_schema_sha256: [u8; 32],
         sqlite_fingerprint: [u8; 32],
     ) -> IngestResult<SemanticCoverageWitness> {
+        let source_rule_present = source.rule_counts(panel_version)?;
+        for family in SemanticFamily::ALL {
+            let source_count = source
+                .family_constellations
+                .get(&family)
+                .copied()
+                .unwrap_or(0);
+            let emitted_count = self
+                .family_constellations
+                .get(&family)
+                .copied()
+                .unwrap_or(0);
+            if source_count != emitted_count {
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "authoritative source family={} rows={source_count} but emitted constellations={emitted_count}",
+                        family.as_str()
+                    ),
+                    "Repair the omitted or duplicated semantic row construction before publication and retry the unchanged source.",
+                ));
+            }
+        }
+        for rule in SEMANTIC_RULES {
+            let source_count = source_rule_present
+                .get(&rule.value_slot)
+                .copied()
+                .unwrap_or(0);
+            let emitted_count = self
+                .rule_present
+                .get(&rule.value_slot)
+                .copied()
+                .unwrap_or(0);
+            if source_count != emitted_count {
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "authoritative source atom family={} path={:?} type={} S{} present={source_count} but emitted={emitted_count}",
+                        rule.family.as_str(),
+                        rule.path,
+                        rule.source_type.as_str(),
+                        rule.value_slot
+                    ),
+                    "Repair the omitted or duplicated typed value emission before publication and retry the unchanged source.",
+                ));
+            }
+        }
+        let source_atom_manifest_sha256 = semantic_atom_manifest_sha256(
+            panel_version,
+            &source.family_constellations,
+            &source_rule_present,
+        );
+        let emitted_atom_manifest_sha256 = semantic_atom_manifest_sha256(
+            panel_version,
+            &self.family_constellations,
+            &self.rule_present,
+        );
+        if source_atom_manifest_sha256 != emitted_atom_manifest_sha256 {
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "authoritative source atom manifest {} differs from emitted manifest {}",
+                    hex_lower(&source_atom_manifest_sha256),
+                    hex_lower(&emitted_atom_manifest_sha256)
+                ),
+                "Repair source-to-slot classification before publication and retry the unchanged source.",
+            ));
+        }
         let mut rules = Vec::with_capacity(SEMANTIC_RULES.len());
         let mut families = Vec::new();
         let mut total_present = 0_u64;
@@ -1409,16 +1695,45 @@ impl SemanticCoverageAccumulator {
             let mut embedded = 0_u64;
             let mut imported_vector = 0_u64;
             for rule in SEMANTIC_RULES.iter().filter(|rule| rule.family == family) {
-                let count = self
-                    .rule_present
+                let count = source_rule_present
                     .get(&rule.value_slot)
                     .copied()
                     .unwrap_or(0);
-                present += count;
+                present = present.checked_add(count).ok_or_else(|| {
+                    semantic_coverage_refusal(
+                        format!("{} source atom count overflow", family.as_str()),
+                        "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                    )
+                })?;
                 match rule.kind {
-                    SemanticKind::LatentCode | SemanticKind::LatentProse => embedded += count,
-                    SemanticKind::ImportedVector => imported_vector += count,
-                    _ => encoded += count,
+                    SemanticKind::LatentCode | SemanticKind::LatentProse => {
+                        embedded = embedded.checked_add(count).ok_or_else(|| {
+                            semantic_coverage_refusal(
+                                format!("{} embedded atom count overflow", family.as_str()),
+                                "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                            )
+                        })?;
+                    }
+                    SemanticKind::ImportedVector => {
+                        imported_vector =
+                            imported_vector.checked_add(count).ok_or_else(|| {
+                                semantic_coverage_refusal(
+                                    format!(
+                                        "{} imported-vector atom count overflow",
+                                        family.as_str()
+                                    ),
+                                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                                )
+                            })?;
+                    }
+                    _ => {
+                        encoded = encoded.checked_add(count).ok_or_else(|| {
+                            semantic_coverage_refusal(
+                                format!("{} encoded atom count overflow", family.as_str()),
+                                "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                            )
+                        })?;
+                    }
                 }
                 rules.push(SemanticCoverageRuleCount {
                     family: family.as_str().to_string(),
@@ -1429,13 +1744,33 @@ impl SemanticCoverageAccumulator {
                     present: count,
                 });
             }
-            total_present += present;
-            total_encoded += encoded;
-            total_embedded += embedded;
-            total_imported += imported_vector;
+            total_present = total_present.checked_add(present).ok_or_else(|| {
+                semantic_coverage_refusal(
+                    "total source atom count overflow",
+                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                )
+            })?;
+            total_encoded = total_encoded.checked_add(encoded).ok_or_else(|| {
+                semantic_coverage_refusal(
+                    "total encoded atom count overflow",
+                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                )
+            })?;
+            total_embedded = total_embedded.checked_add(embedded).ok_or_else(|| {
+                semantic_coverage_refusal(
+                    "total embedded atom count overflow",
+                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                )
+            })?;
+            total_imported = total_imported.checked_add(imported_vector).ok_or_else(|| {
+                semantic_coverage_refusal(
+                    "total imported-vector atom count overflow",
+                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                )
+            })?;
             families.push(SemanticCoverageFamilyCount {
                 family: family.as_str().to_string(),
-                constellations: self
+                constellations: source
                     .family_constellations
                     .get(&family)
                     .copied()
@@ -1446,7 +1781,15 @@ impl SemanticCoverageAccumulator {
                 imported_vector,
             });
         }
-        let classified = total_encoded + total_embedded + total_imported;
+        let classified = total_encoded
+            .checked_add(total_embedded)
+            .and_then(|value| value.checked_add(total_imported))
+            .ok_or_else(|| {
+                semantic_coverage_refusal(
+                    "total classified atom count overflow",
+                    "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                )
+            })?;
         let uncovered = total_present.checked_sub(classified).ok_or_else(|| {
             semantic_coverage_refusal(
                 "classified semantic atoms exceed present atoms",
@@ -1470,7 +1813,19 @@ impl SemanticCoverageAccumulator {
             source_schema_sha256: hex_lower(&semantic_source_schema_sha256),
             sqlite_fingerprint_sha256: hex_lower(&sqlite_fingerprint),
             slot_manifest_sha256: hex_lower(&slot_manifest_sha256),
-            constellations: self.family_constellations.values().sum(),
+            source_atom_manifest_schema: SEMANTIC_SOURCE_ATOM_MANIFEST_SCHEMA.to_string(),
+            source_atom_manifest_sha256: hex_lower(&source_atom_manifest_sha256),
+            emitted_atom_manifest_sha256: hex_lower(&emitted_atom_manifest_sha256),
+            constellations: source
+                .family_constellations
+                .values()
+                .try_fold(0_u64, |total, count| total.checked_add(*count))
+                .ok_or_else(|| {
+                    semantic_coverage_refusal(
+                        "total authoritative source row count overflow",
+                        "Reduce the source to a representable generation and retry without truncating coverage evidence.",
+                    )
+                })?,
             present: total_present,
             encoded: total_encoded,
             embedded: total_embedded,
@@ -1738,13 +2093,22 @@ pub struct CbmCompactGraphNode {
     pub qualified_name: String,
     pub label: String,
     pub cx_id: CxId,
+    /// Exact source range already decoded from the node-map row. Oracle Git
+    /// projection consumes these fields from this same O(N+E) pass instead of
+    /// issuing a second full node-map scan (PC-04).
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
 }
 
 /// Raw live edge endpoints needed by invalidation SCC construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CbmCompactGraphEdge {
     pub source_node_id: i64,
     pub target_node_id: i64,
+    /// Exact CBM edge vocabulary retained for Oracle consequence/test mapping
+    /// from this same compact pass.
+    pub edge_type: String,
 }
 
 /// Machine-readable proof that the compact projection was read in bounded
@@ -2120,8 +2484,22 @@ where
     let mut phase_start = std::time::Instant::now();
     // Per-file content digests (#345) must be computed from the raw node rows before
     // `extract_nodes` consumes them; the manifest comparison happens after the shared
-    // Graph scan below.
-    let new_file_digests = compute_file_digests(&input.nodes, &input.edges, options.panel_version);
+    // Graph scan below. #980/#1064 (PC-04/37/43) fuses the independent source-atom
+    // inventory into this mandatory raw-row traversal: no second N/E pass, store open,
+    // MVCC restore, or retained per-row manifest. The bounded registry is invariant.
+    let mut semantic_source_inventory = authoritative_semantic_metadata_inventory(&input.metadata)?;
+    let new_file_digests = compute_file_digests(
+        &input.nodes,
+        &input.edges,
+        options.panel_version,
+        &mut semantic_source_inventory,
+    )?;
+    semantic_source_inventory.rule_counts(options.panel_version)?;
+    timing_ms.push((
+        "file_digest_and_semantic_source_inventory",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
     let extracted = extract_nodes(input.nodes)?;
     timing_ms.push(("extract_nodes", phase_start.elapsed().as_millis() as u64));
     phase_start = std::time::Instant::now();
@@ -2167,6 +2545,7 @@ where
         input.metadata,
         input.sqlite_fingerprint,
         input.semantic_source_schema_sha256,
+        semantic_source_inventory,
         &existing_graph,
         &digest_plan.reuse,
         &digest_plan.unchanged_files,
@@ -4652,6 +5031,7 @@ fn prepare_batch<C, R>(
     metadata: RawMetadataRows,
     sqlite_fingerprint: [u8; 32],
     semantic_source_schema_sha256: [u8; 32],
+    semantic_source_inventory: SemanticSourceInventory,
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
     digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
     unchanged_files: &BTreeSet<String>,
@@ -4722,6 +5102,7 @@ where
     )?;
     graph_rows.extend(prepared_semantic.graph_rows);
     let coverage_witness = coverage.finish(
+        semantic_source_inventory,
         &options.project,
         options.panel_version,
         semantic_source_schema_sha256,
@@ -5060,13 +5441,24 @@ fn compute_file_digests(
     nodes: &[RawNodeRow],
     edges: &[RawEdgeRow],
     panel_version: u32,
-) -> BTreeMap<String, String> {
+    source_inventory: &mut SemanticSourceInventory,
+) -> IngestResult<BTreeMap<String, String>> {
     let file_by_node = nodes
         .iter()
         .map(|node| (node.id, node.file_path.as_str()))
         .collect::<HashMap<i64, &str>>();
     let mut by_file: BTreeMap<String, Vec<&RawNodeRow>> = BTreeMap::new();
     for node in nodes {
+        observe_node_source_row(
+            source_inventory,
+            SemanticSourceRowIdentity {
+                kind: "node",
+                id: node.id,
+            },
+            node.source_present,
+            &node.properties,
+            node.node_vector.is_some(),
+        )?;
         by_file
             .entry(node.file_path.clone())
             .or_default()
@@ -5074,18 +5466,26 @@ fn compute_file_digests(
     }
     let mut edges_by_file: BTreeMap<&str, Vec<&RawEdgeRow>> = BTreeMap::new();
     for edge in edges {
+        observe_edge_source_row(
+            source_inventory,
+            SemanticSourceRowIdentity {
+                kind: "edge",
+                id: edge.id,
+            },
+            &edge.properties,
+        )?;
         if let Some(file_path) = file_by_node.get(&edge.source_id) {
             edges_by_file.entry(file_path).or_default().push(edge);
         }
     }
-    by_file
+    Ok(by_file
         .into_iter()
         .map(|(file_path, mut file_nodes)| {
             let mut file_edges = edges_by_file.remove(file_path.as_str()).unwrap_or_default();
             let digest = file_content_digest(&mut file_nodes, &mut file_edges, panel_version);
             (file_path, digest)
         })
-        .collect()
+        .collect())
 }
 
 /// Reads the persisted bounded v2 per-file digest manifest for `project` out of the one
@@ -5843,6 +6243,260 @@ fn validate_edge_weight(weight: f32, edge_id: i64, source: &str) -> IngestResult
     }
 }
 
+fn observe_semantic_json_shape(
+    row: &mut SemanticSourceRowInventory,
+    row_identity: SemanticSourceRowIdentity,
+    path: &str,
+    value: &Value,
+) -> IngestResult<()> {
+    match value {
+        Value::Null => {}
+        Value::Bool(_) => row.observe(path, SemanticSourceType::Boolean)?,
+        Value::Number(number) if number.as_i64().is_some() => {
+            row.observe(path, SemanticSourceType::Integer)?;
+        }
+        Value::Number(number) if number.as_f64().is_some_and(f64::is_finite) => {
+            row.observe(path, SemanticSourceType::Real)?;
+        }
+        Value::Number(_) => {
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "{row_identity} authoritative source atom {path:?} is not a finite signed-integer or real JSON number"
+                ),
+                "Preserve the source value, add its exact finite numeric type to the append-only registry, and retry without coercion.",
+            ));
+        }
+        Value::String(_) => row.observe(path, SemanticSourceType::Text)?,
+        Value::Object(object) => {
+            for (child_key, child_value) in object {
+                observe_semantic_json_shape(
+                    row,
+                    row_identity,
+                    &format!("{path}.{child_key}"),
+                    child_value,
+                )?;
+            }
+        }
+        Value::Array(items)
+            if row.family == Some(SemanticFamily::Edge) && path == "properties.args" =>
+        {
+            row.observe("properties.args.count", SemanticSourceType::Integer)?;
+            for (index, item) in items.iter().enumerate() {
+                let object = item.as_object().ok_or_else(|| {
+                    semantic_coverage_refusal(
+                        format!(
+                            "{row_identity} authoritative source atom properties.args[{index}] is not an object"
+                        ),
+                        "Decompose the exact observed array item into append-only typed child paths and retry the unchanged source.",
+                    )
+                })?;
+                for (child_key, child_value) in object {
+                    observe_semantic_json_shape(
+                        row,
+                        row_identity,
+                        &format!("properties.args[].{child_key}"),
+                        child_value,
+                    )?;
+                }
+            }
+        }
+        Value::Array(items) if items.is_empty() || items.iter().all(Value::is_string) => {
+            row.observe(&format!("{path}[]"), SemanticSourceType::TextArray)?;
+        }
+        Value::Array(items) if items.iter().all(|item| item.as_i64().is_some()) => {
+            row.observe(&format!("{path}[]"), SemanticSourceType::IntegerArray)?;
+        }
+        Value::Array(items) if items.iter().all(Value::is_object) => {
+            for (index, item) in items.iter().enumerate() {
+                let object = item.as_object().ok_or_else(|| {
+                    semantic_coverage_refusal(
+                        format!(
+                            "{row_identity} authoritative source atom {path}[{index}] changed type during inventory"
+                        ),
+                        "Preserve the source and retry only after the immutable row can be read consistently.",
+                    )
+                })?;
+                for (child_key, child_value) in object {
+                    observe_semantic_json_shape(
+                        row,
+                        row_identity,
+                        &format!("{path}[].{child_key}"),
+                        child_value,
+                    )?;
+                }
+            }
+        }
+        Value::Array(items) => {
+            let observed = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let kind = match item {
+                        Value::Null => "null",
+                        Value::Bool(_) => "boolean",
+                        Value::Number(number) if number.as_i64().is_some() => "integer",
+                        Value::Number(_) => "real",
+                        Value::String(_) => "text",
+                        Value::Array(_) => "array",
+                        Value::Object(_) => "object",
+                    };
+                    format!("{index}:{kind}")
+                })
+                .collect::<Vec<_>>();
+            return Err(semantic_coverage_refusal(
+                format!(
+                    "{row_identity} authoritative source atom {path:?} has no exact homogeneous array type; observed={observed:?}"
+                ),
+                "Add exact typed child-path rules for the complete observed shape and retry the unchanged source without coercion.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn observe_properties_source_atoms(
+    row: &mut SemanticSourceRowInventory,
+    row_identity: SemanticSourceRowIdentity,
+    properties: &Value,
+) -> IngestResult<()> {
+    let object = properties.as_object().ok_or_else(|| {
+        semantic_coverage_refusal(
+            format!("{row_identity} authoritative properties source is not an object"),
+            "Rebuild the CBM SQLite source with object-valued properties and retry the unchanged import.",
+        )
+    })?;
+    for (key, value) in object {
+        observe_semantic_json_shape(row, row_identity, &format!("properties.{key}"), value)?;
+    }
+    Ok(())
+}
+
+fn observe_frozen_source_columns(
+    row: &mut SemanticSourceRowInventory,
+    table: &str,
+    absent_columns: &[&str],
+) -> IngestResult<()> {
+    let columns = CBM_SEMANTIC_SOURCE_TABLES
+        .iter()
+        .find_map(|(name, columns)| (*name == table).then_some(*columns))
+        .ok_or_else(|| {
+            semantic_coverage_refusal(
+                format!("authoritative semantic source table {table:?} has no frozen schema"),
+                "Add the exact source table schema before retrying the unchanged import.",
+            )
+        })?;
+    for (path, declared_type, _) in columns {
+        if *path == "properties" || absent_columns.contains(path) {
+            continue;
+        }
+        let source_type = match (table, *path, *declared_type) {
+            ("nodes", "source_present", "INTEGER") => SemanticSourceType::Boolean,
+            ("nodes", "source_bytes", "BLOB") => SemanticSourceType::Text,
+            (_, _, "TEXT") => SemanticSourceType::Text,
+            (_, _, "INTEGER") => SemanticSourceType::Integer,
+            ("node_vectors" | "token_vectors", "vector", "BLOB") => SemanticSourceType::BlobI8x768,
+            _ => {
+                return Err(semantic_coverage_refusal(
+                    format!(
+                        "authoritative semantic source table={table:?} column={path:?} declared_type={declared_type:?} has no exact source-atom type"
+                    ),
+                    "Add a typed append-only semantic source mapping for the exact frozen column before retrying the unchanged import.",
+                ));
+            }
+        };
+        row.observe(path, source_type)?;
+    }
+    Ok(())
+}
+
+fn observe_project_source_row(
+    inventory: &mut SemanticSourceInventory,
+    eligible_node_count_present: bool,
+) -> IngestResult<()> {
+    let mut row = SemanticSourceRowInventory::new(SemanticFamily::Project);
+    let absent = (!eligible_node_count_present)
+        .then_some(["semantic_eligible_node_count"])
+        .unwrap_or_default();
+    observe_frozen_source_columns(&mut row, "projects", &absent)?;
+    inventory.observe_row(row)
+}
+
+fn observe_file_hash_source_row(inventory: &mut SemanticSourceInventory) -> IngestResult<()> {
+    let mut row = SemanticSourceRowInventory::new(SemanticFamily::FileHash);
+    observe_frozen_source_columns(&mut row, "file_hashes", &[])?;
+    inventory.observe_row(row)
+}
+
+fn observe_project_summary_source_row(inventory: &mut SemanticSourceInventory) -> IngestResult<()> {
+    let mut row = SemanticSourceRowInventory::new(SemanticFamily::ProjectSummary);
+    observe_frozen_source_columns(&mut row, "project_summaries", &[])?;
+    inventory.observe_row(row)
+}
+
+fn observe_token_vector_source_row(inventory: &mut SemanticSourceInventory) -> IngestResult<()> {
+    let mut row = SemanticSourceRowInventory::new(SemanticFamily::TokenVector);
+    observe_frozen_source_columns(&mut row, "token_vectors", &[])?;
+    inventory.observe_row(row)
+}
+
+fn observe_node_source_row(
+    inventory: &mut SemanticSourceInventory,
+    row_identity: SemanticSourceRowIdentity,
+    source_present: bool,
+    properties: &Value,
+    node_vector_present: bool,
+) -> IngestResult<()> {
+    let mut row = SemanticSourceRowInventory::new(SemanticFamily::Node);
+    let absent = (!source_present)
+        .then_some(["source_bytes"])
+        .unwrap_or_default();
+    observe_frozen_source_columns(&mut row, "nodes", &absent)?;
+    observe_properties_source_atoms(&mut row, row_identity, properties)?;
+    if node_vector_present {
+        row.observe("node_vector", SemanticSourceType::BlobI8x768)?;
+    }
+    inventory.observe_row(row)?;
+    if node_vector_present {
+        let mut vector = SemanticSourceRowInventory::new(SemanticFamily::NodeVector);
+        observe_frozen_source_columns(&mut vector, "node_vectors", &[])?;
+        inventory.observe_row(vector)?;
+    }
+    Ok(())
+}
+
+fn observe_edge_source_row(
+    inventory: &mut SemanticSourceInventory,
+    row_identity: SemanticSourceRowIdentity,
+    properties: &Value,
+) -> IngestResult<()> {
+    let mut row = SemanticSourceRowInventory::new(SemanticFamily::Edge);
+    observe_frozen_source_columns(&mut row, "edges", &[])?;
+    observe_properties_source_atoms(&mut row, row_identity, properties)?;
+    inventory.observe_row(row)
+}
+
+fn authoritative_semantic_metadata_inventory(
+    metadata: &RawMetadataRows,
+) -> IngestResult<SemanticSourceInventory> {
+    let mut inventory = SemanticSourceInventory::default();
+    for project in &metadata.projects {
+        observe_project_source_row(
+            &mut inventory,
+            project.semantic_eligible_node_count.is_some(),
+        )?;
+    }
+    for _ in &metadata.file_hashes {
+        observe_file_hash_source_row(&mut inventory)?;
+    }
+    for _ in &metadata.project_summaries {
+        observe_project_summary_source_row(&mut inventory)?;
+    }
+    for _ in &metadata.token_vectors {
+        observe_token_vector_source_row(&mut inventory)?;
+    }
+    Ok(inventory)
+}
+
 fn insert_semantic_value(
     values: &mut BTreeMap<SlotId, SemanticValue>,
     family: SemanticFamily,
@@ -6587,8 +7241,9 @@ fn build_non_node_semantic_inputs(
     let mut rows = Vec::new();
     let mut project_cx = BTreeMap::new();
     for project in &metadata.projects {
-        let values = semantic_values_from_fields(
-            SemanticFamily::Project,
+        let family = SemanticFamily::Project;
+        let mut values = semantic_values_from_fields(
+            family,
             [
                 ("name", SemanticValue::Text(project.name.clone())),
                 (
@@ -6596,15 +7251,42 @@ fn build_non_node_semantic_inputs(
                     SemanticValue::Text(project.indexed_at.clone()),
                 ),
                 ("root_path", SemanticValue::Text(project.root_path.clone())),
+                (
+                    "index_mode",
+                    SemanticValue::Text(project.index_mode.clone()),
+                ),
+                (
+                    "semantic_state",
+                    SemanticValue::Text(project.semantic_state.clone()),
+                ),
+                (
+                    "semantic_vector_dimension",
+                    SemanticValue::Integer(project.semantic_vector_dimension),
+                ),
+                (
+                    "node_vector_count",
+                    SemanticValue::Integer(project.node_vector_count),
+                ),
+                (
+                    "token_vector_count",
+                    SemanticValue::Integer(project.token_vector_count),
+                ),
             ],
         )?;
-        let canonical =
-            semantic_canonical_input_bytes(SemanticFamily::Project, &project.name, &values)?;
+        if let Some(count) = project.semantic_eligible_node_count {
+            insert_semantic_value(
+                &mut values,
+                family,
+                "semantic_eligible_node_count",
+                SemanticValue::Integer(count),
+            )?;
+        }
+        let canonical = semantic_canonical_input_bytes(family, &project.name, &values)?;
         let salt = vault_salt(&project.name)?;
         let cx_id = cx_id_from_canonical(&canonical, panel_version, salt.as_bytes())?;
         project_cx.insert(project.name.clone(), cx_id);
         rows.push(SemanticInputRow {
-            family: SemanticFamily::Project,
+            family,
             source_key: project.name.clone(),
             links: Vec::new(),
             values,
@@ -6895,7 +7577,10 @@ where
         semantic_values,
     } = input;
     let semantic_value_slots = semantic_values.keys().copied().collect::<Vec<_>>();
-    let legacy_slots_enabled = !node.label.is_structural();
+    // Panel v8 gives every graph atom a measured S20 name vector. Older panel
+    // generations retain their frozen structural behavior.
+    let legacy_slots_enabled =
+        !node.label.is_structural() || options.panel_version >= astrolabe_panel::PANEL_V8_VERSION;
     let mut input = PanelInput::with_available_slots(node.label, options.available_slots.clone())
         .with_scalars(node.symbol.scalars.clone())
         .with_semantic_values(SemanticFamily::Node, semantic_values)
@@ -8768,6 +9453,175 @@ fn verify_semantic_coverage_row(key: &[u8], bytes: &[u8]) -> IngestResult<Semant
         &witness.sqlite_fingerprint_sha256,
         "semantic coverage sqlite_fingerprint_sha256",
     )?;
+    if witness.source_atom_manifest_schema != SEMANTIC_SOURCE_ATOM_MANIFEST_SCHEMA {
+        return Err(readback_mismatch(format!(
+            "semantic coverage {} has source atom manifest schema {:?}, expected {:?}",
+            hex_lower(key),
+            witness.source_atom_manifest_schema,
+            SEMANTIC_SOURCE_ATOM_MANIFEST_SCHEMA
+        )));
+    }
+    let source_atom_manifest_sha256 = parse_lower_hex_32(
+        &witness.source_atom_manifest_sha256,
+        "semantic coverage source_atom_manifest_sha256",
+    )?;
+    let emitted_atom_manifest_sha256 = parse_lower_hex_32(
+        &witness.emitted_atom_manifest_sha256,
+        "semantic coverage emitted_atom_manifest_sha256",
+    )?;
+    if source_atom_manifest_sha256 != emitted_atom_manifest_sha256 {
+        return Err(readback_mismatch(format!(
+            "semantic coverage {} source atom manifest {} differs from emitted manifest {}",
+            hex_lower(key),
+            witness.source_atom_manifest_sha256,
+            witness.emitted_atom_manifest_sha256
+        )));
+    }
+    let mut family_constellations = BTreeMap::new();
+    for family_count in &witness.families {
+        let family = SemanticFamily::from_manifest_str(&family_count.family).ok_or_else(|| {
+            readback_mismatch(format!(
+                "semantic coverage {} has unknown family {:?}",
+                hex_lower(key),
+                family_count.family
+            ))
+        })?;
+        if family_constellations
+            .insert(family, family_count.constellations)
+            .is_some()
+        {
+            return Err(readback_mismatch(format!(
+                "semantic coverage {} duplicates family {:?}",
+                hex_lower(key),
+                family_count.family
+            )));
+        }
+    }
+    if family_constellations.len() != SemanticFamily::ALL.len()
+        || SemanticFamily::ALL
+            .iter()
+            .any(|family| !family_constellations.contains_key(family))
+    {
+        return Err(readback_mismatch(format!(
+            "semantic coverage {} does not contain every source family exactly once",
+            hex_lower(key)
+        )));
+    }
+    let mut rule_present = BTreeMap::new();
+    for rule_count in &witness.rules {
+        let rule = semantic_rule_by_slot(SlotId::new(rule_count.slot_id)).ok_or_else(|| {
+            readback_mismatch(format!(
+                "semantic coverage {} contains unknown rule slot S{}",
+                hex_lower(key),
+                rule_count.slot_id
+            ))
+        })?;
+        if rule_count.family != rule.family.as_str()
+            || rule_count.path != rule.path
+            || rule_count.source_type != rule.source_type.as_str()
+            || rule_count.kind != rule.kind.as_str()
+            || rule_present
+                .insert(rule_count.slot_id, rule_count.present)
+                .is_some()
+        {
+            return Err(readback_mismatch(format!(
+                "semantic coverage {} rule S{} does not exactly match its frozen family/path/type/kind or is duplicated",
+                hex_lower(key),
+                rule_count.slot_id
+            )));
+        }
+    }
+    if rule_present.len() != SEMANTIC_RULES.len()
+        || SEMANTIC_RULES
+            .iter()
+            .any(|rule| !rule_present.contains_key(&rule.value_slot))
+    {
+        return Err(readback_mismatch(format!(
+            "semantic coverage {} does not contain every frozen rule exactly once",
+            hex_lower(key)
+        )));
+    }
+    let recomputed_atom_manifest =
+        semantic_atom_manifest_sha256(witness.panel_version, &family_constellations, &rule_present);
+    if recomputed_atom_manifest != source_atom_manifest_sha256 {
+        return Err(readback_mismatch(format!(
+            "semantic coverage {} source atom manifest hash does not match its persisted family/rule counts",
+            hex_lower(key)
+        )));
+    }
+    let mut derived_constellations = 0_u64;
+    let mut derived_present = 0_u64;
+    let mut derived_encoded = 0_u64;
+    let mut derived_embedded = 0_u64;
+    let mut derived_imported = 0_u64;
+    for family in SemanticFamily::ALL {
+        let family_count = witness
+            .families
+            .iter()
+            .find(|count| count.family == family.as_str())
+            .ok_or_else(|| {
+                readback_mismatch(format!(
+                    "semantic coverage {} lost family {} after roster validation",
+                    hex_lower(key),
+                    family.as_str()
+                ))
+            })?;
+        let mut present = 0_u64;
+        let mut encoded = 0_u64;
+        let mut embedded = 0_u64;
+        let mut imported = 0_u64;
+        for rule in SEMANTIC_RULES.iter().filter(|rule| rule.family == family) {
+            let count = rule_present.get(&rule.value_slot).copied().unwrap_or(0);
+            present = present
+                .checked_add(count)
+                .ok_or_else(|| readback_mismatch("semantic coverage family count overflow"))?;
+            let class = match rule.kind {
+                SemanticKind::LatentCode | SemanticKind::LatentProse => &mut embedded,
+                SemanticKind::ImportedVector => &mut imported,
+                _ => &mut encoded,
+            };
+            *class = class
+                .checked_add(count)
+                .ok_or_else(|| readback_mismatch("semantic coverage class count overflow"))?;
+        }
+        if family_count.present != present
+            || family_count.encoded != encoded
+            || family_count.embedded != embedded
+            || family_count.imported_vector != imported
+        {
+            return Err(readback_mismatch(format!(
+                "semantic coverage {} family {} totals do not match its exact rule counts",
+                hex_lower(key),
+                family.as_str()
+            )));
+        }
+        derived_constellations = derived_constellations
+            .checked_add(family_count.constellations)
+            .ok_or_else(|| readback_mismatch("semantic coverage constellation count overflow"))?;
+        derived_present = derived_present
+            .checked_add(present)
+            .ok_or_else(|| readback_mismatch("semantic coverage present count overflow"))?;
+        derived_encoded = derived_encoded
+            .checked_add(encoded)
+            .ok_or_else(|| readback_mismatch("semantic coverage encoded count overflow"))?;
+        derived_embedded = derived_embedded
+            .checked_add(embedded)
+            .ok_or_else(|| readback_mismatch("semantic coverage embedded count overflow"))?;
+        derived_imported = derived_imported
+            .checked_add(imported)
+            .ok_or_else(|| readback_mismatch("semantic coverage imported count overflow"))?;
+    }
+    if witness.constellations != derived_constellations
+        || witness.present != derived_present
+        || witness.encoded != derived_encoded
+        || witness.embedded != derived_embedded
+        || witness.imported_vector != derived_imported
+    {
+        return Err(readback_mismatch(format!(
+            "semantic coverage {} top-level totals do not match its exact family/rule counts",
+            hex_lower(key)
+        )));
+    }
     let classified = witness
         .encoded
         .checked_add(witness.embedded)
@@ -8800,6 +9654,7 @@ where
     let mut expected_semantic_slots = ExpectedSemanticSlots::new();
     let mut verified_bases = BTreeMap::<CxId, VerifiedSemanticBase>::new();
     let mut coverage_by_project = BTreeMap::<String, SemanticCoverageAccumulator>::new();
+    let mut source_inventory_by_project = BTreeMap::<String, SemanticSourceInventory>::new();
     let mut semantic_rows = Vec::<SemanticConstellationGraphRow>::new();
     let mut coverage_rows = BTreeMap::<String, (SemanticCoverageWitness, Vec<u8>)>::new();
 
@@ -8814,6 +9669,38 @@ where
                 if !supported_node_map_schema(&row.schema) {
                     errors.push(format!("node map {} has wrong schema", hex_lower(&key)));
                     continue;
+                }
+                match row
+                    .properties_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        readback_mismatch(format!(
+                            "node map {} has no authoritative properties JSON",
+                            hex_lower(&key)
+                        ))
+                    })
+                    .and_then(|properties| {
+                        serde_json::from_str::<Value>(properties).map_err(IngestError::from)
+                    })
+                    .and_then(|properties| {
+                        observe_node_source_row(
+                            source_inventory_by_project
+                                .entry(row.project.clone())
+                                .or_default(),
+                            SemanticSourceRowIdentity {
+                                kind: "node Graph readback",
+                                id: row.node_id,
+                            },
+                            row.source_present,
+                            &properties,
+                            row.node_vector.is_some(),
+                        )
+                    }) {
+                    Ok(()) => {}
+                    Err(error) => errors.push(format!(
+                        "node map {} authoritative source inventory: {error}",
+                        hex_lower(&key)
+                    )),
                 }
                 if let Err(error) = read_exact_source_at(
                     vault,
@@ -8941,6 +9828,38 @@ where
                         "structural node {} has empty identity metadata",
                         hex_lower(&key)
                     ));
+                }
+                match row
+                    .properties_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        readback_mismatch(format!(
+                            "structural node {} has no authoritative properties JSON",
+                            hex_lower(&key)
+                        ))
+                    })
+                    .and_then(|properties| {
+                        serde_json::from_str::<Value>(properties).map_err(IngestError::from)
+                    })
+                    .and_then(|properties| {
+                        observe_node_source_row(
+                            source_inventory_by_project
+                                .entry(row.project.clone())
+                                .or_default(),
+                            SemanticSourceRowIdentity {
+                                kind: "structural node Graph readback",
+                                id: row.node_id,
+                            },
+                            row.source_present,
+                            &properties,
+                            row.node_vector.is_some(),
+                        )
+                    }) {
+                    Ok(()) => {}
+                    Err(error) => errors.push(format!(
+                        "structural node {} authoritative source inventory: {error}",
+                        hex_lower(&key)
+                    )),
                 }
             }
             Err(err) => errors.push(format!("decode structural node {}: {err}", hex_lower(&key))),
@@ -9070,6 +9989,180 @@ where
     for (key, value) in vault.scan_cf_range_at(
         snapshot,
         ColumnFamily::Graph,
+        &prefix_range(PROJECT_ROW_PREFIX),
+    )? {
+        match serde_json::from_slice::<CbmProjectRow>(&value) {
+            Ok(row) => {
+                if row.schema != SCHEMA_PROJECT_ROW {
+                    errors.push(format!(
+                        "project row {} has wrong source schema {:?}",
+                        hex_lower(&key),
+                        row.schema
+                    ));
+                    continue;
+                }
+                if let Err(error) = observe_project_source_row(
+                    source_inventory_by_project
+                        .entry(row.project.clone())
+                        .or_default(),
+                    row.semantic_eligible_node_count.is_some(),
+                ) {
+                    errors.push(format!(
+                        "project row {} authoritative source inventory: {error}",
+                        hex_lower(&key)
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "decode project row {} for authoritative source inventory: {error}",
+                hex_lower(&key)
+            )),
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(FILE_HASH_ROW_PREFIX),
+    )? {
+        match serde_json::from_slice::<CbmFileHashRow>(&value) {
+            Ok(row) => {
+                if row.schema != CBM_FILE_HASH_ROW_SCHEMA {
+                    errors.push(format!(
+                        "file-hash row {} has wrong source schema {:?}",
+                        hex_lower(&key),
+                        row.schema
+                    ));
+                    continue;
+                }
+                if let Err(error) = observe_file_hash_source_row(
+                    source_inventory_by_project
+                        .entry(row.project.clone())
+                        .or_default(),
+                ) {
+                    errors.push(format!(
+                        "file-hash row {} authoritative source inventory: {error}",
+                        hex_lower(&key)
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "decode file-hash row {} for authoritative source inventory: {error}",
+                hex_lower(&key)
+            )),
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(PROJECT_SUMMARY_ROW_PREFIX),
+    )? {
+        match serde_json::from_slice::<CbmProjectSummaryRow>(&value) {
+            Ok(row) => {
+                if row.schema != SCHEMA_PROJECT_SUMMARY_ROW {
+                    errors.push(format!(
+                        "project-summary row {} has wrong source schema {:?}",
+                        hex_lower(&key),
+                        row.schema
+                    ));
+                    continue;
+                }
+                if let Err(error) = observe_project_summary_source_row(
+                    source_inventory_by_project
+                        .entry(row.project.clone())
+                        .or_default(),
+                ) {
+                    errors.push(format!(
+                        "project-summary row {} authoritative source inventory: {error}",
+                        hex_lower(&key)
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "decode project-summary row {} for authoritative source inventory: {error}",
+                hex_lower(&key)
+            )),
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(TOKEN_VECTOR_ROW_PREFIX),
+    )? {
+        match serde_json::from_slice::<CbmTokenVectorRow>(&value) {
+            Ok(row) => {
+                if row.schema != SCHEMA_TOKEN_VECTOR_ROW {
+                    errors.push(format!(
+                        "token-vector row {} has wrong source schema {:?}",
+                        hex_lower(&key),
+                        row.schema
+                    ));
+                    continue;
+                }
+                if let Err(error) = observe_token_vector_source_row(
+                    source_inventory_by_project
+                        .entry(row.project.clone())
+                        .or_default(),
+                ) {
+                    errors.push(format!(
+                        "token-vector row {} authoritative source inventory: {error}",
+                        hex_lower(&key)
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "decode token-vector row {} for authoritative source inventory: {error}",
+                hex_lower(&key)
+            )),
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(CBM_EDGE_ROW_PREFIX),
+    )? {
+        match serde_json::from_slice::<CbmRawEdgeRow>(&value) {
+            Ok(row) if row.schema != SCHEMA_CBM_EDGE_ROW => errors.push(format!(
+                "raw edge row {} has wrong source schema {:?}",
+                hex_lower(&key),
+                row.schema
+            )),
+            Ok(row) => match serde_json::from_str::<Value>(&row.properties_json) {
+                Ok(properties) => {
+                    if let Err(error) = observe_edge_source_row(
+                        source_inventory_by_project
+                            .entry(row.project.clone())
+                            .or_default(),
+                        SemanticSourceRowIdentity {
+                            kind: "edge Graph readback",
+                            id: row.sqlite_edge_id,
+                        },
+                        &properties,
+                    ) {
+                        errors.push(format!(
+                            "raw edge row {} authoritative source inventory: {error}",
+                            hex_lower(&key)
+                        ));
+                    }
+                }
+                Err(error) => errors.push(format!(
+                    "raw edge row {} authoritative properties JSON: {error}",
+                    hex_lower(&key)
+                )),
+            },
+            Err(error) => errors.push(format!(
+                "decode raw edge row {} for authoritative source inventory: {error}",
+                hex_lower(&key)
+            )),
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
         &prefix_range(EDGE_ROW_PREFIX),
     )? {
         match serde_json::from_slice::<EdgeGraphRow>(&value) {
@@ -9150,6 +10243,9 @@ where
 
     for (project, (witness, bytes)) in &coverage_rows {
         let accumulator = coverage_by_project.remove(project).unwrap_or_default();
+        let source_inventory = source_inventory_by_project
+            .remove(project)
+            .unwrap_or_default();
         let source_schema = parse_lower_hex_32(
             &witness.source_schema_sha256,
             "semantic coverage source_schema_sha256",
@@ -9159,6 +10255,7 @@ where
             "semantic coverage sqlite_fingerprint_sha256",
         )?;
         match accumulator.finish(
+            source_inventory,
             project,
             witness.panel_version,
             source_schema,
@@ -9205,6 +10302,11 @@ where
     for project in coverage_by_project.keys() {
         errors.push(format!(
             "project {project:?} has exhaustive semantic Base rows but no coverage witness"
+        ));
+    }
+    for project in source_inventory_by_project.keys() {
+        errors.push(format!(
+            "project {project:?} has authoritative semantic source rows but no coverage witness"
         ));
     }
     counts.semantic_slot_rows =
@@ -9369,6 +10471,9 @@ where
                     qualified_name: row.qualified_name,
                     label: row.label,
                     cx_id: row.cx_id,
+                    file_path: row.file_path,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
                 });
             }
             Ok(())
@@ -9442,12 +10547,19 @@ where
                 edges.push(CbmCompactGraphEdge {
                     source_node_id: row.source_node_id,
                     target_node_id: row.target_node_id,
+                    edge_type: row.edge_type,
                 });
             }
             Ok(())
         },
     )?;
-    edges.sort_by_key(|edge| (edge.source_node_id, edge.target_node_id));
+    edges.sort_by(|left, right| {
+        (left.source_node_id, left.target_node_id, &left.edge_type).cmp(&(
+            right.source_node_id,
+            right.target_node_id,
+            &right.edge_type,
+        ))
+    });
     if edges.is_empty() {
         let mut legacy_typed_edges = 0usize;
         vault.scan_cf_range_pages_at(
@@ -9490,11 +10602,15 @@ where
         compact_digest_field(&mut node_hasher, node.qualified_name.as_bytes());
         compact_digest_field(&mut node_hasher, node.label.as_bytes());
         compact_digest_field(&mut node_hasher, node.cx_id.as_bytes());
+        compact_digest_field(&mut node_hasher, node.file_path.as_bytes());
+        compact_digest_field(&mut node_hasher, &node.start_line.to_be_bytes());
+        compact_digest_field(&mut node_hasher, &node.end_line.to_be_bytes());
     }
     let mut edge_hasher = Sha256::new();
     for edge in &edges {
         compact_digest_field(&mut edge_hasher, &edge.source_node_id.to_be_bytes());
         compact_digest_field(&mut edge_hasher, &edge.target_node_id.to_be_bytes());
+        compact_digest_field(&mut edge_hasher, edge.edge_type.as_bytes());
     }
 
     let storage_after = vault.latest_only_readback_status();
@@ -10023,6 +11139,157 @@ where
         resolved.remove(name);
     }
     Ok(resolved)
+}
+
+/// Exact persisted identity for one CBM SQLite node-map row.
+///
+/// This is the bounded identity bridge used by request paths that already carry
+/// the authoritative CBM `node_id`. It performs one Graph CF point read instead
+/// of reconstructing the complete CBM graph merely to recover one CxId.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PersistedNodeMapIdentity {
+    pub project: String,
+    pub node_id: i64,
+    pub atom_id: String,
+    pub qualified_name: String,
+    pub label: String,
+    pub cx_id: CxId,
+    pub file_path: String,
+    pub name: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
+/// Point-reads and validates one exact modern node-map identity at `snapshot`.
+///
+/// Absence is returned only when the exact project/node key is absent. A row at
+/// that key with a mismatched schema or identity is corrupt and refuses.
+pub fn read_node_map_identity_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    project: &str,
+    node_id: i64,
+) -> IngestResult<Option<PersistedNodeMapIdentity>>
+where
+    C: Clock,
+{
+    if project.trim().is_empty() {
+        return Err(IngestError::InvalidInput(
+            "node-map point read requires a nonempty project".to_string(),
+        ));
+    }
+    if node_id <= 0 {
+        return Err(IngestError::InvalidInput(format!(
+            "node-map point read requires a positive SQLite node id, got {node_id}"
+        )));
+    }
+    let key = graph_key(NODE_MAP_PREFIX, project, node_id)?;
+    let Some(value) = vault.read_cf_at(snapshot, ColumnFamily::Graph, &key)? else {
+        return Ok(None);
+    };
+    decode_node_map_identity(project, node_id, &key, &value).map(Some)
+}
+
+/// Batch point-reads exact modern node-map identities at one retained snapshot.
+/// Input ids must be strictly increasing and positive; output preserves that
+/// order and retains explicit absence for each exact key.
+pub fn read_node_map_identities_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    project: &str,
+    node_ids: &[i64],
+) -> IngestResult<Vec<Option<PersistedNodeMapIdentity>>>
+where
+    C: Clock,
+{
+    if project.trim().is_empty() {
+        return Err(IngestError::InvalidInput(
+            "node-map batch read requires a nonempty project".to_string(),
+        ));
+    }
+    if node_ids
+        .iter()
+        .enumerate()
+        .any(|(index, id)| *id <= 0 || (index > 0 && node_ids[index - 1] >= *id))
+    {
+        return Err(IngestError::InvalidInput(format!(
+            "node-map batch read requires strictly increasing positive SQLite node ids, observed {node_ids:?}"
+        )));
+    }
+    let keys = node_ids
+        .iter()
+        .map(|node_id| graph_key(NODE_MAP_PREFIX, project, *node_id))
+        .collect::<IngestResult<Vec<_>>>()?;
+    let values = vault.read_cf_batch_at(
+        snapshot,
+        keys.iter().cloned().map(|key| (ColumnFamily::Graph, key)),
+    )?;
+    if values.len() != keys.len() {
+        return Err(IngestError::InvalidInput(format!(
+            "node-map batch read returned {} rows for {} requested keys",
+            values.len(),
+            keys.len()
+        )));
+    }
+    node_ids
+        .iter()
+        .zip(keys.iter())
+        .zip(values)
+        .map(|((node_id, key), value)| {
+            value
+                .map(|value| decode_node_map_identity(project, *node_id, key, value))
+                .transpose()
+        })
+        .collect()
+}
+
+fn decode_node_map_identity(
+    project: &str,
+    node_id: i64,
+    key: &[u8],
+    value: &[u8],
+) -> IngestResult<PersistedNodeMapIdentity> {
+    let row = decode_graph_row::<NodeMapRow>(&key, &value)?;
+    if !supported_node_map_schema(&row.schema) {
+        return Err(IngestError::InvalidInput(format!(
+            "node map row {node_id} has unsupported schema {:?}",
+            row.schema
+        )));
+    }
+    if row.series_id_schema != SERIES_ID_TAG {
+        return Err(IngestError::InvalidInput(format!(
+            "node map row {node_id} has unsupported SeriesId schema {:?}",
+            row.series_id_schema
+        )));
+    }
+    if row.project != project || row.node_id != node_id {
+        return Err(IngestError::InvalidInput(format!(
+            "node map key for project {project:?} node {node_id} decodes as project {:?} node {}",
+            row.project, row.node_id
+        )));
+    }
+    if row.atom_id.trim().is_empty()
+        || row.qualified_name.trim().is_empty()
+        || row.label.trim().is_empty()
+        || row.name.trim().is_empty()
+        || row.file_path.trim().is_empty()
+    {
+        return Err(IngestError::InvalidInput(format!(
+            "node map row {node_id} has an empty atom/name/label/file identity field"
+        )));
+    }
+    Ok(PersistedNodeMapIdentity {
+        project: row.project,
+        node_id: row.node_id,
+        atom_id: row.atom_id,
+        qualified_name: row.qualified_name,
+        label: row.label,
+        cx_id: row.cx_id,
+        file_path: row.file_path,
+        name: row.name,
+        start_line: row.start_line,
+        end_line: row.end_line,
+    })
 }
 
 /// Global stable source-atom identity to CxId mapping across every persisted
@@ -10740,6 +12007,20 @@ fn fingerprint_sqlite_file(path: &Path) -> IngestResult<[u8; 32]> {
 /// be read.
 pub fn fingerprint_sqlite_hex(path: impl AsRef<Path>) -> IngestResult<String> {
     Ok(hex_lower(&fingerprint_sqlite_file(path.as_ref())?))
+}
+
+/// Reopens a real CBM SQLite source, validates its frozen schema contract, and
+/// returns the canonical semantic-source schema fingerprint persisted by the
+/// zero-gap coverage witness.
+///
+/// This is an explicit generation-verification operation, not a query path. It
+/// reads only SQLite schema rows after the normal read-only source admission;
+/// it does not traverse corpus node or edge rows.
+pub fn semantic_sqlite_source_schema_sha256_hex(path: impl AsRef<Path>) -> IngestResult<String> {
+    let connection = open_cbm_source_connection(path.as_ref())?;
+    Ok(hex_lower(&semantic_sqlite_source_schema_sha256(
+        &connection,
+    )?))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

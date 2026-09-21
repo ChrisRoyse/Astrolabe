@@ -96,7 +96,12 @@ pub fn verify_chain_and_head_vault_path(
     vault_dir: impl AsRef<Path>,
 ) -> IngestResult<(VerifyChainReport, Option<LedgerHeadAnchor>)> {
     let vault_dir = vault_dir.as_ref();
-    if !vault_dir.exists() {
+    if !vault_dir.try_exists().map_err(|error| {
+        CalyxError::disk_pressure(format!(
+            "inspect Aster vault path {}: {error}",
+            vault_dir.display()
+        ))
+    })? {
         return Err(IngestError::InvalidInput(format!(
             "vault dir does not exist: {}",
             vault_dir.display()
@@ -188,11 +193,9 @@ const JANITOR_BUDGET_REMEDIATION: &str = "Set the janitor ledger-entries-per-sli
 
 /// A persisted checkpoint of the ledger prefix already verified by the janitor.
 ///
-/// The janitor never re-walks the whole ledger per pass (#96): it caches how far
-/// it has verified (`verified_through`, an exclusive sequence bound) and only
-/// re-hashes the bounded suffix past that point, exactly like a transparent-log
-/// client that keeps its verified prefix and checks only the new tail
-/// (<https://research.swtch.com/tlog.pdf>).
+/// `verified_through` is an exclusive sequence bound. Each pass asks Aster for
+/// only the next registry-bounded range plus its predecessor and the exact
+/// durable head witness used to delimit that range (PC-40).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JanitorCheckpoint {
     /// Exclusive ledger sequence up to which the chain is already verified.
@@ -223,6 +226,18 @@ pub struct JanitorSliceReport {
     pub slice_end: u64,
     /// Ledger entries re-hashed in this slice (bounded by the budget knob).
     pub entries_verified: u64,
+    /// Exact Aster MVCC generation retained while the slice was copied.
+    pub snapshot_seq: u64,
+    /// Durable external Ledger head height observed in that generation.
+    pub ledger_head_height: u64,
+    /// Durable external Ledger tip hash observed in that generation.
+    pub ledger_head_tip_hash: Option<String>,
+    /// Rows copied from the exact requested range before verification.
+    pub range_rows_copied: u64,
+    /// Whether the range copy also included its predecessor row.
+    pub predecessor_copied: bool,
+    /// Whether head validation needed a separate physical tip point read.
+    pub tip_point_read: bool,
     /// Checkpoint after this slice; feed it to the next slice.
     pub checkpoint: JanitorCheckpoint,
     /// True when the janitor has now verified the whole persisted ledger.
@@ -245,8 +260,10 @@ impl JanitorSliceReport {
 /// Runs one bounded janitor self-verification slice against the persisted ledger.
 ///
 /// Verifies the sequence range `[checkpoint.verified_through, end)` where `end`
-/// is bounded by the janitor budget so a single pass never re-walks the whole
-/// ledger (#96). The budget is the registry-declared knob
+/// is delimited by the exact durable head sampled with the rows. The returned
+/// row plan contains at most the budgeted slice plus one predecessor, while the
+/// physical head tip is independently point-read before the report is accepted
+/// (PC-40). The budget is the registry-declared knob
 /// [`astrolabe_domain::knobs::FSV_JANITOR_LEDGER_ENTRIES_PER_SLICE_KNOB`];
 /// `budget_override` may narrow or widen it within the declared bounds, and any
 /// value outside those bounds is refused fail-closed.
@@ -258,7 +275,8 @@ impl JanitorSliceReport {
 /// # Errors
 ///
 /// Returns [`ASTRO_FSV_JANITOR_BUDGET_INVALID`] when `budget_override` is outside
-/// the declared knob bounds, or a Calyx error when the ledger cannot be scanned.
+/// the declared knob bounds, or a Calyx error when the exact durable head/range
+/// snapshot cannot be read.
 pub fn verify_chain_slice<C>(
     vault: &AsterVault<C>,
     checkpoint: JanitorCheckpoint,
@@ -268,22 +286,32 @@ where
     C: Clock,
 {
     let budget = resolve_janitor_budget(budget_override)?;
-    let store = AsterVaultLedgerStore { vault };
-    let rows = store.scan()?;
-    let height = rows
-        .iter()
-        .map(|row| row.seq.saturating_add(1))
-        .max()
-        .unwrap_or(0);
-
-    let start = checkpoint.verified_through.min(height);
+    let snapshot = vault.read_bounded_ledger_snapshot(checkpoint.verified_through, budget)?;
+    let snapshot_seq = snapshot.snapshot_seq;
+    let height = snapshot.anchor.as_ref().map_or(0, |anchor| anchor.height);
+    let ledger_head_tip_hash = snapshot
+        .anchor
+        .as_ref()
+        .map(|anchor| hex_lower(&anchor.tip_hash));
+    let range_rows_copied = u64::try_from(snapshot.rows.len())
+        .map_err(|_| CalyxError::ledger_corrupt("bounded Ledger copied-row count exceeds u64"))?;
+    let predecessor_copied = snapshot.previous.is_some();
+    let tip_point_read = snapshot.tip_point_read;
+    let start = snapshot.range.start;
+    let end = snapshot.range.end;
     if start >= height {
-        // Already caught up: nothing new to verify, so no work and no rewalk.
+        // Aster already point-checked the physical tip against this exact head.
         return Ok(JanitorSliceReport {
             status: "intact".to_string(),
             slice_start: start,
             slice_end: height,
             entries_verified: 0,
+            snapshot_seq,
+            ledger_head_height: height,
+            ledger_head_tip_hash,
+            range_rows_copied,
+            predecessor_copied,
+            tip_point_read,
             checkpoint: JanitorCheckpoint {
                 verified_through: height,
             },
@@ -293,9 +321,24 @@ where
             remediation: None,
         });
     }
-    let end = start.saturating_add(budget).min(height);
+    let store = LedgerRangeStore {
+        anchor: snapshot.anchor,
+        previous: snapshot.previous,
+        range_start: start,
+        rows: snapshot.rows,
+    };
     let result = calyx_verify_chain(&store, start..end)?;
-    Ok(janitor_report_from_result(result, start, end, height))
+    Ok(janitor_report_from_result(
+        result,
+        start,
+        end,
+        height,
+        snapshot_seq,
+        ledger_head_tip_hash,
+        range_rows_copied,
+        predecessor_copied,
+        tip_point_read,
+    ))
 }
 
 fn resolve_janitor_budget(budget_override: Option<u64>) -> IngestResult<u64> {
@@ -322,6 +365,11 @@ fn janitor_report_from_result(
     slice_start: u64,
     slice_end: u64,
     height: u64,
+    snapshot_seq: u64,
+    ledger_head_tip_hash: Option<String>,
+    range_rows_copied: u64,
+    predecessor_copied: bool,
+    tip_point_read: bool,
 ) -> JanitorSliceReport {
     match result {
         VerifyResult::Intact { count } => JanitorSliceReport {
@@ -329,6 +377,12 @@ fn janitor_report_from_result(
             slice_start,
             slice_end,
             entries_verified: count,
+            snapshot_seq,
+            ledger_head_height: height,
+            ledger_head_tip_hash,
+            range_rows_copied,
+            predecessor_copied,
+            tip_point_read,
             checkpoint: JanitorCheckpoint {
                 verified_through: slice_end,
             },
@@ -342,6 +396,12 @@ fn janitor_report_from_result(
             slice_start,
             slice_end,
             entries_verified: 0,
+            snapshot_seq,
+            ledger_head_height: height,
+            ledger_head_tip_hash,
+            range_rows_copied,
+            predecessor_copied,
+            tip_point_read,
             // Do NOT advance past corruption: the checkpoint stays at the slice
             // start so the next pass re-examines the same range.
             checkpoint: JanitorCheckpoint {
@@ -357,6 +417,12 @@ fn janitor_report_from_result(
             slice_start,
             slice_end,
             entries_verified: 0,
+            snapshot_seq,
+            ledger_head_height: height,
+            ledger_head_tip_hash,
+            range_rows_copied,
+            predecessor_copied,
+            tip_point_read,
             checkpoint: JanitorCheckpoint {
                 verified_through: slice_start,
             },
@@ -365,6 +431,55 @@ fn janitor_report_from_result(
             reason: Some(reason),
             remediation: Some(VERIFY_CHAIN_REMEDIATION),
         },
+    }
+}
+
+struct LedgerRangeStore {
+    anchor: Option<LedgerHeadAnchor>,
+    previous: Option<LedgerRow>,
+    range_start: u64,
+    rows: Vec<LedgerRow>,
+}
+
+impl LedgerCfStore for LedgerRangeStore {
+    fn scan(&self) -> CalyxResult<Vec<LedgerRow>> {
+        let predecessor_count = if self.previous.is_some() { 1 } else { 0 };
+        let capacity = self
+            .rows
+            .len()
+            .checked_add(predecessor_count)
+            .ok_or_else(|| CalyxError::ledger_corrupt("bounded Ledger row capacity overflow"))?;
+        let mut rows = Vec::with_capacity(capacity);
+        if let Some(previous) = &self.previous {
+            rows.push(previous.clone());
+        }
+        rows.extend(self.rows.iter().cloned());
+        Ok(rows)
+    }
+
+    fn read_seq(&self, seq: u64) -> CalyxResult<Option<LedgerRow>> {
+        if let Some(previous) = &self.previous
+            && previous.seq == seq
+        {
+            return Ok(Some(previous.clone()));
+        }
+        let Some(offset) = seq.checked_sub(self.range_start) else {
+            return Ok(None);
+        };
+        let Ok(index) = usize::try_from(offset) else {
+            return Ok(None);
+        };
+        Ok(self.rows.get(index).filter(|row| row.seq == seq).cloned())
+    }
+
+    fn put_new(&mut self, _seq: u64, _bytes: &[u8]) -> CalyxResult<()> {
+        Err(CalyxError::ledger_append_only_violation(
+            "bounded Ledger verification snapshot is read-only",
+        ))
+    }
+
+    fn head_anchor(&self) -> CalyxResult<Option<LedgerHeadAnchor>> {
+        Ok(self.anchor.clone())
     }
 }
 
@@ -478,14 +593,14 @@ where
     }
 
     fn read_seq(&self, seq: u64) -> CalyxResult<Option<LedgerRow>> {
-        self.vault
+        Ok(self
+            .vault
             .read_cf_at(
                 self.vault.latest_seq(),
                 ColumnFamily::Ledger,
                 &ledger_key(seq),
             )?
-            .map(|bytes| Ok(LedgerRow { seq, bytes }))
-            .transpose()
+            .map(|bytes| LedgerRow { seq, bytes }))
     }
 
     fn put_new(&mut self, _seq: u64, _bytes: &[u8]) -> CalyxResult<()> {

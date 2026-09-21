@@ -78,6 +78,7 @@ pub const HNSW_EF_SEARCH_DEFAULT: u64 = 64;
 /// [`SEARCH_INDEX_KNOB_REGISTRY_VERSION`]). Every field is a declared knob with
 /// a cited default; none is a bare inline constant.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexKnobs {
     /// BM25 `k1` in millis (see [`BM25_K1_MILLIS`]).
     pub bm25_k1_millis: u64,

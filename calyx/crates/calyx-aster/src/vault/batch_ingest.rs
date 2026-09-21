@@ -414,7 +414,14 @@ where
             if let (Some(hook), Some(staged)) =
                 (hook_guard.as_deref_mut(), staged_ledger.as_ref())
             {
-                ledger_hook::commit_staged(hook, staged)?;
+                let committed_seq = commit_seq.ok_or_else(|| {
+                    CalyxError::ledger_group_commit_failed(
+                        "staged Ledger rows exist without a committed data sequence",
+                    )
+                })?;
+                ledger_hook::commit_staged(hook, staged).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(committed_seq, &error)
+                })?;
             }
             Ok(BatchIngestWithExistingMergeCommit {
                 readback_seq: commit_seq.unwrap_or(latest),
@@ -662,6 +669,11 @@ where
             });
         }
         let mut rows = anchor_merge_rows;
+        let predicted_seq = self.latest_seq().checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "vault sequence exhausted at u64::MAX before batch-ingest ledger staging",
+            )
+        })?;
         let mut hook_guard = match &self.ledger_hook {
             Some(hook) => Some(ledger_hook::lock_hook(hook)?),
             None => None,
@@ -693,8 +705,8 @@ where
         } else {
             rows.push(encode::WriteRow {
                 cf: ColumnFamily::Ledger,
-                key: ledger_key(self.latest_seq().saturating_add(1)),
-                value: ledger_stub::encode(self.latest_seq().saturating_add(1)),
+                key: ledger_key(predicted_seq),
+                value: ledger_stub::encode(predicted_seq),
             });
             None
         };
@@ -703,7 +715,7 @@ where
             .and_then(|staged| staged.first())
             .map(|row| row.ledger_ref())
             .unwrap_or(LedgerRef {
-                seq: self.latest_seq().saturating_add(1),
+                seq: predicted_seq,
                 hash: [0; 32],
             });
         let artifact_record = if let Some(artifact) = artifact {
@@ -728,7 +740,9 @@ where
         rows.extend(input_rows);
         let commit_seq = self.commit_rows_locked(&rows)?;
         if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref()) {
-            ledger_hook::commit_staged(hook, staged)?;
+            ledger_hook::commit_staged(hook, staged).map_err(|error| {
+                self.reconcile_post_commit_ledger_hook_failure(commit_seq, &error)
+            })?;
         }
         Ok(BatchIngestCommit {
             ids,

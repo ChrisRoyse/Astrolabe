@@ -104,20 +104,22 @@ impl VerifyRestoreReport {
 
 /// Verifies a restored vault with zero write side effects.
 pub fn verify_restore(vault_path: &Path) -> Result<VerifyRestoreReport> {
-    if !vault_path.is_dir() {
+    if !directory_present(vault_path, "vault root")? {
         return Err(restore_invalid(format!(
             "vault path {} does not exist or is not a directory",
             vault_path.display()
         )));
     }
-    if !vault_path.join("cf").is_dir() && !vault_path.join("wal").is_dir() {
+    if !directory_present(&vault_path.join("cf"), "CF root")?
+        && !directory_present(&vault_path.join("wal"), "WAL root")?
+    {
         return Err(restore_invalid(format!(
             "vault path {} holds no Aster state (neither cf/ nor wal/ exists)",
             vault_path.display()
         )));
     }
     for dir in OPTIONAL_REBUILDABLE_DIRS {
-        if !vault_path.join(dir).is_dir() {
+        if !directory_present(&vault_path.join(dir), "optional rebuildable directory")? {
             eprintln!(
                 "calyx verify-restore: optional dir {dir}/ absent in {} - rebuildable, \
                  excluded from backup; skipping",
@@ -145,10 +147,20 @@ pub fn verify_restore(vault_path: &Path) -> Result<VerifyRestoreReport> {
     report.anchor_count = scan.anchor_count;
     report.ledger_entry_count = scan.ledger_rows.len() as u64;
     report.first_cx_id = scan.first_cx_id;
-    if scan.ledger_anchor.is_none()
-        && let Some(head) = scan.ledger_rows.last().map(|row| row.seq.saturating_add(1))
-    {
-        report.error = Some(crate::ledger_head::missing_head_anchor(vault_path, head).to_string());
+    let ledger_head = match scan.ledger_rows.last() {
+        Some(row) => match row.seq.checked_add(1) {
+            Some(head) => head,
+            None => {
+                report.error =
+                    Some(restore_invalid("restored Ledger sequence exhausted u64").to_string());
+                return Ok(report);
+            }
+        },
+        None => 0,
+    };
+    if scan.ledger_anchor.is_none() && ledger_head > 0 {
+        report.error =
+            Some(crate::ledger_head::missing_head_anchor(vault_path, ledger_head).to_string());
         return Ok(report);
     }
 
@@ -156,8 +168,7 @@ pub fn verify_restore(vault_path: &Path) -> Result<VerifyRestoreReport> {
         rows: scan.ledger_rows,
         anchor: scan.ledger_anchor,
     };
-    let head = store.rows.last().map_or(0, |row| row.seq.saturating_add(1));
-    match verify_chain(&store, 0..head) {
+    match verify_chain(&store, 0..ledger_head) {
         Ok(VerifyResult::Intact { .. }) => match tip_hash(&store.rows) {
             Ok(hash) => {
                 report.chain_intact = true;
@@ -206,13 +217,40 @@ fn scan_vault(vault: &Path) -> Result<VaultScan> {
 fn read_wal_overlay(vault: &Path) -> Result<WalOverlay> {
     let wal_dir = vault.join("wal");
     let mut overlay = WalOverlay::new();
-    if !wal_dir.is_dir() {
-        return Ok(overlay);
+    match fs::metadata(&wal_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "WAL path is not a directory: {}",
+                wal_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(overlay),
+        Err(error) => {
+            return Err(CalyxError::disk_pressure(format!(
+                "inspect WAL path {}: {error}",
+                wal_dir.display()
+            )));
+        }
     }
-    let replay_floor_seq = if vault.join("CURRENT").is_file() {
-        ManifestStore::open(vault).load_current()?.durable_seq
-    } else {
-        0
+    let current = vault.join("CURRENT");
+    let replay_floor_seq = match fs::metadata(&current) {
+        Ok(metadata) if metadata.is_file() => {
+            ManifestStore::open(vault).load_current()?.durable_seq
+        }
+        Ok(_) => {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "CURRENT path is not a regular file: {}",
+                current.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(CalyxError::disk_pressure(format!(
+                "inspect restore CURRENT {}: {error}",
+                current.display()
+            )));
+        }
     };
     let replay = replay_dir_read_only_after(&wal_dir, replay_floor_seq)?;
     if let Some(torn) = replay.torn_tail {
@@ -249,8 +287,16 @@ fn merged_cf(
 
 fn read_cf_ssts(vault: &Path, cf: ColumnFamily) -> Result<Vec<SstEntry>> {
     let dir = vault.join("cf").join(cf.name());
-    if !dir.is_dir() {
-        return Ok(Vec::new());
+    match fs::metadata(&dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "CF path is not a directory: {}",
+                dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(read_error(&dir, "inspect CF path", &error.to_string())),
     }
     let mut files = Vec::new();
     for entry in
@@ -342,8 +388,18 @@ fn tip_hash(rows: &[LedgerRow]) -> Result<String> {
 
 fn wal_total_bytes(vault: &Path) -> Result<u64> {
     let wal_dir = vault.join("wal");
-    if !wal_dir.is_dir() {
-        return Ok(0);
+    match fs::metadata(&wal_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "WAL path is not a directory: {}",
+                wal_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(read_error(&wal_dir, "inspect WAL path", &error.to_string()));
+        }
     }
     let mut total = 0;
     for entry in fs::read_dir(&wal_dir)
@@ -375,6 +431,14 @@ impl LedgerCfStore for RestoredLedgerRows {
         Ok(self.rows.clone())
     }
 
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        Ok(self
+            .rows
+            .binary_search_by_key(&seq, |row| row.seq)
+            .ok()
+            .map(|index| self.rows[index].clone()))
+    }
+
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> Result<()> {
         Err(CalyxError::ledger_append_only_violation(format!(
             "verify-restore is read-only; rejected append for seq {seq}"
@@ -391,6 +455,17 @@ fn restore_invalid(message: impl Into<String>) -> CalyxError {
         code: CALYX_ASTER_RESTORE_INVALID,
         message: message.into(),
         remediation: "choose a restored Aster vault directory containing cf/ or wal/ bytes",
+    }
+}
+
+fn directory_present(path: &Path, role: &str) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(restore_invalid(format!(
+            "could not inspect {role} {}: {error}",
+            path.display()
+        ))),
     }
 }
 

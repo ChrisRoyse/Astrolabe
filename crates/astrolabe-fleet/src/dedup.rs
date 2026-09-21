@@ -190,6 +190,25 @@ fn parse_v2_tail<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<(&'a [u8], b
     Ok((snippet, source_absent))
 }
 
+/// Panel v4+ appends an exact semantic-input digest to the canonical symbol
+/// bytes before deriving CxId. The content-only frames remain the prefix, but
+/// accepting arbitrary trailing bytes would make the fleet content join
+/// ambiguous. Accept only the one versioned two-frame suffix emitted by the
+/// ingest identity contract and reject every other tail.
+fn parse_node_semantic_identity_tail(bytes: &[u8], cursor: &mut usize) -> Result<(), CalyxError> {
+    const NODE_SEMANTIC_IDENTITY_TAG: &[u8] = b"astrolabe.cbm.node-semantic-identity.v1";
+    let tag = take_frame(bytes, cursor, "node_semantic_identity_tag")?;
+    if tag != NODE_SEMANTIC_IDENTITY_TAG {
+        return Err(invalid_frame(format!(
+            "unsupported canonical symbol suffix tag {:?}",
+            String::from_utf8_lossy(tag)
+        )));
+    }
+    let digest = take_frame(bytes, cursor, "node_semantic_identity_sha256")?;
+    exact_frame_len(digest, 32, "node_semantic_identity_sha256")?;
+    Ok(())
+}
+
 /// Parses either supported canonical symbol frame version and derives the
 /// content-only key. Every version has an exact, fully consumed layout;
 /// unknown tags and non-canonical count/order/width encodings fail closed.
@@ -201,6 +220,7 @@ pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
     let label = take_frame(bytes, &mut cursor, "label")?;
     let rel_file_path = take_frame(bytes, &mut cursor, "rel_file_path")?;
     let language = take_frame(bytes, &mut cursor, "language")?;
+    let supports_semantic_identity_tail = tag == astrolabe_domain::SYMBOL_CANONICAL_TAG.as_bytes();
     let (snippet, source_absent) = match tag {
         b"astro-symbol-v1" => parse_v1_tail(bytes, &mut cursor)?,
         current if current == astrolabe_domain::SYMBOL_CANONICAL_TAG.as_bytes() => {
@@ -213,6 +233,15 @@ pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
             )));
         }
     };
+    if cursor != bytes.len() {
+        if !supports_semantic_identity_tail {
+            return Err(invalid_frame(
+                "legacy canonical symbol bytes carry an unsupported semantic identity suffix"
+                    .to_string(),
+            ));
+        }
+        parse_node_semantic_identity_tail(bytes, &mut cursor)?;
+    }
     if cursor != bytes.len() {
         return Err(invalid_frame(format!(
             "{} trailing bytes remain after the canonical symbol frame",

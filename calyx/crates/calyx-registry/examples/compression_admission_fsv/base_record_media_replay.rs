@@ -121,6 +121,15 @@ struct BaseEvidence {
     provenance: LedgerIdentity,
 }
 
+struct BaseEvidenceRequest<'a> {
+    role: &'a str,
+    cx_id: CxId,
+    slot_id: u16,
+    modality: Modality,
+    input_bytes: &'a [u8],
+    source_vector: &'a [f32],
+}
+
 /// One product refusal of a real commissioning attempt against one slot of the
 /// shared two-slot media panel. `error` is the complete `Display` form of the
 /// `CalyxError` the shipping Registry returned (`"{code}: {message}"`).
@@ -1277,7 +1286,7 @@ fn require_cross_modality_raw_columns<C: calyx_core::Clock>(
         (IMAGE_SLOT, source_cx_id, source_vector, target_cx_id),
     ] {
         let rows = vault.scan_cf_at(snapshot, ColumnFamily::slot(SlotId::new(slot_id)))?;
-        let expected = vec![
+        let expected = [
             (slot_key(dense_cx_id), dense_slot_encoding(dense_vector)?),
             (slot_key(absent_cx_id), absent.clone()),
         ]
@@ -1348,22 +1357,26 @@ fn base_evidence_set<C: calyx_core::Clock>(
         base_evidence(
             vault,
             snapshot,
-            TEXT_ROLE,
-            target_cx_id,
-            TEXT_SLOT,
-            Modality::Text,
-            DERIVED_TEXT.as_bytes(),
-            target_vector,
+            BaseEvidenceRequest {
+                role: TEXT_ROLE,
+                cx_id: target_cx_id,
+                slot_id: TEXT_SLOT,
+                modality: Modality::Text,
+                input_bytes: DERIVED_TEXT.as_bytes(),
+                source_vector: target_vector,
+            },
         )?,
         base_evidence(
             vault,
             snapshot,
-            IMAGE_ROLE,
-            source_cx_id,
-            IMAGE_SLOT,
-            Modality::Image,
-            source_bytes,
-            source_vector,
+            BaseEvidenceRequest {
+                role: IMAGE_ROLE,
+                cx_id: source_cx_id,
+                slot_id: IMAGE_SLOT,
+                modality: Modality::Image,
+                input_bytes: source_bytes,
+                source_vector,
+            },
         )?,
     ])
 }
@@ -1371,13 +1384,16 @@ fn base_evidence_set<C: calyx_core::Clock>(
 fn base_evidence<C: calyx_core::Clock>(
     vault: &AsterVault<C>,
     snapshot: Seq,
-    role: &str,
-    cx_id: CxId,
-    slot_id: u16,
-    modality: Modality,
-    input_bytes: &[u8],
-    source_vector: &[f32],
+    request: BaseEvidenceRequest<'_>,
 ) -> AnyResult<BaseEvidence> {
+    let BaseEvidenceRequest {
+        role,
+        cx_id,
+        slot_id,
+        modality,
+        input_bytes,
+        source_vector,
+    } = request;
     let bytes = required_row(vault, snapshot, ColumnFamily::Base, &base_key(cx_id), role)?;
     let record = BaseRecord::decode_for_key(cx_id, &bytes)?;
     let cx = record.constellation();

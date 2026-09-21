@@ -49,11 +49,52 @@ void cbm_ui_log_init(void);
 /* Append a log line to the UI ring buffer (called from log hook). */
 void cbm_ui_log_append(const char *line);
 
-/* Set the binary path for subprocess spawning (call from main). */
-void cbm_http_server_set_binary_path(const char *path);
+/* Exact worker-executable binding result. A non-OK result never changes an
+ * existing binding. `native_error` receives a Win32 error (or errno on POSIX)
+ * only when the operating system supplied one; otherwise it is set to zero. */
+#ifndef CBM_WORKER_BINARY_STATUS_DEFINED
+#define CBM_WORKER_BINARY_STATUS_DEFINED
+typedef enum {
+    CBM_WORKER_BINARY_OK = 0,
+    CBM_WORKER_BINARY_UNBOUND = 1,
+    CBM_WORKER_BINARY_INVALID_ARGUMENT = 2,
+    CBM_WORKER_BINARY_SELF_RESOLVE_FAILED = 3,
+    CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE = 4,
+    CBM_WORKER_BINARY_PATH_ENCODING_FAILED = 5,
+    CBM_WORKER_BINARY_OPEN_FAILED = 6,
+    CBM_WORKER_BINARY_NOT_REGULAR_FILE = 7,
+    CBM_WORKER_BINARY_REPARSE_POINT = 8,
+    CBM_WORKER_BINARY_NOT_EXECUTABLE = 9,
+    CBM_WORKER_BINARY_IDENTITY_READ_FAILED = 10,
+    CBM_WORKER_BINARY_FINAL_PATH_FAILED = 11,
+    CBM_WORKER_BINARY_PATH_TOO_LONG = 12,
+    CBM_WORKER_BINARY_ALLOCATION_FAILED = 13,
+    CBM_WORKER_BINARY_CAPABILITY_MISMATCH = 14,
+    CBM_WORKER_BINARY_BIND_IN_PROGRESS = 15,
+    CBM_WORKER_BINARY_CONFLICT = 16,
+} cbm_worker_binary_status_t;
+#endif
 
-/* Resolve argv[0] into an executable path suitable for subprocess spawning. */
-bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz);
+/* Bind the running OS process image without consulting argv or PATH. */
+cbm_worker_binary_status_t cbm_http_server_bind_self_binary(unsigned long *native_error);
+
+/* Bind one absolute, existing ordinary executable. The path is opened first;
+ * its final path and stable file identity are read from that handle, and the
+ * handle is retained for the process lifetime with write/delete sharing denied.
+ * The first identity wins. Rebinding that same identity is idempotent; a
+ * different identity is a conflict and leaves the original binding untouched. */
+cbm_worker_binary_status_t cbm_http_server_bind_explicit_binary(const char *path,
+                                                                unsigned long *native_error);
+
+/* Return the immutable final path retained by a successful bind, or NULL. The
+ * returned process-lifetime string must not be freed or modified. */
+const char *cbm_http_server_binary_path(void);
+
+/* Stable diagnostic fields for every binding status. Unknown integers map to
+ * an explicit unknown-status diagnostic rather than an empty string. */
+const char *cbm_http_server_binary_status_code(int status);
+const char *cbm_http_server_binary_status_message(int status);
+const char *cbm_http_server_binary_status_remediation(int status);
 
 /* Pure git-remote URL helpers used by GET /api/repo-info. Exposed for tests. */
 

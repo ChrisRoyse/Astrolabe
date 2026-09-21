@@ -29,20 +29,23 @@
 use astrolabe_assay::{DeficitSuggestedAction, SufficiencyCard};
 use astrolabe_domain::TrustTag;
 use astrolabe_domain::knobs::U64KnobDeclaration;
+use calyx_core::{CxId, Ts};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::corpus::{OccurrenceRecord, OracleError};
+use crate::corpus::{
+    ASTRO_ORACLE_ROW_CORRUPT, ORACLE_ATTRIBUTION_SCALE, OccurrenceRecord, OracleError, OutcomeId,
+};
 
 // ---------------------------------------------------------------------------
 // Stable failure codes (the oracle failure-mode catalog)
 // ---------------------------------------------------------------------------
 
 /// The panel carries fewer grounded bits than the outcome entropy (or the seed
-/// has fewer grounded occurrences than the floor): there is not enough evidence
+/// has fewer distinct grounded outcomes than the floor): there is not enough evidence
 /// to ground a claim, so the oracle refuses with a per-lens deficit.
 pub const ASTRO_ORACLE_INSUFFICIENT: &str = "ASTRO_ORACLE_INSUFFICIENT";
-/// The failing outcome was observed on too few distinct changes to be a pattern:
+/// The failing signal was observed in too few distinct outcomes to be a pattern:
 /// a one-off is not a recurrence, so no grounded probability is served.
 pub const ASTRO_ORACLE_NO_RECURRENCE: &str = "ASTRO_ORACLE_NO_RECURRENCE";
 /// The grounded evidence contradicts itself (pairwise outcome agreement below the
@@ -66,11 +69,11 @@ const GATE_REMEDIATION: &str = "ground this module before asking the oracle to s
 // ---------------------------------------------------------------------------
 
 /// Registry version tag for the honesty-gate knobs (#52).
-pub const ORACLE_GATE_KNOB_REGISTRY_VERSION: &str = "astrolabe-oracle-gate-knobs-v1";
+pub const ORACLE_GATE_KNOB_REGISTRY_VERSION: &str = "astrolabe-oracle-gate-knobs-v2";
 
-/// Name of the minimum grounded-occurrence floor knob (occurrences).
+/// Name of the minimum grounded-occurrence floor knob (distinct outcomes).
 pub const ORACLE_GATE_MIN_GROUNDED_OCCURRENCES_KNOB: &str = "oracle_gate_min_grounded_occurrences";
-/// Name of the recurrence floor knob (distinct failing changes).
+/// Name of the recurrence floor knob (distinct failing outcomes).
 pub const ORACLE_GATE_RECURRENCE_FLOOR_KNOB: &str = "oracle_gate_recurrence_floor";
 /// Name of the flaky-evidence self-consistency floor knob (permille).
 pub const ORACLE_GATE_FLAKY_SELF_CONSISTENCY_PERMILLE_KNOB: &str =
@@ -81,7 +84,7 @@ pub const ORACLE_GATE_FLAKY_SELF_CONSISTENCY_PERMILLE_KNOB: &str =
 /// The grounded-occurrence floor mirrors the #49 corpus min-edge-support floor
 /// (3) reused by `predict_impact`, so the gate and the predictor agree on when a
 /// module has spoken enough to ground on. The recurrence floor (2 distinct
-/// failing changes) is the smallest count that distinguishes a *pattern* from a
+/// failing outcomes) is the smallest count that distinguishes a *pattern* from a
 /// single incident. The flakiness floor (0.5 pairwise agreement) is the coin-flip
 /// point below which the outcomes disagree more than they agree — a flaky signal.
 /// Every default is a seed to be replaced by a measured value once refusal
@@ -93,9 +96,9 @@ pub const ORACLE_GATE_KNOBS: &[U64KnobDeclaration] = &[
         default: 3,
         min: 1,
         max: 1_000_000,
-        unit: "occurrences",
-        source: "ASTROLABE #49 corpus min-edge-support floor (3), reused as the gate's grounded-speech floor",
-        rationale: "the honesty gate refuses (ASTRO_ORACLE_INSUFFICIENT) unless a module carries at least this many grounded occurrences, matching the corpus edge-support floor and predict_impact's evidence floor so the gate and predictor agree; replace with a measured value once refusal precision is benchmarked",
+        unit: "distinct_outcomes",
+        source: "ASTROLABE #49 corpus distinct-outcome min-edge-support floor (3), reused as the gate's grounded-speech floor",
+        rationale: "the honesty gate refuses (ASTRO_ORACLE_INSUFFICIENT) unless a module carries at least this many distinct source-backed outcomes; candidate-pair fan-out never increases the count, matching the corpus edge-support floor and predict_impact's evidence floor; replace with a measured value once refusal precision is benchmarked",
     },
     U64KnobDeclaration {
         registry_version: ORACLE_GATE_KNOB_REGISTRY_VERSION,
@@ -103,9 +106,9 @@ pub const ORACLE_GATE_KNOBS: &[U64KnobDeclaration] = &[
         default: 2,
         min: 1,
         max: 1_000_000,
-        unit: "changes",
+        unit: "distinct_outcomes",
         source: "ASTROLABE blueprint 11_ORACLE §7: a one-off outcome is not a recurring pattern",
-        rationale: "the gate refuses (ASTRO_ORACLE_NO_RECURRENCE) when the failing outcome was seen on fewer than this many distinct changes; 2 is the smallest count that distinguishes a repeated pattern from a single incident, so the oracle never sells a coincidence as a trend; replace with a measured recurrence threshold once available",
+        rationale: "the gate refuses (ASTRO_ORACLE_NO_RECURRENCE) when there are fewer than this many distinct source-backed failing outcomes; candidate-pair fan-out never creates recurrence, and 2 is the smallest count that distinguishes a repeated pattern from a single incident; replace with a measured recurrence threshold once available",
     },
     U64KnobDeclaration {
         registry_version: ORACLE_GATE_KNOB_REGISTRY_VERSION,
@@ -129,11 +132,12 @@ fn gate_knob(name: &str) -> &'static U64KnobDeclaration {
 }
 
 /// Validated honesty-gate policy (raw knob values; resolved through accessors).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GateConfig {
-    /// Grounded occurrences a module must carry before the gate lets it speak.
+    /// Distinct grounded outcomes a module must carry before the gate lets it speak.
     pub min_grounded_occurrences: u64,
-    /// Distinct failing changes required before an outcome counts as recurring.
+    /// Distinct failing outcomes required before a signal counts as recurring.
     pub recurrence_floor: u64,
     /// Pairwise self-consistency floor, in permille, below which evidence is flaky.
     pub flaky_self_consistency_permille: u64,
@@ -189,69 +193,447 @@ fn check_gate_knob(name: &str, value: u64) -> Result<(), OracleError> {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical distinct-outcome grouping shared by Oracle consumers
+// ---------------------------------------------------------------------------
+
+/// One complete, validated set of candidate rows for a single real outcome.
+///
+/// `OccurrenceRecord` is a candidate-pair row, not an independent observation.
+/// Consumers must count this group once and may only use its candidate credits
+/// after [`validated_outcome_groups`] proves that the group is complete and its
+/// exact fixed-point credits sum to [`ORACLE_ATTRIBUTION_SCALE`].
+pub(crate) struct ValidatedOutcomeGroup {
+    pub(crate) outcome_id: OutcomeId,
+    pub(crate) subject: CxId,
+    pub(crate) outcome_subject: CxId,
+    pub(crate) outcome_kind: calyx_core::AnchorKind,
+    pub(crate) test_identity: Option<CxId>,
+    pub(crate) source: String,
+    pub(crate) change_id: String,
+    pub(crate) change_ts: Ts,
+    pub(crate) candidate_count: usize,
+    pub(crate) outcome_ts: Ts,
+    pub(crate) passed: bool,
+    pub(crate) trust: TrustTag,
+}
+
+/// Validates and canonically groups candidate-pair rows by exact
+/// `(changed subject, source-backed outcome)` identity in
+/// `O(K log G + sum(k_g log k_g))`, bounded by
+/// `O(K log K)` for `K` rows and `G` outcomes (PC-04/PC-16/PC-38).
+///
+/// The same exact source outcome may legitimately cover several subjects. Each
+/// subject must retain a complete candidate partition whose credit sums to one;
+/// no source identity is synthesized and no outcome is counted twice within a
+/// subject. Duplicate, incomplete, or metadata-drifted groups refuse.
+pub(crate) fn validated_outcome_groups(
+    records: &[OccurrenceRecord],
+) -> Result<Vec<ValidatedOutcomeGroup>, OracleError> {
+    let mut groups: BTreeMap<(CxId, OutcomeId), Vec<&OccurrenceRecord>> = BTreeMap::new();
+    let mut source_outcomes: BTreeMap<
+        OutcomeId,
+        (
+            CxId,
+            calyx_core::AnchorKind,
+            Option<CxId>,
+            String,
+            u64,
+            bool,
+            astrolabe_anchors::TrustTag,
+        ),
+    > = BTreeMap::new();
+    for record in records {
+        validate_consumer_occurrence(record)?;
+        let source_metadata = (
+            record.outcome_subject,
+            record.outcome_kind.clone(),
+            record.test_identity,
+            record.source.clone(),
+            record.outcome_ts,
+            record.passed,
+            record.trust,
+        );
+        if let Some(previous) =
+            source_outcomes.insert(record.outcome_id.clone(), source_metadata.clone())
+            && previous != source_metadata
+        {
+            return Err(OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "source outcome {} carries inconsistent anchor/test/source/time/pass/trust metadata across attributed subjects",
+                    record.outcome_id.as_str()
+                ),
+            ));
+        }
+        groups
+            .entry((record.subject, record.outcome_id.clone()))
+            .or_default()
+            .push(record);
+    }
+
+    let mut validated = Vec::with_capacity(groups.len());
+    for ((subject, outcome_id), mut candidates) in groups {
+        candidates.sort_by(|a, b| {
+            (a.lag_s, a.change_id.as_str(), a.change_ts).cmp(&(
+                b.lag_s,
+                b.change_id.as_str(),
+                b.change_ts,
+            ))
+        });
+        let first = candidates[0];
+        if candidates.iter().any(|row| {
+            row.subject != first.subject
+                || row.source != first.source
+                || row.outcome_subject != first.outcome_subject
+                || row.outcome_kind != first.outcome_kind
+                || row.test_identity != first.test_identity
+                || row.outcome_ts != first.outcome_ts
+                || row.passed != first.passed
+                || row.candidate_count != first.candidate_count
+                || row.trust != first.trust
+        }) {
+            return Err(OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {}/{} carries inconsistent source/test/time/pass/count/trust metadata",
+                    subject,
+                    outcome_id.as_str()
+                ),
+            ));
+        }
+        if candidates.len() != first.candidate_count {
+            return Err(OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {} has {} candidate rows but declares {}",
+                    outcome_id.as_str(),
+                    candidates.len(),
+                    first.candidate_count
+                ),
+            ));
+        }
+
+        let mut change_ids = BTreeSet::new();
+        let mut credit_sum = 0u64;
+        for row in &candidates {
+            if !change_ids.insert(row.change_id.as_str()) {
+                return Err(OracleError::new(
+                    ASTRO_ORACLE_ROW_CORRUPT,
+                    format!(
+                        "Oracle outcome group {} repeats change identity {:?}",
+                        outcome_id.as_str(),
+                        row.change_id
+                    ),
+                ));
+            }
+            credit_sum = credit_sum.checked_add(row.credit.units()).ok_or_else(|| {
+                OracleError::new(
+                    ASTRO_ORACLE_ROW_CORRUPT,
+                    format!(
+                        "Oracle outcome group {} credit sum overflowed u64",
+                        outcome_id.as_str()
+                    ),
+                )
+            })?;
+        }
+        if credit_sum != ORACLE_ATTRIBUTION_SCALE {
+            return Err(OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {} credit sum {credit_sum} differs from exact scale {ORACLE_ATTRIBUTION_SCALE}",
+                    outcome_id.as_str()
+                ),
+            ));
+        }
+        let expected_credits = expected_consumer_credit_units(
+            &candidates
+                .iter()
+                .map(|row| row.decay_weight.units())
+                .collect::<Vec<_>>(),
+            &outcome_id,
+        )?;
+        if candidates
+            .iter()
+            .zip(expected_credits)
+            .any(|(row, expected)| row.credit.units() != expected)
+        {
+            return Err(OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {} credits do not match the declared positive-largest-remainder fixed-point apportionment",
+                    outcome_id.as_str()
+                ),
+            ));
+        }
+
+        validated.push(ValidatedOutcomeGroup {
+            outcome_id,
+            subject,
+            outcome_subject: first.outcome_subject,
+            outcome_kind: first.outcome_kind.clone(),
+            test_identity: first.test_identity,
+            source: first.source.clone(),
+            change_id: first.change_id.clone(),
+            change_ts: first.change_ts,
+            candidate_count: first.candidate_count,
+            outcome_ts: first.outcome_ts,
+            passed: first.passed,
+            trust: first.trust,
+        });
+    }
+    Ok(validated)
+}
+
+fn expected_consumer_credit_units(
+    weights: &[u64],
+    outcome_id: &OutcomeId,
+) -> Result<Vec<u64>, OracleError> {
+    let candidate_count = u64::try_from(weights.len()).map_err(|_| {
+        OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {} candidate count exceeds u64",
+                outcome_id.as_str()
+            ),
+        )
+    })?;
+    if candidate_count == 0 || candidate_count > ORACLE_ATTRIBUTION_SCALE {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {} candidate count {candidate_count} is outside [1, {ORACLE_ATTRIBUTION_SCALE}]",
+                outcome_id.as_str()
+            ),
+        ));
+    }
+    let weight_sum = weights.iter().try_fold(0u128, |sum, &weight| {
+        sum.checked_add(u128::from(weight)).ok_or_else(|| {
+            OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {} weight sum overflowed u128",
+                    outcome_id.as_str()
+                ),
+            )
+        })
+    })?;
+    let distributable = ORACLE_ATTRIBUTION_SCALE - candidate_count;
+    let mut assigned = 0u64;
+    let mut credits = Vec::with_capacity(weights.len());
+    let mut remainders = Vec::with_capacity(weights.len());
+    for (index, &weight) in weights.iter().enumerate() {
+        let numerator = u128::from(distributable)
+            .checked_mul(u128::from(weight))
+            .ok_or_else(|| {
+                OracleError::new(
+                    ASTRO_ORACLE_ROW_CORRUPT,
+                    format!(
+                        "Oracle outcome group {} credit numerator overflowed u128",
+                        outcome_id.as_str()
+                    ),
+                )
+            })?;
+        let quotient = u64::try_from(numerator / weight_sum).map_err(|_| {
+            OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {} credit quotient exceeds u64",
+                    outcome_id.as_str()
+                ),
+            )
+        })?;
+        assigned = assigned.checked_add(quotient).ok_or_else(|| {
+            OracleError::new(
+                ASTRO_ORACLE_ROW_CORRUPT,
+                format!(
+                    "Oracle outcome group {} assigned credit overflowed u64",
+                    outcome_id.as_str()
+                ),
+            )
+        })?;
+        credits.push(1 + quotient);
+        remainders.push((numerator % weight_sum, index));
+    }
+    let residual = distributable.checked_sub(assigned).ok_or_else(|| {
+        OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {} apportioned credit exceeds the exact scale",
+                outcome_id.as_str()
+            ),
+        )
+    })?;
+    remainders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let residual = usize::try_from(residual).map_err(|_| {
+        OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {} residual credit exceeds usize",
+                outcome_id.as_str()
+            ),
+        )
+    })?;
+    for (_, index) in remainders.into_iter().take(residual) {
+        credits[index] += 1;
+    }
+    Ok(credits)
+}
+
+fn validate_consumer_occurrence(record: &OccurrenceRecord) -> Result<(), OracleError> {
+    let outcome_id = record.outcome_id.as_str();
+    if outcome_id.len() != 64
+        || !outcome_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!("Oracle outcome identity {outcome_id:?} is not canonical lowercase BLAKE3 hex"),
+        ));
+    }
+    if record.change_id.trim().is_empty() || record.source.trim().is_empty() {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!("Oracle outcome group {outcome_id} carries an empty change or source identity"),
+        ));
+    }
+    if record.test_identity.is_some_and(|test| {
+        test != record.outcome_subject || record.outcome_kind != calyx_core::AnchorKind::TestPass
+    }) {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {outcome_id} carries an invalid source-test identity binding"
+            ),
+        ));
+    }
+    if record.change_ts == 0
+        || record.outcome_ts == 0
+        || record.outcome_ts < record.change_ts
+        || record.lag_s != record.outcome_ts - record.change_ts
+    {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {outcome_id} carries invalid change/outcome/lag timestamps"
+            ),
+        ));
+    }
+    if record.candidate_count == 0
+        || record.decay_weight.units() == 0
+        || record.decay_weight.units() > ORACLE_ATTRIBUTION_SCALE
+        || record.credit.units() == 0
+        || record.credit.units() > ORACLE_ATTRIBUTION_SCALE
+    {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {outcome_id} carries an invalid candidate count, decay weight, or credit"
+            ),
+        ));
+    }
+    let expected_trust = astrolabe_anchors::trust_for_source(&record.source).map_err(|error| {
+        OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {outcome_id} carries invalid source {:?}: {}",
+                record.source,
+                error.message()
+            ),
+        )
+    })?;
+    if record.trust != expected_trust {
+        return Err(OracleError::new(
+            ASTRO_ORACLE_ROW_CORRUPT,
+            format!(
+                "Oracle outcome group {outcome_id} trust {:?} differs from catalog-derived {expected_trust:?}",
+                record.trust
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Evidence snapshot — the structured input every detection predicate reads
 // ---------------------------------------------------------------------------
 
 /// The structured evidence context a [`FailureMode`] detection predicate reads.
 ///
 /// It is a *pure summary* of what grounding exists for one served claim: the
-/// grounded-occurrence counts on the subject, how the failing outcomes are spread
-/// across distinct changes (recurrence), the pairwise outcome agreement
+/// distinct grounded-outcome counts on the subject, the failing outcome count
+/// (recurrence), the pairwise outcome agreement
 /// (flakiness), the optional panel sufficiency card (`I(panel;axis)` vs
 /// `H(axis)`), and the optional backtest verdict. Detection predicates read this
 /// snapshot and nothing else, so a refusal is reproducible from the snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceSnapshot {
-    /// Total grounded occurrences on the subject(s) under test.
-    pub direct_occurrences: usize,
-    /// Failing grounded occurrences.
-    pub failing_occurrences: usize,
-    /// Passing grounded occurrences.
-    pub passing_occurrences: usize,
-    /// Distinct changes that produced a *failing* outcome (recurrence spread).
-    pub distinct_failing_changes: usize,
+    /// Total distinct grounded outcomes on the subject(s) under test.
+    direct_outcomes: usize,
+    /// Distinct failing grounded outcomes.
+    failing_outcomes: usize,
+    /// Distinct passing grounded outcomes.
+    passing_outcomes: usize,
     /// Pairwise outcome agreement in `[0, 1]`; `1.0` when unmeasurable (< 2 obs).
-    pub self_consistency: f64,
+    self_consistency: f64,
     /// The panel sufficiency card, when a panel measurement exists for this axis.
-    pub sufficiency: Option<SufficiencyCard>,
+    sufficiency: Option<SufficiencyCard>,
     /// The backtest verdict (`Some(false)` = grounded did not beat the baseline).
-    pub beats_baseline: Option<bool>,
+    beats_baseline: Option<bool>,
 }
 
 impl EvidenceSnapshot {
-    /// Summarizes the grounded occurrence records for one subject into a snapshot.
+    /// Summarizes complete grounded outcome groups for one subject into a snapshot.
     ///
     /// `self_consistency` is the pairwise agreement `(C(f,2)+C(p,2))/C(n,2)`; with
-    /// fewer than two occurrences flakiness is unmeasurable and it is held at
+    /// fewer than two outcomes flakiness is unmeasurable and it is held at
     /// `1.0` (the INSUFFICIENT mode fires first in that regime).
-    pub fn from_records(records: &[OccurrenceRecord]) -> Self {
+    pub fn from_records(records: &[OccurrenceRecord]) -> Result<Self, OracleError> {
+        let outcomes = validated_outcome_groups(records)?;
         let mut failing = 0usize;
         let mut passing = 0usize;
-        let mut failing_changes: BTreeSet<&str> = BTreeSet::new();
-        for record in records {
-            if record.passed {
+        for outcome in &outcomes {
+            if outcome.passed {
                 passing += 1;
             } else {
                 failing += 1;
-                failing_changes.insert(record.change_id.as_str());
             }
         }
-        let n = records.len();
+        let n = outcomes.len();
         let pairs = choose2(n);
         let self_consistency = if pairs == 0 {
             1.0
         } else {
             (choose2(failing) + choose2(passing)) as f64 / pairs as f64
         };
-        EvidenceSnapshot {
-            direct_occurrences: n,
-            failing_occurrences: failing,
-            passing_occurrences: passing,
-            distinct_failing_changes: failing_changes.len(),
+        Ok(EvidenceSnapshot {
+            direct_outcomes: n,
+            failing_outcomes: failing,
+            passing_outcomes: passing,
             self_consistency,
             sufficiency: None,
             beats_baseline: None,
-        }
+        })
+    }
+
+    /// Number of distinct source-backed grounded outcomes in the snapshot.
+    pub const fn direct_outcome_count(&self) -> usize {
+        self.direct_outcomes
+    }
+
+    /// Number of distinct source-backed failing outcomes in the snapshot.
+    pub const fn failing_outcome_count(&self) -> usize {
+        self.failing_outcomes
+    }
+
+    /// Number of distinct source-backed passing outcomes in the snapshot.
+    pub const fn passing_outcome_count(&self) -> usize {
+        self.passing_outcomes
+    }
+
+    /// Pairwise pass/fail agreement over distinct source-backed outcomes.
+    pub const fn self_consistency(&self) -> f64 {
+        self.self_consistency
     }
 
     /// Attaches a panel sufficiency card (the `panel_bits < H(axis)` measurement).
@@ -267,8 +649,9 @@ impl EvidenceSnapshot {
     }
 }
 
-fn choose2(k: usize) -> usize {
-    k.saturating_mul(k.saturating_sub(1)) / 2
+fn choose2(k: usize) -> u128 {
+    let k = k as u128;
+    k * k.saturating_sub(1) / 2
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +691,7 @@ pub struct FailureMode {
 }
 
 fn detect_insufficient(snap: &EvidenceSnapshot, cfg: &GateConfig) -> bool {
-    if snap.direct_occurrences < cfg.min_grounded_occurrences as usize {
+    if snap.direct_outcomes < cfg.min_grounded_occurrences as usize {
         return true;
     }
     // A measured panel that does not clear H(axis) is insufficient regardless of
@@ -319,13 +702,13 @@ fn detect_insufficient(snap: &EvidenceSnapshot, cfg: &GateConfig) -> bool {
 fn detect_flaky(snap: &EvidenceSnapshot, cfg: &GateConfig) -> bool {
     // Flakiness needs at least one pair; below the floor it is INSUFFICIENT, not
     // flaky, so this predicate is only reached with enough evidence to measure.
-    snap.direct_occurrences >= 2 && snap.self_consistency < cfg.flaky_self_consistency()
+    snap.direct_outcomes >= 2 && snap.self_consistency < cfg.flaky_self_consistency()
 }
 
 fn detect_no_recurrence(snap: &EvidenceSnapshot, cfg: &GateConfig) -> bool {
-    // There is a failing signal, but it was observed on too few distinct changes
-    // to be a recurring pattern.
-    snap.failing_occurrences > 0 && snap.distinct_failing_changes < cfg.recurrence_floor as usize
+    // There is a failing signal, but too few distinct source outcomes support it
+    // as a recurring pattern. Candidate-pair fan-out never changes this count.
+    snap.failing_outcomes > 0 && snap.failing_outcomes < cfg.recurrence_floor as usize
 }
 
 fn detect_backtest_not_beaten(snap: &EvidenceSnapshot, _cfg: &GateConfig) -> bool {
@@ -336,7 +719,7 @@ fn detect_backtest_not_beaten(snap: &EvidenceSnapshot, _cfg: &GateConfig) -> boo
 ///
 /// Precedence matters: INSUFFICIENT (no evidence at all) is diagnosed before
 /// FLAKY (evidence that contradicts itself), which is diagnosed before
-/// NO_RECURRENCE (evidence too concentrated on one change), which is diagnosed
+/// NO_RECURRENCE (fewer than two distinct failing outcomes), which is diagnosed
 /// before BACKTEST_NOT_BEATEN (grounded mode not validated against the baseline).
 /// The first mode whose predicate fires wins.
 pub static ORACLE_FAILURE_MODES: &[FailureMode] = &[
@@ -356,8 +739,8 @@ pub static ORACLE_FAILURE_MODES: &[FailureMode] = &[
     },
     FailureMode {
         code: ASTRO_ORACLE_NO_RECURRENCE,
-        summary: "the failing outcome was observed on too few distinct changes to be a pattern; a one-off is not a recurrence",
-        remediation: "wait for the outcome to recur across distinct changes, or lower oracle_gate_recurrence_floor deliberately; the oracle will not sell a single incident as a trend",
+        summary: "the failing signal was observed in too few distinct outcomes to be a pattern; a one-off is not a recurrence",
+        remediation: "wait for another distinct source-backed failing outcome, or lower oracle_gate_recurrence_floor deliberately; the oracle will not sell one outcome with many candidate changes as a trend",
         degraded_mode: DegradedMode::Refuse,
         detect: detect_no_recurrence,
     },
@@ -498,9 +881,27 @@ fn build_deficits(
             .collect();
     }
 
+    if code == ASTRO_ORACLE_NO_RECURRENCE {
+        let have = snapshot.failing_outcomes;
+        let need = config.recurrence_floor as usize;
+        let have_bits = (have as f64 + 1.0).log2();
+        let need_bits = (need as f64 + 1.0).log2();
+        return vec![LensDeficit {
+            axis: "change_outcome".to_string(),
+            lens: "failure_recurrence".to_string(),
+            have_bits,
+            need_bits,
+            missing_bits: (need_bits - have_bits).max(0.0),
+            bootstrap: format!(
+                "anchor_outcome then mine_corpus: record {} more distinct failing outcome(s) on this module (have {have}, need {need}); additional candidate changes for an existing outcome do not count",
+                need.saturating_sub(have)
+            ),
+        }];
+    }
+
     // Otherwise itemize the direct change-history sensor in bits: the information
-    // shortfall between the grounded occurrences the module has and the floor.
-    let have = snapshot.direct_occurrences;
+    // shortfall between the distinct grounded outcomes the module has and the floor.
+    let have = snapshot.direct_outcomes;
     let need = config.min_grounded_occurrences as usize;
     let have_bits = (have as f64 + 1.0).log2();
     let need_bits = (need as f64 + 1.0).log2();

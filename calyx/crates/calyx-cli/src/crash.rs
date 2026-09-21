@@ -256,7 +256,7 @@ fn write_batch_ssts(vault: &Path, seq: u64, rows: &[WriteRow], tag: &str) -> Cli
 fn write_manifest(vault: &Path, seq: u64) -> CliResult<calyx_aster::manifest::ManifestWrite> {
     let (panel_ref, codebook_refs) = ensure_manifest_assets(vault)?;
     let manifest = VaultManifest::new(seq, seq, panel_ref, codebook_refs)?;
-    Ok(ManifestStore::open(vault).write_current(&manifest)?)
+    Ok(ManifestStore::open(vault).write_current_unlocked_crash_fixture(&manifest)?)
 }
 
 fn ensure_manifest_assets(vault: &Path) -> CliResult<(ImmutableRef, Vec<ImmutableRef>)> {

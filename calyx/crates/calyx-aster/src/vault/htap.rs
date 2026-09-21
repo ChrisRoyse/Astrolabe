@@ -114,7 +114,7 @@ where
         for (idx, ((expected_cx, (resolved_cx, vector)), column_row)) in column
             .cx_ids
             .iter()
-            .zip(point_rows.into_iter())
+            .zip(point_rows)
             .zip(readback.rows.iter())
             .enumerate()
         {

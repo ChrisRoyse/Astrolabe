@@ -22,11 +22,15 @@ pub(crate) fn optimizer_ack_triggers_json_at(
         }));
     }
 
-    let vault = open_shadow_vault_writable(
+    let vault = open_shadow_vault_writable_latest_selected(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Ledger, ColumnFamily::Reactive],
+        vec![
+            ColumnFamily::Ledger,
+            ColumnFamily::Reactive,
+            ColumnFamily::TimeIndex,
+        ],
     )?;
     let report = match acknowledge_reactive_subscription(
         &vault,

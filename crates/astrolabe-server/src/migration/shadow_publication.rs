@@ -10,6 +10,11 @@ const PUBLICATION_DIR: &str = ".astrolabe-shadow-publication";
 const PUBLICATION_JOURNAL: &str = "transaction.json";
 pub(crate) const PUBLICATION_SCHEMA: &str = "astrolabe.shadow-publication.v3";
 
+struct StagePreservationOutcome {
+    label: String,
+    evidence: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicationOwner {
@@ -388,6 +393,56 @@ impl ShadowPublication {
         self.abort_error(phase, error)
     }
 
+    /// Abort one staged build and preserve its actionable error contract.
+    /// Cleanup failure remains authoritative and propagates as `Err`; a clean
+    /// abort returns one structured tool fault whose evidence names the exact
+    /// preserved stage rather than flattening it into prose (#990/#1147).
+    pub(crate) fn abort_tool_fault(self, phase: &str, error: DynError) -> Result<String, DynError> {
+        let underlying_error = error.to_string();
+        let underlying_calyx = error.downcast_ref::<calyx_core::CalyxError>();
+        let underlying_fault = underlying_calyx
+            .map(|error| {
+                json!({
+                    "schema": TOOL_FAULT_SCHEMA,
+                    "status": "error",
+                    "code": error.code,
+                    "message": error.message,
+                    "remediation": error.remediation,
+                })
+            })
+            .or_else(|| ToolFault::from_error(error.as_ref()).map(|fault| fault.envelope()));
+        let underlying_code = underlying_calyx
+            .map(|error| error.code.to_string())
+            .or_else(|| {
+                underlying_fault
+                    .as_ref()
+                    .and_then(|fault| fault.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let preservation = self.preserve_stage_outcome(phase, &underlying_error);
+        self.abort_cleanup_after_preservation(phase, &underlying_error, &preservation.label)?;
+        let mut fault = ToolFault::new(
+            "ASTRO_SHADOW_PUBLICATION_ABORTED",
+            format!(
+                "shadow publication for project {:?} failed during {phase}: {underlying_error}; the prior live generation was not committed",
+                self.project
+            ),
+            "fix the named underlying error, inspect the preserved-stage evidence, and rerun index_repository with calyx=\"shadow\"; never publish or substitute a partial generation",
+        )
+        .with_detail("project", self.project.clone())
+        .with_detail("failed_phase", phase.to_string())
+        .with_detail("underlying_error", underlying_error)
+        .with_detail("stage_preservation", preservation.evidence);
+        if let Some(code) = underlying_code {
+            fault = fault.with_detail("underlying_code", code);
+        }
+        if let Some(envelope) = underlying_fault {
+            fault = fault.with_detail("underlying_fault", envelope);
+        }
+        fault.into_result()
+    }
+
     /// Remove an unpublished staged transaction while preserving an already
     /// validated MCP tool-error envelope for the caller. The originating error
     /// may be returned only after both the abort journal and physical cleanup
@@ -456,7 +511,7 @@ impl ShadowPublication {
                 &staged_vault,
                 &outcome.vault_id,
                 &outcome.vault_salt,
-                Vec::new(),
+                vec![ColumnFamily::Ledger],
             )?;
             let chain = verify_chain(&vault)?;
             let staged_ledger_checkpoint =
@@ -916,8 +971,12 @@ impl ShadowPublication {
                 )
                 .into());
             }
-            let vault =
-                open_shadow_vault_read_only(&live_vault, &vault_id, &vault_salt, Vec::new())?;
+            let vault = open_shadow_vault_read_only(
+                &live_vault,
+                &vault_id,
+                &vault_salt,
+                vec![ColumnFamily::Ledger],
+            )?;
             let verification = verify_chain(&vault)?;
             let live_ledger_checkpoint = capture_shadow_ledger_checkpoint(
                 &live_vault,
@@ -1225,7 +1284,14 @@ impl ShadowPublication {
                         &staged_vault_dir,
                         SHADOW_VAULT_ID,
                         &salt,
-                        Vec::new(),
+                        vec![
+                            ColumnFamily::Base,
+                            ColumnFamily::Blob,
+                            ColumnFamily::Graph,
+                            ColumnFamily::Kv,
+                            ColumnFamily::Recurrence,
+                            ColumnFamily::Kernel,
+                        ],
                     )?;
                     let prior = read_persisted_lower_state(&self.stage_cache, &self.project)?
                         .ok_or_else(|| {
@@ -1265,11 +1331,20 @@ impl ShadowPublication {
                                 "ASTRO_SHADOW_PUBLICATION_SEED_LOWER_REPAIR_CODE_MISSING: a typed regenerable lowered-artifact refusal lost its machine code; remediation: preserve the staged generation and repair the error contract before retrying".into()
                             })?;
                             drop(staged_vault);
-                            let writable_vault = open_shadow_vault_writable(
+                            let writable_vault = open_shadow_vault_writable_latest_selected(
                                 &staged_vault_dir,
                                 SHADOW_VAULT_ID,
                                 &salt,
-                                Vec::new(),
+                                vec![
+                                    ColumnFamily::Base,
+                                    ColumnFamily::Blob,
+                                    ColumnFamily::Graph,
+                                    ColumnFamily::Kv,
+                                    ColumnFamily::Recurrence,
+                                    ColumnFamily::Kernel,
+                                    ColumnFamily::Ledger,
+                                    ColumnFamily::TimeIndex,
+                                ],
                             )?;
                             let repaired = regenerate_and_persist_shadow_lower(
                                 &self.stage_cache,
@@ -1281,7 +1356,14 @@ impl ShadowPublication {
                                 &staged_vault_dir,
                                 SHADOW_VAULT_ID,
                                 &salt,
-                                Vec::new(),
+                                vec![
+                                    ColumnFamily::Base,
+                                    ColumnFamily::Blob,
+                                    ColumnFamily::Graph,
+                                    ColumnFamily::Kv,
+                                    ColumnFamily::Recurrence,
+                                    ColumnFamily::Kernel,
+                                ],
                             )?;
                             let readback = verify_lowered_artifact(
                                 &readback_vault,
@@ -1411,9 +1493,12 @@ impl ShadowPublication {
     /// failure is labeled and surfaced, never silently swallowed; it does not
     /// block cleanup, because leaving a half-published transaction behind is the
     /// worse outcome.
-    fn preserve_stage_label(&self, phase: &str, error: &str) -> String {
+    fn preserve_stage_outcome(&self, phase: &str, error: &str) -> StagePreservationOutcome {
         let Some(arming) = self.stage_preservation.as_ref() else {
-            return String::new();
+            return StagePreservationOutcome {
+                label: String::new(),
+                evidence: json!({"status": "not_armed"}),
+            };
         };
         if !preserve_aborted_stage_enabled() {
             let label = format!(
@@ -1424,7 +1509,13 @@ impl ShadowPublication {
                 "astro.shadow.stage_preserved project={} status=skipped reason=operator_opt_out",
                 self.project
             );
-            return label;
+            return StagePreservationOutcome {
+                label,
+                evidence: json!({
+                    "status": "skipped",
+                    "reason": "operator_opt_out",
+                }),
+            };
         }
         match preserve_stage(
             &self.live_cache,
@@ -1442,7 +1533,7 @@ impl ShadowPublication {
                     "astro.shadow.stage_preserved project={} status=preserved evidence={evidence}",
                     self.project
                 );
-                format!(
+                let label = format!(
                     "; {ASTRO_SHADOW_STAGE_PRESERVED}: the complete staged cache family was preserved at {} (resume_token={}, source_sha256={}, source_bytes={}, stage_sha256={}, stage_bytes={}, stage_files={}, config_path={}, signal_card_ledger_path={}); remediation: inspect the staged _config.db marker and ledger at that root; after fixing the named phase error, retry with ASTRO_SHADOW_RESUME_PRESERVED_STAGE=1 to adopt the CBM store instead of re-running that pass — adoption refuses unless every input fingerprint still matches",
                     evidence["preserved_stage_dir"],
                     evidence["resume_token"],
@@ -1453,22 +1544,35 @@ impl ShadowPublication {
                     evidence["stage_file_count"],
                     evidence["config_path"],
                     evidence["signal_card_ledger_path"],
-                )
+                );
+                StagePreservationOutcome {
+                    label,
+                    evidence: json!({
+                        "status": "preserved",
+                        "evidence": evidence,
+                    }),
+                }
             }
             Err(preserve_error) => {
                 eprintln!(
                     "astro.shadow.stage_preserved project={} status=failed error={preserve_error}",
                     self.project
                 );
-                format!("; {ASTRO_SHADOW_STAGE_PRESERVE_FAILED}: {preserve_error}")
+                StagePreservationOutcome {
+                    label: format!("; {ASTRO_SHADOW_STAGE_PRESERVE_FAILED}: {preserve_error}"),
+                    evidence: json!({
+                        "status": "failed",
+                        "error": preserve_error.to_string(),
+                    }),
+                }
             }
         }
     }
 
     fn abort_cleanup(&self, phase: &str, error: impl std::fmt::Display) -> Result<(), DynError> {
         let error = error.to_string();
-        let preservation = self.preserve_stage_label(phase, &error);
-        self.abort_cleanup_after_preservation(phase, &error, &preservation)
+        let preservation = self.preserve_stage_outcome(phase, &error);
+        self.abort_cleanup_after_preservation(phase, &error, &preservation.label)
     }
 
     fn abort_cleanup_after_preservation(
@@ -1514,15 +1618,16 @@ impl ShadowPublication {
 
     fn abort_error(&self, phase: &str, error: impl std::fmt::Display) -> DynError {
         let error = error.to_string();
-        let preservation = self.preserve_stage_label(phase, &error);
+        let preservation = self.preserve_stage_outcome(phase, &error);
         if let Err(cleanup_error) =
-            self.abort_cleanup_after_preservation(phase, &error, &preservation)
+            self.abort_cleanup_after_preservation(phase, &error, &preservation.label)
         {
             return cleanup_error;
         }
         format!(
             "ASTRO_SHADOW_PUBLICATION_ABORTED: shadow publication for project {:?} failed during {phase}: {error}. The prior live generation was not committed. Remediation: fix the named phase error and rerun index_repository with calyx=\"shadow\"{preservation}",
-            self.project
+            self.project,
+            preservation = preservation.label,
         )
         .into()
     }

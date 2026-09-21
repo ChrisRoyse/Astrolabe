@@ -231,14 +231,13 @@ pub(super) fn lock_hook<C: Clock>(
         .map_err(|_| CalyxError::ledger_group_commit_failed("ledger hook lock poisoned"))
 }
 
-pub(super) fn refresh_hook<C: Clock>(
-    hook: &AsterLedgerHook<C>,
+pub(super) fn prepare_hook_refresh<C: Clock>(
     vault_dir: &Path,
     recovery: &RecoveredBatches,
     checkpoint: Option<CheckpointConfig>,
     tiering_policy: Option<&TieringPolicy>,
     clock: Arc<C>,
-) -> Result<()> {
+) -> Result<DefaultLedgerHook<MemoryLedgerStore, Arc<C>>> {
     let store = match physical_ledger_store(
         vault_dir,
         LedgerViewLock::AlreadyHeld,
@@ -248,12 +247,9 @@ pub(super) fn refresh_hook<C: Clock>(
         Some(store) => store,
         None => recovered_ledger_store(recovery)?,
     };
-    let replacement = recover_hook_from_store(store, checkpoint, clock)?
+    recover_hook_from_store(store, checkpoint, clock)?
         .into_inner()
-        .map_err(|_| CalyxError::ledger_group_commit_failed("new ledger hook lock poisoned"))?;
-    let mut guard = lock_hook(hook)?;
-    *guard = replacement;
-    Ok(())
+        .map_err(|_| CalyxError::ledger_group_commit_failed("new ledger hook lock poisoned"))
 }
 
 pub(super) fn stage_ingest<C: Clock>(

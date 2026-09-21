@@ -9,9 +9,9 @@
 //! dedup (#455), kernel composition (#456), the growth scheduler (#457), and
 //! fleet-scope serving (#459). None of those atoms import SQLite rows or run
 //! panels; coupling them to the server would drag the C half into every fleet
-//! tool. This crate depends on the Calyx vault engine, the ledger, and (since
-//! #452, for the orchestrator's independent readbacks only) the pure-Rust
-//! `astrolabe-ingest` kernel-artifact codec plus `rusqlite` — never `cbm-sys`.
+//! tool. This crate depends on the Calyx vault engine, the ledger, the
+//! pure-Rust ingest/composite-generation codecs used by independent readback
+//! and composition, plus `rusqlite` — never `cbm-sys`.
 //!
 //! # Where the data lives
 //!
@@ -31,6 +31,7 @@ pub mod dedup;
 pub mod discover;
 pub mod farm_lock;
 pub mod grow;
+pub mod kernel_generation;
 pub mod orchestrator;
 pub mod projection_upgrade;
 pub mod record;
@@ -117,13 +118,27 @@ pub use clone_farm::{
     run_clone_pass, target_dir,
 };
 pub use compose::{
-    ASTRO_FLEET_COMPOSE_NO_KERNELS, ASTRO_FLEET_KERNEL_MISSING, ComposeConfig,
-    FLEET_COMPOSE_KNOB_REGISTRY_VERSION, FLEET_COMPOSE_KNOBS, FLEET_KERNEL_REPORT_KIND,
-    compose_fleet_kernel, read_fleet_kernel, verify_member_provenance,
+    ASTRO_FLEET_COMPOSE_ARITHMETIC_OVERFLOW, ASTRO_FLEET_COMPOSE_NO_KERNELS,
+    ASTRO_FLEET_KERNEL_ATOMIC_GENERATION_REQUIRED, ASTRO_FLEET_KERNEL_MISSING, ComposeConfig,
+    FLEET_COMPOSE_KNOB_REGISTRY_VERSION, FLEET_COMPOSE_KNOBS, FleetKernelSourceVerificationPass,
+    FleetKernelSourceVerificationReport, compose_fleet_kernel, read_fleet_kernel,
+    read_fleet_kernel_with_provenance, read_verified_fleet_kernel_generation,
+    verify_fleet_kernel_generation_sources, verify_member_provenance,
 };
 pub use discover::{
     ASTRO_FLEET_DISCOVERY_INCOMPLETE, ASTRO_FLEET_GH_API, DEFAULT_CATALOG_ROOT, DEFAULT_LANGUAGES,
     DEFAULT_STAR_FLOOR, run_discovery,
+};
+pub use kernel_generation::{
+    ASTRO_FLEET_ADMISSION_REQUIRED, ASTRO_FLEET_GENERATION_CORRUPT,
+    ASTRO_FLEET_GENERATION_INCOMPLETE, ASTRO_FLEET_GENERATION_PERSIST,
+    ASTRO_FLEET_GENERATION_SOURCE_DRIFT, CurrentFleetKernelGeneration,
+    FLEET_KERNEL_ADMISSION_SCHEMA, FLEET_KERNEL_ADMISSION_SOURCE_KIND, FleetKernelAdmissionInput,
+    FleetKernelGenerationHeader, FleetKernelGenerationManifest, FleetKernelGenerationPointer,
+    FleetKernelMemberIndexDescriptor, FleetKernelSourceRoster, FleetMemberOccurrenceProvenance,
+    FleetMemberProvenance, FleetMemberProvenanceRoster, LoadedFleetKernelMemberIndex,
+    read_current_fleet_kernel_generation, read_current_fleet_kernel_generation_header,
+    verify_fleet_kernel_generation_retention,
 };
 pub use orchestrator::{
     ASTRO_FLEET_HOST_BUSY, ASTRO_FLEET_PIPELINE_CONFIG, ASTRO_FLEET_PIPELINE_INCOMPLETE,

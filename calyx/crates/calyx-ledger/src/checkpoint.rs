@@ -244,6 +244,13 @@ impl LedgerCfStore for OverlayLedgerStore {
             .collect())
     }
 
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        Ok(self.rows.get(&seq).map(|bytes| LedgerRow {
+            seq,
+            bytes: bytes.clone(),
+        }))
+    }
+
     fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> Result<()> {
         Err(CalyxError::ledger_append_only_violation(format!(
             "checkpoint overlay store is read-only for seq {seq}"

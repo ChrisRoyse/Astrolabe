@@ -494,10 +494,12 @@ where
             }
             // Input-store rows ride the same atomic batch as the base record.
             rows.extend(input_rows);
-            self.commit_rows_locked(&rows)?;
+            let committed_seq = self.commit_rows_locked(&rows)?;
             if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
             {
-                ledger_hook::commit_staged(hook, staged)?;
+                ledger_hook::commit_staged(hook, staged).map_err(|error| {
+                    self.reconcile_post_commit_ledger_hook_failure(committed_seq, &error)
+                })?;
             }
             Ok(id)
         })
@@ -535,8 +537,8 @@ where
     fn anchor(&self, id: CxId, anchor: Anchor) -> Result<()> {
         anchor.validate_schema()?;
         self.with_recurrence_write_lock(|| {
-            let latest = self.snapshot();
-            let snapshot = self.snapshot_handle(latest);
+            let evaluation_seq = self.snapshot();
+            let snapshot = self.snapshot_handle(evaluation_seq);
             let base = self
                 .rows
                 .read_at(
@@ -568,7 +570,7 @@ where
                 .into_iter()
                 .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
                 .collect::<Vec<_>>();
-            self.commit_rows(&rows)?;
+            self.commit_rows_if_seq(evaluation_seq, rows, "anchor append")?;
             Ok(())
         })
     }

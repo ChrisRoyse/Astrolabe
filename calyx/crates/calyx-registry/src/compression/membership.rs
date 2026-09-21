@@ -64,7 +64,7 @@ pub(super) fn build_membership<'a>(
         let mut index = leaf_index;
         let mut siblings = Vec::with_capacity(depth);
         for level in levels.iter().take(levels.len().saturating_sub(1)) {
-            let sibling_index = if index % 2 == 0 {
+            let sibling_index = if index.is_multiple_of(2) {
                 (index + 1).min(level.len() - 1)
             } else {
                 index - 1
@@ -126,7 +126,7 @@ pub(super) fn verify_membership_proof(
     let mut index = proof.leaf_index as usize;
     let mut width = proof.leaf_count as usize;
     for sibling in proof.siblings {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             if index + 1 >= width && sibling != current {
                 return Err(invalid(
                     "compressed membership proof has a non-canonical sibling for an unpaired leaf",

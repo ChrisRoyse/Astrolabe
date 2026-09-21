@@ -5,20 +5,65 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::ffi::{CStr, CString, NulError};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
+use sha2::{Digest, Sha256};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Publishes one already-synced file under a new name without replacing an
+/// existing target. Windows requests write-through namespace publication; the
+/// caller remains responsible for byte readback and pending-name cleanup.
+#[cfg(windows)]
+pub fn publish_file_no_replace_write_through(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut target_wide = target.as_os_str().encode_wide().collect::<Vec<_>>();
+    if source_wide.contains(&0) || target_wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "immutable publication path contains an interior NUL",
+        ));
+    }
+    source_wide.push(0);
+    target_wide.push(0);
+    // SAFETY: both vectors are NUL-terminated and remain live for the call;
+    // MoveFileExW retains neither pointer. Omitting REPLACE_EXISTING preserves
+    // the no-replace contract.
+    if unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Publishes one already-synced file under a new name without replacing an
+/// existing target. The caller remains responsible for byte readback and
+/// pending-name cleanup.
+#[cfg(not(windows))]
+pub fn publish_file_no_replace_write_through(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::hard_link(source, target)?;
+    fs::remove_file(source)
+}
 
 fn initialize_cbm_allocator() -> Result<(), BridgeError> {
     cbm_sys::initialize_allocator_bindings_first()
@@ -77,6 +122,17 @@ pub struct WindowsDirectoryIdentityError {
     pub message: String,
 }
 
+/// Stable Windows identity and immutable metadata for one opened ordinary file.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowsFileIdentity {
+    pub volume_serial: u64,
+    pub file_id_128: [u8; 16],
+    pub final_handle_path: String,
+    pub bytes: u64,
+    pub last_write_time: u64,
+    pub file_attributes: u32,
+}
+
 impl fmt::Display for WindowsDirectoryIdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -88,6 +144,140 @@ impl fmt::Display for WindowsDirectoryIdentityError {
 }
 
 impl Error for WindowsDirectoryIdentityError {}
+
+#[cfg(windows)]
+fn windows_file_identity_from_open_file(
+    path: &Path,
+    file: &File,
+) -> Result<WindowsFileIdentity, WindowsDirectoryIdentityError> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO, FILE_NAME_NORMALIZED, FileIdInfo,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let failure = |step, error: std::io::Error| WindowsDirectoryIdentityError {
+        step,
+        raw_os_error: error.raw_os_error(),
+        message: format!("{}: {error}", path.display()),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| failure("file_metadata", error))?;
+    if !metadata.is_file() {
+        return Err(failure(
+            "file_kind",
+            std::io::Error::other("the worker executable path is not an ordinary file"),
+        ));
+    }
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(failure(
+            "file_reparse",
+            std::io::Error::other("the worker executable path is a reparse point"),
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(failure(
+            "file_empty",
+            std::io::Error::other("the worker executable file is empty"),
+        ));
+    }
+
+    let handle = file.as_raw_handle();
+    let mut file_id = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a live file handle and `file_id` is a correctly sized
+    // writable output buffer. No borrowed value escapes this call.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut file_id).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO fits u32"),
+        )
+    } == 0
+    {
+        return Err(failure("file_id_info", std::io::Error::last_os_error()));
+    }
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    // SAFETY: the null buffer is the documented size query for the retained
+    // handle and is not dereferenced.
+    let required = unsafe { GetFinalPathNameByHandleW(handle, ptr::null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(failure("final_path_size", std::io::Error::last_os_error()));
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    let capacity = u32::try_from(buffer.len()).map_err(|_| {
+        failure(
+            "final_path_capacity",
+            std::io::Error::other("final path buffer exceeds u32"),
+        )
+    })?;
+    // SAFETY: the buffer is writable for `capacity` UTF-16 units and the file
+    // handle remains live for the duration of the call.
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), capacity, flags) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(failure("final_path_read", std::io::Error::last_os_error()));
+    }
+    let mut final_handle_path =
+        String::from_utf16(&buffer[..written as usize]).map_err(|error| {
+            failure(
+                "final_path_utf16",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            )
+        })?;
+    if let Some(rest) = final_handle_path.strip_prefix(r"\\?\UNC\") {
+        final_handle_path = format!(r"\\{rest}");
+    } else if let Some(rest) = final_handle_path.strip_prefix(r"\\?\") {
+        final_handle_path = rest.to_string();
+    }
+    Ok(WindowsFileIdentity {
+        volume_serial: file_id.VolumeSerialNumber,
+        file_id_128: file_id.FileId.Identifier,
+        final_handle_path,
+        bytes: metadata.len(),
+        last_write_time: metadata.last_write_time(),
+        file_attributes: metadata.file_attributes(),
+    })
+}
+
+/// Open and independently identify one ordinary Windows file without retaining
+/// the handle after this function returns.
+#[cfg(windows)]
+pub fn capture_windows_file_identity(
+    path: &Path,
+) -> Result<WindowsFileIdentity, WindowsDirectoryIdentityError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .map_err(|error| WindowsDirectoryIdentityError {
+            step: "open_file",
+            raw_os_error: error.raw_os_error(),
+            message: format!("{}: {error}", path.display()),
+        })?;
+    windows_file_identity_from_open_file(path, &file)
+}
+
+#[cfg(not(windows))]
+pub fn capture_windows_file_identity(
+    path: &Path,
+) -> Result<WindowsFileIdentity, WindowsDirectoryIdentityError> {
+    Err(WindowsDirectoryIdentityError {
+        step: "platform",
+        raw_os_error: None,
+        message: format!(
+            "{}: Windows file identity is unavailable outside the native Windows target",
+            path.display()
+        ),
+    })
+}
 
 #[cfg(windows)]
 pub fn capture_windows_directory_identity(
@@ -669,20 +859,2455 @@ pub enum CbmLogMode {
     Silent,
 }
 
-pub fn initialize_cbm_host_process(binary_path: Option<&str>) -> Result<(), BridgeError> {
-    initialize_cbm_host_process_with_log_mode(binary_path, CbmLogMode::Default)
+const ASTRO_INDEX_WORKER_CAPABILITY_ARG: &str = "__astrolabe-index-worker-capability-v1";
+const ASTRO_INDEX_WORKER_CAPABILITY_SCHEMA: &str = "astrolabe.index-worker-capability.v3";
+const ASTRO_INDEX_WORKER_ARGV_SCHEMA: &str = "astrolabe.index-worker-argv.v2";
+const ASTRO_INDEX_WORKER_PROGRESS_SCHEMA: &str = "cbm.worker-progress.v1";
+const ASTRO_WORKER_SOURCE_GENERATION_SCHEMA: &str = "astrolabe.worker-source-generation.v1";
+static WORKER_CAPABILITY_CHALLENGE_ORDINAL: AtomicU64 = AtomicU64::new(0);
+
+// A Windows extended path contains at most 32,767 UTF-16 units. JSON escaping
+// can expand one unit to at most six ASCII bytes; the fixed capability fields
+// fit inside the additional 16 KiB. This is a protocol-shape ceiling, not a
+// measured runtime budget.
+#[cfg(windows)]
+const WORKER_CAPABILITY_OUTPUT_MAX_BYTES: usize = 32_767 * 6 + 16 * 1024;
+
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CbmWorkerCapabilityReceipt {
+    pub schema: String,
+    pub challenge: String,
+    pub worker_argv_schema: String,
+    pub progress_schema: String,
+    pub progress_schema_version: u64,
+    pub worker_argv_template: Vec<String>,
+    pub worker_cache_arg: String,
+    pub transition_grant_arg: String,
+    pub package_version: String,
+    pub source_generation_schema: String,
+    pub source_generation_sha256: String,
+    pub artifact_identity: WindowsFileIdentity,
 }
 
-pub fn initialize_cbm_host_process_silent(binary_path: Option<&str>) -> Result<(), BridgeError> {
-    initialize_cbm_host_process_with_log_mode(binary_path, CbmLogMode::Silent)
+struct ExternalWorkerLease {
+    file: File,
+    identity: WindowsFileIdentity,
 }
 
-/// Initialize the CBM host process for a `cli <tool>` invocation, raising the
-/// libcbm log floor to the registry-declared `cli_stderr_log_level_floor` (WARN)
-/// so per-call INFO lines (`mem.init`/`vmem.init`) never reach stderr (#392).
-/// Warnings and errors still flow through the tracing sink to stderr.
-pub fn initialize_cbm_host_process_cli(binary_path: Option<&str>) -> Result<(), BridgeError> {
-    initialize_cbm_host_process_with_log_mode(binary_path, CbmLogMode::CliWarnFloor)
+/// Independent parent-side evidence that the private capability process began
+/// as one detached, suspended, atomically Job-owned generation, was resumed
+/// exactly once, reached bounded EOF, and left the same lifetime accounting
+/// with the Job observed empty twice before its receipt was accepted.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CbmWorkerCapabilityObservation {
+    pub child_pid: u32,
+    pub primary_thread_id: u32,
+    pub resume_previous_suspend_count: u32,
+    pub timeout_ms: u32,
+    pub elapsed_micros: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub job_empty_readbacks: u32,
+    pub job_pre_spawn_snapshot: CbmWorkerCapabilityJobSnapshot,
+    pub job_suspended_snapshot: CbmWorkerCapabilityJobSnapshot,
+    pub job_terminal_snapshot: CbmWorkerCapabilityJobSnapshot,
+}
+
+/// Exact parent-side bracketed Job accounting and PID-list state at one
+/// capability lifecycle boundary.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CbmWorkerCapabilityJobSnapshot {
+    pub accounting_before_total_processes: u32,
+    pub accounting_before_active_processes: u32,
+    pub accounting_before_total_terminated_processes: u32,
+    pub total_processes: u32,
+    pub active_processes: u32,
+    pub total_terminated_processes: u32,
+    pub assigned_processes: u32,
+    pub listed_processes: u32,
+    pub listed_process_id: Option<u32>,
+}
+
+struct BoundedCapabilityProcess {
+    output: Output,
+    observation: CbmWorkerCapabilityObservation,
+}
+
+#[cfg(windows)]
+mod capability_process {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::process::ExitStatusExt;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER,
+        GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+        UpdateProcThreadAttribute, WaitForSingleObject,
+    };
+
+    const PROCESS_ATTRIBUTE_COUNT: u32 = 2;
+    const MAX_WINDOWS_COMMAND_LINE_UNITS: usize = 32_767;
+    const REQUIRED_JOB_LIMITS: u32 =
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    const REQUIRED_ACTIVE_PROCESS_LIMIT: u32 = 1;
+    const REQUIRED_EMPTY_READBACKS: u32 = 2;
+    const CLEANUP_RESERVE_DIVISOR: u32 = 4;
+    const CAPABILITY_TERMINATION_EXIT_CODE: u32 = 0xA57C_0001;
+    const PROCESS_LIST_OFFSET: usize = offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+
+    #[derive(Debug)]
+    struct PipeCapture {
+        bytes: Vec<u8>,
+        overflow: bool,
+        total_bytes: u64,
+    }
+
+    type CapabilityPipeRead = std::io::Result<PipeCapture>;
+
+    struct CapabilityReader {
+        label: &'static str,
+        receiver: Receiver<CapabilityPipeRead>,
+    }
+
+    impl CapabilityReader {
+        fn spawn(label: &'static str, file: File) -> Result<Self, BridgeError> {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let thread_name = format!("cbm-capability-{label}");
+            let reader = thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    let result = read_bounded_pipe(file);
+                    let _ = sender.send(result);
+                })
+                .map_err(|error| {
+                    envelope(
+                        format!(
+                            "ASTRO_CBM_WORKER_CAPABILITY_{}_READER_SPAWN_FAILED",
+                            label.to_ascii_uppercase()
+                        ),
+                        format!("capability {label} reader could not start: {error}"),
+                        "Stop startup and inspect native thread creation; never run a capability process with an unconsumed pipe.",
+                    )
+                })?;
+            // The result channel, not JoinHandle::join, is the bounded terminal
+            // protocol. A panicking reader disconnects the channel; no caller
+            // can acquire an unbounded thread-join tail after its deadline.
+            drop(reader);
+            Ok(Self { label, receiver })
+        }
+
+        fn finish(self, deadline: Instant) -> Result<PipeCapture, String> {
+            let received = match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => self
+                    .receiver
+                    .recv_timeout(remaining)
+                    .map_err(|error| match error {
+                        RecvTimeoutError::Timeout => format!(
+                            "{} reader did not publish EOF before its deadline",
+                            self.label
+                        ),
+                        RecvTimeoutError::Disconnected => {
+                            format!("{} reader terminated without a result", self.label)
+                        }
+                    }),
+                _ => self.receiver.try_recv().map_err(|error| match error {
+                    TryRecvError::Empty => {
+                        format!("{} reader deadline expired before EOF", self.label)
+                    }
+                    TryRecvError::Disconnected => {
+                        format!("{} reader terminated without a result", self.label)
+                    }
+                }),
+            }?;
+            received.map_err(|error| format!("{} pipe read failed: {error}", self.label))
+        }
+    }
+
+    #[derive(Default)]
+    struct CapabilityReaders {
+        stdout: Option<CapabilityReader>,
+        stderr: Option<CapabilityReader>,
+    }
+
+    impl CapabilityReaders {
+        fn finish(
+            &mut self,
+            deadline: Instant,
+        ) -> (Result<PipeCapture, String>, Result<PipeCapture, String>) {
+            let stdout = self
+                .stdout
+                .take()
+                .ok_or_else(|| "stdout reader was not retained".to_string())
+                .and_then(|reader| reader.finish(deadline));
+            let stderr = self
+                .stderr
+                .take()
+                .ok_or_else(|| "stderr reader was not retained".to_string())
+                .and_then(|reader| reader.finish(deadline));
+            (stdout, stderr)
+        }
+    }
+
+    fn pipe_result_summary(result: &Result<PipeCapture, String>) -> String {
+        match result {
+            Ok(capture) => format!(
+                "ok(retained_bytes={}, total_bytes={}, overflow={})",
+                capture.bytes.len(),
+                capture.total_bytes,
+                capture.overflow
+            ),
+            Err(error) => format!("error({error})"),
+        }
+    }
+
+    struct OwnedKernelHandle(HANDLE);
+
+    impl OwnedKernelHandle {
+        fn new(handle: HANDLE) -> Option<Self> {
+            (!handle.is_null()).then_some(Self(handle))
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+
+        fn into_raw(self) -> HANDLE {
+            let handle = self.0;
+            std::mem::forget(self);
+            handle
+        }
+
+        fn close(self) -> Result<(), (Self, u32)> {
+            // SAFETY: `self` uniquely owns this exact non-null handle. A
+            // successful close consumes that ownership and forgets the guard so
+            // Drop cannot close it again. A failed close returns the still-owned
+            // guard with the immediately captured thread-local error.
+            if unsafe { CloseHandle(self.0) } != 0 {
+                std::mem::forget(self);
+                Ok(())
+            } else {
+                let os_code = unsafe { GetLastError() };
+                Err((self, os_code))
+            }
+        }
+    }
+
+    impl Drop for OwnedKernelHandle {
+        fn drop(&mut self) {
+            // SAFETY: this guard uniquely owns one non-null kernel handle.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    struct ProcThreadAttributeList {
+        buffer: Vec<usize>,
+    }
+
+    impl ProcThreadAttributeList {
+        fn new() -> Result<Self, BridgeError> {
+            let mut byte_len = 0_usize;
+            // SAFETY: the documented sizing call writes only the required byte
+            // length when passed a null attribute-list pointer.
+            let sized = unsafe {
+                InitializeProcThreadAttributeList(
+                    std::ptr::null_mut(),
+                    PROCESS_ATTRIBUTE_COUNT,
+                    0,
+                    &mut byte_len,
+                )
+            };
+            // SAFETY: this read immediately follows the sizing call.
+            let size_error = unsafe { GetLastError() };
+            if sized != 0 || size_error != ERROR_INSUFFICIENT_BUFFER || byte_len == 0 {
+                return Err(win32_failure(
+                    "ASTRO_CBM_WORKER_CAPABILITY_ATTRIBUTE_LIST_FAILED",
+                    format!(
+                        "capability process attribute-list sizing returned success={sized}, bytes={byte_len}"
+                    ),
+                    size_error,
+                    "Inspect the Windows extended-startup attribute-list contract; do not launch an unbound capability process.",
+                ));
+            }
+            let words = byte_len.div_ceil(size_of::<usize>());
+            let mut buffer = Vec::new();
+            buffer.try_reserve_exact(words).map_err(|error| {
+                envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_ATTRIBUTE_LIST_FAILED",
+                    format!(
+                        "could not reserve {byte_len} bytes for capability process attributes: {error}"
+                    ),
+                    "Stop startup and inspect memory pressure; do not launch an unbound capability process.",
+                )
+            })?;
+            buffer.resize(words, 0);
+            let list = buffer.as_mut_ptr().cast();
+            // SAFETY: the aligned buffer has at least the size returned by the
+            // sizing call and remains owned by this guard.
+            if unsafe {
+                InitializeProcThreadAttributeList(list, PROCESS_ATTRIBUTE_COUNT, 0, &mut byte_len)
+            } == 0
+            {
+                return Err(last_win32_failure(
+                    "ASTRO_CBM_WORKER_CAPABILITY_ATTRIBUTE_LIST_FAILED",
+                    "could not initialize the capability process attribute list",
+                    "Inspect the Windows extended-startup attribute-list contract; do not launch an unbound capability process.",
+                ));
+            }
+            Ok(Self { buffer })
+        }
+
+        fn raw(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+            self.buffer.as_ptr().cast_mut().cast()
+        }
+
+        fn update_handles(
+            &mut self,
+            attribute: usize,
+            handles: &[HANDLE],
+            label: &str,
+        ) -> Result<(), BridgeError> {
+            if handles.is_empty() || handles.iter().any(|handle| handle.is_null()) {
+                return Err(envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_ATTRIBUTE_LIST_FAILED",
+                    format!("the capability {label} is empty or contains a null handle"),
+                    "Stop startup and inspect process-handle construction; do not launch an unbound capability process.",
+                ));
+            }
+            let byte_len = handles
+                .len()
+                .checked_mul(size_of::<HANDLE>())
+                .ok_or_else(|| {
+                    envelope(
+                        "ASTRO_CBM_WORKER_CAPABILITY_ATTRIBUTE_LIST_FAILED",
+                        format!("the capability {label} byte length overflowed"),
+                        "Stop startup and inspect process-handle construction; do not launch an unbound capability process.",
+                    )
+                })?;
+            // SAFETY: the initialized list and handle array remain live through
+            // CreateProcessW, and the exact handle-array byte length is passed.
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    self.raw(),
+                    0,
+                    attribute,
+                    handles.as_ptr().cast(),
+                    byte_len,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(last_win32_failure(
+                    "ASTRO_CBM_WORKER_CAPABILITY_ATTRIBUTE_LIST_FAILED",
+                    format!("could not apply the capability {label}"),
+                    "Inspect the Windows extended-startup handle-list contract; do not launch an unbound capability process.",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ProcThreadAttributeList {
+        fn drop(&mut self) {
+            // SAFETY: the buffer contains one successfully initialized list.
+            unsafe { DeleteProcThreadAttributeList(self.raw()) };
+        }
+    }
+
+    struct CapabilityJob {
+        handle: OwnedKernelHandle,
+    }
+
+    impl CapabilityJob {
+        fn create() -> Result<Self, BridgeError> {
+            // SAFETY: null attributes and name request a private unnamed Job.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            let handle = OwnedKernelHandle::new(handle).ok_or_else(|| {
+                last_win32_failure(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_CREATE_FAILED",
+                    "could not create the private capability Job Object",
+                    "Inspect Windows Job Object creation; do not run a capability outside an owned kill-on-close Job.",
+                )
+            })?;
+            let job = Self { handle };
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = REQUIRED_JOB_LIMITS;
+            limits.BasicLimitInformation.ActiveProcessLimit = REQUIRED_ACTIVE_PROCESS_LIMIT;
+            // SAFETY: the Job handle is live and `limits` is initialized for
+            // its exact structure size.
+            if unsafe {
+                SetInformationJobObject(
+                    job.handle.raw(),
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&limits).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_win32_failure(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_CONFIGURE_FAILED",
+                    "could not configure ACTIVE_PROCESS=1 and KILL_ON_JOB_CLOSE for the capability Job Object",
+                    "Inspect Windows Job Object policy; do not run a capability without the exact cohort limits.",
+                ));
+            }
+            let observed = query_job_limits(job.handle.raw())?;
+            if observed.BasicLimitInformation.LimitFlags != REQUIRED_JOB_LIMITS
+                || observed.BasicLimitInformation.ActiveProcessLimit
+                    != REQUIRED_ACTIVE_PROCESS_LIMIT
+            {
+                return Err(envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_LIMIT_READBACK_MISMATCH",
+                    format!(
+                        "the capability Job readback was flags={:#x}, active_process_limit={}, expected flags={REQUIRED_JOB_LIMITS:#x}, active_process_limit={REQUIRED_ACTIVE_PROCESS_LIMIT}",
+                        observed.BasicLimitInformation.LimitFlags,
+                        observed.BasicLimitInformation.ActiveProcessLimit
+                    ),
+                    "Stop startup and inspect host Job Object policy; never accept a capability whose exact kill and process-count limits were not read back.",
+                ));
+            }
+            Ok(job)
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.handle.raw()
+        }
+    }
+
+    struct PipePair {
+        reader: File,
+        child_writer: OwnedKernelHandle,
+    }
+
+    fn create_pipe(label: &str) -> Result<PipePair, BridgeError> {
+        let mut read_handle = std::ptr::null_mut();
+        let mut write_handle = std::ptr::null_mut();
+        // SAFETY: both output pointers are writable. Null security attributes
+        // make both initial handles non-inheritable.
+        let created =
+            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0) };
+        // Capture the error before closing any partial handles.
+        let os_code = (created == 0).then(|| unsafe { GetLastError() });
+        let read_handle = OwnedKernelHandle::new(read_handle);
+        let write_handle = OwnedKernelHandle::new(write_handle);
+        if let Some(os_code) = os_code {
+            return Err(win32_failure(
+                "ASTRO_CBM_WORKER_CAPABILITY_PIPE_CREATE_FAILED",
+                format!("could not create the capability {label} pipe"),
+                os_code,
+                "Inspect Windows anonymous-pipe creation; do not launch a capability without independently drained output.",
+            ));
+        }
+        let read_handle = read_handle.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_PIPE_CREATE_FAILED",
+                format!("CreatePipe returned a null capability {label} read handle"),
+                "Stop startup and inspect Windows anonymous-pipe creation; do not launch a capability without independently drained output.",
+            )
+        })?;
+        let write_handle = write_handle.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_PIPE_CREATE_FAILED",
+                format!("CreatePipe returned a null capability {label} write handle"),
+                "Stop startup and inspect Windows anonymous-pipe creation; do not launch a capability without independently drained output.",
+            )
+        })?;
+        let child_writer = duplicate_inheritable_handle(write_handle.raw(), label)?;
+        drop(write_handle);
+        // SAFETY: ownership of this unique pipe handle moves into `File`.
+        let reader = unsafe { File::from_raw_handle(read_handle.into_raw()) };
+        Ok(PipePair {
+            reader,
+            child_writer,
+        })
+    }
+
+    fn duplicate_inheritable_handle(
+        source: HANDLE,
+        label: &str,
+    ) -> Result<OwnedKernelHandle, BridgeError> {
+        if source.is_null() {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_HANDLE_DUPLICATE_FAILED",
+                format!("the capability {label} source handle is null"),
+                "Stop startup and inspect process-handle construction; do not launch a capability with ambiguous inheritance.",
+            ));
+        }
+        // SAFETY: this pseudo-handle identifies the current process.
+        let current = unsafe { GetCurrentProcess() };
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: `source` is owned by this process, output storage is valid,
+        // and only this duplicate is marked inheritable for HANDLE_LIST.
+        if unsafe {
+            DuplicateHandle(
+                current,
+                source,
+                current,
+                &mut duplicate,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(last_win32_failure(
+                "ASTRO_CBM_WORKER_CAPABILITY_HANDLE_DUPLICATE_FAILED",
+                format!("could not duplicate capability {label} as inheritable"),
+                "Inspect Windows handle duplication; do not launch a capability with ambiguous inheritance.",
+            ));
+        }
+        OwnedKernelHandle::new(duplicate).ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_HANDLE_DUPLICATE_FAILED",
+                format!("DuplicateHandle returned a null capability {label} handle"),
+                "Stop startup and inspect Windows handle duplication; do not launch a capability with ambiguous inheritance.",
+            )
+        })
+    }
+
+    fn query_job_limits(
+        handle: HANDLE,
+    ) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, BridgeError> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut returned_len = 0_u32;
+        // SAFETY: the Job handle is live and `limits` is writable for its exact
+        // structure size; `returned_len` is a live output.
+        if unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut returned_len,
+            )
+        } == 0
+        {
+            return Err(last_win32_failure(
+                "ASTRO_CBM_WORKER_CAPABILITY_JOB_QUERY_FAILED",
+                "could not read back capability Job limits",
+                "Stop startup and inspect Windows Job Object state; do not accept an unevaluable capability cohort.",
+            ));
+        }
+        if returned_len != size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32 {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_JOB_QUERY_INVALID",
+                format!(
+                    "capability Job limit readback returned {returned_len} bytes, expected {}",
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
+                ),
+                "Stop startup and inspect Windows Job Object state; do not accept a partial limit readback.",
+            ));
+        }
+        Ok(limits)
+    }
+
+    #[derive(Debug)]
+    struct CapabilityJobSnapshot {
+        observation: CbmWorkerCapabilityJobSnapshot,
+        process_ids: Vec<u32>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum JobEmptyExpectation {
+        Normal {
+            expected_pid: u32,
+            expected_total_processes: u32,
+            expected_total_terminated_processes: u32,
+        },
+        TerminatedCleanup,
+    }
+
+    #[derive(Debug)]
+    struct JobEmptyReadback {
+        consecutive_readbacks: u32,
+        terminal_snapshot: CbmWorkerCapabilityJobSnapshot,
+    }
+
+    fn process_is_in_job(process: HANDLE, job: HANDLE) -> Result<bool, String> {
+        let mut result = 0;
+        // SAFETY: both exact handles are live and `result` is a writable BOOL.
+        if unsafe { IsProcessInJob(process, job, &mut result) } == 0 {
+            let os_code = unsafe { GetLastError() };
+            return Err(format!("IsProcessInJob failed (GetLastError={os_code})"));
+        }
+        Ok(result != 0)
+    }
+
+    fn query_job_accounting(
+        handle: HANDLE,
+    ) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, String> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let mut accounting_bytes = 0_u32;
+        // SAFETY: the Job handle is live and `accounting` is writable for its
+        // exact structure size.
+        if unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut accounting).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                &mut accounting_bytes,
+            )
+        } == 0
+        {
+            let os_code = unsafe { GetLastError() };
+            return Err(format!(
+                "QueryInformationJobObject(BasicAccounting) failed (GetLastError={os_code})"
+            ));
+        }
+        if accounting_bytes != size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32 {
+            return Err(format!(
+                "capability Job accounting readback returned {accounting_bytes} bytes, expected {}",
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()
+            ));
+        }
+        Ok(accounting)
+    }
+
+    fn query_job_snapshot(handle: HANDLE) -> Result<CapabilityJobSnapshot, String> {
+        // Bracket the variable-length PID-list query with independent Job
+        // accounting reads. A process exit can race either call; only equal
+        // membership-control counters on both sides form one stable snapshot.
+        let accounting_before = query_job_accounting(handle)?;
+        let mut processes = JOBOBJECT_BASIC_PROCESS_ID_LIST::default();
+        let mut returned_len = 0_u32;
+        // ACTIVE_PROCESS=1 bounds the live PID roster to the structure's one
+        // inline slot. `NumberOfAssignedProcesses` may nevertheless exceed
+        // `NumberOfProcessIdsInList` while a terminal process object is still
+        // referenced, so that documented inequality is a transitional state,
+        // never proof of emptiness.
+        // SAFETY: the Job handle is live and the structure is writable for its
+        // exact size.
+        if unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectBasicProcessIdList,
+                std::ptr::from_mut(&mut processes).cast(),
+                size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() as u32,
+                &mut returned_len,
+            )
+        } == 0
+        {
+            let os_code = unsafe { GetLastError() };
+            return Err(format!(
+                "QueryInformationJobObject(ProcessIdList) failed (GetLastError={os_code})"
+            ));
+        }
+        let assigned = processes.NumberOfAssignedProcesses;
+        let listed = processes.NumberOfProcessIdsInList;
+        if assigned > REQUIRED_ACTIVE_PROCESS_LIMIT
+            || listed > assigned
+            || listed > REQUIRED_ACTIVE_PROCESS_LIMIT
+        {
+            return Err(format!(
+                "capability Job returned impossible PID counts: assigned={assigned}, listed={listed}, bytes={returned_len}"
+            ));
+        }
+        let listed = usize::try_from(listed)
+            .map_err(|_| "capability Job listed PID count does not fit usize".to_string())?;
+        let required_bytes = PROCESS_LIST_OFFSET
+            .checked_add(
+                listed
+                    .checked_mul(size_of::<usize>())
+                    .ok_or_else(|| "capability Job PID-list byte count overflowed".to_string())?,
+            )
+            .ok_or_else(|| "capability Job PID-list size overflowed".to_string())?;
+        if PROCESS_LIST_OFFSET >= size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            || required_bytes > size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            || (returned_len as usize) < required_bytes
+            || (returned_len as usize) > size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+        {
+            return Err("capability Job PID-list layout is invalid".to_string());
+        }
+        let mut process_ids = Vec::with_capacity(listed);
+        if listed == 1 {
+            let process_id = u32::try_from(processes.ProcessIdList[0]).map_err(|_| {
+                format!(
+                    "capability Job returned unrepresentable process id {}",
+                    processes.ProcessIdList[0]
+                )
+            })?;
+            if process_id == 0 {
+                return Err("capability Job returned process id zero".to_string());
+            }
+            process_ids.push(process_id);
+        }
+        let accounting_after = query_job_accounting(handle)?;
+        Ok(CapabilityJobSnapshot {
+            observation: CbmWorkerCapabilityJobSnapshot {
+                accounting_before_total_processes: accounting_before.TotalProcesses,
+                accounting_before_active_processes: accounting_before.ActiveProcesses,
+                accounting_before_total_terminated_processes: accounting_before
+                    .TotalTerminatedProcesses,
+                total_processes: accounting_after.TotalProcesses,
+                active_processes: accounting_after.ActiveProcesses,
+                total_terminated_processes: accounting_after.TotalTerminatedProcesses,
+                assigned_processes: assigned,
+                listed_processes: processes.NumberOfProcessIdsInList,
+                listed_process_id: process_ids.first().copied(),
+            },
+            process_ids,
+        })
+    }
+
+    fn job_snapshot_accounting_is_stable(snapshot: &CapabilityJobSnapshot) -> bool {
+        let state = snapshot.observation;
+        state.accounting_before_total_processes == state.total_processes
+            && state.accounting_before_active_processes == state.active_processes
+            && state.accounting_before_total_terminated_processes
+                == state.total_terminated_processes
+    }
+
+    fn validate_pre_spawn_job_snapshot(snapshot: &CapabilityJobSnapshot) -> Result<(), String> {
+        let state = snapshot.observation;
+        if !job_snapshot_accounting_is_stable(snapshot)
+            || state.total_processes != 0
+            || state.active_processes != 0
+            || state.total_terminated_processes != 0
+            || state.assigned_processes != 0
+            || state.listed_processes != 0
+            || state.listed_process_id.is_some()
+            || !snapshot.process_ids.is_empty()
+        {
+            return Err(format!(
+                "fresh capability Job was not exactly empty before process creation: snapshot={snapshot:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_suspended_job_snapshot(
+        snapshot: &CapabilityJobSnapshot,
+        expected_pid: u32,
+    ) -> Result<(), String> {
+        let state = snapshot.observation;
+        if !job_snapshot_accounting_is_stable(snapshot)
+            || state.total_processes != 1
+            || state.active_processes != REQUIRED_ACTIVE_PROCESS_LIMIT
+            || state.total_terminated_processes != 0
+            || state.assigned_processes != REQUIRED_ACTIVE_PROCESS_LIMIT
+            || state.listed_processes != REQUIRED_ACTIVE_PROCESS_LIMIT
+            || state.listed_process_id != Some(expected_pid)
+            || snapshot.process_ids.as_slice() != [expected_pid]
+        {
+            return Err(format!(
+                "suspended capability Job did not contain exactly its one primary process: expected_pid={expected_pid}, snapshot={snapshot:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_normal_job_snapshot(
+        snapshot: &CapabilityJobSnapshot,
+        expected_pid: u32,
+        expected_total_processes: u32,
+        expected_total_terminated_processes: u32,
+    ) -> Result<(), String> {
+        let state = snapshot.observation;
+        if state.accounting_before_total_processes != expected_total_processes
+            || state.total_processes != expected_total_processes
+            || state.accounting_before_total_terminated_processes
+                != expected_total_terminated_processes
+            || state.total_terminated_processes != expected_total_terminated_processes
+            || state.accounting_before_active_processes > REQUIRED_ACTIVE_PROCESS_LIMIT
+            || state.active_processes > REQUIRED_ACTIVE_PROCESS_LIMIT
+            || snapshot
+                .process_ids
+                .iter()
+                .any(|process_id| *process_id != expected_pid)
+        {
+            return Err(format!(
+                "capability Job state changed from its suspended lifetime baseline or listed a foreign process: expected_pid={expected_pid}, expected_total_processes={expected_total_processes}, expected_total_terminated_processes={expected_total_terminated_processes}, snapshot={snapshot:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_job_empty_twice(
+        handle: HANDLE,
+        deadline: Instant,
+        expectation: JobEmptyExpectation,
+    ) -> Result<JobEmptyReadback, String> {
+        let mut consecutive = 0_u32;
+        loop {
+            let snapshot = query_job_snapshot(handle)?;
+            let state = snapshot.observation;
+            if let JobEmptyExpectation::Normal {
+                expected_pid,
+                expected_total_processes,
+                expected_total_terminated_processes,
+            } = expectation
+            {
+                validate_normal_job_snapshot(
+                    &snapshot,
+                    expected_pid,
+                    expected_total_processes,
+                    expected_total_terminated_processes,
+                )?;
+            }
+            let empty = job_snapshot_accounting_is_stable(&snapshot)
+                && state.accounting_before_active_processes == 0
+                && state.active_processes == 0
+                && state.assigned_processes == 0
+                && state.listed_processes == 0
+                && state.listed_process_id.is_none()
+                && snapshot.process_ids.is_empty();
+            if empty {
+                consecutive += 1;
+                if consecutive == REQUIRED_EMPTY_READBACKS {
+                    return Ok(JobEmptyReadback {
+                        consecutive_readbacks: consecutive,
+                        terminal_snapshot: state,
+                    });
+                }
+            } else {
+                consecutive = 0;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "capability Job did not produce {REQUIRED_EMPTY_READBACKS} consecutive paired empty readbacks before its deadline; last_snapshot={snapshot:?}"
+                ));
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn read_bounded_pipe(mut file: File) -> CapabilityPipeRead {
+        let mut bytes = Vec::new();
+        let mut overflow = false;
+        let mut total_bytes = 0_u64;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => {
+                    return Ok(PipeCapture {
+                        bytes,
+                        overflow,
+                        total_bytes,
+                    });
+                }
+                Ok(read) => {
+                    total_bytes = total_bytes.checked_add(read as u64).ok_or_else(|| {
+                        std::io::Error::other("capability pipe byte count overflowed u64")
+                    })?;
+                    let remaining = WORKER_CAPABILITY_OUTPUT_MAX_BYTES.saturating_sub(bytes.len());
+                    let retained = remaining.min(read);
+                    bytes.extend_from_slice(&buffer[..retained]);
+                    overflow |= retained != read;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn extended_application_wide(path: &Path) -> Result<Vec<u16>, BridgeError> {
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.is_empty() || wide.contains(&0) {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_COMMAND_LINE_INVALID",
+                "the retained capability application path is empty or contains an embedded NUL",
+                "Pass one exact ordinary absolute executable path and a valid generated challenge.",
+            ));
+        }
+        let separator = |unit: u16| unit == b'\\' as u16 || unit == b'/' as u16;
+        let has_namespace_prefix = wide.len() >= 4
+            && separator(wide[0])
+            && separator(wide[1])
+            && (wide[2] == b'?' as u16 || wide[2] == b'.' as u16)
+            && separator(wide[3]);
+        let mut application = if has_namespace_prefix {
+            wide
+        } else if wide.len() >= 2 && separator(wide[0]) && separator(wide[1]) {
+            // A normalized UNC path becomes the documented extended UNC form.
+            let mut extended = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+            extended.extend_from_slice(&wide[2..]);
+            extended
+        } else if wide.len() >= 3 && wide[1] == b':' as u16 && separator(wide[2]) {
+            // A normalized drive path becomes the documented extended drive
+            // form. The command-line argv[0] remains the caller's original
+            // spelling; only lpApplicationName uses this exact launch path.
+            let mut extended = r"\\?\".encode_utf16().collect::<Vec<_>>();
+            extended.extend_from_slice(&wide);
+            extended
+        } else {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_APPLICATION_PATH_INVALID",
+                format!(
+                    "the retained capability application path {} is not an absolute drive, UNC, or Windows namespace path",
+                    path.display()
+                ),
+                "Pass the exact retained absolute shipping artifact path; executable search and drive-relative paths are forbidden.",
+            ));
+        };
+        // Win32 namespace paths require backslash separators. Replacing `/` is
+        // identity-preserving because `/` cannot be a Windows filename unit.
+        for unit in &mut application {
+            if *unit == b'/' as u16 {
+                *unit = b'\\' as u16;
+            }
+        }
+        application.push(0);
+        if application.len() > MAX_WINDOWS_COMMAND_LINE_UNITS {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_APPLICATION_PATH_INVALID",
+                format!(
+                    "the extended capability application path is {} UTF-16 units, exceeding the Windows limit of {MAX_WINDOWS_COMMAND_LINE_UNITS}",
+                    application.len()
+                ),
+                "Use the exact retained shipping artifact whose normalized extended path fits the Windows process-creation boundary.",
+            ));
+        }
+        Ok(application)
+    }
+
+    fn windows_command_line(
+        executable: &OsStr,
+        arguments: &[&OsStr],
+    ) -> Result<Vec<u16>, BridgeError> {
+        let mut command_line = Vec::new();
+        append_quoted_argument(&mut command_line, executable)?;
+        for argument in arguments {
+            command_line.push(b' ' as u16);
+            append_quoted_argument(&mut command_line, argument)?;
+        }
+        command_line.push(0);
+        if command_line.len() > MAX_WINDOWS_COMMAND_LINE_UNITS {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_COMMAND_LINE_INVALID",
+                format!(
+                    "the capability command line is {} UTF-16 units, exceeding the Windows limit of {MAX_WINDOWS_COMMAND_LINE_UNITS}",
+                    command_line.len()
+                ),
+                "Use the exact published worker path and generated bounded challenge; do not truncate process arguments.",
+            ));
+        }
+        Ok(command_line)
+    }
+
+    fn append_quoted_argument(
+        command_line: &mut Vec<u16>,
+        argument: &OsStr,
+    ) -> Result<(), BridgeError> {
+        let wide = argument.encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_COMMAND_LINE_INVALID",
+                "a capability process argument contains an embedded NUL",
+                "Use the exact published worker path and generated bounded challenge; do not truncate process arguments.",
+            ));
+        }
+        command_line.push(b'"' as u16);
+        let mut backslashes = 0_usize;
+        for unit in wide {
+            if unit == b'\\' as u16 {
+                backslashes = backslashes.checked_add(1).ok_or_else(|| {
+                    envelope(
+                        "ASTRO_CBM_WORKER_CAPABILITY_COMMAND_LINE_INVALID",
+                        "a capability process argument backslash count overflowed",
+                        "Use the exact published worker path and generated bounded challenge.",
+                    )
+                })?;
+                continue;
+            }
+            if unit == b'"' as u16 {
+                extend_backslashes(command_line, backslashes, true, true)?;
+                command_line.push(unit);
+            } else {
+                extend_backslashes(command_line, backslashes, false, false)?;
+                command_line.push(unit);
+            }
+            backslashes = 0;
+        }
+        extend_backslashes(command_line, backslashes, true, false)?;
+        command_line.push(b'"' as u16);
+        Ok(())
+    }
+
+    fn extend_backslashes(
+        command_line: &mut Vec<u16>,
+        count: usize,
+        double: bool,
+        escape_quote: bool,
+    ) -> Result<(), BridgeError> {
+        let mut count = if double {
+            count.checked_mul(2).ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_COMMAND_LINE_INVALID",
+                    "a capability process argument quote escape count overflowed",
+                    "Use the exact published worker path and generated bounded challenge.",
+                )
+            })?
+        } else {
+            count
+        };
+        if escape_quote {
+            count = count.checked_add(1).ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_COMMAND_LINE_INVALID",
+                    "a capability process argument quote escape count overflowed",
+                    "Use the exact published worker path and generated bounded challenge.",
+                )
+            })?;
+        }
+        command_line.extend(std::iter::repeat_n(b'\\' as u16, count));
+        Ok(())
+    }
+
+    fn wait_millis(deadline: Instant) -> Option<u32> {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let whole_millis = remaining.as_millis();
+        if whole_millis == 0 {
+            return None;
+        }
+        u32::try_from(whole_millis).ok().filter(|value| *value > 0)
+    }
+
+    fn wait_process(handle: HANDLE, deadline: Instant) -> Result<bool, String> {
+        let Some(wait_ms) = wait_millis(deadline) else {
+            return Ok(false);
+        };
+        // SAFETY: the caller retains the live process handle through this wait.
+        match unsafe { WaitForSingleObject(handle, wait_ms) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => {
+                let os_code = unsafe { GetLastError() };
+                Err(format!(
+                    "WaitForSingleObject(process) failed (GetLastError={os_code})"
+                ))
+            }
+            status => Err(format!(
+                "WaitForSingleObject(process) returned unexpected status {status:#x}"
+            )),
+        }
+    }
+
+    fn process_is_signaled_now(handle: HANDLE) -> Result<bool, String> {
+        // SAFETY: the caller retains the live exact process handle through this
+        // zero-duration state observation.
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => {
+                let os_code = unsafe { GetLastError() };
+                Err(format!(
+                    "WaitForSingleObject(process, 0) failed (GetLastError={os_code})"
+                ))
+            }
+            status => Err(format!(
+                "WaitForSingleObject(process, 0) returned unexpected status {status:#x}"
+            )),
+        }
+    }
+
+    fn elapsed_micros(started: Instant) -> Result<u64, BridgeError> {
+        u64::try_from(started.elapsed().as_micros()).map_err(|_| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_ELAPSED_OVERFLOW",
+                "the capability process elapsed time does not fit in u64 microseconds",
+                "Stop startup and inspect the monotonic clock; do not publish an incomplete capability observation.",
+            )
+        })
+    }
+
+    fn cleanup_summary(context: CapabilityFailureContext<'_>) -> String {
+        let CapabilityFailureContext {
+            job,
+            process,
+            thread,
+            known_exit_code,
+            pid,
+            readers,
+            timeout_ms,
+            terminal_deadline,
+        } = context;
+        let started = Instant::now();
+        let remaining_at_entry_micros = terminal_deadline
+            .checked_duration_since(started)
+            .map(|remaining| remaining.as_micros())
+            .unwrap_or(0);
+        // SAFETY: this private Job handle remains live for the complete bounded
+        // cleanup phase and owns every process in the capability cohort.
+        let termination =
+            if unsafe { TerminateJobObject(job.raw(), CAPABILITY_TERMINATION_EXIT_CODE) } != 0 {
+                "ok".to_string()
+            } else {
+                let os_code = unsafe { GetLastError() };
+                format!("failed(GetLastError={os_code})")
+            };
+        let (thread_handle_close, retained_thread) = match thread {
+            Some(thread) => match thread.close() {
+                Ok(()) => ("ok".to_string(), None),
+                Err((thread, os_code)) => (
+                    format!("failed(GetLastError={os_code}, retained_reference=true)"),
+                    Some(thread),
+                ),
+            },
+            None => ("not_owned".to_string(), None),
+        };
+        let process_terminal = match process.as_ref() {
+            Some(process) => match wait_process(process.raw(), terminal_deadline) {
+                Ok(true) => {
+                    let mut exit_code = 0_u32;
+                    // SAFETY: the bounded wait observed this exact retained
+                    // process handle signaled and `exit_code` is writable.
+                    if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } != 0 {
+                        format!("signaled(exit_code={exit_code})")
+                    } else {
+                        let os_code = unsafe { GetLastError() };
+                        format!("signaled(exit_query_failed(GetLastError={os_code}))")
+                    }
+                }
+                Ok(false) => "deadline".to_string(),
+                Err(error) => format!("wait_failed({error})"),
+            },
+            None => known_exit_code.map_or_else(
+                || "unavailable".to_string(),
+                |exit_code| format!("captured_before_cleanup(exit_code={exit_code})"),
+            ),
+        };
+        // BasicAccounting.ActiveProcesses is decremented only after the
+        // terminal process and every retained process-object reference are
+        // released. Drop the exact parent handle before asking the Job to prove
+        // that its terminated cohort is physically empty.
+        let (process_handle_close, retained_process) = match process {
+            Some(process) => match process.close() {
+                Ok(()) => ("ok".to_string(), None),
+                Err((process, os_code)) => (
+                    format!("failed(GetLastError={os_code}, retained_reference=true)"),
+                    Some(process),
+                ),
+            },
+            None => ("not_owned".to_string(), None),
+        };
+        let job_empty = if retained_process.is_some() || retained_thread.is_some() {
+            format!(
+                "unevaluable(handle_close_failed, retained_process_reference={}, retained_thread_reference={})",
+                retained_process.is_some(),
+                retained_thread.is_some()
+            )
+        } else {
+            format!(
+                "{:?}",
+                wait_for_job_empty_twice(
+                    job.raw(),
+                    terminal_deadline,
+                    JobEmptyExpectation::TerminatedCleanup,
+                )
+            )
+        };
+        let (stdout, stderr) = readers.finish(terminal_deadline);
+        let stdout = pipe_result_summary(&stdout);
+        let stderr = pipe_result_summary(&stderr);
+        let elapsed = started.elapsed().as_micros();
+        format!(
+            "pid={pid}, total_timeout_ms={timeout_ms}, remaining_at_entry_micros={remaining_at_entry_micros}, cleanup_elapsed_micros={elapsed}, job_termination={termination}, process_terminal={process_terminal}, primary_thread_handle_close={thread_handle_close}, process_handle_close={process_handle_close}, job_empty={job_empty}, stdout={stdout}, stderr={stderr}"
+        )
+    }
+
+    struct CapabilityFailureContext<'a> {
+        job: &'a CapabilityJob,
+        process: Option<OwnedKernelHandle>,
+        thread: Option<OwnedKernelHandle>,
+        known_exit_code: Option<u32>,
+        pid: u32,
+        readers: &'a mut CapabilityReaders,
+        timeout_ms: u32,
+        terminal_deadline: Instant,
+    }
+
+    fn failure_after_spawn(
+        code: &'static str,
+        message: String,
+        remediation: &'static str,
+        context: CapabilityFailureContext<'_>,
+    ) -> BridgeError {
+        let cleanup = cleanup_summary(context);
+        envelope(code, format!("{message}; cleanup=({cleanup})"), remediation)
+    }
+
+    fn last_win32_failure(
+        code: &'static str,
+        message: impl Into<String>,
+        remediation: &'static str,
+    ) -> BridgeError {
+        // SAFETY: callers invoke this immediately after the failed Win32 call.
+        let os_code = unsafe { GetLastError() };
+        win32_failure(code, message, os_code, remediation)
+    }
+
+    fn win32_failure(
+        code: &'static str,
+        message: impl Into<String>,
+        os_code: u32,
+        remediation: &'static str,
+    ) -> BridgeError {
+        envelope(
+            code,
+            format!("{} (GetLastError={os_code})", message.into()),
+            remediation,
+        )
+    }
+
+    pub(super) fn run(
+        application_path: &Path,
+        argv0_path: &Path,
+        challenge: &str,
+    ) -> Result<BoundedCapabilityProcess, BridgeError> {
+        let timeout_ms = astrolabe_domain::knobs::worker_capability_timeout_ms();
+        if timeout_ms < 2 || timeout_ms == u32::MAX {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_TIMEOUT_INVALID",
+                format!(
+                    "worker_capability_timeout_ms is {timeout_ms}; the capability deadline must be finite and leave positive execution and cleanup intervals"
+                ),
+                "Repair the registered worker capability timeout before startup; zero and INFINITE are not valid execution budgets.",
+            ));
+        }
+        let started = Instant::now();
+        // The registered knob is one end-to-end wall-time bound. Reserve one
+        // quarter for TerminateJobObject + process/Job/pipe readback so a hung
+        // execution cannot silently expand the bound to 2x. N is invariant at
+        // one primary process because ACTIVE_PROCESS=1 is read back above.
+        let cleanup_reserve_ms = timeout_ms.div_ceil(CLEANUP_RESERVE_DIVISOR);
+        let execution_budget_ms = timeout_ms.checked_sub(cleanup_reserve_ms).ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_TIMEOUT_INVALID",
+                format!(
+                    "worker_capability_timeout_ms={timeout_ms} cannot reserve cleanup_ms={cleanup_reserve_ms}"
+                ),
+                "Repair the registered end-to-end capability timeout before startup.",
+            )
+        })?;
+        let terminal_deadline = started
+            .checked_add(Duration::from_millis(u64::from(timeout_ms)))
+            .ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_DEADLINE_OVERFLOW",
+                    format!("the {timeout_ms} ms capability deadline exceeds the monotonic clock"),
+                    "Repair the registered worker capability timeout before startup; do not execute without a finite deadline.",
+                )
+            })?;
+        let execution_deadline = started
+            .checked_add(Duration::from_millis(u64::from(execution_budget_ms)))
+            .ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_WORKER_CAPABILITY_DEADLINE_OVERFLOW",
+                    format!(
+                        "the {execution_budget_ms} ms capability execution deadline exceeds the monotonic clock"
+                    ),
+                    "Repair the registered worker capability timeout before startup; do not execute without a finite deadline.",
+                )
+            })?;
+        let job = CapabilityJob::create()?;
+        let job_pre_spawn = query_job_snapshot(job.raw()).map_err(|error| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_JOB_QUERY_FAILED",
+                format!("fresh capability Job pre-spawn readback failed: {error}"),
+                "Stop startup and inspect the exact private Job; do not create a capability process from an unevaluable baseline.",
+            )
+        })?;
+        validate_pre_spawn_job_snapshot(&job_pre_spawn).map_err(|error| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_JOB_PRESPAWN_NOT_EMPTY",
+                error,
+                "Stop startup and inspect private Job creation; never reuse or execute from a Job whose exact initial accounting is nonempty.",
+            )
+        })?;
+        let job_pre_spawn_snapshot = job_pre_spawn.observation;
+        let stdout_pipe = create_pipe("stdout")?;
+        let stderr_pipe = create_pipe("stderr")?;
+        let stdin = File::open("NUL").map_err(|error| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_STDIN_OPEN_FAILED",
+                format!("could not open Windows NUL for capability stdin: {error}"),
+                "Inspect the Windows NUL device; do not launch a capability with inherited or interactive stdin.",
+            )
+        })?;
+        let inherited_stdin = duplicate_inheritable_handle(stdin.as_raw_handle().cast(), "stdin")?;
+        let mut readers = CapabilityReaders {
+            stdout: Some(CapabilityReader::spawn("stdout", stdout_pipe.reader)?),
+            stderr: Some(CapabilityReader::spawn("stderr", stderr_pipe.reader)?),
+        };
+        let inherited_handles = [
+            inherited_stdin.raw(),
+            stdout_pipe.child_writer.raw(),
+            stderr_pipe.child_writer.raw(),
+        ];
+        let job_handles = [job.raw()];
+        let mut attributes = ProcThreadAttributeList::new()?;
+        attributes.update_handles(
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            &job_handles,
+            "atomic Job list",
+        )?;
+        attributes.update_handles(
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            &inherited_handles,
+            "inherited standard-handle list",
+        )?;
+        let application = extended_application_wide(application_path)?;
+        let mut command_line = windows_command_line(
+            argv0_path.as_os_str(),
+            [
+                OsStr::new(ASTRO_INDEX_WORKER_CAPABILITY_ARG),
+                OsStr::new(challenge),
+            ]
+            .as_slice(),
+        )?;
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = inherited_stdin.raw();
+        startup.StartupInfo.hStdOutput = stdout_pipe.child_writer.raw();
+        startup.StartupInfo.hStdError = stderr_pipe.child_writer.raw();
+        startup.lpAttributeList = attributes.raw();
+        let mut process_info = PROCESS_INFORMATION::default();
+        if Instant::now() >= execution_deadline {
+            drop(attributes);
+            drop(inherited_stdin);
+            drop(stdout_pipe.child_writer);
+            drop(stderr_pipe.child_writer);
+            drop(stdin);
+            let (stdout, stderr) = readers.finish(terminal_deadline);
+            let stdout = pipe_result_summary(&stdout);
+            let stderr = pipe_result_summary(&stderr);
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_PRESPAWN_TIMEOUT",
+                format!(
+                    "capability setup exhausted its {execution_budget_ms} ms execution interval before CreateProcessW; total_timeout_ms={timeout_ms}, cleanup_reserve_ms={cleanup_reserve_ms}, stdout={stdout}, stderr={stderr}"
+                ),
+                "Inspect capability setup latency; do not launch a process after its reserved execution interval has expired.",
+            ));
+        }
+        // SAFETY: all pointer-backed application, command-line, startup, Job,
+        // and handle-list storage remains live for the call. The explicit
+        // application path disables executable search, and HANDLE_LIST limits
+        // inheritance to the three standard handles. DETACHED_PROCESS avoids a
+        // console-host process in this noninteractive protocol; the explicit
+        // pipe handles remain its only standard streams. CREATE_SUSPENDED lets
+        // the parent prove the exact Job generation before application code.
+        let created = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                DETACHED_PROCESS | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::from_ref(&startup).cast::<STARTUPINFOW>(),
+                &mut process_info,
+            )
+        };
+        // GetLastError is process-thread state and must be captured before any
+        // handle close can overwrite the CreateProcessW failure diagnostic.
+        let create_error = (created == 0).then(|| unsafe { GetLastError() });
+        // The parent must release every inheritable pipe writer immediately so
+        // EOF is produced only by the Job-owned process generation.
+        drop(attributes);
+        drop(inherited_stdin);
+        drop(stdout_pipe.child_writer);
+        drop(stderr_pipe.child_writer);
+        drop(stdin);
+        if let Some(os_code) = create_error {
+            let (stdout, stderr) = readers.finish(terminal_deadline);
+            let stdout = pipe_result_summary(&stdout);
+            let stderr = pipe_result_summary(&stderr);
+            return Err(win32_failure(
+                "ASTRO_CBM_WORKER_CAPABILITY_SPAWN_FAILED",
+                format!(
+                    "the retained worker executable {} could not be created atomically in its capability Job (stdout={stdout}, stderr={stderr})",
+                    application_path.display()
+                ),
+                os_code,
+                "Inspect the exact executable and Windows atomic process-creation error; do not enable indexing.",
+            ));
+        }
+        let process = OwnedKernelHandle::new(process_info.hProcess);
+        let thread = OwnedKernelHandle::new(process_info.hThread);
+        let child_pid = process_info.dwProcessId;
+        let primary_thread_id = process_info.dwThreadId;
+        let (process, thread) = match (process, thread) {
+            (Some(process), Some(thread)) if child_pid != 0 && primary_thread_id != 0 => {
+                (process, thread)
+            }
+            (process, thread) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_PROCESS_IDENTITY_INVALID",
+                    format!(
+                        "CreateProcessW returned child_pid={child_pid}, primary_thread_id={primary_thread_id}, process_handle={}, thread_handle={} for {}",
+                        process.is_some(),
+                        thread.is_some(),
+                        application_path.display()
+                    ),
+                    "Stop startup and inspect the exact CreateProcessW result; do not accept a capability without retained process and primary-thread identities.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process,
+                        thread,
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+        };
+        let initial_membership = match process_is_in_job(process.raw(), job.raw()) {
+            Ok(assigned) => assigned,
+            Err(error) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_QUERY_FAILED",
+                    format!(
+                        "capability child {child_pid} exact-handle Job membership readback failed: {error}"
+                    ),
+                    "Stop startup and inspect the exact Job and process; do not accept an unevaluable atomic assignment.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: Some(process),
+                        thread: Some(thread),
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+        };
+        if !initial_membership {
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_JOB_MEMBERSHIP_MISMATCH",
+                format!(
+                    "suspended capability child {child_pid} was not assigned to its exact private Job before its primary thread could run"
+                ),
+                "Stop startup and inspect the atomic JOB_LIST assignment; never resume a capability outside its exact private Job.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: Some(thread),
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        match process_is_signaled_now(process.raw()) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_SUSPENDED_PROCESS_TERMINAL",
+                    format!(
+                        "capability child {child_pid} was already terminal before its suspended primary thread was resumed"
+                    ),
+                    "Stop startup and inspect image initialization; never accept a capability that terminated before its pre-execution Job state was proven.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: Some(process),
+                        thread: Some(thread),
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_QUERY_FAILED",
+                    format!(
+                        "suspended capability child {child_pid} exact-handle state readback failed: {error}"
+                    ),
+                    "Stop startup and inspect the exact process handle; do not resume an unevaluable capability.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: Some(process),
+                        thread: Some(thread),
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+        }
+        let job_suspended = match query_job_snapshot(job.raw()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_QUERY_FAILED",
+                    format!(
+                        "suspended capability child {child_pid} Job readback failed before resume: {error}"
+                    ),
+                    "Stop startup and inspect the exact Job accounting; do not resume an unevaluable capability generation.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: Some(process),
+                        thread: Some(thread),
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+        };
+        if let Err(error) = validate_suspended_job_snapshot(&job_suspended, child_pid) {
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_JOB_MEMBERSHIP_MISMATCH",
+                error,
+                "Stop startup and inspect DETACHED_PROCESS plus the atomic JOB_LIST assignment; never resume anything except the exact one-process suspended cohort.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: Some(thread),
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        let job_suspended_snapshot = job_suspended.observation;
+        if Instant::now() >= execution_deadline {
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_PRERESUME_TIMEOUT",
+                format!(
+                    "capability setup exhausted its {execution_budget_ms} ms execution interval after proving suspended child {child_pid} and before ResumeThread; total_timeout_ms={timeout_ms}, cleanup_reserve_ms={cleanup_reserve_ms}, suspended_job={job_suspended_snapshot:?}"
+                ),
+                "Inspect suspended capability setup latency; never resume a process after its reserved execution interval has expired.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: Some(thread),
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        // SAFETY: the retained primary-thread handle belongs to the exact
+        // CREATE_SUSPENDED process. A return of one proves this call released
+        // its sole creation-time suspend count.
+        let resume_previous_suspend_count = unsafe { ResumeThread(thread.raw()) };
+        if resume_previous_suspend_count == u32::MAX {
+            let os_code = unsafe { GetLastError() };
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_RESUME_FAILED",
+                format!(
+                    "resuming capability child {child_pid} primary thread {primary_thread_id} failed (GetLastError={os_code})"
+                ),
+                "Stop startup and inspect the exact suspended thread; do not substitute another process or retry through executable search.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: Some(thread),
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        if resume_previous_suspend_count != 1 {
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_SUSPEND_COUNT_INVALID",
+                format!(
+                    "resuming capability child {child_pid} primary thread {primary_thread_id} returned previous_suspend_count={resume_previous_suspend_count}, expected exactly 1"
+                ),
+                "Stop startup and inspect process creation; never accept a capability whose primary-thread execution boundary was not exact.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: Some(thread),
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        if let Err((thread, os_code)) = thread.close() {
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_THREAD_HANDLE_CLOSE_FAILED",
+                format!(
+                    "capability child {child_pid} resumed from exactly one suspend count, but closing primary thread {primary_thread_id} failed (GetLastError={os_code})"
+                ),
+                "Stop startup and inspect the exact primary-thread handle lifecycle; do not accept output while the parent reference remains live.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: Some(thread),
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        match wait_process(process.raw(), execution_deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_TIMEOUT",
+                    format!(
+                        "capability child {child_pid} did not finish within its {execution_budget_ms} ms execution interval; total_timeout_ms={timeout_ms}, cleanup_reserve_ms={cleanup_reserve_ms}"
+                    ),
+                    "Inspect the exact non-mutating child; do not consume the reserved terminal-cleanup interval or enable indexing until the capability path terminates normally.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: Some(process),
+                        thread: None,
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_WAIT_FAILED",
+                    format!("waiting for capability child {child_pid} failed: {error}"),
+                    "Inspect the exact Windows wait and process identity; do not enable indexing after an unevaluable capability process.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: Some(process),
+                        thread: None,
+                        known_exit_code: None,
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+        }
+        let mut exit_code = 0_u32;
+        // SAFETY: the process has signaled and the retained handle remains live.
+        if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } == 0 {
+            let error = unsafe { GetLastError() };
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_EXIT_READBACK_FAILED",
+                format!(
+                    "capability child {child_pid} signaled but GetExitCodeProcess failed (GetLastError={error})"
+                ),
+                "Stop startup and inspect the exact process handle; do not accept a capability with an unreadable terminal state.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: None,
+                    known_exit_code: None,
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        // The exact child has signaled and its exit code is retained. Release
+        // the parent process-object reference before Job accounting/PID-list
+        // emptiness readback; Windows does not decrement ActiveProcesses until
+        // every such reference is gone.
+        if let Err((process, os_code)) = process.close() {
+            return Err(failure_after_spawn(
+                "ASTRO_CBM_WORKER_CAPABILITY_PROCESS_HANDLE_CLOSE_FAILED",
+                format!(
+                    "capability child {child_pid} signaled with exit_code={exit_code}, but closing its retained process handle failed (GetLastError={os_code})"
+                ),
+                "Stop startup and inspect the exact Windows process-handle lifecycle; do not accept output when the parent reference could not be released.",
+                CapabilityFailureContext {
+                    job: &job,
+                    process: Some(process),
+                    thread: None,
+                    known_exit_code: Some(exit_code),
+                    pid: child_pid,
+                    readers: &mut readers,
+                    timeout_ms,
+                    terminal_deadline,
+                },
+            ));
+        }
+        let job_empty = match wait_for_job_empty_twice(
+            job.raw(),
+            execution_deadline,
+            JobEmptyExpectation::Normal {
+                expected_pid: child_pid,
+                expected_total_processes: job_suspended_snapshot.total_processes,
+                expected_total_terminated_processes: job_suspended_snapshot
+                    .total_terminated_processes,
+            },
+        ) {
+            Ok(readbacks) => readbacks,
+            Err(error) => {
+                return Err(failure_after_spawn(
+                    "ASTRO_CBM_WORKER_CAPABILITY_JOB_NOT_EMPTY",
+                    format!(
+                        "capability child {child_pid} exited but its Job did not become provably empty: {error}"
+                    ),
+                    "Stop startup and inspect the exact capability Job cohort; do not accept output while any member state remains.",
+                    CapabilityFailureContext {
+                        job: &job,
+                        process: None,
+                        thread: None,
+                        known_exit_code: Some(exit_code),
+                        pid: child_pid,
+                        readers: &mut readers,
+                        timeout_ms,
+                        terminal_deadline,
+                    },
+                ));
+            }
+        };
+        let job_empty_readbacks = job_empty.consecutive_readbacks;
+        let job_terminal_snapshot = job_empty.terminal_snapshot;
+        let (stdout, stderr) = readers.finish(execution_deadline);
+        let stdout = stdout.map_err(|error| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_STDOUT_READ_FAILED",
+                format!(
+                    "capability child {child_pid} stdout did not reach bounded EOF: {error}; timeout_ms={timeout_ms}, job_empty_readbacks={job_empty_readbacks}"
+                ),
+                "Stop startup and inspect the exact pipe ownership; do not accept a capability without complete bounded stdout.",
+            )
+        })?;
+        let stderr = stderr.map_err(|error| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_STDERR_READ_FAILED",
+                format!(
+                    "capability child {child_pid} stderr did not reach bounded EOF: {error}; timeout_ms={timeout_ms}, job_empty_readbacks={job_empty_readbacks}"
+                ),
+                "Stop startup and inspect the exact pipe ownership; do not accept a capability without complete bounded stderr.",
+            )
+        })?;
+        if stdout.overflow || stderr.overflow {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_OUTPUT_OVERSIZED",
+                format!(
+                    "capability child {child_pid} exceeded the structural {}-byte cap (stdout_bytes={}, stdout_overflow={}, stderr_bytes={}, stderr_overflow={}, timeout_ms={timeout_ms}, job_empty_readbacks={job_empty_readbacks})",
+                    WORKER_CAPABILITY_OUTPUT_MAX_BYTES,
+                    stdout.total_bytes,
+                    stdout.overflow,
+                    stderr.total_bytes,
+                    stderr.overflow
+                ),
+                "Repair the fixed capability output to emit one bounded receipt and bounded diagnostics; do not enable indexing.",
+            ));
+        }
+        let elapsed_micros = elapsed_micros(started)?;
+        let execution_budget_micros = u64::from(execution_budget_ms) * 1_000;
+        if elapsed_micros > execution_budget_micros {
+            return Err(envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_TIMEOUT",
+                format!(
+                    "capability child {child_pid} completed its process, Job, and pipe readbacks after its execution interval: elapsed_micros={elapsed_micros}, execution_budget_micros={execution_budget_micros}, total_timeout_ms={timeout_ms}, cleanup_reserve_ms={cleanup_reserve_ms}, job_empty_readbacks={job_empty_readbacks}, stdout_bytes={}, stderr_bytes={}",
+                    stdout.total_bytes, stderr.total_bytes
+                ),
+                "Inspect the exact capability path; do not accept a receipt that consumed the terminal-cleanup reserve.",
+            ));
+        }
+        Ok(BoundedCapabilityProcess {
+            output: Output {
+                status: std::process::ExitStatus::from_raw(exit_code),
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+            },
+            observation: CbmWorkerCapabilityObservation {
+                child_pid,
+                primary_thread_id,
+                resume_previous_suspend_count,
+                timeout_ms,
+                elapsed_micros,
+                stdout_bytes: stdout.total_bytes,
+                stderr_bytes: stderr.total_bytes,
+                job_empty_readbacks,
+                job_pre_spawn_snapshot,
+                job_suspended_snapshot,
+                job_terminal_snapshot,
+            },
+        })
+    }
+}
+
+#[cfg(windows)]
+fn run_bounded_capability_process(
+    application_path: &Path,
+    argv0_path: &Path,
+    challenge: &str,
+) -> Result<BoundedCapabilityProcess, BridgeError> {
+    capability_process::run(application_path, argv0_path, challenge)
+}
+
+#[cfg(not(windows))]
+fn run_bounded_capability_process(
+    _application_path: &Path,
+    _argv0_path: &Path,
+    _challenge: &str,
+) -> Result<BoundedCapabilityProcess, BridgeError> {
+    Err(envelope(
+        "ASTRO_CBM_WORKER_BINARY_PLATFORM_DEFERRED",
+        "external worker capability processes are unavailable outside the native Windows target",
+        "Run the native Windows shipping target; cross-platform worker binding is deferred.",
+    ))
+}
+
+#[cfg(windows)]
+fn open_external_worker_lease(path: &Path) -> Result<ExternalWorkerLease, BridgeError> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        let code = if error.kind() == std::io::ErrorKind::NotFound {
+            "ASTRO_CBM_WORKER_BINARY_MISSING"
+        } else {
+            "ASTRO_CBM_WORKER_BINARY_METADATA_FAILED"
+        };
+        envelope(
+            code,
+            format!("the external worker path {} could not be inspected: {error}", path.display()),
+            "Pass one existing ordinary non-reparse Astrolabe executable and inspect the filesystem error.",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_BINARY_NOT_ORDINARY",
+            format!(
+                "the external worker path {} is not an ordinary file",
+                path.display()
+            ),
+            "Pass the exact shipping Astrolabe executable, not a directory or other filesystem object.",
+        ));
+    }
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_BINARY_REPARSE",
+            format!(
+                "the external worker path {} is a reparse point",
+                path.display()
+            ),
+            "Pass the direct ordinary shipping Astrolabe executable path.",
+        ));
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        // Deny write/delete sharing from capability launch through the native
+        // retained-handle bind. The candidate bytes cannot be replaced in the
+        // preflight-to-publication window.
+        .share_mode(FILE_SHARE_READ)
+        // Open the namespace object itself so a reparse point installed after
+        // the lstat-style precheck cannot redirect this retained authority.
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            envelope(
+                "ASTRO_CBM_WORKER_BINARY_OPEN_FAILED",
+                format!(
+                    "the external worker executable {} could not be retained for capability verification: {error}",
+                    path.display()
+                ),
+                "Pass one existing ordinary non-reparse Astrolabe executable whose bytes are readable.",
+            )
+        })?;
+    let identity = windows_file_identity_from_open_file(path, &file).map_err(|error| {
+        let code = match error.step {
+            "file_kind" => "ASTRO_CBM_WORKER_BINARY_NOT_ORDINARY",
+            "file_reparse" => "ASTRO_CBM_WORKER_BINARY_REPARSE",
+            "file_empty" => "ASTRO_CBM_WORKER_BINARY_EMPTY",
+            _ => "ASTRO_CBM_WORKER_BINARY_IDENTITY_FAILED",
+        };
+        envelope(
+            code,
+            format!(
+                "the external worker executable {} failed identity validation at {}: {}",
+                path.display(),
+                error.step,
+                error.message
+            ),
+            "Pass one readable, non-empty ordinary Astrolabe executable and inspect the reported filesystem operation.",
+        )
+    })?;
+    Ok(ExternalWorkerLease { file, identity })
+}
+
+#[cfg(not(windows))]
+fn open_external_worker_lease(path: &Path) -> Result<ExternalWorkerLease, BridgeError> {
+    let file = File::open(path).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_BINARY_OPEN_FAILED",
+            format!(
+                "the external worker executable {} could not be opened: {error}",
+                path.display()
+            ),
+            "Run the native Windows shipping target; cross-platform worker binding is deferred.",
+        )
+    })?;
+    drop(file);
+    Err(envelope(
+        "ASTRO_CBM_WORKER_BINARY_PLATFORM_DEFERRED",
+        format!(
+            "external worker identity for {} is unavailable outside the native Windows target",
+            path.display()
+        ),
+        "Run the native Windows shipping target; cross-platform worker binding is deferred.",
+    ))
+}
+
+fn retained_file_sha256(file: &mut File) -> Result<String, BridgeError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_ARTIFACT_HASH_SEEK_FAILED",
+            format!("the retained worker executable could not seek to its first byte: {error}"),
+            "Inspect the exact executable handle and filesystem error; do not bind an artifact whose bytes cannot be read deterministically.",
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => digest.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(envelope(
+                    "ASTRO_CBM_WORKER_ARTIFACT_HASH_READ_FAILED",
+                    format!("the retained worker executable could not be hashed: {error}"),
+                    "Inspect the exact executable handle and filesystem error; do not bind an artifact whose complete bytes cannot be read.",
+                ));
+            }
+        }
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_ARTIFACT_HASH_REWIND_FAILED",
+            format!("the retained worker executable could not be rewound after hashing: {error}"),
+            "Inspect the exact executable handle and filesystem error; do not publish a binding after incomplete artifact readback.",
+        )
+    })?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn verify_external_worker_capability(
+    path: &Path,
+    expected_artifact_sha256: &str,
+    expected_source_generation_sha256: &str,
+) -> Result<
+    (
+        ExternalWorkerLease,
+        CbmWorkerCapabilityReceipt,
+        CbmWorkerCapabilityObservation,
+    ),
+    BridgeError,
+> {
+    if expected_artifact_sha256.len() != 64
+        || !expected_artifact_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_EXPECTED_SHA256_INVALID",
+            format!(
+                "the expected worker artifact SHA-256 is not 64 lowercase hexadecimal bytes: {expected_artifact_sha256:?}"
+            ),
+            "Pass the exact lowercase SHA-256 from the immutable worker artifact publication receipt.",
+        ));
+    }
+    if expected_source_generation_sha256.len() != 64
+        || !expected_source_generation_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_EXPECTED_SOURCE_GENERATION_INVALID",
+            format!(
+                "the expected worker source generation is not 64 lowercase hexadecimal bytes: {expected_source_generation_sha256:?}"
+            ),
+            "Pass the exact source-generation SHA-256 from the frozen build publication receipt.",
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE",
+            format!(
+                "the external worker path {} is not absolute",
+                path.display()
+            ),
+            "Pass the exact absolute path from the immutable shipping artifact publication receipt; executable search is not permitted.",
+        ));
+    }
+    let mut lease = open_external_worker_lease(path)?;
+    let artifact_sha256 = retained_file_sha256(&mut lease.file)?;
+    if artifact_sha256 != expected_artifact_sha256 {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_ARTIFACT_SHA256_MISMATCH",
+            format!(
+                "the retained worker executable {} hashes to {artifact_sha256}, expected {expected_artifact_sha256}",
+                path.display()
+            ),
+            "Select the exact immutable shipping artifact named by the publication receipt; do not bind a stale or substituted executable.",
+        ));
+    }
+    let pid = std::process::id();
+    let process_start = process_start_utc_ticks(pid).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_OWNER_IDENTITY_FAILED",
+            format!("could not resolve capability verifier process {pid}: {error}"),
+            "Inspect the exact verifier process identity and retry from one live native host.",
+        )
+    })?;
+    let ordinal = WORKER_CAPABILITY_CHALLENGE_ORDINAL.fetch_add(1, Ordering::Relaxed);
+    let challenge = format!("{pid:08x}-{process_start:016x}-{ordinal:016x}");
+    // Launch through the normalized path read from the retained file handle,
+    // while preserving the caller's original absolute spelling as argv[0].
+    // `run_bounded_capability_process` converts this exact drive/UNC path to
+    // extended-length lpApplicationName syntax before CreateProcessW.
+    let application_path = Path::new(&lease.identity.final_handle_path);
+    let BoundedCapabilityProcess {
+        output,
+        observation,
+    } = run_bounded_capability_process(application_path, path, &challenge)?;
+    let stdout_bytes = u64::try_from(output.stdout.len()).map_err(|_| {
+        envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_OBSERVATION_INVALID",
+            "the retained capability stdout length does not fit in u64",
+            "Stop startup and inspect the bounded capability reader; do not publish an incomplete parent observation.",
+        )
+    })?;
+    let stderr_bytes = u64::try_from(output.stderr.len()).map_err(|_| {
+        envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_OBSERVATION_INVALID",
+            "the retained capability stderr length does not fit in u64",
+            "Stop startup and inspect the bounded capability reader; do not publish an incomplete parent observation.",
+        )
+    })?;
+    let expected_empty_initial = CbmWorkerCapabilityJobSnapshot {
+        accounting_before_total_processes: 0,
+        accounting_before_active_processes: 0,
+        accounting_before_total_terminated_processes: 0,
+        total_processes: 0,
+        active_processes: 0,
+        total_terminated_processes: 0,
+        assigned_processes: 0,
+        listed_processes: 0,
+        listed_process_id: None,
+    };
+    let expected_suspended = CbmWorkerCapabilityJobSnapshot {
+        accounting_before_total_processes: 1,
+        accounting_before_active_processes: 1,
+        accounting_before_total_terminated_processes: 0,
+        total_processes: 1,
+        active_processes: 1,
+        total_terminated_processes: 0,
+        assigned_processes: 1,
+        listed_processes: 1,
+        listed_process_id: Some(observation.child_pid),
+    };
+    let expected_empty_terminal = CbmWorkerCapabilityJobSnapshot {
+        accounting_before_total_processes: 1,
+        accounting_before_active_processes: 0,
+        accounting_before_total_terminated_processes: 0,
+        total_processes: 1,
+        active_processes: 0,
+        total_terminated_processes: 0,
+        assigned_processes: 0,
+        listed_processes: 0,
+        listed_process_id: None,
+    };
+    if observation.child_pid == 0
+        || observation.primary_thread_id == 0
+        || observation.resume_previous_suspend_count != 1
+        || observation.timeout_ms == 0
+        || observation.timeout_ms == u32::MAX
+        || observation.elapsed_micros == 0
+        || observation.job_empty_readbacks != 2
+        || observation.job_pre_spawn_snapshot != expected_empty_initial
+        || observation.job_suspended_snapshot != expected_suspended
+        || observation.job_terminal_snapshot != expected_empty_terminal
+        || observation.stdout_bytes != stdout_bytes
+        || observation.stderr_bytes != stderr_bytes
+    {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_OBSERVATION_INVALID",
+            format!(
+                "the bounded capability process returned an inconsistent parent observation: observation={observation:?}, retained_stdout_bytes={stdout_bytes}, retained_stderr_bytes={stderr_bytes}"
+            ),
+            "Stop startup and inspect the atomic Job/process/pipe terminal protocol; do not publish an internally inconsistent capability observation.",
+        ));
+    }
+    if !output.status.success() {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_REFUSED",
+            format!(
+                "the retained worker executable {} refused the private capability probe (exit={:?}, stdout={:?}, stderr={:?})",
+                path.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            "Pass the matching shipping Astrolabe executable that implements the current private worker and progress schemas.",
+        ));
+    }
+    if !output.stderr.is_empty() {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_STDERR",
+            format!(
+                "the retained worker executable {} emitted stderr during its capability probe: {:?}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            "Repair the capability path so successful non-mutating probes emit exactly one stdout receipt and no diagnostics.",
+        ));
+    }
+    let receipt_bytes = output.stdout.strip_suffix(b"\n").ok_or_else(|| {
+        envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_RECEIPT_FRAMING_INVALID",
+            format!(
+                "the worker capability receipt must end with exactly one LF byte: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            ),
+            "Repair the private capability path so it emits exactly one compact JSON receipt followed by one LF byte.",
+        )
+    })?;
+    // `stdout_bytes` deliberately includes the one required terminal LF; the
+    // receipt payload alone is one byte shorter.
+    let framed_receipt_bytes = u64::try_from(receipt_bytes.len())
+        .ok()
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_WORKER_CAPABILITY_OBSERVATION_INVALID",
+                "the framed capability receipt length does not fit in u64",
+                "Stop startup and inspect the bounded capability output; do not publish an incomplete byte-count observation.",
+            )
+        })?;
+    if observation.stdout_bytes != framed_receipt_bytes {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_OBSERVATION_INVALID",
+            format!(
+                "the capability stdout observation does not include exactly the JSON object and its terminal LF: observed={}, framed_receipt={framed_receipt_bytes}",
+                observation.stdout_bytes
+            ),
+            "Stop startup and inspect the bounded capability framing; do not publish an observation that omits or adds output bytes.",
+        ));
+    }
+    if receipt_bytes.is_empty()
+        || receipt_bytes.first() != Some(&b'{')
+        || receipt_bytes.last() != Some(&b'}')
+        || receipt_bytes
+            .iter()
+            .any(|byte| *byte == b'\n' || *byte == b'\r')
+    {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_RECEIPT_FRAMING_INVALID",
+            format!(
+                "the worker capability receipt is not exactly one JSON object line: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            ),
+            "Repair the private capability path so it emits exactly one compact JSON receipt followed by one LF byte.",
+        ));
+    }
+    let stdout = std::str::from_utf8(receipt_bytes).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_UTF8_INVALID",
+            format!("the worker capability receipt is not UTF-8: {error}"),
+            "Use the matching shipping Astrolabe executable and inspect its capability output bytes.",
+        )
+    })?;
+    let receipt: CbmWorkerCapabilityReceipt = serde_json::from_str(stdout).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_RECEIPT_INVALID",
+            format!("the worker capability receipt is not the required JSON schema: {error}"),
+            "Use the matching shipping Astrolabe executable and inspect its capability receipt.",
+        )
+    })?;
+    let expected_entrypoint = [
+        "cli",
+        "--index-worker",
+        "index_repository",
+        "--args-file",
+        "{args_path}",
+        "--response-out",
+        "{response_path}",
+        "--worker-progress-out",
+        "{progress_path}",
+        "--worker-progress-attempt",
+        "{attempt_sha256}",
+    ];
+    if receipt.schema != ASTRO_INDEX_WORKER_CAPABILITY_SCHEMA
+        || receipt.challenge != challenge
+        || receipt.worker_argv_schema != ASTRO_INDEX_WORKER_ARGV_SCHEMA
+        || receipt.progress_schema != ASTRO_INDEX_WORKER_PROGRESS_SCHEMA
+        || receipt.progress_schema_version != 1
+        || receipt
+            .worker_argv_template
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != expected_entrypoint
+        || receipt.worker_cache_arg != "_astrolabe_worker_cache_dir"
+        || receipt.transition_grant_arg != "_astrolabe_project_transition_writer"
+        || receipt.package_version != env!("CARGO_PKG_VERSION")
+        || receipt.source_generation_schema != ASTRO_WORKER_SOURCE_GENERATION_SCHEMA
+        || receipt.source_generation_sha256 != expected_source_generation_sha256
+        || receipt.artifact_identity != lease.identity
+    {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_CAPABILITY_MISMATCH",
+            format!(
+                "the worker capability receipt from {} does not bind the exact retained artifact and current private protocols: {receipt:?}",
+                path.display()
+            ),
+            "Use the exact shipping Astrolabe executable built from this source generation; do not run a stale or embedding image.",
+        ));
+    }
+    Ok((lease, receipt, observation))
+}
+
+/// Read back the exact native worker executable bound for this process.
+/// Absence is explicit so callers can distinguish an unconfigured host from an
+/// unreadable or malformed native path.
+pub fn configured_cbm_host_binary_path() -> Result<Option<PathBuf>, BridgeError> {
+    // SAFETY: the native getter returns either NULL or one process-lifetime
+    // immutable NUL-terminated string published with release/acquire ordering.
+    let configured = unsafe { cbm_sys::cbm_http_server_binary_path() };
+    if configured.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: non-NULL is the immutable native string described above.
+    let path = unsafe { CStr::from_ptr(configured) }.to_str()?;
+    Ok(Some(PathBuf::from(path)))
+}
+
+fn worker_binary_status_text(
+    status: cbm_sys::cbm_worker_binary_status_t,
+    selector: unsafe extern "C" fn(c_int) -> *const c_char,
+    fallback: &str,
+) -> String {
+    // SAFETY: the selector accepts every integer status and returns a static
+    // NUL-terminated diagnostic string.
+    let value = unsafe { selector(status) };
+    if value.is_null() {
+        return fallback.to_string();
+    }
+    // SAFETY: non-NULL selector results are process-lifetime static C strings.
+    unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn worker_binary_status_error(
+    status: cbm_sys::cbm_worker_binary_status_t,
+    native_error: c_ulong,
+    path: Option<&Path>,
+) -> BridgeError {
+    let code = worker_binary_status_text(
+        status,
+        cbm_sys::cbm_http_server_binary_status_code,
+        "CBM_WORKER_BINARY_UNKNOWN_STATUS",
+    );
+    let base_message = worker_binary_status_text(
+        status,
+        cbm_sys::cbm_http_server_binary_status_message,
+        "the worker executable binding returned an unknown status",
+    );
+    let remediation = worker_binary_status_text(
+        status,
+        cbm_sys::cbm_http_server_binary_status_remediation,
+        "report the unknown status and do not enable supervised indexing",
+    );
+    let context = path
+        .map(|path| format!(" path={:?}", path))
+        .unwrap_or_default();
+    envelope(
+        code,
+        format!("{base_message}; status={status}; native_error={native_error};{context}"),
+        remediation,
+    )
+}
+
+fn prepare_cbm_host_binding() -> Result<(), BridgeError> {
+    // Refuse a store-relocating environment before any process-global logging,
+    // profile, host-role, or memory initialization is changed (#194/#232).
+    validate_cbm_store_env(
+        std::env::var("CBM_CACHE_DIR").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+    )?;
+    initialize_cbm_allocator()
+}
+
+/// Bind the operating-system current process image as the sole worker binary.
+/// No argv/PATH spelling participates in this production authority.
+pub fn bind_cbm_host_self() -> Result<PathBuf, BridgeError> {
+    prepare_cbm_host_binding()?;
+    let requested = std::env::current_exe().map_err(|error| {
+        envelope(
+            "ASTRO_CBM_HOST_CURRENT_EXE_FAILED",
+            format!("the operating system did not expose the current process image: {error}"),
+            "Launch the existing ordinary shipping Astrolabe executable directly and inspect the operating-system error.",
+        )
+    })?;
+    let requested_identity = capture_windows_file_identity(&requested).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_HOST_CURRENT_EXE_IDENTITY_FAILED",
+            format!("the current process image failed independent identity readback: {error}"),
+            "Launch one ordinary non-reparse shipping Astrolabe executable and inspect the reported filesystem operation.",
+        )
+    })?;
+    let mut native_error: c_ulong = 0;
+    // SAFETY: the native function has one valid writable error output and uses
+    // the operating system's current-image authority internally.
+    let status = unsafe { cbm_sys::cbm_http_server_bind_self_binary(&mut native_error) };
+    if status != cbm_sys::cbm_worker_binary_status_t_CBM_WORKER_BINARY_OK {
+        return Err(worker_binary_status_error(
+            status,
+            native_error,
+            Some(&requested),
+        ));
+    }
+    let observed = configured_cbm_host_binary_path()?.ok_or_else(|| {
+        envelope(
+            "ASTRO_CBM_HOST_BINARY_PATH_READBACK_FAILED",
+            "the native self binding reported success but its immutable path getter is absent",
+            "Stop startup and inspect the native binding publication before enabling indexing.",
+        )
+    })?;
+    let observed_identity = capture_windows_file_identity(&observed).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_HOST_BINARY_IDENTITY_READBACK_FAILED",
+            format!(
+                "the bound self path {} failed independent identity readback: {error}",
+                observed.display()
+            ),
+            "Stop startup and inspect the retained worker file identity before enabling indexing.",
+        )
+    })?;
+    if observed_identity != requested_identity {
+        return Err(envelope(
+            "ASTRO_CBM_HOST_BINARY_IDENTITY_READBACK_MISMATCH",
+            format!(
+                "the native bound identity {observed_identity:?} does not equal the operating-system current image {requested_identity:?}"
+            ),
+            "Stop startup; do not enable indexing until one exact current-image identity is bound and read back.",
+        ));
+    }
+    Ok(observed)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CbmVerifiedWorkerBinding {
+    pub configured_path: PathBuf,
+    pub capability: CbmWorkerCapabilityReceipt,
+    pub capability_observation: CbmWorkerCapabilityObservation,
+    pub retained_identity: WindowsFileIdentity,
+    pub artifact_sha256: String,
+}
+
+/// Bind an external shipping worker only after its exact retained file answers
+/// the current private argv/progress capability challenge without mutation.
+pub fn bind_verified_external_cbm_worker(
+    path: &Path,
+    expected_artifact_sha256: &str,
+    expected_source_generation_sha256: &str,
+) -> Result<CbmVerifiedWorkerBinding, BridgeError> {
+    prepare_cbm_host_binding()?;
+    let (lease, capability, capability_observation) = verify_external_worker_capability(
+        path,
+        expected_artifact_sha256,
+        expected_source_generation_sha256,
+    )?;
+    let path_text = path.to_str().ok_or_else(|| {
+        envelope(
+            "ASTRO_CBM_WORKER_BINARY_PATH_UTF8_INVALID",
+            format!("the external worker path {path:?} is not valid UTF-8"),
+            "Pass the exact absolute UTF-8 path to the shipping Astrolabe executable.",
+        )
+    })?;
+    let path_c = CString::new(path_text)?;
+    let mut native_error: c_ulong = 0;
+    // SAFETY: the C string and writable native-error output remain live for the
+    // call. `lease` simultaneously denies write/delete sharing over these bytes.
+    let status = unsafe {
+        cbm_sys::cbm_http_server_bind_explicit_binary(path_c.as_ptr(), &mut native_error)
+    };
+    if status != cbm_sys::cbm_worker_binary_status_t_CBM_WORKER_BINARY_OK {
+        return Err(worker_binary_status_error(status, native_error, Some(path)));
+    }
+    let observed = configured_cbm_host_binary_path()?.ok_or_else(|| {
+        envelope(
+            "ASTRO_CBM_HOST_BINARY_PATH_READBACK_FAILED",
+            "the verified external binding reported success but its immutable path getter is absent",
+            "Stop startup and inspect the native binding publication before enabling indexing.",
+        )
+    })?;
+    let observed_identity = capture_windows_file_identity(&observed).map_err(|error| {
+        envelope(
+            "ASTRO_CBM_WORKER_BINARY_IDENTITY_READBACK_FAILED",
+            format!(
+                "the bound external worker {} failed identity readback: {error}",
+                observed.display()
+            ),
+            "Stop startup and inspect the retained worker identity before enabling indexing.",
+        )
+    })?;
+    if observed_identity != lease.identity {
+        return Err(envelope(
+            "ASTRO_CBM_WORKER_BINARY_IDENTITY_READBACK_MISMATCH",
+            format!(
+                "the native bound identity {observed_identity:?} does not equal the capability-held identity {:?}",
+                lease.identity
+            ),
+            "Stop startup; do not enable indexing until the capability and native retained handle bind one exact file identity.",
+        ));
+    }
+    Ok(CbmVerifiedWorkerBinding {
+        configured_path: observed,
+        capability,
+        capability_observation,
+        retained_identity: observed_identity,
+        artifact_sha256: expected_artifact_sha256.to_string(),
+    })
 }
 
 pub fn run_cbm_installer_command(command: &str, args: &[String]) -> Result<i32, BridgeError> {
@@ -732,36 +3357,13 @@ pub fn cbm_install_plan_json(home: &str, binary_path: &str) -> Result<String, Br
     }
 }
 
-fn initialize_cbm_host_process_with_log_mode(
-    binary_path: Option<&str>,
-    log_mode: CbmLogMode,
-) -> Result<(), BridgeError> {
-    initialize_cbm_log_configuration()?;
-    // Refuse a store-relocating environment at startup rather than discovering it
-    // one indexed project too late (#194/#232).
-    validate_cbm_store_env(
-        std::env::var("CBM_CACHE_DIR").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-        std::env::var("USERPROFILE").ok().as_deref(),
-    )?;
-    initialize_cbm_allocator()?;
-    let binary_path = binary_path.map(CString::new).transpose()?;
-
-    let profile_active = initialize_cbm_profile_mode()?;
-    // SAFETY: all called CBM startup functions are process-global initializers
-    // intended for main() startup. The optional binary path C string is live for
-    // the duration of the call; CBM copies it internally.
+fn apply_cbm_log_mode(log_mode: CbmLogMode, profile_active: bool) {
+    // SAFETY: these are process-global startup settings. Binary binding and its
+    // independent readback have already completed before this helper is called.
     unsafe {
         match log_mode {
             CbmLogMode::Default => {}
             CbmLogMode::CliWarnFloor => {
-                // #392: reserve CLI stderr for warn/error. Raise the libcbm log
-                // floor to the registry-declared ordinal (WARN) BEFORE cbm_mem_init
-                // so its INFO `mem.init`/`vmem.init` lines are dropped at the
-                // source rather than emitted. Warn/error still flow to stderr via
-                // the tracing sink installed by route_cbm_logs_to_tracing().
-                // Explicit profiling requests native INFO diagnostics, so it
-                // keeps the level selected by cbm_log_init_from_env.
                 if !profile_active {
                     let floor =
                         c_int::try_from(astrolabe_domain::knobs::cli_stderr_log_level_floor())
@@ -777,19 +3379,89 @@ fn initialize_cbm_host_process_with_log_mode(
                 );
             }
         }
-        cbm_sys::cbm_index_supervisor_mark_host();
-        cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
+    }
+}
 
+fn activate_cbm_memory() {
+    // SAFETY: version and memory initialization are process-global startup
+    // operations and take no caller-owned pointers.
+    unsafe {
+        cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
         let info = cbm_sys::cbm_system_info();
         let ram_fraction = cbm_sys::cbm_mem_ram_fraction_for_total(info.total_ram);
         cbm_sys::cbm_mem_init(ram_fraction);
-
-        if let Some(binary_path) = binary_path.as_ref() {
-            cbm_sys::cbm_http_server_set_binary_path(binary_path.as_ptr());
-        }
     }
+}
 
+/// Complete host-role activation after a successful exact binary bind and after
+/// the caller has installed its tracing/log route.
+pub fn activate_cbm_host_process(
+    log_mode: CbmLogMode,
+    profile_active: bool,
+) -> Result<(), BridgeError> {
+    if configured_cbm_host_binary_path()?.is_none() {
+        return Err(envelope(
+            "CBM_INDEX_WORKER_BINARY_PATH_UNBOUND",
+            "host activation was requested before an exact worker executable identity was bound",
+            "Bind and independently read back the self or capability-verified worker identity before host activation.",
+        ));
+    }
+    apply_cbm_log_mode(log_mode, profile_active);
+    // SAFETY: the host-role flag is one process-global startup mutation with no
+    // caller-owned pointers. It follows the mandatory binding readback above.
+    unsafe { cbm_sys::cbm_index_supervisor_mark_host() };
+    activate_cbm_memory();
     Ok(())
+}
+
+/// Validate non-host process prerequisites before any logging/profile mutation.
+pub fn prepare_cbm_non_host_process() -> Result<(), BridgeError> {
+    prepare_cbm_host_binding()
+}
+
+/// Initialize libcbm for a process that may perform in-process reads but is not
+/// authorized to spawn supervised index workers (for example hook augmentation).
+pub fn activate_cbm_non_host_process(
+    log_mode: CbmLogMode,
+    profile_active: bool,
+) -> Result<(), BridgeError> {
+    apply_cbm_log_mode(log_mode, profile_active);
+    activate_cbm_memory();
+    Ok(())
+}
+
+fn initialize_bound_cbm_host(log_mode: CbmLogMode) -> Result<(), BridgeError> {
+    bind_cbm_host_self()?;
+    initialize_cbm_log_configuration()?;
+    let profile_active = initialize_cbm_profile_mode()?;
+    activate_cbm_host_process(log_mode, profile_active)
+}
+
+/// Initialize a normal Astrolabe host from the operating-system current image.
+pub fn initialize_cbm_host_process() -> Result<(), BridgeError> {
+    initialize_bound_cbm_host(CbmLogMode::Default)
+}
+
+/// Initialize a CLI host from the operating-system current image.
+pub fn initialize_cbm_host_process_cli() -> Result<(), BridgeError> {
+    initialize_bound_cbm_host(CbmLogMode::CliWarnFloor)
+}
+
+/// Capability-check, retain, bind, and activate an external shipping worker.
+pub fn initialize_cbm_host_process_with_verified_worker(
+    path: &Path,
+    expected_artifact_sha256: &str,
+    expected_source_generation_sha256: &str,
+) -> Result<CbmVerifiedWorkerBinding, BridgeError> {
+    let binding = bind_verified_external_cbm_worker(
+        path,
+        expected_artifact_sha256,
+        expected_source_generation_sha256,
+    )?;
+    initialize_cbm_log_configuration()?;
+    let profile_active = initialize_cbm_profile_mode()?;
+    activate_cbm_host_process(CbmLogMode::Default, profile_active)?;
+    Ok(binding)
 }
 
 unsafe extern "C" fn cbm_log_silent_sink(_line: *const c_char) {}

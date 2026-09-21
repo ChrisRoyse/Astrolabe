@@ -123,6 +123,16 @@ struct RegisteredSlot {
     truncate_dim: Option<u32>,
 }
 
+struct AlgorithmicSlotRegistration<'a> {
+    lens: AlgorithmicLens,
+    name: &'a str,
+    dim: u32,
+    slot_id: u16,
+    bits_per_channel_x2: u8,
+    runtime_kind: String,
+    truncate_dim: Option<u32>,
+}
+
 struct Corpus {
     inputs: Vec<Vec<u8>>,
     cx_ids: Vec<CxId>,
@@ -177,7 +187,7 @@ fn run() -> AnyResult<()> {
     }));
 
     let mut registry = Registry::new();
-    let happy_slots = vec![
+    let happy_slots = [
         register_slot(&mut registry, "issue551-tq25", HAPPY_DIM, 31, 5)?,
         register_slot(&mut registry, "issue551-tq35", HAPPY_DIM, 32, 7)?,
         register_truncated_slot(
@@ -255,13 +265,15 @@ fn register_slot(
     let lens = AlgorithmicLens::one_hot(name, Modality::Text, dim);
     register_algorithmic_slot(
         registry,
-        lens,
-        name,
-        dim,
-        slot_id,
-        bits_per_channel_x2,
-        format!("one_hot:{dim}"),
-        None,
+        AlgorithmicSlotRegistration {
+            lens,
+            name,
+            dim,
+            slot_id,
+            bits_per_channel_x2,
+            runtime_kind: format!("one_hot:{dim}"),
+            truncate_dim: None,
+        },
     )
 }
 
@@ -276,26 +288,31 @@ fn register_truncated_slot(
     let lens = AlgorithmicLens::one_hot(name, Modality::Text, dim);
     register_algorithmic_slot(
         registry,
-        lens,
-        name,
-        dim,
-        slot_id,
-        bits_per_channel_x2,
-        format!("one_hot:{dim}"),
-        Some(truncate_dim),
+        AlgorithmicSlotRegistration {
+            lens,
+            name,
+            dim,
+            slot_id,
+            bits_per_channel_x2,
+            runtime_kind: format!("one_hot:{dim}"),
+            truncate_dim: Some(truncate_dim),
+        },
     )
 }
 
 fn register_algorithmic_slot(
     registry: &mut Registry,
-    lens: AlgorithmicLens,
-    name: &str,
-    dim: u32,
-    slot_id: u16,
-    bits_per_channel_x2: u8,
-    runtime_kind: String,
-    truncate_dim: Option<u32>,
+    registration: AlgorithmicSlotRegistration<'_>,
 ) -> AnyResult<RegisteredSlot> {
+    let AlgorithmicSlotRegistration {
+        lens,
+        name,
+        dim,
+        slot_id,
+        bits_per_channel_x2,
+        runtime_kind,
+        truncate_dim,
+    } = registration;
     let contract = lens.contract().clone();
     let quant = QuantPolicy::TurboQuant {
         bits_per_channel_x2,
@@ -828,7 +845,7 @@ fn recall_identity_edges(
         same_positive_ray_exact(&valid.values, &repeated.values),
         "duplicate-query edge is not exactly collinear",
     )?;
-    let duplicate_queries = vec![
+    let duplicate_queries = [
         CompressionQuery {
             cx_id: valid.cx_id,
             values: valid.values.clone(),
@@ -854,7 +871,7 @@ fn compressed_boundary_tie_edge(
     registered: &RegisteredSlot,
 ) -> AnyResult<()> {
     let SlotShape::Dense(dim) = registered.slot.shape else {
-        return Err(failure("compressed tie edge requires a dense slot").into());
+        return Err(failure("compressed tie edge requires a dense slot"));
     };
     let level = expected_level(registered.bits_per_channel_x2)?;
     let seed = current_shared_seed(registered, dim as usize, level);
@@ -1018,8 +1035,7 @@ fn compressed_boundary_tie_edge(
             }));
             return Err(failure(
                 "locally computed compressed-score collision was not a collision in the production compression path",
-            )
-            .into());
+            ));
         }
     };
     require(
@@ -1606,7 +1622,7 @@ fn legacy_migration_edge(
         .ok_or_else(|| failure("legacy migration query missing"))?;
     let raw_dim = match registered.slot.shape {
         SlotShape::Dense(dim) => dim,
-        _ => return Err(failure("legacy migration fixture requires a dense slot").into()),
+        _ => return Err(failure("legacy migration fixture requires a dense slot")),
     };
     let stored_dim = stored_dim_for(registry, registered)?;
     let golden = legacy_golden_set(registry, registered, corpus)?;
@@ -1844,7 +1860,7 @@ fn derive_legacy_golden_rows(
 ) -> AnyResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let raw_dim = match registered.slot.shape {
         SlotShape::Dense(dim) => dim,
-        _ => return Err(failure("legacy golden derivation requires a dense slot").into()),
+        _ => return Err(failure("legacy golden derivation requires a dense slot")),
     };
     let stored_dim = u32::try_from(stored_dim_for(registry, registered)?)
         .map_err(|_| failure("legacy golden stored dimension exceeds u32"))?;
@@ -1887,12 +1903,11 @@ fn build_legacy_v2_envelope(
         other => {
             return Err(failure(format!(
                 "legacy golden derivation supports only Bits2p5/Bits3p5, got {other:?}"
-            ))
-            .into());
+            )));
         }
     };
     require(
-        qv.dim as u32 == stored_dim && stored_dim > 0 && stored_dim <= raw_dim,
+        qv.dim as u32 == stored_dim && (1..=raw_dim).contains(&stored_dim),
         "legacy golden inner geometry disagrees with the frozen slot dimensions",
     )?;
     let payload = &qv.bytes;
@@ -2073,7 +2088,7 @@ fn parse_legacy_fixture_row(key: &[u8], envelope: &[u8]) -> AnyResult<LegacyFixt
     let raw_dim = u32::from_be_bytes(envelope[4..8].try_into()?);
     let stored_dim = u32::from_be_bytes(envelope[8..12].try_into()?);
     require(
-        raw_dim > 0 && stored_dim > 0 && stored_dim <= raw_dim && stored_dim <= MAX_DIM,
+        raw_dim > 0 && (1..=raw_dim).contains(&stored_dim) && stored_dim <= MAX_DIM,
         "legacy staging row dimensions are outside the frozen 1..=4096 contract",
     )?;
     let flags = envelope[12];
@@ -2116,8 +2131,7 @@ fn parse_legacy_fixture_row(key: &[u8], envelope: &[u8]) -> AnyResult<LegacyFixt
             other => {
                 return Err(failure(format!(
                     "legacy staging row has unsupported codec/level bytes {other:?}"
-                ))
-                .into());
+                )));
             }
         };
     require(
@@ -2558,7 +2572,7 @@ fn legacy_identity_refusal_edge(
     // The pinned legacy-identity golden is the tq25/dim128 geometry only.
     let raw_dim = match registered.slot.shape {
         SlotShape::Dense(dim) => dim,
-        _ => return Err(failure("legacy identity edge requires a dense slot").into()),
+        _ => return Err(failure("legacy identity edge requires a dense slot")),
     };
     let stored_dim = stored_dim_for(registry, registered)?;
     require(
@@ -3105,7 +3119,7 @@ fn raw_corruption_edge(
 fn maximum_dimension_edge(root: &Path) -> AnyResult<()> {
     let mut registry = Registry::new();
     let registered = register_slot(&mut registry, "issue551-max4096", MAX_DIM, 33, 5)?;
-    let slots = vec![registered.clone()];
+    let slots = [registered.clone()];
     let corpus = build_mixed_one_hot_corpus(&registry, &slots, 2, "max4096")?;
     let directory = root.join("max-dimension");
     let reports = populate_and_compress(&directory, &registry, &slots, &corpus, false)?;
@@ -3164,7 +3178,7 @@ fn over_limit_edge(root: &Path) -> AnyResult<()> {
         34,
         5,
     )?;
-    let slots = vec![registered.clone()];
+    let slots = [registered.clone()];
     let corpus = build_mixed_one_hot_corpus(&registry, &slots, 2, "overlimit4097")?;
     let directory = root.join("over-limit");
     fs::create_dir_all(&directory)?;
@@ -3377,11 +3391,11 @@ fn stored_dim_for(registry: &Registry, registered: &RegisteredSlot) -> AnyResult
 
 fn registered_stored_dim(registered: &RegisteredSlot) -> AnyResult<usize> {
     let SlotShape::Dense(raw_dim) = registered.slot.shape else {
-        return Err(failure("registered compression slot is not dense").into());
+        return Err(failure("registered compression slot is not dense"));
     };
     let stored_dim = registered.truncate_dim.unwrap_or(raw_dim);
     require(
-        stored_dim > 0 && stored_dim <= raw_dim,
+        (1..=raw_dim).contains(&stored_dim),
         format!(
             "registered compression stored dimension {stored_dim} is invalid for raw dimension {raw_dim}"
         ),
@@ -3537,7 +3551,7 @@ fn cx_id_from_key(key: &[u8]) -> AnyResult<CxId> {
 
 fn decode_hex(value: &str) -> AnyResult<Vec<u8>> {
     require(
-        value.len() % 2 == 0,
+        value.len().is_multiple_of(2),
         format!("hex input has odd length {}", value.len()),
     )?;
     (0..value.len())

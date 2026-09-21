@@ -165,6 +165,9 @@ pub(crate) fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynEr
     // #198: an Astrolabe-side knob, never forwarded to the CBM tool, which would reject it as
     // an unknown argument.
     sanitized.remove(SKILL_DISCOVERY_ARG);
+    // #1148: the host consumes and persists this real-query admission contract
+    // in the composite Kernel generation. libcbm has no ownership of it.
+    sanitized.remove(KERNEL_ADMISSION_ARG);
     // #1113: the public request is validated at the Astrolabe admission
     // boundary and replaced with one private, immutable worker transport. It
     // is generation provenance, not a caller action/cache identity.
@@ -210,12 +213,11 @@ pub(crate) fn project_from_tool_result(result: &str) -> Option<String> {
 }
 
 /// Read the libcbm `delete_project` `status` field ("deleted" / "not_found" /
-/// "delete_failed") out of a wrapped tool result. On an *error* result the C
-/// handler emits no `structuredContent` (see `cbm_mcp_text_result` — it only
-/// mirrors the payload into `structuredContent` when `is_error` is false), so
-/// the status then lives ONLY in the `content[0].text` JSON. Probe both, so this
-/// works for the success ("deleted") and error ("not_found"/"delete_failed")
-/// results alike. Returns `None` when the field is absent or unparseable.
+/// "delete_failed") out of a wrapped tool result. Object-shaped C results are
+/// mirrored into `structuredContent`; legacy or malformed error text may still
+/// exist only in `content[0].text`. Probe both, so this works for the success
+/// ("deleted") and error ("not_found"/"delete_failed") results alike. Returns
+/// `None` when the field is absent or unparseable.
 pub(crate) fn tool_result_c_status(result: &str) -> Option<String> {
     let value: Value = serde_json::from_str(result).ok()?;
     if let Some(status) = value

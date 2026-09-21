@@ -940,6 +940,27 @@ int main(int argc, char **argv) {
     if (allocator_rc != 0) {
         return EXIT_FAILURE;
     }
+    /* The worker authority is the operating system's current process image,
+     * never argv[0] or PATH. Bind and independently retain that identity before
+     * changing any other process-global host configuration. */
+    unsigned long binary_native_error = 0;
+    cbm_worker_binary_status_t binary_status =
+        cbm_http_server_bind_self_binary(&binary_native_error);
+    if (binary_status != CBM_WORKER_BINARY_OK) {
+        fprintf(stderr, "code=%s message=%s remediation=%s native_error=%lu\n",
+                cbm_http_server_binary_status_code(binary_status),
+                cbm_http_server_binary_status_message(binary_status),
+                cbm_http_server_binary_status_remediation(binary_status), binary_native_error);
+        return EXIT_FAILURE;
+    }
+    if (!cbm_http_server_binary_path()) {
+        binary_status = CBM_WORKER_BINARY_UNBOUND;
+        fprintf(stderr, "code=%s message=%s remediation=%s native_error=0\n",
+                cbm_http_server_binary_status_code(binary_status),
+                cbm_http_server_binary_status_message(binary_status),
+                cbm_http_server_binary_status_remediation(binary_status));
+        return EXIT_FAILURE;
+    }
     /* Log-format admission precedes argv allocation, profile selection, host
      * publication, and every command/server path. Invalid input is reported
      * without installing a sink or committing either logging setting. */
@@ -1009,8 +1030,6 @@ int main(int argc, char **argv) {
 
     /* Default: MCP server on stdio */
     cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
-    /* Store binary path for subprocess spawning + hook log sink */
-    cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
     cbm_log_info("server.start", "version", CBM_VERSION);
     cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */

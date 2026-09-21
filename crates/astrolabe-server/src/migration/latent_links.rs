@@ -456,7 +456,16 @@ fn persist_latent_result(
     let actor = ActorId::Service(LATENT_ACTOR.to_string());
     let subject = SubjectId::Kernel(request_sha256.to_vec());
 
-    let vault = open_shadow_vault_writable(vault_dir, vault_id, vault_salt, Vec::new())?;
+    let vault = open_shadow_vault_writable_latest_selected(
+        vault_dir,
+        vault_id,
+        vault_salt,
+        vec![
+            ColumnFamily::Kernel,
+            ColumnFamily::Ledger,
+            ColumnFamily::TimeIndex,
+        ],
+    )?;
     let current_seq = vault.latest_seq();
     if current_seq != input.source_seq {
         return Err(format!(

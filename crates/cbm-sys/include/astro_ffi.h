@@ -49,7 +49,40 @@ CBM_API void cbm_index_set_transition_writer_project(const char *project);
 CBM_API void cbm_profile_init(void);
 CBM_API bool cbm_profile_is_active(void);
 CBM_API void cbm_index_supervisor_mark_host(void);
-CBM_API void cbm_http_server_set_binary_path(const char *path);
+CBM_API bool cbm_index_supervisor_should_wrap(void);
+/* Keep this bindgen-facing definition byte-for-byte aligned with
+ * cbm/src/ui/http_server.h. The guard permits native translation units that
+ * include both public surfaces without redefining the ABI type. */
+#ifndef CBM_WORKER_BINARY_STATUS_DEFINED
+#define CBM_WORKER_BINARY_STATUS_DEFINED
+typedef enum {
+    CBM_WORKER_BINARY_OK = 0,
+    CBM_WORKER_BINARY_UNBOUND = 1,
+    CBM_WORKER_BINARY_INVALID_ARGUMENT = 2,
+    CBM_WORKER_BINARY_SELF_RESOLVE_FAILED = 3,
+    CBM_WORKER_BINARY_PATH_NOT_ABSOLUTE = 4,
+    CBM_WORKER_BINARY_PATH_ENCODING_FAILED = 5,
+    CBM_WORKER_BINARY_OPEN_FAILED = 6,
+    CBM_WORKER_BINARY_NOT_REGULAR_FILE = 7,
+    CBM_WORKER_BINARY_REPARSE_POINT = 8,
+    CBM_WORKER_BINARY_NOT_EXECUTABLE = 9,
+    CBM_WORKER_BINARY_IDENTITY_READ_FAILED = 10,
+    CBM_WORKER_BINARY_FINAL_PATH_FAILED = 11,
+    CBM_WORKER_BINARY_PATH_TOO_LONG = 12,
+    CBM_WORKER_BINARY_ALLOCATION_FAILED = 13,
+    CBM_WORKER_BINARY_CAPABILITY_MISMATCH = 14,
+    CBM_WORKER_BINARY_BIND_IN_PROGRESS = 15,
+    CBM_WORKER_BINARY_CONFLICT = 16,
+} cbm_worker_binary_status_t;
+#endif
+CBM_API cbm_worker_binary_status_t
+cbm_http_server_bind_self_binary(unsigned long *native_error);
+CBM_API cbm_worker_binary_status_t
+cbm_http_server_bind_explicit_binary(const char *path, unsigned long *native_error);
+CBM_API const char *cbm_http_server_binary_path(void);
+CBM_API const char *cbm_http_server_binary_status_code(int status);
+CBM_API const char *cbm_http_server_binary_status_message(int status);
+CBM_API const char *cbm_http_server_binary_status_remediation(int status);
 
 /* One canonical merge boundary for every cross-LSP resolver route. Success
  * commits the exact per-file accounting receipt while preserving first-row

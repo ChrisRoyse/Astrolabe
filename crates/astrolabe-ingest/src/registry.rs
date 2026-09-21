@@ -808,6 +808,7 @@ pub fn verify_deep_vault_path(
     let options = VaultOptions {
         read_only: true,
         restore_ledger_hook: false,
+        restore_mvcc_rows: false,
         // Deep verification must open every physically existing dynamic Slot CF;
         // a selected core-only view cannot prove the semantic vectors on disk.
         selected_cfs: None,

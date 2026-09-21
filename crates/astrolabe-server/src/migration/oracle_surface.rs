@@ -4,9 +4,9 @@ use astrolabe_domain::{TrustTag, rollup_trust};
 use astrolabe_oracle::{
     AbductionConfig, AbductionOutcome, AbductionReport, AbductionRequest, CauseHypothesis,
     FlakyOutcome, FlakyRefusal, ForecastConfig, ForecastOutcome, ForecastReport, OccurrenceRecord,
-    OracleError, RecurrenceRefusal, abduce_cause, failure_events_from_occurrences,
-    forecast_flaky_window, forecast_recurrence, outcome_series_from_occurrences,
-    read_occurrence_rows,
+    OracleError, PersistedOccurrenceRow, RecurrenceRefusal, abduce_cause,
+    failure_events_from_occurrences, forecast_flaky_window, forecast_recurrence,
+    outcome_series_from_occurrences, read_occurrence_rows, read_occurrence_rows_for_subjects_at,
 };
 use calyx_core::{CxId, Ts};
 
@@ -15,9 +15,9 @@ use calyx_core::{CxId, Ts};
 // ---------------------------------------------------------------------------
 
 /// Envelope schema for the `abduce_cause` MCP tool.
-pub(crate) const ABDUCE_CAUSE_SCHEMA: &str = "astrolabe.abduce_cause.v1";
+pub(crate) const ABDUCE_CAUSE_SCHEMA: &str = "astrolabe.abduce_cause.v2";
 /// Envelope schema for the `forecast` MCP tool.
-pub(crate) const FORECAST_SCHEMA: &str = "astrolabe.forecast.v1";
+pub(crate) const FORECAST_SCHEMA: &str = "astrolabe.forecast.v2";
 
 // ---------------------------------------------------------------------------
 // Stable failure codes (abduce_cause)
@@ -51,13 +51,20 @@ fn read_occurrence_records<C>(vault: &AsterVault<C>) -> Result<Vec<OccurrenceRec
 where
     C: Clock,
 {
-    let records = read_occurrence_rows(vault)?
-        .into_iter()
+    Ok(occurrence_records_from_rows(read_occurrence_rows(vault)?))
+}
+
+fn occurrence_records_from_rows(rows: Vec<PersistedOccurrenceRow>) -> Vec<OccurrenceRecord> {
+    rows.into_iter()
         .map(|persisted| {
             let row = persisted.row;
             OccurrenceRecord {
                 subject: row.subject,
                 change_id: row.change_id,
+                outcome_id: row.outcome_id,
+                outcome_subject: row.outcome_subject,
+                outcome_kind: row.outcome_kind,
+                test_identity: row.test_identity,
                 source: row.source,
                 change_ts: row.change_ts,
                 outcome_ts: row.outcome_ts,
@@ -69,8 +76,7 @@ where
                 trust: row.trust,
             }
         })
-        .collect();
-    Ok(records)
+        .collect()
 }
 
 fn trust_str(trust: TrustTag) -> &'static str {
@@ -440,14 +446,6 @@ pub(crate) fn forecast_json_at(
         vec![ColumnFamily::Graph, ColumnFamily::Base, ColumnFamily::Kv],
     )?;
     let node_map = astrolabe_ingest::read_node_map_cx_ids(&vault, project)?;
-    let records = read_occurrence_records(&vault)?;
-    drop(vault);
-
-    let mut cx_to_qn: BTreeMap<CxId, String> = BTreeMap::new();
-    for (qn, cx) in &node_map {
-        cx_to_qn.insert(*cx, qn.clone());
-    }
-
     let Some(&subject_cx) = node_map.get(subject_name) else {
         return Ok(refused(
             FORECAST_SCHEMA,
@@ -458,12 +456,33 @@ pub(crate) fn forecast_json_at(
         ));
     };
 
+    // Forecast is a one-subject query: open exactly that v4 occurrence prefix
+    // at one retained snapshot, not the full Oracle corpus (PC-04/PC-07/PC-16).
+    // The physical cost is one range open plus this subject's candidate rows;
+    // the production outcome/row cardinalities remain honest runtime receipts,
+    // not guesses derived from the N=192,873/E=328,899 graph measured
+    // 2026-08-08. Canonical OutcomeId order is invariant (PC-38/PC-41).
+    let subjects = BTreeSet::from([subject_cx]);
+    let rows = read_occurrence_rows_for_subjects_at(&vault, vault.snapshot(), &subjects)?;
+    let records = occurrence_records_from_rows(rows);
+    drop(vault);
+
+    let mut cx_to_qn: BTreeMap<CxId, String> = BTreeMap::new();
+    for (qn, cx) in &node_map {
+        cx_to_qn.insert(*cx, qn.clone());
+    }
+
     let subject_label = cx_label(subject_cx, &cx_to_qn);
     let config = ForecastConfig::default();
 
     match mode {
         "recurrence" => {
-            let events = failure_events_from_occurrences(&records, subject_cx);
+            let events = match failure_events_from_occurrences(&records, subject_cx) {
+                Ok(events) => events,
+                Err(error) => {
+                    return Ok(oracle_error_refused(FORECAST_SCHEMA, project, &error));
+                }
+            };
             match forecast_recurrence(&events, now_ts, Some(subject_cx), &config) {
                 Ok(ForecastOutcome::Forecast(report)) => Ok(forecast_report_json(
                     project,
@@ -482,7 +501,12 @@ pub(crate) fn forecast_json_at(
             }
         }
         _ => {
-            let series = outcome_series_from_occurrences(&records, subject_cx);
+            let series = match outcome_series_from_occurrences(&records, subject_cx) {
+                Ok(series) => series,
+                Err(error) => {
+                    return Ok(oracle_error_refused(FORECAST_SCHEMA, project, &error));
+                }
+            };
             match forecast_flaky_window(&series, subject_cx, now_ts, &config) {
                 Ok(FlakyOutcome::Window(report)) => Ok(forecast_report_json(
                     project,
